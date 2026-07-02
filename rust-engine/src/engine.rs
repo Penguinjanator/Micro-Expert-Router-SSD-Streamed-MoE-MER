@@ -5439,6 +5439,155 @@ mod tests {
         );
     }
 
+    /// Policy audit (validation closure, item 4): the *attention*
+    /// fallback policy must not enable expert degradation — an expert
+    /// fetch failure still fails the step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attention_fallback_policy_does_not_enable_expert_degradation() {
+        let dir = TempDir::new("attnfb-no-expert-degrade");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xA11);
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.policy = crate::inference::RealInferencePolicy {
+            allow_nonfinite_attention_fallback: true,
+            ..crate::inference::RealInferencePolicy::STRICT
+        };
+        let engine = Arc::new(engine_owned);
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA11);
+        let err = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect_err("attention fallback policy must not tolerate expert failures");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert_eq!(
+            engine.report().degraded_expert_substitutions,
+            0,
+            "no expert substitution may occur under the attention-only policy"
+        );
+    }
+
+    /// Policy audit (item 4): the truncated-payload policy must not
+    /// enable expert degradation either — a failed expert fetch still
+    /// fails the step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_payload_policy_does_not_enable_expert_degradation() {
+        let dir = TempDir::new("trunc-no-expert-degrade");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xA12);
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.policy = crate::inference::RealInferencePolicy {
+            allow_truncated_expert_payloads: true,
+            ..crate::inference::RealInferencePolicy::STRICT
+        };
+        let engine = Arc::new(engine_owned);
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA12);
+        let err = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect_err("truncated-payload policy must not tolerate expert fetch failures");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert_eq!(engine.report().degraded_expert_substitutions, 0);
+    }
+
+    /// Policy audit (item 4): `EngineReport` must reflect the exact
+    /// engine-scoped policy, and defaults must be strict (all false).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_report_reflects_configured_policy_and_defaults_strict() {
+        let dir = TempDir::new("policy-report");
+        let engine = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0xA13);
+        let report = engine.report();
+        assert_eq!(
+            report.inference_policy,
+            crate::inference::RealInferencePolicy::STRICT,
+            "default engine policy must be strict"
+        );
+        assert!(!report.inference_policy.any_degraded());
+
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        let custom = crate::inference::RealInferencePolicy {
+            allow_degraded_experts: true,
+            allow_nonfinite_attention_fallback: false,
+            allow_truncated_expert_payloads: true,
+        };
+        engine_owned.core.options.policy = custom;
+        let engine = Arc::new(engine_owned);
+        assert_eq!(
+            engine.report().inference_policy,
+            custom,
+            "EngineReport must carry the exact configured policy"
+        );
+        assert!(engine.report().inference_policy.any_degraded());
+    }
+
+    /// Policy audit (item 4): the fail-open policy is engine-scoped,
+    /// never process-global — a strict engine must fail closed even
+    /// while a degraded engine coexists in the same process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_engine_does_not_inherit_policy_from_degraded_engine() {
+        let d_model = 16;
+        let dir_degraded = TempDir::new("policy-scope-degraded");
+        let engine_degraded = build_engine(&dir_degraded.path, 8, d_model, 32, 4, 2, 1, 0xA14);
+        let mut owned = match Arc::try_unwrap(engine_degraded) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        owned.core.options.policy.allow_degraded_experts = true;
+        let engine_degraded = Arc::new(owned);
+
+        let dir_strict = TempDir::new("policy-scope-strict");
+        let engine_strict = build_engine(&dir_strict.path, 8, d_model, 32, 4, 2, 1, 0xA15);
+
+        // Break expert 3 in both data dirs.
+        for engine in [&engine_degraded, &engine_strict] {
+            let path = engine.core.storage.expert_path(3);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("truncate expert file");
+        }
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA14);
+
+        // The degraded engine substitutes; the strict engine fails —
+        // in either construction/execution order.
+        engine_degraded
+            .moe_step(0, 0, &hidden, &[3])
+            .await
+            .expect("degraded engine substitutes");
+        let err = engine_strict
+            .moe_step(0, 0, &hidden, &[3])
+            .await
+            .expect_err("strict engine must fail closed regardless of the degraded engine");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert!(engine_degraded.report().degraded_expert_substitutions >= 1);
+        assert_eq!(
+            engine_strict.report().degraded_expert_substitutions,
+            0,
+            "the strict engine's telemetry must be unaffected by the degraded engine"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn warm_with_preloads_experts_into_cache() {
         // Mirrors the spec's "router selects Expert ID 3 and 7" warm-up.

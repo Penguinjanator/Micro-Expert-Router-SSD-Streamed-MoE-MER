@@ -2162,15 +2162,13 @@ fn bench_sampling_params(
     }
 }
 
-async fn build_bench_real_runtime(
-    config_path: &Path,
-) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
-    use crate::config::Config;
-    use crate::metrics::Metrics;
-    use crate::tokenizer::Tokenizer;
-
-    let mut cfg = Config::from_file(config_path)?;
-    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
+/// Fail-closed policy gate for `bench-real` (hardening pass, item 4):
+/// every development-only fail-open flag is rejected — independently
+/// and in combination — because a benchmark taken under any degraded
+/// policy is not a production measurement. Factored out of
+/// [`build_bench_real_runtime`] so the rejection matrix is directly
+/// unit-testable.
+fn validate_bench_real_policies(cfg: &crate::config::Config) -> Result<(), String> {
     if !cfg.real_transformer.enabled {
         return Err("bench-real requires [real_transformer] enabled = true".into());
     }
@@ -2229,6 +2227,19 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    Ok(())
+}
+
+async fn build_bench_real_runtime(
+    config_path: &Path,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    use crate::config::Config;
+    use crate::metrics::Metrics;
+    use crate::tokenizer::Tokenizer;
+
+    let mut cfg = Config::from_file(config_path)?;
+    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
+    validate_bench_real_policies(&cfg)?;
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
         reconcile_real_model_config(&mut cfg)?;
@@ -6052,6 +6063,146 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Item 4: bench-real fail-open policy rejection matrix ----
+
+    /// A minimal config that passes every `bench-real` policy gate:
+    /// real transformer enabled, CPU offload, a weights dir, strict
+    /// weights, and every fail-open flag disabled.
+    fn bench_real_ok_cfg() -> crate::config::Config {
+        use std::path::PathBuf;
+        crate::config::Config {
+            server: crate::config::ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                max_tokens: 32,
+                session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
+            },
+            model: crate::config::ModelConfig {
+                data_dir: PathBuf::from("./data"),
+                num_experts: 8,
+                top_k: 2,
+                d_model: 8,
+                d_ff: 16,
+                expert_size: 4096,
+                num_layers: 1,
+                dtype: crate::inference::WeightDtype::F32,
+            },
+            storage: crate::config::StorageConfigToml {
+                cache_slots: 4,
+                block_align: 4096,
+                no_direct: true,
+                predict_fanout: 2,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
+                predict_min_prob: 0.05,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
+            },
+            tokenizer: crate::config::TokenizerConfig::default(),
+            real_transformer: {
+                let mut rt = crate::config::RealTransformerConfig::default();
+                rt.enabled = true;
+                rt.weights_dir = Some(PathBuf::from("./weights"));
+                rt
+            },
+            sampling: crate::config::SamplingConfig::default(),
+            predictive: crate::config::PredictiveConfig::default(),
+            security: crate::config::SecurityConfig::default(),
+            gpu_cache: crate::config::GpuCacheConfig::default(),
+            distributed: crate::config::DistributedConfig::default(),
+        }
+    }
+
+    /// The baseline (strict) config passes the gate; the serde
+    /// defaults keep every fail-open flag disabled.
+    #[test]
+    fn bench_real_accepts_strict_baseline_and_flags_default_false() {
+        let cfg = bench_real_ok_cfg();
+        assert!(!cfg.real_transformer.allow_degraded_experts);
+        assert!(!cfg.real_transformer.allow_nonfinite_attention_fallback);
+        assert!(!cfg.real_transformer.allow_truncated_expert_payloads);
+        assert_eq!(
+            cfg.real_transformer.inference_policy(),
+            crate::inference::RealInferencePolicy::STRICT
+        );
+        validate_bench_real_policies(&cfg).expect("strict baseline must pass");
+    }
+
+    /// Each fail-open flag is rejected independently, with an error
+    /// that names the offending flag.
+    #[test]
+    fn bench_real_rejects_each_fail_open_flag_independently() {
+        let cases: [(&str, fn(&mut crate::config::Config)); 3] = [
+            ("allow_degraded_experts", |c| {
+                c.real_transformer.allow_degraded_experts = true
+            }),
+            ("allow_nonfinite_attention_fallback", |c| {
+                c.real_transformer.allow_nonfinite_attention_fallback = true
+            }),
+            ("allow_truncated_expert_payloads", |c| {
+                c.real_transformer.allow_truncated_expert_payloads = true
+            }),
+        ];
+        for (name, set) in cases {
+            let mut cfg = bench_real_ok_cfg();
+            set(&mut cfg);
+            let err = validate_bench_real_policies(&cfg)
+                .expect_err("bench-real must reject a fail-open policy");
+            assert!(
+                err.contains(name),
+                "rejection for {name} must name the flag; got: {err}"
+            );
+        }
+    }
+
+    /// Combinations of fail-open flags are rejected too (the gate
+    /// fails on the first offending flag; no combination slips
+    /// through).
+    #[test]
+    fn bench_real_rejects_fail_open_flag_combinations() {
+        for mask in 1u8..8 {
+            let mut cfg = bench_real_ok_cfg();
+            cfg.real_transformer.allow_degraded_experts = mask & 1 != 0;
+            cfg.real_transformer.allow_nonfinite_attention_fallback = mask & 2 != 0;
+            cfg.real_transformer.allow_truncated_expert_payloads = mask & 4 != 0;
+            assert!(
+                validate_bench_real_policies(&cfg).is_err(),
+                "flag combination {mask:03b} must be rejected"
+            );
+        }
+    }
+
+    /// The pre-existing gates still hold alongside the policy flags.
+    #[test]
+    fn bench_real_rejects_seeded_fallback_non_strict_and_non_cpu() {
+        let mut cfg = bench_real_ok_cfg();
+        cfg.real_transformer.allow_seeded_fallback = true;
+        assert!(validate_bench_real_policies(&cfg)
+            .expect_err("seeded fallback rejected")
+            .contains("allow_seeded_fallback"));
+
+        let mut cfg = bench_real_ok_cfg();
+        cfg.real_transformer.strict_weights = false;
+        assert!(validate_bench_real_policies(&cfg)
+            .expect_err("non-strict weights rejected")
+            .contains("strict_weights"));
+
+        for offload in [
+            crate::backend::ComputeOffload::Gpu,
+            crate::backend::ComputeOffload::Auto,
+            crate::backend::ComputeOffload::Hybrid,
+        ] {
+            let mut cfg = bench_real_ok_cfg();
+            cfg.real_transformer.compute_offload = offload;
+            assert!(
+                validate_bench_real_policies(&cfg).is_err(),
+                "{offload:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn bench_real_validity_detects_softmax_fallback_delta() {

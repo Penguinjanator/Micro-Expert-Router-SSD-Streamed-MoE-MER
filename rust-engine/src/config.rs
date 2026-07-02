@@ -1565,6 +1565,36 @@ mod tests {
         );
     }
 
+    /// Item 4: the TOML flags default to false and map one-to-one
+    /// into the strict engine policy (no flag enables another).
+    #[test]
+    fn real_transformer_policy_flags_default_false_and_map_independently() {
+        let rt = RealTransformerConfig::default();
+        assert!(!rt.allow_degraded_experts);
+        assert!(!rt.allow_nonfinite_attention_fallback);
+        assert!(!rt.allow_truncated_expert_payloads);
+        assert_eq!(
+            rt.inference_policy(),
+            crate::inference::RealInferencePolicy::STRICT
+        );
+        // Each flag maps only to its own policy field.
+        let mut one = RealTransformerConfig::default();
+        one.allow_degraded_experts = true;
+        let p = one.inference_policy();
+        assert!(p.allow_degraded_experts);
+        assert!(!p.allow_nonfinite_attention_fallback && !p.allow_truncated_expert_payloads);
+        let mut two = RealTransformerConfig::default();
+        two.allow_nonfinite_attention_fallback = true;
+        let p = two.inference_policy();
+        assert!(p.allow_nonfinite_attention_fallback);
+        assert!(!p.allow_degraded_experts && !p.allow_truncated_expert_payloads);
+        let mut three = RealTransformerConfig::default();
+        three.allow_truncated_expert_payloads = true;
+        let p = three.inference_policy();
+        assert!(p.allow_truncated_expert_payloads);
+        assert!(!p.allow_degraded_experts && !p.allow_nonfinite_attention_fallback);
+    }
+
     // ---- Finding 1: fail-closed real-model weight policy ----
 
     #[test]

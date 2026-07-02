@@ -5533,6 +5533,19 @@ mod tests {
     /// one-byte-short or one-page-short buffer is a hard error and is
     /// never zero-filled. Strictness is now scoped (tolerance = 0), not
     /// a process-global switch.
+    /// Item 4: every fail-open policy defaults to `false` — the
+    /// default policy is exactly [`RealInferencePolicy::STRICT`].
+    #[test]
+    fn real_inference_policy_defaults_are_strict() {
+        let d = RealInferencePolicy::default();
+        assert_eq!(d, RealInferencePolicy::STRICT);
+        assert!(!d.allow_degraded_experts);
+        assert!(!d.allow_nonfinite_attention_fallback);
+        assert!(!d.allow_truncated_expert_payloads);
+        assert!(!d.any_degraded());
+        assert_eq!(d.expert_size_tolerance(), 0);
+    }
+
     #[test]
     fn q4_0_strict_requires_exact_logical_payload() {
         assert_eq!(

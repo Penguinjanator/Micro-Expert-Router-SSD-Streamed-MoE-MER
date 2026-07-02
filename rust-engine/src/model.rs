@@ -5194,6 +5194,38 @@ mod tests {
         assert!(matches!(err, RealInferenceError::NonFiniteAttention { .. }));
     }
 
+    /// Policy separation (item 4): `allow_truncated_expert_payloads`
+    /// must NOT enable the uniform-attention fallback either — NaN
+    /// attention still fails the request under the payload-only policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_payload_policy_does_not_enable_attention_fallback() {
+        let dir = TempDir::new("nanattn_truncated_payloads");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_truncated_expert_payloads: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("payload tolerance must not fabricate attention");
+        assert!(matches!(err, RealInferenceError::NonFiniteAttention { .. }));
+    }
+
     /// Policy separation: only the explicit
     /// `allow_nonfinite_attention_fallback` policy re-enables the
     /// legacy uniform-attention fallback for non-finite rows.
