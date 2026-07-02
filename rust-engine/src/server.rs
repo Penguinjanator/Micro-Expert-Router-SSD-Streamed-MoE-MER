@@ -1649,6 +1649,21 @@ async fn build_completion_stream(
         session_id,
     )
     .await?;
+    Ok(wrap_completion_events(inner, id, model_name, metrics))
+}
+
+/// Wrap the inner token stream in OpenAI-compatible completion SSE
+/// events. Factored out of [`build_completion_stream`] so the
+/// event-ordering contract (item 6: a non-empty final decoder tail is
+/// emitted as a normal content chunk *before* `[DONE]`; item 5: errors
+/// terminate the stream with an error event and never `[DONE]`) is
+/// directly testable against a synthetic inner stream.
+fn wrap_completion_events(
+    inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>,
+    id: String,
+    model_name: String,
+    metrics: Metrics,
+) -> impl Stream<Item = Result<Event, Infallible>> {
     struct WrapSt {
         inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>,
         id: String,
@@ -1769,7 +1784,7 @@ async fn build_completion_stream(
             }
         }
     });
-    Ok(s)
+    s
 }
 
 /// Serialize an OpenAI-compatible SSE error payload for a failed
@@ -1809,7 +1824,22 @@ async fn build_chat_stream(
         session_id,
     )
     .await?;
+    Ok(wrap_chat_events(inner, id, model_name, metrics))
+}
 
+/// Wrap the inner token stream in OpenAI-compatible chat SSE events
+/// (leading `role: assistant` delta, then content deltas). Factored
+/// out of [`build_chat_stream`] so the event-ordering contract (item
+/// 6: a non-empty final decoder tail is emitted as a content delta
+/// *before* `[DONE]`; item 5: errors terminate the stream with an
+/// error event and never `[DONE]`) is directly testable against a
+/// synthetic inner stream.
+fn wrap_chat_events(
+    inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>,
+    id: String,
+    model_name: String,
+    metrics: Metrics,
+) -> impl Stream<Item = Result<Event, Infallible>> {
     // OpenAI emits a first "delta: { role: assistant }" event before any
     // content tokens. We do the same so streaming chat clients see the
     // role before the first content delta.
@@ -1938,7 +1968,7 @@ async fn build_chat_stream(
             }
         }
     });
-    Ok(s)
+    s
 }
 
 /// 64-bit pseudo-random id derived from the wall clock and a per-call
@@ -3150,5 +3180,523 @@ mod tests {
             stream.next().await.is_none(),
             "stream must terminate after the error"
         );
+    }
+
+    // =============== A7 closure tests (validation closure, item 1) ===============
+
+    /// Spawn a [`BatchScheduler`] on a dedicated secondary runtime so
+    /// the test can deterministically terminate the scheduler loop task
+    /// (closing its mpsc channels) while the registry `Arc` — shared
+    /// with the handle — stays alive.
+    fn spawn_scheduler_on_runtime(
+        model: &Arc<crate::model::RealModel>,
+        engine: &Arc<Engine>,
+    ) -> (
+        tokio::runtime::Runtime,
+        Arc<crate::batch_scheduler::BatchScheduler>,
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("secondary runtime");
+        let scheduler = {
+            let _guard = rt.enter();
+            Arc::new(crate::batch_scheduler::BatchScheduler::spawn(
+                model.clone(),
+                engine.clone(),
+                crate::batch_scheduler::BatchConfig {
+                    max_batch_size: 4,
+                    batch_timeout: std::time::Duration::from_millis(2),
+                    ..Default::default()
+                },
+            ))
+        };
+        (rt, scheduler)
+    }
+
+    /// Fully shut down the secondary runtime from inside an async test
+    /// (dropping a runtime inline in async context is not allowed).
+    /// After this returns the scheduler loop task has been dropped, so
+    /// its submission channels are closed.
+    async fn shutdown_runtime(rt: tokio::runtime::Runtime) {
+        tokio::task::spawn_blocking(move || {
+            rt.shutdown_timeout(std::time::Duration::from_secs(10));
+        })
+        .await
+        .expect("runtime shutdown");
+    }
+
+    /// A7 item 1: the scheduler's channels close *before* any scheduled
+    /// execution. The registered KV state is still in the shared
+    /// registry, so the direct fallback must recover that exact state
+    /// (never fabricate fresh KV) and complete the request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_channel_closure_before_execution_recovers_registered_kv() {
+        let cfg = tiny_real_cfg();
+        let (mut state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.clone().unwrap();
+        let (rt, scheduler) = spawn_scheduler_on_runtime(&model, &state.engine);
+        state.batch_scheduler = Some(scheduler.clone());
+        // Terminate the scheduler loop before it executes anything.
+        shutdown_runtime(rt).await;
+
+        let mut request =
+            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        // decode_step registers the KV (registry op is synchronous and
+        // survives the loop), then the channel send fails with
+        // SchedulerClosed — the fallback must recover the registered
+        // state and decode directly.
+        request
+            .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("closure before execution must recover the registered KV and continue");
+        assert_eq!(scheduler.registrations_total(), 1);
+        assert_eq!(scheduler.releases_total(), 1);
+        let kv = request.finish().expect("recovered KV must be persistable");
+        assert_eq!(kv[0].seq_len, 1, "the direct decode advanced the recovered KV");
+    }
+
+    /// A7 item 1: the scheduler's channels close *after* scheduled
+    /// steps already mutated the registered KV state. The fallback
+    /// must recover the exact mutated state — positions written by the
+    /// scheduler are preserved, never reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_closure_after_kv_mutation_recovers_exact_mutated_state() {
+        let cfg = tiny_real_cfg();
+        let (mut state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.clone().unwrap();
+        let (rt, scheduler) = spawn_scheduler_on_runtime(&model, &state.engine);
+        state.batch_scheduler = Some(scheduler.clone());
+
+        let greedy = crate::sampling::SamplingParams::greedy();
+        let mut request =
+            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        // Two scheduled decodes mutate the registered KV in place.
+        let n1 = request.decode_step(1, 0, &greedy).await.expect("scheduled step 1");
+        let n2 = request.decode_step(n1, 1, &greedy).await.expect("scheduled step 2");
+        assert_eq!(scheduler.registrations_total(), 1);
+
+        shutdown_runtime(rt).await;
+
+        // Third decode: channel closed → direct fallback on the exact
+        // recovered (mutated) KV state.
+        request
+            .decode_step(n2, 2, &greedy)
+            .await
+            .expect("closure after mutation must recover the mutated KV and continue");
+        let kv = request.finish().expect("recovered KV must be persistable");
+        assert_eq!(
+            kv[0].seq_len, 3,
+            "recovered KV must carry the scheduler-written positions plus the direct step"
+        );
+    }
+
+    /// A7 item 1: end-to-end non-streaming request — losing the
+    /// scheduler-registered KV state mid-request makes `generate`
+    /// return a typed [`GenerateError::KvStateLost`], never a
+    /// successful completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_streaming_generate_fails_with_kv_state_lost_after_scheduler_loss() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        state
+            .runtime
+            .try_reload(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 256;
+                c
+            })
+            .unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let st2 = state.clone();
+        let task = tokio::spawn(async move {
+            generate(
+                &st2,
+                "Hi",
+                256,
+                "test-model",
+                crate::sampling::SamplingParams::greedy(),
+                None,
+            )
+            .await
+        });
+        // Wait for the request to register its KV, then steal it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scheduler.registrations_total() < 1 {
+            assert!(std::time::Instant::now() < deadline, "request never registered");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let _ = scheduler.release(crate::batch_scheduler::RequestId(0));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("request must terminate promptly after KV loss")
+            .expect("task must not panic");
+        let err = result.expect_err("KV loss must fail the non-streaming request");
+        assert!(
+            matches!(err, GenerateError::KvStateLost(_)),
+            "expected KvStateLost, got: {err}"
+        );
+    }
+
+    /// Read an SSE response body incrementally: accumulate frames into
+    /// `acc` until `stop(acc)` returns true (or the body ends).
+    async fn read_sse_until(
+        body: &mut (impl Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin),
+        acc: &mut String,
+        mut stop: impl FnMut(&str) -> bool,
+    ) {
+        use futures::stream::StreamExt;
+        while !stop(acc) {
+            match body.next().await {
+                Some(frame) => {
+                    let bytes = frame.expect("body frame");
+                    acc.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// A7 item 1: completion SSE stream — KV loss mid-stream emits an
+    /// OpenAI-compatible `kv_state_lost` error event and terminates
+    /// with no `[DONE]` and no successful finish reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_sse_stream_kv_loss_emits_error_event_and_no_done() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        state
+            .runtime
+            .try_reload(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 256;
+                c
+            })
+            .unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "prompt": "Hi",
+            "max_tokens": 256,
+            "stream": true,
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut acc = String::new();
+        // Pull a couple of content events so the request has
+        // registered its KV with the scheduler.
+        read_sse_until(&mut body, &mut acc, |s| s.matches("text_completion").count() >= 2)
+            .await;
+        assert!(scheduler.registrations_total() >= 1);
+        let _ = scheduler.release(crate::batch_scheduler::RequestId(0));
+        // Drain to the end of the stream.
+        read_sse_until(&mut body, &mut acc, |_| false).await;
+        assert!(
+            acc.contains("kv_state_lost"),
+            "expected a typed kv_state_lost error event; got:\n{acc}"
+        );
+        assert!(
+            !acc.contains("[DONE]"),
+            "a failed stream must not emit [DONE]; got:\n{acc}"
+        );
+        assert!(
+            !acc.contains(r#""finish_reason":"length""#)
+                && !acc.contains(r#""finish_reason":"stop""#),
+            "a failed stream must not emit a normal finish reason; got:\n{acc}"
+        );
+    }
+
+    /// A7 item 1: chat SSE stream — same contract as the completion
+    /// stream (error event, no `[DONE]`, no normal finish reason).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_sse_stream_kv_loss_emits_error_event_and_no_done() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        state
+            .runtime
+            .try_reload(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 256;
+                c
+            })
+            .unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 256,
+            "stream": true,
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body().into_data_stream();
+        let mut acc = String::new();
+        // Role event + at least two content deltas → KV registered.
+        read_sse_until(&mut body, &mut acc, |s| {
+            s.matches("chat.completion.chunk").count() >= 3
+        })
+        .await;
+        assert!(acc.contains(r#""role":"assistant""#));
+        assert!(scheduler.registrations_total() >= 1);
+        let _ = scheduler.release(crate::batch_scheduler::RequestId(0));
+        read_sse_until(&mut body, &mut acc, |_| false).await;
+        assert!(
+            acc.contains("kv_state_lost"),
+            "expected a typed kv_state_lost error event; got:\n{acc}"
+        );
+        assert!(!acc.contains("[DONE]"), "no [DONE] after failure; got:\n{acc}");
+        assert!(
+            !acc.contains(r#""finish_reason":"length""#)
+                && !acc.contains(r#""finish_reason":"stop""#),
+            "no normal finish reason after failure; got:\n{acc}"
+        );
+    }
+
+    /// A7 item 1: a request that fails on KV loss must not persist an
+    /// empty or stale session cache, and a follow-up request with the
+    /// same session id must start fresh and succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_kv_recovery_does_not_persist_session_and_next_request_starts_fresh() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        state
+            .runtime
+            .try_reload(&{
+                let mut c = test_minimal_cfg();
+                c.server.max_tokens = 256;
+                c
+            })
+            .unwrap();
+        let store = state.sessions.clone().unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let greedy = crate::sampling::SamplingParams::greedy();
+
+        // Turn 1: succeeds and persists the session.
+        generate(&state, "Hi", 2, "test-model", greedy, Some("s".into()))
+            .await
+            .expect("turn 1 succeeds");
+        assert_eq!(store.len(), 1, "turn 1 must persist the session");
+        assert_eq!(scheduler.registrations_total(), 1);
+
+        // Turn 2: KV loss mid-request → typed failure.
+        let st2 = state.clone();
+        let task = tokio::spawn(async move {
+            generate(&st2, "!", 256, "test-model", greedy, Some("s".into())).await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while scheduler.registrations_total() < 2 {
+            assert!(std::time::Instant::now() < deadline, "turn 2 never registered");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let _ = scheduler.release(crate::batch_scheduler::RequestId(1));
+        let err = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .expect("turn 2 must terminate promptly")
+            .expect("task must not panic")
+            .expect_err("turn 2 must fail on KV loss");
+        assert!(matches!(err, GenerateError::KvStateLost(_)));
+
+        // The failed request must not re-insert an empty or stale
+        // session cache under the cursor.
+        assert!(
+            store.take("s").is_none(),
+            "failed KV recovery must not persist a session entry"
+        );
+
+        // Turn 3: the same session id starts fresh and succeeds.
+        let resp = generate(&state, "Hi", 2, "test-model", greedy, Some("s".into()))
+            .await
+            .expect("turn 3 must start a fresh session and succeed");
+        assert_eq!(resp.usage.completion_tokens, 2);
+        assert_eq!(store.len(), 1, "turn 3 must persist the fresh session");
+    }
+
+    /// A7 item 1: dropping an in-flight request (client cancellation)
+    /// releases its scheduler registration exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_releases_scheduler_registration_exactly_once() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.clone().unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let mut request =
+            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        request
+            .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("decode registers the request");
+        assert_eq!(scheduler.registrations_total(), 1);
+        assert_eq!(scheduler.active_requests(), 1);
+        drop(request);
+        assert_eq!(scheduler.releases_total(), 1, "Drop must release exactly once");
+        assert_eq!(scheduler.active_requests(), 0);
+    }
+
+    /// A7 item 1: a normal `finish()` consumes the registration; the
+    /// subsequent `Drop` must not double-release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_then_drop_does_not_double_release() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let model = state.real_model.clone().unwrap();
+        let scheduler = state.batch_scheduler.clone().unwrap();
+        let mut request =
+            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        request
+            .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("decode registers the request");
+        let _kv = request.finish().expect("finish recovers the KV");
+        assert_eq!(scheduler.releases_total(), 1);
+        assert_eq!(
+            scheduler.active_requests(),
+            0,
+            "finish + Drop must release the registration exactly once"
+        );
+    }
+
+    // ============ SSE wrapper contracts (validation closure, item 2) ============
+
+    /// Render a finite SSE event stream to its wire text.
+    async fn sse_events_to_string(
+        s: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    ) -> String {
+        let resp = Sse::new(s).into_response();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn chunk(text: &str, finished: bool) -> Result<StreamChunk, GenerateError> {
+        Ok(StreamChunk {
+            text: text.to_string(),
+            finished,
+            hits: 0,
+            misses: 0,
+        })
+    }
+
+    fn scrape_tokens_generated(metrics: &Metrics) -> u64 {
+        let s = String::from_utf8(metrics.render().unwrap()).unwrap();
+        s.lines()
+            .find_map(|l| {
+                l.strip_prefix("mer_tokens_generated_total ")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .map(|f| f as u64)
+            .unwrap_or(0)
+    }
+
+    /// Item 2: the completion SSE wrapper emits a non-empty held-back
+    /// decoder tail as a normal content chunk *before* `[DONE]`, and
+    /// the token metric counts only real streamed tokens (not the
+    /// tail chunk).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_wrapper_emits_final_tail_before_done() {
+        let metrics = Metrics::new();
+        let inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>> =
+            Box::pin(stream::iter(vec![
+                chunk("he", false),
+                chunk("y", false),
+                chunk("TAIL€", true),
+            ]));
+        let s = wrap_completion_events(inner, "cmpl-t".into(), "m".into(), metrics.clone());
+        let body = sse_events_to_string(s).await;
+        let tail_idx = body.find("TAIL€").expect("tail chunk must be emitted");
+        let done_idx = body.find("[DONE]").expect("stream must terminate with [DONE]");
+        assert!(
+            tail_idx < done_idx,
+            "the final decoder tail must be delivered before [DONE]:\n{body}"
+        );
+        assert!(body.contains("text_completion"));
+        assert_eq!(
+            scrape_tokens_generated(&metrics),
+            2,
+            "the tail chunk is held-back text from already-counted tokens"
+        );
+    }
+
+    /// Item 2: the chat SSE wrapper behaves consistently with the
+    /// completion wrapper — role event first, content deltas, tail
+    /// before `[DONE]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_wrapper_emits_final_tail_before_done() {
+        let metrics = Metrics::new();
+        let inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>> =
+            Box::pin(stream::iter(vec![
+                chunk("he", false),
+                chunk("y", false),
+                chunk("TAIL€", true),
+            ]));
+        let s = wrap_chat_events(inner, "chatcmpl-t".into(), "m".into(), metrics.clone());
+        let body = sse_events_to_string(s).await;
+        let role_idx = body.find(r#""role":"assistant""#).expect("role event first");
+        let tail_idx = body.find("TAIL€").expect("tail chunk must be emitted");
+        let done_idx = body.find("[DONE]").expect("stream must terminate with [DONE]");
+        assert!(role_idx < tail_idx && tail_idx < done_idx);
+        assert!(body.contains("chat.completion.chunk"));
+        assert_eq!(scrape_tokens_generated(&metrics), 2);
+    }
+
+    /// Item 2: a decoder/inference failure mid-stream emits an
+    /// OpenAI-compatible error event, no `[DONE]`, no finish reason —
+    /// and metrics count only the successfully emitted tokens. Both
+    /// wrappers share the contract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrappers_emit_error_event_without_done_on_stream_failure() {
+        for chat in [false, true] {
+            let metrics = Metrics::new();
+            let inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>> =
+                Box::pin(stream::iter(vec![
+                    chunk("ok", false),
+                    Err(GenerateError::Tokenizer("decoder exploded".into())),
+                ]));
+            let body = if chat {
+                let s = wrap_chat_events(inner, "chatcmpl-t".into(), "m".into(), metrics.clone());
+                sse_events_to_string(s).await
+            } else {
+                let s =
+                    wrap_completion_events(inner, "cmpl-t".into(), "m".into(), metrics.clone());
+                sse_events_to_string(s).await
+            };
+            assert!(
+                body.contains(r#""type":"server_error""#),
+                "chat={chat}: expected an error event; got:\n{body}"
+            );
+            assert!(body.contains("decoder exploded"), "chat={chat}");
+            assert!(!body.contains("[DONE]"), "chat={chat}: no [DONE] after failure");
+            assert!(
+                !body.contains(r#""finish_reason":"length""#)
+                    && !body.contains(r#""finish_reason":"stop""#),
+                "chat={chat}: no normal finish reason after failure"
+            );
+            assert_eq!(
+                scrape_tokens_generated(&metrics),
+                1,
+                "chat={chat}: metrics must count only successfully emitted tokens"
+            );
+        }
     }
 }
