@@ -515,9 +515,15 @@ pub enum GenerateError {
     /// fails, the process survives.
     ExpertRead(String),
     /// Real-model inference failed closed (hardening pass, Part A):
-    /// expert load/compute failure, non-finite attention, invalid
-    /// token id, or lost scheduler KV state. Maps to a 500.
+    /// expert load/compute failure, non-finite attention, or invalid
+    /// token id. Maps to a 500.
     Inference(String),
+    /// The exact scheduler-registered KV state for an in-progress
+    /// sequence could not be recovered (hardening pass, Part A7).
+    /// Distinct from a model-compute failure: the model math was fine,
+    /// but continuing (or persisting) the sequence would silently reset
+    /// its context. Maps to a 500 with its own error type.
+    KvStateLost(String),
 }
 
 impl std::fmt::Display for GenerateError {
@@ -527,6 +533,7 @@ impl std::fmt::Display for GenerateError {
             GenerateError::InvalidRequest(m) => write!(f, "invalid request: {m}"),
             GenerateError::ExpertRead(m) => write!(f, "expert read error: {m}"),
             GenerateError::Inference(m) => write!(f, "inference error: {m}"),
+            GenerateError::KvStateLost(m) => write!(f, "kv state lost: {m}"),
         }
     }
 }
@@ -814,16 +821,18 @@ async fn generate(
         }
         stage_timing.record_since(crate::stage_timing::TOTAL_DECODE, decode_started);
         let pending_token = completion_ids.last().copied();
-        if let Some(kv) = request.finish() {
-            save_session_kv(
-                state,
-                session_id.as_deref(),
-                kv,
-                start_pos,
-                pending_token,
-                checkout,
-            );
-        }
+        // Part A7: KV loss at completion fails the request — never
+        // return success for a sequence whose exact state was lost
+        // (session persistence must not silently skip the error).
+        let kv = request.finish()?;
+        save_session_kv(
+            state,
+            session_id.as_deref(),
+            kv,
+            start_pos,
+            pending_token,
+            checkout,
+        );
         let post = state.engine.report();
         hits_total = post.hits.saturating_sub(pre_hits);
         misses_total = post.misses.saturating_sub(pre_misses);
@@ -1029,27 +1038,26 @@ impl RealRequestState {
     /// fresh KV state** (hardening pass, Part A7): once a sequence has
     /// KV history, continuing it on empty caches would silently reset
     /// the context and produce mathematically wrong output — if the
-    /// exact state cannot be recovered the request fails.
+    /// exact state cannot be recovered the request fails with a typed
+    /// [`GenerateError::KvStateLost`].
     fn direct_kv(&mut self) -> Result<&mut Vec<crate::transformer::KvCache>, GenerateError> {
-        if self.kv.is_none() && !self.release_scheduler_to_local() {
-            return Err(GenerateError::Inference(
-                "scheduler could not return this request's KV state;                  refusing to continue the sequence on a fresh KV cache"
-                    .into(),
-            ));
+        if self.kv.is_none() {
+            self.release_scheduler_to_local()?;
         }
         self.kv.as_mut().ok_or_else(|| {
-            GenerateError::Inference(
+            GenerateError::KvStateLost(
                 "request holds no KV state and none is registered with the scheduler".into(),
             )
         })
     }
 
     /// Recover the registered KV state from the scheduler into
-    /// `self.kv`. Returns `false` when the request was registered but
-    /// the scheduler could not return the exact state (Part A7: the
-    /// caller must fail, never continue on fresh KV). Returns `true`
-    /// when nothing was registered or the state was recovered.
-    fn release_scheduler_to_local(&mut self) -> bool {
+    /// `self.kv`. Returns [`GenerateError::KvStateLost`] when the
+    /// request was registered but the scheduler could not return the
+    /// exact state (Part A7: the caller must fail, never continue on
+    /// fresh KV). Succeeds when nothing was registered or the state was
+    /// recovered.
+    fn release_scheduler_to_local(&mut self) -> Result<(), GenerateError> {
         if let (Some(scheduler), Some(id)) = (self.scheduler.take(), self.request_id.take()) {
             let started = RequestStageTiming::start_optional(self.stage_timings.as_deref());
             self.kv = scheduler.release(id);
@@ -1061,26 +1069,32 @@ impl RealRequestState {
             if self.kv.is_none() {
                 tracing::error!(
                     request_id = id.0,
-                    "scheduler lost this request's KV state; failing the request instead of                      resetting context"
+                    "scheduler lost this request's KV state; failing the request instead of \
+                     resetting context"
                 );
-                return false;
+                return Err(GenerateError::KvStateLost(format!(
+                    "scheduler could not return the exact KV state for request {}; refusing to \
+                     continue the sequence on a fresh KV cache",
+                    id.0
+                )));
             }
         }
-        true
+        Ok(())
     }
 
     /// Take ownership of the request's KV state for session
-    /// persistence. Returns `None` when the state was lost (Part A7):
-    /// callers must skip persisting rather than store an empty cache
-    /// under a session cursor that claims history.
-    fn take_kv(&mut self) -> Option<Vec<crate::transformer::KvCache>> {
-        if !self.release_scheduler_to_local() {
-            return None;
-        }
-        self.kv.take()
+    /// persistence. Returns [`GenerateError::KvStateLost`] when the
+    /// state was lost (Part A7): callers must fail the request rather
+    /// than return success with an unpersistable (silently reset)
+    /// session.
+    fn take_kv(&mut self) -> Result<Vec<crate::transformer::KvCache>, GenerateError> {
+        self.release_scheduler_to_local()?;
+        self.kv.take().ok_or_else(|| {
+            GenerateError::KvStateLost("request holds no KV state to persist".into())
+        })
     }
 
-    fn finish(mut self) -> Option<Vec<crate::transformer::KvCache>> {
+    fn finish(mut self) -> Result<Vec<crate::transformer::KvCache>, GenerateError> {
         self.take_kv()
     }
 }
@@ -1334,13 +1348,21 @@ struct StreamChunk {
 /// after each step. Both the real-transformer and legacy paths are
 /// supported (mirroring `generate`). Returns a boxed Stream so the
 /// SSE handler can wrap it.
+///
+/// **Failures are visible** (hardening pass, item 5): the stream item
+/// is `Result<StreamChunk, GenerateError>` — a real-model inference,
+/// tokenizer/decoder, or KV-state failure is yielded as an `Err` and
+/// terminates the stream. It is never converted into a successful
+/// `finished` chunk. The legacy synthetic path keeps its historic
+/// end-of-stream behaviour.
 async fn stream_tokens(
     state: AppState,
     prompt: String,
     requested_max: usize,
     params: SamplingParams,
     session_id: Option<String>,
-) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>, GenerateError> {
+) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>, GenerateError>
+{
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest(
             "prompt must be non-empty".into(),
@@ -1451,9 +1473,11 @@ async fn stream_tokens(
             return None;
         }
         if st.emitted >= st.max_tokens {
-            // Final chunk carries `finish_reason: length` and no new text.
+            st.finished_emitted = true;
             // Persist KV-cache state back to the session store so a
-            // follow-up request can pick up where we stopped.
+            // follow-up request can pick up where we stopped. Part A7:
+            // KV loss is a visible stream error — never a normal
+            // `finished` chunk after a silently-skipped persistence.
             if let GenMode::Real {
                 request,
                 position,
@@ -1461,34 +1485,46 @@ async fn stream_tokens(
                 ..
             } = &mut st.mode
             {
-                if let Some(kv_take) = request.take_kv() {
-                    let pending_token = st.completion_ids.last().copied();
-                    save_session_kv(
-                        &st.state,
-                        st.session_id.as_deref(),
-                        kv_take,
-                        *position,
-                        pending_token,
-                        checkout.take(),
-                    );
-                }
+                let kv_take = match request.take_kv() {
+                    Ok(kv) => kv,
+                    Err(e) => {
+                        tracing::error!(error = %e, "real stream: KV state lost at completion");
+                        st.stage_timing.publish();
+                        return Some((Err(e), st));
+                    }
+                };
+                let pending_token = st.completion_ids.last().copied();
+                save_session_kv(
+                    &st.state,
+                    st.session_id.as_deref(),
+                    kv_take,
+                    *position,
+                    pending_token,
+                    checkout.take(),
+                );
             }
             st.stage_timing.publish();
-            st.finished_emitted = true;
             // Flush any held-back (incomplete-sequence) text from the
             // incremental decoder so the final chunk never drops
-            // trailing output (F2).
-            let tail = st
-                .decoder
-                .finish(&st.state.tokenizer)
-                .unwrap_or_default();
+            // trailing output (F2). Decoder failures propagate instead
+            // of silently replacing the tail with an empty string.
+            let tail = match st.decoder.finish(&st.state.tokenizer) {
+                Ok(tail) => tail,
+                Err(e) => {
+                    tracing::error!(error = %e, "real stream: decoder failed on final flush");
+                    return Some((
+                        Err(GenerateError::Tokenizer(e.to_string())),
+                        st,
+                    ));
+                }
+            };
             return Some((
-                StreamChunk {
+                Ok(StreamChunk {
                     text: tail,
                     finished: true,
                     hits: 0,
                     misses: 0,
-                },
+                }),
                 st,
             ));
         }
@@ -1512,21 +1548,14 @@ async fn stream_tokens(
                     {
                         Ok(n) => n,
                         Err(e) => {
-                            // Fail-closed real inference (Part A1): a
-                            // deterministic model failure ends the
-                            // stream cleanly with a final chunk instead
-                            // of continuing with corrupt output.
-                            tracing::error!(error = %e, "real stream: decode failed; ending stream");
+                            // Fail-closed real inference (Part A1 /
+                            // item 5): a deterministic model failure is
+                            // a visible stream error — never converted
+                            // into a successful `finished` chunk.
+                            tracing::error!(error = %e, "real stream: decode failed; failing stream");
                             st.finished_emitted = true;
-                            return Some((
-                                StreamChunk {
-                                    text: String::new(),
-                                    finished: true,
-                                    hits: 0,
-                                    misses: 0,
-                                },
-                                st,
-                            ));
+                            st.stage_timing.publish();
+                            return Some((Err(e), st));
                         }
                     };
                     st.stage_timing
@@ -1541,19 +1570,21 @@ async fn stream_tokens(
                         let _ = stats;
                     }
                     Err(e) => {
-                        // A routed expert could not be read even after
-                        // retries. Terminate the stream cleanly instead
-                        // of crashing the process: emit a final
+                        // Legacy synthetic benchmark path (kept
+                        // separate from real inference): a routed
+                        // expert could not be read even after retries.
+                        // Terminate the stream cleanly instead of
+                        // crashing the process: emit a final
                         // `finished` chunk so the client sees EOS.
                         tracing::warn!(error = %e, "legacy stream: expert read failed; ending stream");
                         st.finished_emitted = true;
                         return Some((
-                            StreamChunk {
+                            Ok(StreamChunk {
                                 text: String::new(),
                                 finished: true,
                                 hits: 0,
                                 misses: 0,
-                            },
+                            }),
                             st,
                         ));
                     }
@@ -1575,24 +1606,26 @@ async fn stream_tokens(
         st.emitted += 1;
 
         // Incremental decode (F2): decode only the bounded look-behind
-        // window and emit the newly stable text. Tokenizer errors fall
-        // back to "no new text this step" rather than aborting the
-        // stream, matching the legacy behaviour.
-        let delta = st
-            .decoder
-            .push(&st.state.tokenizer, next)
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "stream decoder failed; emitting no text this step");
-                String::new()
-            });
+        // window and emit the newly stable text. Decoder failures are
+        // visible stream errors (item 6): silently emitting an empty
+        // delta would lose generated text.
+        let delta = match st.decoder.push(&st.state.tokenizer, next) {
+            Ok(delta) => delta,
+            Err(e) => {
+                tracing::error!(error = %e, "stream decoder failed; failing stream");
+                st.finished_emitted = true;
+                st.stage_timing.publish();
+                return Some((Err(GenerateError::Tokenizer(e.to_string())), st));
+            }
+        };
 
         Some((
-            StreamChunk {
+            Ok(StreamChunk {
                 text: delta,
                 finished: false,
                 hits,
                 misses,
-            },
+            }),
             st,
         ))
     })))
@@ -1616,80 +1649,96 @@ async fn build_completion_stream(
         session_id,
     )
     .await?;
-    let s = stream::unfold(
-        (inner, id, model_name, metrics, 0u64, 0u64, 0u64, false),
-        |(
-            mut inner,
-            id,
-            model_name,
-            metrics,
-            mut hits,
-            mut misses,
-            mut tokens_done,
-            terminated,
-        )| async move {
-            if terminated {
-                return None;
+    struct WrapSt {
+        inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>,
+        id: String,
+        model_name: String,
+        metrics: Metrics,
+        hits: u64,
+        misses: u64,
+        tokens_done: u64,
+        /// A queued terminal `[DONE]` event, emitted on the next poll
+        /// after a final decoder-tail content chunk (item 6: the tail
+        /// must reach the client *before* the terminator).
+        pending_done: bool,
+        terminated: bool,
+    }
+    let st = WrapSt {
+        inner,
+        id,
+        model_name,
+        metrics,
+        hits: 0,
+        misses: 0,
+        tokens_done: 0,
+        pending_done: false,
+        terminated: false,
+    };
+    let s = stream::unfold(st, |mut st| async move {
+        if st.terminated {
+            return None;
+        }
+        if st.pending_done {
+            st.pending_done = false;
+            st.terminated = true;
+            st.metrics.record_tokens(st.tokens_done);
+            st.metrics.record_cache(st.hits, st.misses);
+            info!(
+                tokens = st.tokens_done,
+                cache_hits = st.hits,
+                cache_misses = st.misses,
+                "streamed completion finished"
+            );
+            return Some((Ok(Event::default().data("[DONE]")), st));
+        }
+        use futures::stream::StreamExt;
+        match st.inner.next().await {
+            None => {
+                // Inner exhausted unexpectedly — emit DONE.
+                st.metrics.record_tokens(st.tokens_done);
+                st.metrics.record_cache(st.hits, st.misses);
+                st.terminated = true;
+                Some((Ok(Event::default().data("[DONE]")), st))
             }
-            // Pull next token from the inner generator.
-            use futures::stream::StreamExt;
-            match inner.next().await {
-                None => {
-                    // Inner exhausted unexpectedly — emit DONE.
-                    metrics.record_tokens(tokens_done);
-                    metrics.record_cache(hits, misses);
-                    let ev = Event::default().data("[DONE]");
-                    Some((
-                        Ok(ev),
-                        (
-                            inner,
-                            id,
-                            model_name,
-                            metrics,
-                            hits,
-                            misses,
-                            tokens_done,
-                            true,
-                        ),
-                    ))
-                }
-                Some(chunk) => {
-                    hits += chunk.hits;
-                    misses += chunk.misses;
-                    if chunk.finished {
-                        // End of stream: emit `[DONE]` and terminate.
-                        // (We could optionally precede it with a chunk
-                        // carrying `finish_reason: length` and empty
-                        // text; OpenAI-compatible clients handle either
-                        // shape, so we keep the wire output minimal.)
-                        let done = Event::default().data("[DONE]");
-                        metrics.record_tokens(tokens_done);
-                        metrics.record_cache(hits, misses);
+            Some(Err(e)) => {
+                // Item 5: a real inference / decoder / KV-state failure
+                // is surfaced as an OpenAI-compatible error event and
+                // the stream terminates — never a successful
+                // `finish_reason` or `[DONE]`, and no "finished" log.
+                // Token/cache metrics reflect only the successfully
+                // emitted work.
+                st.metrics.record_tokens(st.tokens_done);
+                st.metrics.record_cache(st.hits, st.misses);
+                tracing::error!(error = %e, "streamed completion failed");
+                st.terminated = true;
+                let ev = Event::default().data(stream_error_payload(&e));
+                Some((Ok(ev), st))
+            }
+            Some(Ok(chunk)) => {
+                st.hits += chunk.hits;
+                st.misses += chunk.misses;
+                if chunk.finished {
+                    if chunk.text.is_empty() {
+                        // End of stream with no held-back tail: emit
+                        // `[DONE]` and terminate.
+                        st.metrics.record_tokens(st.tokens_done);
+                        st.metrics.record_cache(st.hits, st.misses);
                         info!(
-                            tokens = tokens_done,
-                            cache_hits = hits,
-                            cache_misses = misses,
+                            tokens = st.tokens_done,
+                            cache_hits = st.hits,
+                            cache_misses = st.misses,
                             "streamed completion finished"
                         );
-                        Some((
-                            Ok(done),
-                            (
-                                inner,
-                                id,
-                                model_name,
-                                metrics,
-                                hits,
-                                misses,
-                                tokens_done,
-                                true,
-                            ),
-                        ))
+                        st.terminated = true;
+                        Some((Ok(Event::default().data("[DONE]")), st))
                     } else {
-                        tokens_done += 1;
+                        // Item 6: the final decoder tail is real
+                        // generated text — emit it as a normal content
+                        // chunk first, then `[DONE]` on the next poll.
                         let payload = CompletionChunk {
-                            id: id.clone(),
+                            id: st.id.clone(),
                             object: "text_completion",
-                            model: model_name.clone(),
+                            model: st.model_name.clone(),
                             choices: vec![CompletionChunkChoice {
                                 text: chunk.text,
                                 index: 0,
@@ -1698,25 +1747,48 @@ async fn build_completion_stream(
                         };
                         let ev = Event::default()
                             .data(serde_json::to_string(&payload).unwrap_or_default());
-                        Some((
-                            Ok(ev),
-                            (
-                                inner,
-                                id,
-                                model_name,
-                                metrics,
-                                hits,
-                                misses,
-                                tokens_done,
-                                false,
-                            ),
-                        ))
+                        st.pending_done = true;
+                        Some((Ok(ev), st))
                     }
+                } else {
+                    st.tokens_done += 1;
+                    let payload = CompletionChunk {
+                        id: st.id.clone(),
+                        object: "text_completion",
+                        model: st.model_name.clone(),
+                        choices: vec![CompletionChunkChoice {
+                            text: chunk.text,
+                            index: 0,
+                            finish_reason: None,
+                        }],
+                    };
+                    let ev = Event::default()
+                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    Some((Ok(ev), st))
                 }
             }
-        },
-    );
+        }
+    });
     Ok(s)
+}
+
+/// Serialize an OpenAI-compatible SSE error payload for a failed
+/// stream (item 5): the same `{ "error": { message, type } }` shape as
+/// the non-streaming error body, emitted as the final event before the
+/// stream terminates (no `[DONE]`, no successful `finish_reason`).
+fn stream_error_payload(e: &GenerateError) -> String {
+    let kind = match e {
+        GenerateError::InvalidRequest(_) => "invalid_request_error",
+        GenerateError::KvStateLost(_) => "kv_state_lost",
+        _ => "server_error",
+    };
+    serde_json::to_string(&ErrorBody {
+        error: ErrorBodyInner {
+            message: e.to_string(),
+            kind,
+        },
+    })
+    .unwrap_or_else(|_| "{\"error\":{\"message\":\"stream failed\",\"type\":\"server_error\"}}".into())
 }
 
 async fn build_chat_stream(
@@ -1756,139 +1828,116 @@ async fn build_chat_stream(
     };
     let role_event = Event::default().data(serde_json::to_string(&role_chunk).unwrap_or_default());
 
-    let s = stream::unfold(
-        (
-            Some(role_event),
-            inner,
-            id,
-            model_name,
-            metrics,
-            0u64,
-            0u64,
-            0u64,
-            false,
-        ),
-        |(
-            role_ev,
-            mut inner,
-            id,
-            model_name,
-            metrics,
-            mut hits,
-            mut misses,
-            mut tokens_done,
-            terminated,
-        )| async move {
-            if let Some(ev) = role_ev {
-                // Emit the role event first.
-                return Some((
-                    Ok(ev),
-                    (
-                        None,
-                        inner,
-                        id,
-                        model_name,
-                        metrics,
-                        hits,
-                        misses,
-                        tokens_done,
-                        terminated,
-                    ),
-                ));
+    struct ChatWrapSt {
+        role_ev: Option<Event>,
+        inner: Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>,
+        id: String,
+        model_name: String,
+        metrics: Metrics,
+        hits: u64,
+        misses: u64,
+        tokens_done: u64,
+        /// A queued terminal `[DONE]` event, emitted on the next poll
+        /// after a final decoder-tail content delta (item 6).
+        pending_done: bool,
+        terminated: bool,
+    }
+    let st = ChatWrapSt {
+        role_ev: Some(role_event),
+        inner,
+        id,
+        model_name,
+        metrics,
+        hits: 0,
+        misses: 0,
+        tokens_done: 0,
+        pending_done: false,
+        terminated: false,
+    };
+    let s = stream::unfold(st, |mut st| async move {
+        if let Some(ev) = st.role_ev.take() {
+            // Emit the role event first.
+            return Some((Ok(ev), st));
+        }
+        if st.terminated {
+            return None;
+        }
+        if st.pending_done {
+            st.pending_done = false;
+            st.terminated = true;
+            st.metrics.record_tokens(st.tokens_done);
+            st.metrics.record_cache(st.hits, st.misses);
+            info!(
+                tokens = st.tokens_done,
+                cache_hits = st.hits,
+                cache_misses = st.misses,
+                "streamed chat completion finished"
+            );
+            return Some((Ok(Event::default().data("[DONE]")), st));
+        }
+        use futures::stream::StreamExt;
+        match st.inner.next().await {
+            None => {
+                st.metrics.record_tokens(st.tokens_done);
+                st.metrics.record_cache(st.hits, st.misses);
+                st.terminated = true;
+                Some((Ok(Event::default().data("[DONE]")), st))
             }
-            if terminated {
-                return None;
+            Some(Err(e)) => {
+                // Item 5: failures are surfaced as an OpenAI-compatible
+                // error event and the stream terminates — never a
+                // successful `finish_reason`, `[DONE]`, or "finished"
+                // log. Metrics reflect only successfully emitted work.
+                st.metrics.record_tokens(st.tokens_done);
+                st.metrics.record_cache(st.hits, st.misses);
+                tracing::error!(error = %e, "streamed chat completion failed");
+                st.terminated = true;
+                let ev = Event::default().data(stream_error_payload(&e));
+                Some((Ok(ev), st))
             }
-            use futures::stream::StreamExt;
-            match inner.next().await {
-                None => {
-                    metrics.record_tokens(tokens_done);
-                    metrics.record_cache(hits, misses);
-                    let ev = Event::default().data("[DONE]");
-                    Some((
-                        Ok(ev),
-                        (
-                            None,
-                            inner,
-                            id,
-                            model_name,
-                            metrics,
-                            hits,
-                            misses,
-                            tokens_done,
-                            true,
-                        ),
-                    ))
-                }
-                Some(chunk) => {
-                    hits += chunk.hits;
-                    misses += chunk.misses;
+            Some(Ok(chunk)) => {
+                st.hits += chunk.hits;
+                st.misses += chunk.misses;
+                if chunk.finished && chunk.text.is_empty() {
+                    // End of stream with no held-back tail.
+                    st.metrics.record_tokens(st.tokens_done);
+                    st.metrics.record_cache(st.hits, st.misses);
+                    info!(
+                        tokens = st.tokens_done,
+                        cache_hits = st.hits,
+                        cache_misses = st.misses,
+                        "streamed chat completion finished"
+                    );
+                    st.terminated = true;
+                    Some((Ok(Event::default().data("[DONE]")), st))
+                } else {
                     if chunk.finished {
-                        // End of stream. We could optionally precede the
-                        // terminator with a `ChatChunk { delta: {},
-                        // finish_reason: "length" }` event; OpenAI-
-                        // compatible clients accept either shape, so we
-                        // emit only the `[DONE]` terminator to keep the
-                        // wire output minimal.
-                        let done = Event::default().data("[DONE]");
-                        metrics.record_tokens(tokens_done);
-                        metrics.record_cache(hits, misses);
-                        info!(
-                            tokens = tokens_done,
-                            cache_hits = hits,
-                            cache_misses = misses,
-                            "streamed chat completion finished"
-                        );
-                        Some((
-                            Ok(done),
-                            (
-                                None,
-                                inner,
-                                id,
-                                model_name,
-                                metrics,
-                                hits,
-                                misses,
-                                tokens_done,
-                                true,
-                            ),
-                        ))
+                        // Item 6: emit the final decoder tail as a
+                        // normal content delta, then `[DONE]` next poll.
+                        st.pending_done = true;
                     } else {
-                        tokens_done += 1;
-                        let payload = ChatChunk {
-                            id: id.clone(),
-                            object: "chat.completion.chunk",
-                            model: model_name.clone(),
-                            choices: vec![ChatChunkChoice {
-                                index: 0,
-                                delta: ChatDelta {
-                                    role: None,
-                                    content: Some(chunk.text),
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-                        let ev = Event::default()
-                            .data(serde_json::to_string(&payload).unwrap_or_default());
-                        Some((
-                            Ok(ev),
-                            (
-                                None,
-                                inner,
-                                id,
-                                model_name,
-                                metrics,
-                                hits,
-                                misses,
-                                tokens_done,
-                                false,
-                            ),
-                        ))
+                        st.tokens_done += 1;
                     }
+                    let payload = ChatChunk {
+                        id: st.id.clone(),
+                        object: "chat.completion.chunk",
+                        model: st.model_name.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                role: None,
+                                content: Some(chunk.text),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    let ev = Event::default()
+                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    Some((Ok(ev), st))
                 }
             }
-        },
-    );
+        }
+    });
     Ok(s)
 }
 
@@ -1928,6 +1977,10 @@ fn error_response(e: GenerateError) -> Response {
         GenerateError::Tokenizer(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         GenerateError::ExpertRead(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         GenerateError::Inference(_) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+        // Distinguishable from a model-compute failure (Part A7): the
+        // request's exact KV state could not be recovered, so the
+        // sequence cannot be continued or persisted.
+        GenerateError::KvStateLost(_) => (StatusCode::INTERNAL_SERVER_ERROR, "kv_state_lost"),
     };
     (
         status,
@@ -2903,12 +2956,15 @@ mod tests {
             .await
             .expect_err("KV loss must fail the request");
         assert!(
-            matches!(err, GenerateError::Inference(_)),
-            "expected Inference error, got: {err}"
+            matches!(err, GenerateError::KvStateLost(_)),
+            "expected typed KvStateLost error, got: {err}"
         );
         // And the request's terminal KV take must not fabricate state
-        // either: the session store must skip persisting.
-        assert!(request.finish().is_none());
+        // either: session persistence must surface the typed loss.
+        assert!(matches!(
+            request.finish(),
+            Err(GenerateError::KvStateLost(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3022,11 +3078,77 @@ mod tests {
             .unwrap();
         let mut streamed = String::new();
         while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream must not fail");
+            // The final chunk may carry the decoder's held-back tail
+            // (item 6): append it before stopping.
+            streamed.push_str(&chunk.text);
             if chunk.finished {
                 break;
             }
-            streamed.push_str(&chunk.text);
         }
         assert_eq!(streamed, non_stream);
+    }
+
+    /// Part A7 / item 5 (streaming): losing the scheduler-registered KV
+    /// state mid-stream must surface as a typed stream error — never a
+    /// successful `finished` chunk (which the SSE layer would turn into
+    /// a normal `[DONE]`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_kv_loss_yields_error_not_finished_chunk() {
+        let cfg = tiny_real_cfg();
+        let (state, _tmp) = make_state_with_real_model(cfg).await;
+        let scheduler = state.batch_scheduler.as_ref().unwrap().clone();
+        let params = crate::sampling::SamplingParams::greedy();
+        let mut stream = stream_tokens(state.clone(), "Hi".to_string(), 4, params, None)
+            .await
+            .unwrap();
+
+        // First chunk: the pending first token (no scheduler use yet).
+        let c1 = stream
+            .next()
+            .await
+            .unwrap()
+            .expect("first chunk must succeed");
+        assert!(!c1.finished);
+        // Second chunk: the first decode step registers KV with the
+        // scheduler.
+        let c2 = stream
+            .next()
+            .await
+            .unwrap()
+            .expect("second chunk must succeed");
+        assert!(!c2.finished);
+        assert_eq!(scheduler.registrations_total(), 1);
+
+        // Steal the registered KV state out from under the stream
+        // (simulated registry loss). The fresh per-test scheduler
+        // assigns id 0 to its first registration.
+        let stolen = scheduler.release(crate::batch_scheduler::RequestId(0));
+        assert!(stolen.is_some(), "the stream's KV state was registered");
+
+        // The stream must now fail with a typed KV-state error and then
+        // terminate — never emit a successful finished chunk.
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => assert!(
+                    !chunk.finished,
+                    "stream must not end successfully after KV loss"
+                ),
+                Err(e) => {
+                    assert!(
+                        matches!(e, GenerateError::KvStateLost(_)),
+                        "expected KvStateLost, got: {e}"
+                    );
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "KV loss must surface as a stream error");
+        assert!(
+            stream.next().await.is_none(),
+            "stream must terminate after the error"
+        );
     }
 }
