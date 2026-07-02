@@ -2176,11 +2176,13 @@ async fn build_bench_real_runtime(
     }
     if matches!(
         cfg.real_transformer.compute_offload,
-        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+        crate::backend::ComputeOffload::Gpu
+            | crate::backend::ComputeOffload::Auto
+            | crate::backend::ComputeOffload::Hybrid
     ) || cfg.gpu_cache.enabled
     {
         return Err(
-            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\" and \"auto\" are rejected) and disable [gpu_cache].enabled"
+            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\", \"auto\" and \"hybrid\" are rejected) and disable [gpu_cache].enabled"
                 .into(),
         );
     }
@@ -3370,103 +3372,152 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         ))
     };
     let mut backend_fallback_occurred = false;
+    // Strict attention numerics (the production default) can only be
+    // validated on the checked CPU softmax path, so backend resolution is
+    // strictness-aware (hardening pass, strict GPU behaviour): an explicit
+    // `gpu` request fails startup, `auto` resolves to CPU with a recorded
+    // reason, and the explicitly named `hybrid` mode runs checked CPU
+    // attention with GPU expert offload.
+    let strict_attention = cfg.real_transformer.enabled
+        && !cfg
+            .real_transformer
+            .inference_policy()
+            .allow_nonfinite_attention_fallback;
+    let mut backend_attention_plane: &'static str = "cpu";
+    let mut backend_expert_plane: &'static str = "cpu";
     if matches!(
         cfg.real_transformer.compute_offload,
-        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+        crate::backend::ComputeOffload::Gpu
+            | crate::backend::ComputeOffload::Auto
+            | crate::backend::ComputeOffload::Hybrid
     ) {
-        let num_layers = cfg.model.num_layers;
-        let max_seq_len = if cfg.real_transformer.window_size == 0 {
-            4096
-        } else {
-            cfg.real_transformer.window_size
-        };
-        let num_heads = cfg.real_transformer.num_heads;
-        let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
-            num_heads
-        } else {
-            cfg.real_transformer.num_kv_heads
-        };
-        let head_dim = if cfg.real_transformer.head_dim == 0 {
-            if num_heads > 0 {
-                cfg.model.d_model / num_heads
-            } else {
-                64
-            }
-        } else {
-            cfg.real_transformer.head_dim
-        };
-        let backend_box = crate::backend::BackendBox::init_blocking(
-            num_layers,
-            max_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            // Finding 12: the run path does not surface an asymmetric
-            // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
-            // models force the CPU attention path via the eligibility guard
-            // in transformer.rs, so the symmetric GPU sizing is never used
-            // for them.
-            0,
-            gpu_expert_cache.clone(),
-            cfg.real_transformer
-                .inference_policy()
-                .expert_size_tolerance(),
-        );
-        let has_device = backend_box.is_gpu();
-        // Reconcile the operator's request with the observed init result
-        // (Finding 5). An explicit `gpu` request fails closed; `auto`
-        // demotes to CPU and records a fallback. `is_gpu()` is the signal
-        // because `init_blocking` internally swallows GPU errors and returns
-        // a CPU backend.
-        let resolution = crate::backend::resolve_backend_selection(
+        // Resolve the request *before* touching the device so unsupported
+        // combinations (explicit gpu + strict numerics, hybrid + legacy
+        // attention fallback) fail startup without a partial init, and
+        // `auto` under strict numerics skips GPU init entirely.
+        let precheck = crate::backend::resolve_backend_selection_with_numerics(
             cfg.real_transformer.compute_offload,
-            || {
-                if has_device {
-                    Ok(())
-                } else {
-                    Err("GPU backend initialization did not produce a GPU device".to_string())
-                }
-            },
+            strict_attention,
+            || Ok(()),
         )?;
-        backend_fallback_occurred = resolution.fallback_occurred;
-        let device_name = backend_box.device_name().to_string();
-        let compute_plane = backend_box.compute_plane().to_string();
-        if resolution.fallback_occurred {
-            warn!(
-                requested = ?resolution.requested,
-                resolved = ?resolution.resolved,
-                "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
-            );
-        }
-        let gpu = std::sync::Arc::new(backend_box);
-        if let Err(e) = crate::backend::set_backend(gpu) {
-            // Finding 5 (fail-closed GPU): installation failure is fatal for an
-            // explicit `gpu` request — we must never silently continue on CPU.
-            // Under `auto` it is a recorded fallback instead.
-            if matches!(
-                resolution.requested,
-                crate::backend::ComputeOffload::Gpu
-            ) {
-                return Err(format!(
-                    "explicit compute_offload = \"gpu\": GpuBackend installation failed ({e}); \
-                     refusing to fall back to CPU"
-                )
-                .into());
+        if !precheck.install_gpu_backend() {
+            // `auto` resolved to CPU under strict numerics: record why and
+            // keep the CPU backend (never report GPU while strict
+            // attention runs on CPU).
+            if let Some(reason) = precheck.reason.as_deref() {
+                info!(
+                    requested = ?precheck.requested,
+                    resolved = ?precheck.resolved,
+                    reason,
+                    "compute backend resolved to CPU"
+                );
             }
-            backend_fallback_occurred = true;
-            warn!(
-                error = e,
-                "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
-            );
         } else {
-            info!(
-                device = device_name,
-                compute_plane,
-                has_device,
-                requested = ?resolution.requested,
-                resolved = ?resolution.resolved,
-                "math backend installed for dense backbone"
+            let num_layers = cfg.model.num_layers;
+            let max_seq_len = if cfg.real_transformer.window_size == 0 {
+                4096
+            } else {
+                cfg.real_transformer.window_size
+            };
+            let num_heads = cfg.real_transformer.num_heads;
+            let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
+                num_heads
+            } else {
+                cfg.real_transformer.num_kv_heads
+            };
+            let head_dim = if cfg.real_transformer.head_dim == 0 {
+                if num_heads > 0 {
+                    cfg.model.d_model / num_heads
+                } else {
+                    64
+                }
+            } else {
+                cfg.real_transformer.head_dim
+            };
+            let backend_box = crate::backend::BackendBox::init_blocking(
+                num_layers,
+                max_seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                // Finding 12: the run path does not surface an asymmetric
+                // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
+                // models force the CPU attention path via the eligibility guard
+                // in transformer.rs, so the symmetric GPU sizing is never used
+                // for them.
+                0,
+                gpu_expert_cache.clone(),
+                cfg.real_transformer
+                    .inference_policy()
+                    .expert_size_tolerance(),
             );
+            let has_device = backend_box.is_gpu();
+            // Reconcile the operator's request with the observed init result
+            // (Finding 5). An explicit `gpu`/`hybrid` request fails closed;
+            // `auto` demotes to CPU and records a fallback. `is_gpu()` is the
+            // signal because `init_blocking` internally swallows GPU errors
+            // and returns a CPU backend.
+            let resolution = crate::backend::resolve_backend_selection_with_numerics(
+                cfg.real_transformer.compute_offload,
+                strict_attention,
+                || {
+                    if has_device {
+                        Ok(())
+                    } else {
+                        Err("GPU backend initialization did not produce a GPU device".to_string())
+                    }
+                },
+            )?;
+            backend_fallback_occurred = resolution.fallback_occurred;
+            let device_name = backend_box.device_name().to_string();
+            let compute_plane = backend_box.compute_plane().to_string();
+            if resolution.fallback_occurred {
+                warn!(
+                    requested = ?resolution.requested,
+                    resolved = ?resolution.resolved,
+                    reason = resolution.reason.as_deref().unwrap_or(""),
+                    "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
+                );
+            }
+            if resolution.install_gpu_backend() {
+                let gpu = std::sync::Arc::new(backend_box);
+                if let Err(e) = crate::backend::set_backend(gpu) {
+                    // Finding 5 (fail-closed GPU): installation failure is fatal for an
+                    // explicit `gpu`/`hybrid` request — we must never silently continue
+                    // on CPU. Under `auto` it is a recorded fallback instead.
+                    if matches!(
+                        resolution.requested,
+                        crate::backend::ComputeOffload::Gpu
+                            | crate::backend::ComputeOffload::Hybrid
+                    ) {
+                        return Err(format!(
+                            "explicit compute_offload = {:?}: GpuBackend installation failed \
+                             ({e}); refusing to fall back to CPU",
+                            resolution.requested
+                        )
+                        .into());
+                    }
+                    backend_fallback_occurred = true;
+                    warn!(
+                        error = e,
+                        "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
+                    );
+                } else {
+                    backend_attention_plane = resolution.attention_plane();
+                    backend_expert_plane = resolution.expert_plane();
+                    info!(
+                        device = device_name,
+                        compute_plane,
+                        has_device,
+                        requested = ?resolution.requested,
+                        resolved = ?resolution.resolved,
+                        attention_plane = backend_attention_plane,
+                        expert_plane = backend_expert_plane,
+                        reason = resolution.reason.as_deref().unwrap_or(""),
+                        "math backend installed for dense backbone"
+                    );
+                }
+            }
         }
     }
     crate::backend::install_default();
@@ -3795,6 +3846,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     if backend_fallback_occurred {
         metrics.record_gpu_cpu_fallback(1);
     }
+    // Per-component compute planes (hardening pass, strict GPU
+    // behaviour): make an intentional hybrid split (checked CPU
+    // attention + GPU experts) observable in /metrics.
+    metrics.set_backend_component_planes(backend_attention_plane, backend_expert_plane);
     let mut engine_builder = Engine::with_options(
         cache,
         pool,
