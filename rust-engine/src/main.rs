@@ -1248,6 +1248,9 @@ fn install_run_gpu_backend(
         1, // head_dim
         1, // v_head_dim
         gpu_expert_cache.clone(),
+        // The synthetic GPU tool path never serves real checkpoints;
+        // strict payload sizing (tolerance 0) always applies here.
+        0,
     );
     if !backend_box.is_gpu() {
         return Err("explicit --gpu request failed: GPU backend initialization did not \
@@ -2203,6 +2206,13 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    if cfg.real_transformer.allow_nonfinite_attention_fallback {
+        return Err(
+            "bench-real rejects real_transformer.allow_nonfinite_attention_fallback = true; \
+             uniform-attention fallback benchmarks are not production measurements"
+                .into(),
+        );
+    }
     if cfg.real_transformer.allow_truncated_expert_payloads {
         return Err(
             "bench-real rejects real_transformer.allow_truncated_expert_payloads = true; \
@@ -2409,7 +2419,7 @@ async fn build_bench_real_runtime(
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
-            allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+            policy: cfg.real_transformer.inference_policy(),
         },
     );
     engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
@@ -3398,6 +3408,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             // for them.
             0,
             gpu_expert_cache.clone(),
+            cfg.real_transformer
+                .inference_policy()
+                .expert_size_tolerance(),
         );
         let has_device = backend_box.is_gpu();
         // Reconcile the operator's request with the observed init result
@@ -3604,6 +3617,14 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                  NON-AUTHORITATIVE (see degraded_expert_substitutions)."
             );
         }
+        if rt.allow_nonfinite_attention_fallback {
+            warn!(
+                "NON-FINITE-ATTENTION FALLBACK ENABLED: \
+                 real_transformer.allow_nonfinite_attention_fallback = true — a non-finite \
+                 attention softmax row is replaced by a uniform distribution instead of \
+                 failing the request. Output is NON-AUTHORITATIVE."
+            );
+        }
         if rt.allow_truncated_expert_payloads {
             warn!(
                 "TRUNCATED-PAYLOAD TOLERANCE ENABLED: \
@@ -3612,7 +3633,18 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                  request. Output is NON-AUTHORITATIVE."
             );
         }
-        crate::inference::set_allow_truncated_expert_payloads(rt.allow_truncated_expert_payloads);
+        // Log each resolved fail-open policy explicitly, so the effective
+        // strict/degraded posture of the run is always visible at startup
+        // (hardening pass, policy separation). The policy is engine-scoped
+        // (threaded via `EngineOptions::policy`), not a process global.
+        let policy = rt.inference_policy();
+        info!(
+            allow_degraded_experts = policy.allow_degraded_experts,
+            allow_nonfinite_attention_fallback = policy.allow_nonfinite_attention_fallback,
+            allow_truncated_expert_payloads = policy.allow_truncated_expert_payloads,
+            degraded = policy.any_degraded(),
+            "resolved real-inference fail-open policies"
+        );
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
         } else {
@@ -3789,7 +3821,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
-            allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+            policy: cfg.real_transformer.inference_policy(),
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -4874,7 +4906,10 @@ async fn cmd_run(
                 // The synthetic `run` benchmark path keeps the legacy
                 // drop-from-mixture behaviour: a corrupt synthetic
                 // expert must not abort a long streaming benchmark.
-                allow_degraded_experts: true,
+                policy: crate::inference::RealInferencePolicy {
+                    allow_degraded_experts: true,
+                    ..crate::inference::RealInferencePolicy::STRICT
+                },
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {

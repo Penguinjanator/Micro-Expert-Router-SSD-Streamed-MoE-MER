@@ -2620,18 +2620,20 @@ impl RealModel {
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
         // Fail-closed numerical propagation (hardening pass, A3
-        // rework): strict production mode routes attention through the
-        // `try_` variants, which return a typed
+        // rework + policy separation): strict production mode routes
+        // attention through the `try_` variants, which return a typed
         // [`crate::transformer::AttentionNumericalError`] from the
         // softmax itself — no side-channel counters are consulted for
         // correctness (the global `nonfinite_softmax_fallbacks`
-        // counter remains telemetry only). The development-only
-        // `allow_degraded_experts` mode keeps the legacy
-        // uniform-fallback behaviour. GPU-offloaded attention performs
-        // its softmax on-device where non-finite rows cannot be
-        // detected; strict mode therefore always uses the checked CPU
-        // attention path (see `forward_into_impl`).
-        let strict_numerics = !engine.allow_degraded_experts();
+        // counter remains telemetry only). Only the *independent*
+        // development-only `allow_nonfinite_attention_fallback` policy
+        // keeps the legacy uniform-fallback behaviour — enabling
+        // `allow_degraded_experts` does NOT fabricate attention.
+        // GPU-offloaded attention performs its softmax on-device where
+        // non-finite rows cannot be detected; strict mode therefore
+        // always uses the checked CPU attention path (see
+        // `forward_into_impl`).
+        let strict_numerics = !engine.allow_nonfinite_attention_fallback();
         let allow_degraded = engine.allow_degraded_experts();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
@@ -5068,14 +5070,13 @@ mod tests {
             num_layers: 2,
             ..RealModelConfig::tiny()
         };
-        let engine = {
-            let mut engine =
-                Arc::try_unwrap(build_engine_for_model(&dir.path, &cfg)).unwrap_or_else(|_| {
-                    panic!("engine must be uniquely owned here");
-                });
-            engine.core.options.allow_degraded_experts = true;
-            Arc::new(engine)
-        };
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_degraded_experts: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
         let mut model = RealModel::new_seeded(cfg.clone(), 1);
         let broken = || {
             let mut se = SharedExpert::from_projections(
@@ -5145,6 +5146,83 @@ mod tests {
             }
             other => panic!("expected NonFiniteAttention, got: {other}"),
         }
+    }
+
+    /// Rebuild an engine with a custom fail-open policy (the test owns
+    /// the sole Arc right after construction).
+    fn with_policy(
+        engine: Arc<Engine>,
+        policy: crate::inference::RealInferencePolicy,
+    ) -> Arc<Engine> {
+        let mut owned = match Arc::try_unwrap(engine) {
+            Ok(e) => e,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        owned.core.options.policy = policy;
+        Arc::new(owned)
+    }
+
+    /// Policy separation: `allow_degraded_experts` must NOT enable the
+    /// uniform-attention fallback — NaN attention still fails the
+    /// request even in expert-degraded mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_experts_policy_does_not_enable_attention_fallback() {
+        let dir = TempDir::new("nanattn_degraded_experts");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_degraded_experts: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("expert degradation must not fabricate attention");
+        assert!(matches!(err, RealInferenceError::NonFiniteAttention { .. }));
+    }
+
+    /// Policy separation: only the explicit
+    /// `allow_nonfinite_attention_fallback` policy re-enables the
+    /// legacy uniform-attention fallback for non-finite rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonfinite_attention_fallback_policy_enables_uniform_fallback() {
+        let dir = TempDir::new("nanattn_fallback_policy");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_nonfinite_attention_fallback: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect("explicit fallback policy keeps the legacy uniform behaviour");
     }
 
     /// Part A3: a finite forward pass does not trip the non-finite

@@ -335,6 +335,15 @@ pub struct RealTransformerConfig {
     /// flag.
     #[serde(default)]
     pub allow_degraded_experts: bool,
+    /// Development-only opt-in that re-enables the legacy uniform
+    /// fallback for a non-finite attention softmax row (hardening pass,
+    /// Part A3 / policy separation). **Defaults to `false`** — strict
+    /// production mode treats an unexpected NaN/±inf attention row as
+    /// numerical corruption and fails the request. This policy is
+    /// independent of `allow_degraded_experts`: enabling one never
+    /// enables the other. `bench-real` rejects this flag.
+    #[serde(default)]
+    pub allow_nonfinite_attention_fallback: bool,
     /// Development-only opt-in that re-enables the legacy tolerance for
     /// quantised expert payloads that arrive up to one block alignment
     /// (page) short of the exact logical size, zero-filling the missing
@@ -539,6 +548,17 @@ pub enum RealWeightPolicy {
 }
 
 impl RealTransformerConfig {
+    /// Resolve the independent fail-open inference policies (hardening
+    /// pass, policy separation). Each development-only flag maps to its
+    /// own field; enabling one never enables another.
+    pub fn inference_policy(&self) -> crate::inference::RealInferencePolicy {
+        crate::inference::RealInferencePolicy {
+            allow_degraded_experts: self.allow_degraded_experts,
+            allow_nonfinite_attention_fallback: self.allow_nonfinite_attention_fallback,
+            allow_truncated_expert_payloads: self.allow_truncated_expert_payloads,
+        }
+    }
+
     /// Resolve the fail-closed weight-loading policy for real-model serving.
     ///
     /// Production real-model paths must fail closed on incomplete or

@@ -560,6 +560,12 @@ pub struct GpuBackend {
     expert_workspaces: ParkingMutex<Vec<ExpertWorkspace>>,
     /// Wakes dispatchers parked on an empty workspace pool.
     expert_workspace_cv: parking_lot::Condvar,
+    /// Engine-scoped truncated-payload tolerance in bytes
+    /// (`RealInferencePolicy::expert_size_tolerance`), fixed at
+    /// construction from config. `0` (strict, the default) requires the
+    /// exact logical Q4_0 payload size on VRAM upload — never a mutable
+    /// process-global switch (hardening pass, policy separation).
+    q4_truncation_tolerance: usize,
 }
 
 impl GpuBackend {
@@ -571,6 +577,7 @@ impl GpuBackend {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Result<Self> {
         // GQA models have num_kv_heads < num_heads; 0 means MHA.
         let num_kv_heads = if num_kv_heads == 0 { num_heads } else { num_kv_heads };
@@ -1098,6 +1105,7 @@ impl GpuBackend {
             gpu_expert_cache,
             expert_workspaces: ParkingMutex::new(expert_workspaces),
             expert_workspace_cv: parking_lot::Condvar::new(),
+            q4_truncation_tolerance,
         })
     }
 
@@ -1255,7 +1263,7 @@ impl GpuBackend {
         // Strict mode requires the exact logical payload; the ≤ one-page
         // zero-fill shortfall survives only behind the explicitly named
         // `allow_truncated_expert_payloads` development flag.
-        let tol = crate::inference::effective_expert_size_tolerance();
+        let tol = self.q4_truncation_tolerance;
         anyhow::ensure!(
             weight_bytes.len() >= need
                 || (need > tol && tol > 0 && need - weight_bytes.len() <= tol),
@@ -2148,8 +2156,9 @@ impl BackendBox {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Self {
-        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, v_head_dim, gpu_expert_cache).await {
+        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, v_head_dim, gpu_expert_cache, q4_truncation_tolerance).await {
             Ok(gpu) => BackendBox::Gpu(gpu),
             Err(e) => {
                 tracing::warn!(
@@ -2170,6 +2179,7 @@ impl BackendBox {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Self {
         pollster::block_on(Self::init(
             num_layers,
@@ -2179,6 +2189,7 @@ impl BackendBox {
             head_dim,
             v_head_dim,
             gpu_expert_cache,
+            q4_truncation_tolerance,
         ))
     }
 

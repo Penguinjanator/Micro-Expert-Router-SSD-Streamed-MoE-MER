@@ -979,17 +979,18 @@ pub struct EngineOptions {
     /// `--profile-out`. `false` (the default) keeps the per-token bump
     /// free when no consumer needs the counts.
     pub collect_route_profile: bool,
-    /// **Fail-closed MoE inference (hardening pass, Part A1).** When
-    /// `false` (the default, strict production mode), a routed expert
-    /// that fails to load, validate, prepare, or execute fails the
-    /// whole `moe_step` with a [`MoeStepError`] instead of silently
-    /// contributing a zero vector to the mixture. When `true`
-    /// (development-only degraded mode), the legacy behaviour is
-    /// preserved: failed experts are dropped from the mixture with a
-    /// prominent warning and the `degraded_expert_substitutions`
-    /// counter is bumped so metrics/benchmark output can be marked
-    /// non-authoritative. `bench-real` rejects this flag.
-    pub allow_degraded_experts: bool,
+    /// **Fail-closed real inference policies (hardening pass).**
+    /// Independent development-only fail-open switches; all default to
+    /// `false` (strict). See [`crate::inference::RealInferencePolicy`]:
+    /// `allow_degraded_experts` preserves the legacy drop-from-mixture
+    /// behaviour for failed routed/shared/dense experts (counted via
+    /// `degraded_expert_substitutions`), `allow_nonfinite_attention_fallback`
+    /// preserves the legacy uniform-softmax fallback for non-finite
+    /// attention rows, and `allow_truncated_expert_payloads` preserves
+    /// the legacy one-page zero-fill tolerance for short quantised
+    /// payloads. Enabling one never enables another; `bench-real`
+    /// rejects all three.
+    pub policy: crate::inference::RealInferencePolicy,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -1035,7 +1036,7 @@ impl Default for EngineOptions {
             cost_aware_eviction: false,
             pregate_enabled: false,
             collect_route_profile: false,
-            allow_degraded_experts: false,
+            policy: crate::inference::RealInferencePolicy::STRICT,
         }
     }
 }
@@ -1594,6 +1595,9 @@ fn dispatch_expert_forward(
     x: &[f32],
     d_model: usize,
     d_ff: usize,
+    // Engine-scoped truncated-payload tolerance in bytes
+    // (`RealInferencePolicy::expert_size_tolerance`); `0` = strict.
+    q4_tolerance: usize,
     timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     // One-time diagnostic: log the actual resident buffer size against
@@ -1649,15 +1653,15 @@ fn dispatch_expert_forward(
         WeightDtype::Q4_0
             if use_qmm && d_model % Q4_0_BLOCK_ELEMS == 0 && d_ff % Q4_0_BLOCK_ELEMS == 0 =>
         {
-            match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff) {
+            match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff, q4_tolerance) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     debug!(error = %e, "QMatMul Q4_0 path failed; falling back to dequant");
-                    run_inference_q4_0(token_idx, r, x, d_model, d_ff)
+                    run_inference_q4_0(token_idx, r, x, d_model, d_ff, q4_tolerance)
                 }
             }
         }
-        WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff, q4_tolerance),
         WeightDtype::Q8_0
             if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
         {
@@ -1879,6 +1883,7 @@ impl Engine {
         let backend = crate::backend::BackendBox::init_blocking(
             /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
             /* num_kv_heads = */ 1, /* head_dim     = */ 1, /* v_head_dim   = */ 1, gpu,
+            self.core.options.policy.expert_size_tolerance(),
         );
         self.core.backend = Arc::new(backend);
     }
@@ -2578,6 +2583,7 @@ impl Engine {
                             x,
                             self.core.shape.d_model,
                             self.core.shape.d_ff,
+                            self.core.options.policy.expert_size_tolerance(),
                             None,
                         )
                     };
@@ -3818,7 +3824,21 @@ impl Engine {
     /// numerical checks (Part A3) in addition to the engine's own
     /// expert-failure handling (Part A1).
     pub fn allow_degraded_experts(&self) -> bool {
-        self.core.options.allow_degraded_experts
+        self.core.options.policy.allow_degraded_experts
+    }
+
+    /// Whether the development-only uniform fallback for non-finite
+    /// attention rows (`[real_transformer]
+    /// allow_nonfinite_attention_fallback`) is active. Independent of
+    /// [`Self::allow_degraded_experts`] (hardening pass, policy
+    /// separation): degraded experts never enable fabricated attention.
+    pub fn allow_nonfinite_attention_fallback(&self) -> bool {
+        self.core.options.policy.allow_nonfinite_attention_fallback
+    }
+
+    /// The engine-scoped fail-open policy set (all default `false`).
+    pub fn inference_policy(&self) -> crate::inference::RealInferencePolicy {
+        self.core.options.policy
     }
 
     /// Record one degraded-mode zero substitution of a required expert
@@ -3936,6 +3956,7 @@ impl Engine {
             x,
             self.core.shape.d_model,
             self.core.shape.d_ff,
+            self.core.options.policy.expert_size_tolerance(),
             timings,
         )
         .map(|(_out, y)| y)
@@ -4214,7 +4235,7 @@ impl Engine {
         // (a zero contribution below) with a prominent warning and the
         // `degraded_expert_substitutions` counter marks the run
         // non-authoritative.
-        let allow_degraded = self.core.options.allow_degraded_experts;
+        let allow_degraded = self.core.options.policy.allow_degraded_experts;
         let mut first_fetch_error: Option<MoeStepError> = None;
         for (i, h) in miss_handles {
             // `fetch_with_retry` already retried with backoff. A join
@@ -4642,6 +4663,7 @@ impl Engine {
                 .counters
                 .degraded_expert_substitutions
                 .load(Ordering::Relaxed),
+            inference_policy: self.core.options.policy,
             prefetch_dropped_concurrency: self
                 .metrics
                 .counters
@@ -4977,6 +4999,12 @@ pub struct EngineReport {
     /// strict production mode; any non-zero value marks the run's
     /// output and benchmark figures as degraded / non-authoritative.
     pub degraded_expert_substitutions: u64,
+    /// The engine-scoped fail-open policy set active for this run
+    /// (hardening pass, policy separation). Any `true` field marks the
+    /// run's output and every benchmark figure as potentially
+    /// non-authoritative — surfaced here so request/benchmark metadata
+    /// can report whether a degraded policy was used.
+    pub inference_policy: crate::inference::RealInferencePolicy,
     /// Speculative prefetches dropped because
     /// `EngineOptions::max_concurrent_prefetches` was already saturated.
     pub prefetch_dropped_concurrency: u64,
@@ -5385,7 +5413,7 @@ mod tests {
             Ok(engine) => engine,
             Err(_) => panic!("test owns the sole engine Arc"),
         };
-        engine_owned.core.options.allow_degraded_experts = true;
+        engine_owned.core.options.policy.allow_degraded_experts = true;
         let engine = Arc::new(engine_owned);
         let path = engine.core.storage.expert_path(3);
         std::fs::OpenOptions::new()
