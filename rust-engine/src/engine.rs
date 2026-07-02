@@ -1523,7 +1523,7 @@ enum MoeStepResult {
 
 /// Error taxonomy for a failed real-model MoE step (hardening pass,
 /// Part A1). Under strict production mode (the default,
-/// `EngineOptions::allow_degraded_experts == false`) any required
+/// `EngineOptions::policy.allow_degraded_experts == false`) any required
 /// routed expert that fails to load or execute fails the whole step
 /// with one of these variants instead of silently degrading the
 /// mixture. These are recoverable *request-level* failures: callers
