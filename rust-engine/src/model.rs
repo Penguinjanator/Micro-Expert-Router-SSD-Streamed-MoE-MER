@@ -41,6 +41,7 @@ use crate::architecture::{
 };
 use crate::dense_tensor::{dense_checksum, DenseDType, DenseTensorManifest, DenseWeight};
 use crate::engine::Engine;
+use crate::engine::MoeStepError;
 use crate::gating::{LinearGate, ScoringFunc};
 use crate::mla::MultiHeadLatentAttention;
 use crate::transformer::{
@@ -352,6 +353,22 @@ impl WeightLoadFailure {
             detail: Some(detail.into()),
         }
     }
+
+    fn malformed(
+        tensor: impl Into<String>,
+        group: &'static str,
+        expected: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            tensor: tensor.into(),
+            group,
+            kind: WeightLoadFailureKind::Malformed,
+            expected: expected.into(),
+            actual: None,
+            detail: Some(detail.into()),
+        }
+    }
 }
 
 /// Aggregate strict-load error. Keeping the individual failures attached
@@ -650,6 +667,113 @@ impl RealModelConfig {
             first_k_dense_replace: hf.first_k_dense_replace.unwrap_or(0),
             advanced,
         }
+    }
+}
+
+/// Request-level error for the real-model inference path (hardening
+/// pass, Part A). Real-model methods fail closed: a corrupted or
+/// mathematically invalid step returns one of these instead of
+/// silently continuing with incomplete inference. Callers map it to an
+/// HTTP 500 (server) or a CLI error (bench) — never a panic.
+#[derive(Debug)]
+pub enum RealInferenceError {
+    /// A token id outside `[0, vocab_size)` reached real-model
+    /// embedding lookup (tokenizer/model vocabulary mismatch or caller
+    /// bug). Real inference never wraps ids with modulo.
+    InvalidTokenId { token_id: u32, vocab_size: usize },
+    /// A required routed or shared expert failed to load or execute.
+    MoeStep(MoeStepError),
+    /// An active attention softmax row produced unexpected NaN or
+    /// infinity — numerical corruption, not a valid masked row (A3
+    /// rework: propagated structurally from
+    /// `softmax → attention → transformer layer → RealModel`, with
+    /// full head/position/architecture context).
+    NonFiniteAttention {
+        layer: usize,
+        head: usize,
+        pos: usize,
+        architecture: crate::architecture::Architecture,
+        kind: crate::transformer::NumericalErrorKind,
+    },
+    /// A scheduler-registered KV state could not be recovered; the
+    /// request must fail rather than continue on a fresh KV cache.
+    KvStateLost(String),
+    /// An architecturally required resident FFN (Qwen2-MoE / DeepSeek
+    /// shared expert, or a dense layer's SwiGLU FFN) failed to execute
+    /// (hardening pass, A1 completion). Strict mode fails the request;
+    /// only the explicit development-only degraded mode may substitute
+    /// a zero contribution, and it increments the engine's
+    /// `degraded_expert_substitutions` counter.
+    ResidentFfn {
+        layer: usize,
+        role: ResidentFfnRole,
+        source: crate::transformer::SharedExpertError,
+    },
+}
+
+/// Which resident FFN failed in [`RealInferenceError::ResidentFfn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentFfnRole {
+    /// Always-on shared expert (Qwen2-MoE / DeepSeek-MoE).
+    Shared,
+    /// Dense layer FFN (Mistral Small 3, Phi-4, DeepSeek dense prefix).
+    Dense,
+}
+
+impl std::fmt::Display for ResidentFfnRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResidentFfnRole::Shared => write!(f, "shared expert"),
+            ResidentFfnRole::Dense => write!(f, "dense FFN"),
+        }
+    }
+}
+
+impl std::fmt::Display for RealInferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size,
+            } => write!(
+                f,
+                "invalid token id {token_id}: model vocab_size is {vocab_size}"
+            ),
+            RealInferenceError::MoeStep(e) => write!(f, "moe step failed: {e}"),
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => write!(
+                f,
+                "non-finite attention detected: {kind} at layer {layer}, head {head}, \
+                 position {pos} (architecture {architecture:?})"
+            ),
+            RealInferenceError::KvStateLost(m) => write!(f, "kv state lost: {m}"),
+            RealInferenceError::ResidentFfn {
+                layer,
+                role,
+                source,
+            } => write!(f, "required {role} failed at layer {layer}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for RealInferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RealInferenceError::MoeStep(e) => Some(e),
+            RealInferenceError::ResidentFfn { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<MoeStepError> for RealInferenceError {
+    fn from(e: MoeStepError) -> Self {
+        RealInferenceError::MoeStep(e)
     }
 }
 
@@ -1126,19 +1250,40 @@ impl RealModel {
             // from the on-disk tensor length (`gate floats / d_model`).
             if config.advanced.num_shared_experts > 0 && naming.ffn_kind(l) == FfnKind::Moe {
                 tried += 1;
-                if let Some(se) = Self::load_shared_expert_bin(dir, l, d_model) {
-                    let resident_bytes = (se.weights.len()
-                        + se.gate_inp.as_ref().map(|g| g.len()).unwrap_or(0))
-                        * 4;
-                    model.layers[l].shared_expert = Some(se);
-                    summary.record(GROUP_SHARED_FFN, "f32", resident_bytes);
-                    loaded += 1;
-                } else if options.strict_weights {
-                    failures.push(WeightLoadFailure::missing(
-                        format!("layer_{l}_shexp_*"),
-                        GROUP_SHARED_FFN,
-                        "resident shared-expert gate/up/down projections",
-                    ));
+                match Self::load_shared_expert_bin(dir, l, d_model) {
+                    Ok(Some(se)) => {
+                        let resident_bytes = (se.weights.len()
+                            + se.gate_inp.as_ref().map(|g| g.len()).unwrap_or(0))
+                            * 4;
+                        model.layers[l].shared_expert = Some(se);
+                        summary.record(GROUP_SHARED_FFN, "f32", resident_bytes);
+                        loaded += 1;
+                    }
+                    Ok(None) => {
+                        if options.strict_weights {
+                            failures.push(WeightLoadFailure::missing(
+                                format!("layer_{l}_shexp_*"),
+                                GROUP_SHARED_FFN,
+                                "resident shared-expert gate/up/down projections",
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        // Present but malformed: never silently drop a
+                        // required shared expert (A1) — strict loading
+                        // records a malformed failure, non-strict keeps
+                        // the seeded fallback with a loud warning.
+                        warn!(layer = l, error = %e,
+                            "shared expert tensors present but malformed");
+                        if options.strict_weights {
+                            failures.push(WeightLoadFailure::malformed(
+                                format!("layer_{l}_shexp_*"),
+                                GROUP_SHARED_FFN,
+                                "resident shared-expert gate/up/down projections",
+                                e.to_string(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1210,34 +1355,49 @@ impl RealModel {
     }
 
     /// Load a layer's optional shared expert from the GGUF-extractor
-    /// `.bin` files (`layer_{l}_shexp_{gate,up,down,gate_inp}.bin`). The
-    /// shared intermediate size is inferred from the gate tensor length;
-    /// inconsistent or partial tensor sets degrade to `None` so a missing
-    /// or malformed shared expert never aborts the load.
-    fn load_shared_expert_bin(dir: &Path, l: usize, d_model: usize) -> Option<SharedExpert> {
-        let gate = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate.bin")))?;
-        let up = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_up.bin")))?;
-        let down = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_down.bin")))?;
+    /// `.bin` files (`layer_{l}_shexp_{gate,up,down,gate_inp}.bin`).
+    /// The shared intermediate size is inferred from the gate tensor
+    /// length. Absent tensor files return `Ok(None)` (the checkpoint
+    /// genuinely has no shared expert on disk); files that are present
+    /// but inconsistent return a typed error so an architecturally
+    /// *required* shared expert is never silently dropped (A1).
+    fn load_shared_expert_bin(
+        dir: &Path,
+        l: usize,
+        d_model: usize,
+    ) -> Result<Option<SharedExpert>, crate::transformer::SharedExpertError> {
+        let gate = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate.bin")));
+        let up = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_up.bin")));
+        let down = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_down.bin")));
+        let (Some(gate), Some(up), Some(down)) = (gate, up, down) else {
+            return Ok(None);
+        };
+        let shape_err = |gate_inp_len: Option<usize>| {
+            crate::transformer::SharedExpertError::ShapeMismatch {
+                d_model,
+                d_ff: if d_model == 0 { 0 } else { gate.len() / d_model },
+                gate_len: gate.len(),
+                up_len: up.len(),
+                down_len: down.len(),
+                gate_inp_len,
+            }
+        };
         if d_model == 0 || gate.len() % d_model != 0 {
-            return None;
+            return Err(shape_err(None));
         }
         let shared_d_ff = gate.len() / d_model;
         if shared_d_ff == 0 {
-            return None;
+            return Err(shape_err(None));
         }
-        // The sigmoid gate (Qwen2-MoE) is optional; DeepSeek-MoE omits it.
-        let gate_inp = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate_inp.bin")))
-            .filter(|g| g.len() == d_model);
-        let se = SharedExpert::from_projections(d_model, shared_d_ff, &gate, &up, &down, gate_inp);
-        if se.is_none() {
-            warn!(
-                layer = l,
-                shared_d_ff,
-                d_model,
-                "shared expert tensors present but shapes are inconsistent; ignoring"
-            );
+        // The sigmoid gate (Qwen2-MoE) is optional; DeepSeek-MoE omits it —
+        // but a *present* gate file with the wrong length is malformed.
+        let gate_inp = Self::read_full_f32(&dir.join(format!("layer_{l}_shexp_gate_inp.bin")));
+        if let Some(g) = gate_inp.as_ref() {
+            if g.len() != d_model {
+                return Err(shape_err(Some(g.len())));
+            }
         }
-        se
+        SharedExpert::from_projections(d_model, shared_d_ff, &gate, &up, &down, gate_inp).map(Some)
     }
 
     /// Like [`Self::from_dir`] but loads dense weights from
@@ -1980,7 +2140,7 @@ impl RealModel {
             // `RealModel::step` can run it directly. Phi-4 fuses gate+up
             // into a single `mlp.gate_up_proj` that we split.
             if naming.ffn_kind(l) == FfnKind::Dense {
-                let dense = if naming.mlp_gate_up_fused() {
+                let dense: Result<Option<SharedExpert>, _> = if naming.mlp_gate_up_fused() {
                     // Phi-4: `mlp.gate_up_proj` is `[2*d_ff, d_model]`,
                     // row-major, gate rows first then up rows. `down_proj`
                     // is `[d_model, d_ff]`.
@@ -1995,7 +2155,7 @@ impl RealModel {
                             let se = SharedExpert::from_projections(
                                 d_model, ffn_d, gate, up, &down, None,
                             );
-                            if se.is_some() {
+                            if se.is_ok() {
                                 summary.record(
                                     GROUP_DENSE_FFN,
                                     safetensor_source_dtype(&parsed, &gu_name),
@@ -2007,9 +2167,21 @@ impl RealModel {
                                     down.len() * 4,
                                 );
                             }
-                            se
+                            se.map(Some)
                         }
-                        _ => None,
+                        (Some((_, gu)), Some((_, down))) => {
+                            // Present but inconsistently shaped fused
+                            // projections: malformed, not absent (A1).
+                            Err(crate::transformer::SharedExpertError::ShapeMismatch {
+                                d_model,
+                                d_ff: 0,
+                                gate_len: gu.len(),
+                                up_len: gu.len(),
+                                down_len: down.len(),
+                                gate_inp_len: None,
+                            })
+                        }
+                        _ => Ok(None),
                     }
                 } else {
                     let gate = find_f32_any_named(&[naming.mlp_gate(l)]);
@@ -2023,7 +2195,7 @@ impl RealModel {
                             let se = SharedExpert::from_projections(
                                 d_model, ffn_d, &gate, &up, &down, None,
                             );
-                            if se.is_some() {
+                            if se.is_ok() {
                                 summary.record(
                                     GROUP_DENSE_FFN,
                                     safetensor_source_dtype(&parsed, &gate_name),
@@ -2040,15 +2212,37 @@ impl RealModel {
                                     down.len() * 4,
                                 );
                             }
-                            se
+                            se.map(Some)
                         }
-                        _ => None,
+                        (Some((_, gate)), Some((_, up)), Some((_, down))) => {
+                            Err(crate::transformer::SharedExpertError::ShapeMismatch {
+                                d_model,
+                                d_ff: 0,
+                                gate_len: gate.len(),
+                                up_len: up.len(),
+                                down_len: down.len(),
+                                gate_inp_len: None,
+                            })
+                        }
+                        _ => Ok(None),
                     }
                 };
                 tried += 1;
-                if let Some(se) = dense {
-                    model.layers[l].dense_ffn = Some(se);
-                    loaded += 1;
+                match dense {
+                    Ok(Some(se)) => {
+                        model.layers[l].dense_ffn = Some(se);
+                        loaded += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // A dense layer's FFN is architecturally required;
+                        // present-but-malformed tensors must not silently
+                        // degrade to the seeded fallback without a loud
+                        // signal (A1). `loaded < tried` marks the seeded
+                        // fallback, and strict startup validation rejects it.
+                        warn!(layer = l, error = %e,
+                            "dense FFN tensors present but malformed");
+                    }
                 }
             }
 
@@ -2170,7 +2364,7 @@ impl RealModel {
                             &down,
                             gate_inp_vec,
                         ) {
-                            Some(se) => {
+                            Ok(se) => {
                                 summary.record(
                                     GROUP_SHARED_FFN,
                                     safetensor_source_dtype(&parsed, &gate_name),
@@ -2196,11 +2390,15 @@ impl RealModel {
                                 model.layers[l].shared_expert = Some(se);
                                 loaded += 1;
                             }
-                            None => warn!(
+                            // Present but malformed: leave the seeded
+                            // fallback flagged (`loaded < tried`) instead of
+                            // silently removing a required shared expert (A1).
+                            Err(e) => warn!(
                                 layer = l,
                                 shared_d_ff,
                                 d_model,
-                                "shared expert tensors present but shapes are inconsistent; ignoring"
+                                error = %e,
+                                "shared expert tensors present but malformed"
                             ),
                         }
                     }
@@ -2274,12 +2472,34 @@ impl RealModel {
             .collect()
     }
 
-    /// Look up the embedding row for a token id.
+    /// Look up the embedding row for a token id, wrapping out-of-range
+    /// ids with modulo. **Synthetic/speculative paths only** (routing
+    /// peeks, draft-token KV previews, seeded benchmarks): real
+    /// inference must use [`Self::try_embed`], which rejects invalid
+    /// ids instead of silently aliasing them onto a valid row
+    /// (hardening pass, Part A5).
     pub fn embed(&self, token_id: u32) -> Vec<f32> {
         let id = (token_id as usize) % self.config.vocab_size;
         let mut out = Vec::with_capacity(self.config.d_model);
         self.embedding.row_dequant_into(id, &mut out);
         out
+    }
+
+    /// Fail-closed embedding lookup for real inference (Part A5): a
+    /// token id outside `[0, vocab_size)` is a tokenizer/model
+    /// vocabulary mismatch or a caller bug and must fail the request,
+    /// never wrap onto an unrelated embedding row.
+    pub fn try_embed(&self, token_id: u32) -> Result<Vec<f32>, RealInferenceError> {
+        let id = token_id as usize;
+        if id >= self.config.vocab_size {
+            return Err(RealInferenceError::InvalidTokenId {
+                token_id,
+                vocab_size: self.config.vocab_size,
+            });
+        }
+        let mut out = Vec::with_capacity(self.config.d_model);
+        self.embedding.row_dequant_into(id, &mut out);
+        Ok(out)
     }
 
     /// Translate a `(layer, local_expert_id)` pair into the global flat
@@ -2289,63 +2509,56 @@ impl RealModel {
     /// API changes.
     #[inline]
     pub fn global_expert_id(&self, layer: usize, local: u32) -> u32 {
-        (layer as u32) * (self.config.num_experts as u32) + local
+        // Checked namespace arithmetic (hardening pass, Part A6): the
+        // product/sum is validated at config load, so an overflow here
+        // is a programming error — fail loudly instead of wrapping a
+        // malformed id into another layer's cache namespace.
+        let layer = u32::try_from(layer).expect("layer index exceeds u32");
+        debug_assert!((local as usize) < self.config.num_experts);
+        layer
+            .checked_mul(self.config.num_experts as u32)
+            .and_then(|base| base.checked_add(local))
+            .expect("global expert id overflows u32 (num_layers * num_experts too large)")
     }
 
-    /// **SSD-read pre-pass peek (gist Phase 1).** Return a best-effort
-    /// estimate of the global expert ids this step is likely to
-    /// require. The pre-pass is cheap and side-effect-free:
+    /// **SSD-read pre-pass peek (gist Phase 1, reworked by hardening
+    /// pass C2).** Return a best-effort, **lightweight** estimate of
+    /// the global expert ids this step is likely to require. The
+    /// pre-pass is cheap, side-effect-free and request-agnostic:
     ///
-    /// 1. **Layer 0 is exact:** we run the embedding +
-    ///    attention-normalised gate against a *clone* of the layer-0
-    ///    KV cache, so the prediction matches the actual routing
-    ///    decision the upcoming [`Self::step`] will make.
-    /// 2. **Deeper layers are approximated** by re-using the
-    ///    embedding as a stand-in for each layer's residual stream
-    ///    and running its gate. This is not exact — those decisions
-    ///    really depend on every preceding MoE FFN output — but it
-    ///    captures the strong layerwise correlation seen on
-    ///    Mixtral-class checkpoints and provides plenty of useful
-    ///    hints for the warm pass. The remaining miss-on-miss
-    ///    fetches still funnel through `Engine`'s in-flight
-    ///    singleflight, so deduplication holds even when the peek
-    ///    is wrong.
+    /// * Every layer's gate is evaluated against the token's
+    ///   **embedding** as a stand-in for that layer's residual
+    ///   stream. This is not exact — real routing depends on
+    ///   attention over the request's KV state and every preceding
+    ///   MoE FFN output — but it captures the strong tokenwise /
+    ///   layerwise routing correlation seen on Mixtral-class
+    ///   checkpoints and provides useful hints for the warm pass.
+    ///
+    /// The previous implementation additionally *cloned the layer-0 KV
+    /// cache and re-ran full layer-0 attention* per peeked token to
+    /// make layer 0 exact. That paid an `O(pos · kv_dim)` copy plus a
+    /// duplicate attention pass on every scheduled request per batch —
+    /// far more than the one routing decision it sharpened was worth —
+    /// and forced the scheduler to lock each request's KV state during
+    /// the pre-pass. Both are gone: the peek reads nothing but the
+    /// token id and the resident gate weights, so it never touches
+    /// request state and cannot leak routing observations across
+    /// requests.
+    ///
+    /// Misses are cheap by construction: anything the peek gets wrong
+    /// is still caught by the in-flight singleflight on the critical
+    /// path, and the scheduler's profitability gate disables the
+    /// pre-pass entirely when its measured benefit is non-positive.
     ///
     /// The returned vector is **not** deduplicated; the caller is
     /// expected to fold it into a [`HashSet`] before calling
     /// [`Engine::warm_with`].
-    pub fn peek_experts(&self, token_id: u32, pos: usize, kv: &[KvCache]) -> Vec<u32> {
-        assert_eq!(
-            kv.len(),
-            self.config.num_layers,
-            "kv cache slice must have one entry per layer"
-        );
+    pub fn peek_experts(&self, token_id: u32) -> Vec<u32> {
         // Each layer contributes exactly `routing.experts.len()` ids,
-        // which by the gating contract equals `config.top_k`. We
-        // assert this loosely below via `debug_assert`; the
-        // pre-allocation is a tight upper bound that avoids any
-        // `Vec` growth even when `top_k` is dynamically reduced
-        // (e.g. by alias-deduplication).
+        // which by the gating contract equals `config.top_k`.
         let mut out = Vec::with_capacity(self.config.num_layers * self.config.top_k);
         let embed = self.embed(token_id);
-        // Layer 0: run real attention against a *clone* of the KV
-        // slot so the cache is not mutated by the peek.
-        {
-            let layer = &self.layers[0];
-            let mut kv0 = kv[0].clone();
-            let backend = crate::backend::current();
-            let attn_out = layer.attn_block(&embed, pos, 0, &mut kv0, &*backend);
-            let (_normed, routing) = layer.moe_pre(&attn_out);
-            for &local in &routing.experts {
-                out.push(self.global_expert_id(0, local));
-            }
-        }
-        // Layers ≥ 1: use the embedding as a fast residual-stream
-        // approximation. Cheap (no attention, no cloning), and good
-        // enough to seed the warm pass — anything the peek misses is
-        // still caught by the in-flight singleflight on the critical
-        // path.
-        for layer_idx in 1..self.config.num_layers {
+        for layer_idx in 0..self.config.num_layers {
             let layer = &self.layers[layer_idx];
             let (_normed, routing) = layer.moe_pre(&embed);
             for &local in &routing.experts {
@@ -2381,7 +2594,7 @@ impl RealModel {
         token_id: u32,
         pos: usize,
         kv: &mut [KvCache],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         self.forward_token_hidden_with_timing(engine, token_id, pos, kv, None)
             .await
     }
@@ -2393,7 +2606,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, RealInferenceError> {
         assert_eq!(
             kv.len(),
             self.config.num_layers,
@@ -2401,23 +2614,60 @@ impl RealModel {
         );
         let mut x =
             crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
-                self.embed(token_id)
-            });
+                self.try_embed(token_id)
+            })?;
         let backend = crate::backend::current();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
+        // Fail-closed numerical propagation (hardening pass, A3
+        // rework + policy separation): strict production mode routes
+        // attention through the `try_` variants, which return a typed
+        // [`crate::transformer::AttentionNumericalError`] from the
+        // softmax itself — no side-channel counters are consulted for
+        // correctness (the global `nonfinite_softmax_fallbacks`
+        // counter remains telemetry only). Only the *independent*
+        // development-only `allow_nonfinite_attention_fallback` policy
+        // keeps the legacy uniform-fallback behaviour — enabling
+        // `allow_degraded_experts` does NOT fabricate attention.
+        // GPU-offloaded attention performs its softmax on-device where
+        // non-finite rows cannot be detected; strict mode therefore
+        // always uses the checked CPU attention path (see
+        // `forward_into_impl`).
+        let strict_numerics = !engine.allow_nonfinite_attention_fallback();
+        let allow_degraded = engine.allow_degraded_experts();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // Attention sub-block.
-            layer.attn_block_into_with_timing(
-                &x,
-                pos,
-                layer_idx,
-                &mut kv[layer_idx],
-                &*backend,
-                &mut layer_scratch,
-                &mut next_x,
-                timings,
-            );
+            if strict_numerics {
+                layer
+                    .try_attn_block_into_with_timing(
+                        &x,
+                        pos,
+                        layer_idx,
+                        &mut kv[layer_idx],
+                        &*backend,
+                        &mut layer_scratch,
+                        &mut next_x,
+                        timings,
+                    )
+                    .map_err(|e| RealInferenceError::NonFiniteAttention {
+                        layer: layer_idx,
+                        head: e.head,
+                        pos: e.pos,
+                        architecture: self.config.architecture,
+                        kind: e.kind,
+                    })?;
+            } else {
+                layer.attn_block_into_with_timing(
+                    &x,
+                    pos,
+                    layer_idx,
+                    &mut kv[layer_idx],
+                    &*backend,
+                    &mut layer_scratch,
+                    &mut next_x,
+                    timings,
+                );
+            }
             std::mem::swap(&mut x, &mut next_x);
             next_x.clear();
             // Sliding-Window-Attention layers (MiMo-V2 SWA layers, GPT-OSS
@@ -2433,10 +2683,34 @@ impl RealModel {
             }
             // Dense FFN layers (Mistral Small 3, Phi-4, DeepSeek dense
             // prefix) bypass the SSD-streamed expert path entirely: run the
-            // resident SwiGLU FFN and skip routing.
-            if let Some(dense_out) = layer.dense_forward_with_timing(&x, timings) {
-                x = dense_out;
-                continue;
+            // resident SwiGLU FFN and skip routing. A dense FFN failure
+            // fails the request in strict mode (A1 completion); only the
+            // explicit degraded mode substitutes a zero contribution
+            // (residual add of zero == hidden unchanged) and counts it.
+            match layer.dense_forward_with_timing(&x, timings) {
+                Ok(Some(dense_out)) => {
+                    x = dense_out;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    if !allow_degraded {
+                        return Err(RealInferenceError::ResidentFfn {
+                            layer: layer_idx,
+                            role: ResidentFfnRole::Dense,
+                            source,
+                        });
+                    }
+                    engine.record_degraded_expert_substitution();
+                    tracing::warn!(
+                        layer = layer_idx,
+                        error = %source,
+                        "DEGRADED MODE: dense FFN failed; substituting zero \
+                         contribution (allow_degraded_experts = true, output is \
+                         non-authoritative)"
+                    );
+                    continue;
+                }
             }
             // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
             let routing = layer.moe_pre_into_with_timing(&x, &mut layer_scratch, timings);
@@ -2464,7 +2738,7 @@ impl RealModel {
                     &mut layer_scratch.moe_accum,
                     timings,
                 )
-                .await;
+                .await?;
             layer.moe_accumulated_into_with_timing(
                 &x,
                 &layer_scratch.moe_accum,
@@ -2477,16 +2751,41 @@ impl RealModel {
             // Qwen2-MoE / DeepSeek-MoE shared expert: a dense always-on
             // FFN over the same MoE-normalised hidden, added to the
             // residual alongside the routed experts. `None` for Mixtral
-            // (no-op), keeping the engine MoE-architecture-agnostic.
-            if let Some(shared) = layer.shared_expert_forward_with_timing(normed, timings) {
-                crate::transformer::add_residual_into(&x, &shared, &mut next_x);
-                std::mem::swap(&mut x, &mut next_x);
-                next_x.clear();
+            // (no-op), keeping the engine MoE-architecture-agnostic. A
+            // shared-expert failure fails the request in strict mode (A1
+            // completion); only the explicit degraded mode drops the
+            // contribution (and counts the substitution).
+            match layer.shared_expert_forward_with_timing(normed, timings) {
+                Ok(Some(shared)) => {
+                    crate::transformer::add_residual_into(&x, &shared, &mut next_x);
+                    std::mem::swap(&mut x, &mut next_x);
+                    next_x.clear();
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    if !allow_degraded {
+                        return Err(RealInferenceError::ResidentFfn {
+                            layer: layer_idx,
+                            role: ResidentFfnRole::Shared,
+                            source,
+                        });
+                    }
+                    engine.record_degraded_expert_substitution();
+                    tracing::warn!(
+                        layer = layer_idx,
+                        error = %source,
+                        "DEGRADED MODE: shared expert failed; dropping its \
+                         contribution (allow_degraded_experts = true, output is \
+                         non-authoritative)"
+                    );
+                }
             }
         }
-        crate::stage_timing::time_optional(timings, crate::stage_timing::FINAL_RMS_NORM, || {
-            self.final_rms.forward(&x)
-        })
+        Ok(crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::FINAL_RMS_NORM,
+            || self.final_rms.forward(&x),
+        ))
     }
 
     /// Sample a next-token id from an already-computed final hidden state.
@@ -2503,6 +2802,13 @@ impl RealModel {
         self.lm_head.sample(hidden, params, pos as u64)
     }
 
+    /// Timed variant of [`Self::sample_hidden`] (hardening pass, D3):
+    /// delegates to [`crate::transformer::LMHead::sample_with_timing`],
+    /// which is the *same* code path as the untimed sampler with
+    /// per-stage timing recorded inside each fast path. Timing on/off
+    /// therefore selects the same algorithm and returns the same
+    /// token, and timed greedy / top-K-only sampling never allocates
+    /// full logits.
     pub fn sample_hidden_with_timing(
         &self,
         hidden: &[f32],
@@ -2510,13 +2816,8 @@ impl RealModel {
         pos: usize,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> u32 {
-        let logits =
-            crate::stage_timing::time_optional(timings, crate::stage_timing::LM_HEAD, || {
-                self.lm_head.forward(hidden)
-            });
-        crate::stage_timing::time_optional(timings, crate::stage_timing::SAMPLING, || {
-            crate::sampling::sample(&logits, params, pos as u64)
-        })
+        self.lm_head
+            .sample_with_timing(hidden, params, pos as u64, timings)
     }
 
     /// Ingest one token and sample the following token. This is the
@@ -2529,9 +2830,9 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
-        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await;
-        self.sample_hidden(&hidden, params, pos)
+    ) -> Result<u32, RealInferenceError> {
+        let hidden = self.forward_token_hidden(engine, token_id, pos, kv).await?;
+        Ok(self.sample_hidden(&hidden, params, pos))
     }
 
     pub async fn decode_step_with_timing(
@@ -2542,11 +2843,11 @@ impl RealModel {
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         let hidden = self
             .forward_token_hidden_with_timing(engine, token_id, pos, kv, timings)
-            .await;
-        self.sample_hidden_with_timing(&hidden, params, pos, timings)
+            .await?;
+        Ok(self.sample_hidden_with_timing(&hidden, params, pos, timings))
     }
 
     /// Backwards-compatible alias for callers that still express a full
@@ -2558,7 +2859,7 @@ impl RealModel {
         pos: usize,
         kv: &mut [KvCache],
         params: &crate::sampling::SamplingParams,
-    ) -> u32 {
+    ) -> Result<u32, RealInferenceError> {
         self.decode_step(engine, token_id, pos, kv, params).await
     }
 }
@@ -4479,7 +4780,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((next as usize) < cfg.vocab_size);
         // KV caches grew by exactly one position.
         for c in &kv {
@@ -4542,7 +4844,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4551,11 +4854,424 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         assert!((t1 as usize) < cfg.vocab_size);
         assert!((t2 as usize) < cfg.vocab_size);
         for c in &kv {
             assert_eq!(c.seq_len, 2, "each MLA layer cached two positions");
+        }
+    }
+
+    /// Part A5 (fail-closed inference): real-model forward must reject
+    /// token ids outside `[0, vocab_size)` instead of wrapping them
+    /// with modulo onto an unrelated embedding row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_rejects_out_of_range_token_ids() {
+        let dir = TempDir::new("badtok");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let vocab = cfg.vocab_size as u32;
+
+        // Boundary-valid ids succeed: token 0 and the last valid token.
+        for tid in [0u32, vocab - 1] {
+            let mut kv = model.fresh_kv_caches();
+            model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .unwrap_or_else(|e| panic!("token {tid} must be valid: {e}"));
+        }
+
+        // `vocab_size` (one past the end) and `u32::MAX` fail closed.
+        for tid in [vocab, u32::MAX] {
+            let mut kv = model.fresh_kv_caches();
+            let err = model
+                .forward_token_hidden(&engine, tid, 0, &mut kv)
+                .await
+                .expect_err("out-of-range token id must fail");
+            match err {
+                RealInferenceError::InvalidTokenId {
+                    token_id,
+                    vocab_size,
+                } => {
+                    assert_eq!(token_id, tid);
+                    assert_eq!(vocab_size, cfg.vocab_size);
+                }
+                other => panic!("expected InvalidTokenId, got: {other}"),
+            }
+        }
+
+        // try_embed mirrors the same contract directly.
+        assert!(model.try_embed(vocab - 1).is_ok());
+        assert!(model.try_embed(vocab).is_err());
+    }
+
+    /// A1 completion: malformed required shared-expert projections are a
+    /// typed [`SharedExpertError::ShapeMismatch`], never a silent `None`.
+    #[test]
+    fn shared_expert_malformed_projections_is_typed_error() {
+        let d_model = 4;
+        let d_ff = 3;
+        let gate = vec![0.05f32; d_ff * d_model];
+        let up = vec![0.07f32; d_ff * d_model];
+        let down_short = vec![0.09f32; d_model * d_ff - 1];
+        let err = SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down_short, None)
+            .expect_err("inconsistent shapes must be a typed error");
+        assert!(matches!(
+            err,
+            crate::transformer::SharedExpertError::ShapeMismatch { .. }
+        ));
+        // A wrong-length sigmoid gate is equally malformed.
+        let down = vec![0.09f32; d_model * d_ff];
+        let err = SharedExpert::from_projections(
+            d_model,
+            d_ff,
+            &gate,
+            &up,
+            &down,
+            Some(vec![0.0f32; d_model + 1]),
+        )
+        .expect_err("wrong-length gate_inp must be a typed error");
+        assert!(matches!(
+            err,
+            crate::transformer::SharedExpertError::ShapeMismatch { .. }
+        ));
+    }
+
+    /// A1 completion: a shared expert whose cached Candle execution fails
+    /// returns [`SharedExpertError::Compute`]; one whose per-call weight
+    /// reconstruction fails returns [`SharedExpertError::Reconstruction`].
+    /// Neither ever fabricates a zero vector.
+    #[test]
+    fn shared_expert_forward_failures_are_typed_errors() {
+        let d_model = 4;
+        let d_ff = 3;
+        let gate = vec![0.05f32; d_ff * d_model];
+        let up = vec![0.07f32; d_ff * d_model];
+        let down = vec![0.09f32; d_model * d_ff];
+        // Cached Candle tensor execution failure (shape-incompatible
+        // cached tensors make the matmul fail at forward time).
+        let mut se =
+            SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down, None).unwrap();
+        se.poison_cached_tensors_for_test();
+        let err = se
+            .forward(&vec![0.1f32; d_model])
+            .expect_err("candle execution failure must propagate");
+        assert!(matches!(
+            err,
+            crate::transformer::SharedExpertError::Compute { .. }
+        ));
+        // Reconstruction fallback failure (tensor cache dropped and the
+        // stored weight blob corrupted).
+        let mut se =
+            SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down, None).unwrap();
+        se.corrupt_weights_for_test();
+        let err = se
+            .forward(&vec![0.1f32; d_model])
+            .expect_err("weight reconstruction failure must propagate");
+        assert!(matches!(
+            err,
+            crate::transformer::SharedExpertError::Reconstruction { .. }
+        ));
+        // The reconstruction fallback itself stays numerically correct when
+        // only the tensor cache is dropped.
+        let mut se =
+            SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down, None).unwrap();
+        se.drop_cached_tensors_for_test();
+        se.forward(&vec![0.1f32; d_model])
+            .expect("reconstruction fallback path must still succeed");
+    }
+
+    /// A1 completion (strict): a failing always-on shared expert fails the
+    /// whole request with layer/role context instead of dropping its
+    /// contribution from the residual stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_fails_closed_on_shared_expert_failure() {
+        let dir = TempDir::new("shexp_fail_strict");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        let mut se = SharedExpert::from_projections(
+            cfg.d_model,
+            3,
+            &vec![0.05f32; 3 * cfg.d_model],
+            &vec![0.07f32; 3 * cfg.d_model],
+            &vec![0.09f32; cfg.d_model * 3],
+            None,
+        )
+        .unwrap();
+        se.corrupt_weights_for_test();
+        model.layers[0].shared_expert = Some(se);
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("failing shared expert must fail the request in strict mode");
+        match err {
+            RealInferenceError::ResidentFfn {
+                layer,
+                role,
+                source,
+            } => {
+                assert_eq!(layer, 0);
+                assert_eq!(role, ResidentFfnRole::Shared);
+                assert!(matches!(
+                    source,
+                    crate::transformer::SharedExpertError::Reconstruction { .. }
+                ));
+            }
+            other => panic!("expected ResidentFfn, got: {other}"),
+        }
+    }
+
+    /// A1 completion (strict): a failing dense-prefix FFN fails the whole
+    /// request with layer/role context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_fails_closed_on_dense_ffn_failure() {
+        let dir = TempDir::new("dense_fail_strict");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        let mut ffn = SharedExpert::from_projections(
+            cfg.d_model,
+            3,
+            &vec![0.05f32; 3 * cfg.d_model],
+            &vec![0.07f32; 3 * cfg.d_model],
+            &vec![0.09f32; cfg.d_model * 3],
+            None,
+        )
+        .unwrap();
+        ffn.corrupt_weights_for_test();
+        model.layers[0].dense_ffn = Some(ffn);
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("failing dense FFN must fail the request in strict mode");
+        match err {
+            RealInferenceError::ResidentFfn { layer, role, .. } => {
+                assert_eq!(layer, 0);
+                assert_eq!(role, ResidentFfnRole::Dense);
+            }
+            other => panic!("expected ResidentFfn, got: {other}"),
+        }
+    }
+
+    /// A1 completion (explicit degraded mode): with
+    /// `allow_degraded_experts = true` a failing shared expert or dense
+    /// FFN substitutes a zero contribution, the request succeeds, and
+    /// every substitution is counted so the output is marked
+    /// non-authoritative.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_mode_substitutes_zero_for_failing_resident_ffn() {
+        let dir = TempDir::new("shexp_fail_degraded");
+        let cfg = RealModelConfig {
+            num_layers: 2,
+            ..RealModelConfig::tiny()
+        };
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_degraded_experts: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        let broken = || {
+            let mut se = SharedExpert::from_projections(
+                cfg.d_model,
+                3,
+                &vec![0.05f32; 3 * cfg.d_model],
+                &vec![0.07f32; 3 * cfg.d_model],
+                &vec![0.09f32; cfg.d_model * 3],
+                None,
+            )
+            .unwrap();
+            se.corrupt_weights_for_test();
+            se
+        };
+        model.layers[0].shared_expert = Some(broken());
+        model.layers[1].dense_ffn = Some(broken());
+        let mut kv = model.fresh_kv_caches();
+        model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect("degraded mode substitutes zero and continues");
+        let report = engine.report();
+        assert!(
+            report.degraded_expert_substitutions >= 2,
+            "each substituted resident FFN must be counted, got {}",
+            report.degraded_expert_substitutions
+        );
+    }
+
+    /// Part A3 (fail-closed inference): unexpected NaN in an active
+    /// attention row must fail the request in strict mode instead of
+    /// fabricating a uniform attention distribution. Poisoning the
+    /// layer-1 Q projection makes every layer-1 attention row NaN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_fails_closed_on_non_finite_attention() {
+        let dir = TempDir::new("nanattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("NaN attention must fail the request in strict mode");
+        match err {
+            RealInferenceError::NonFiniteAttention {
+                layer,
+                head,
+                pos,
+                architecture,
+                kind,
+            } => {
+                assert_eq!(layer, 0);
+                assert_eq!(head, 0);
+                assert_eq!(pos, 0);
+                assert_eq!(architecture, cfg.architecture);
+                assert_eq!(kind, crate::transformer::NumericalErrorKind::NaNScores);
+            }
+            other => panic!("expected NonFiniteAttention, got: {other}"),
+        }
+    }
+
+    /// Rebuild an engine with a custom fail-open policy (the test owns
+    /// the sole Arc right after construction).
+    fn with_policy(
+        engine: Arc<Engine>,
+        policy: crate::inference::RealInferencePolicy,
+    ) -> Arc<Engine> {
+        let mut owned = match Arc::try_unwrap(engine) {
+            Ok(e) => e,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        owned.core.options.policy = policy;
+        Arc::new(owned)
+    }
+
+    /// Policy separation: `allow_degraded_experts` must NOT enable the
+    /// uniform-attention fallback — NaN attention still fails the
+    /// request even in expert-degraded mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_experts_policy_does_not_enable_attention_fallback() {
+        let dir = TempDir::new("nanattn_degraded_experts");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_degraded_experts: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("expert degradation must not fabricate attention");
+        assert!(matches!(err, RealInferenceError::NonFiniteAttention { .. }));
+    }
+
+    /// Policy separation (item 4): `allow_truncated_expert_payloads`
+    /// must NOT enable the uniform-attention fallback either — NaN
+    /// attention still fails the request under the payload-only policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_payload_policy_does_not_enable_attention_fallback() {
+        let dir = TempDir::new("nanattn_truncated_payloads");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_truncated_expert_payloads: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        let err = model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect_err("payload tolerance must not fabricate attention");
+        assert!(matches!(err, RealInferenceError::NonFiniteAttention { .. }));
+    }
+
+    /// Policy separation: only the explicit
+    /// `allow_nonfinite_attention_fallback` policy re-enables the
+    /// legacy uniform-attention fallback for non-finite rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonfinite_attention_fallback_policy_enables_uniform_fallback() {
+        let dir = TempDir::new("nanattn_fallback_policy");
+        let cfg = RealModelConfig::tiny();
+        let engine = with_policy(
+            build_engine_for_model(&dir.path, &cfg),
+            crate::inference::RealInferencePolicy {
+                allow_nonfinite_attention_fallback: true,
+                ..crate::inference::RealInferencePolicy::STRICT
+            },
+        );
+        let mut model = RealModel::new_seeded(cfg.clone(), 1);
+        {
+            let attn = &mut model.layers[0].attn;
+            let rows = cfg.num_heads * cfg.d_model / cfg.num_heads;
+            attn.wq = crate::dense_tensor::DenseWeight::from_f32(
+                vec![f32::NAN; rows * cfg.d_model],
+                rows,
+                cfg.d_model,
+            );
+        }
+        let mut kv = model.fresh_kv_caches();
+        model
+            .forward_token_hidden(&engine, 1, 0, &mut kv)
+            .await
+            .expect("explicit fallback policy keeps the legacy uniform behaviour");
+    }
+
+    /// Part A3: a finite forward pass does not trip the non-finite
+    /// check (guards against false positives from the thread-local
+    /// counter snapshotting).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_model_finite_forward_passes_strict_numeric_check() {
+        let dir = TempDir::new("finiteattn");
+        let cfg = RealModelConfig::tiny();
+        let engine = build_engine_for_model(&dir.path, &cfg);
+        let model = RealModel::new_seeded(cfg.clone(), 1);
+        let mut kv = model.fresh_kv_caches();
+        for pos in 0..3 {
+            model
+                .forward_token_hidden(&engine, (pos as u32) + 1, pos, &mut kv)
+                .await
+                .expect("finite forward must pass");
         }
     }
 
@@ -4575,7 +5291,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let t2 = model
             .step(
                 &engine,
@@ -4584,7 +5301,8 @@ mod tests {
                 &mut kv1,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         let mut kv2 = model.fresh_kv_caches();
         let u1 = model
@@ -4595,7 +5313,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         let u2 = model
             .step(
                 &engine,
@@ -4604,7 +5323,8 @@ mod tests {
                 &mut kv2,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
 
         assert_eq!((t1, t2), (u1, u2));
     }
@@ -4629,7 +5349,8 @@ mod tests {
                 &mut kv,
                 &crate::sampling::SamplingParams::greedy(),
             )
-            .await;
+            .await
+            .expect("model step");
         // Both layers contributed to KV cache growth.
         assert_eq!(kv.len(), 2);
         for c in &kv {
@@ -5832,7 +6553,7 @@ mod tests {
         assert!(se.gate_inp.is_some(), "sigmoid gate present");
         // forward produces a finite, d_model-length vector.
         let x: Vec<f32> = (0..d_model).map(|i| 0.01 * i as f32).collect();
-        let y = se.forward(&x);
+        let y = se.forward(&x).expect("shared expert forward succeeds");
         assert_eq!(y.len(), d_model);
         assert!(y.iter().all(|v| v.is_finite()));
     }
@@ -5896,7 +6617,7 @@ mod tests {
 
         let ungated =
             SharedExpert::from_projections(d_model, d_ff, &gate, &up, &down, None).unwrap();
-        let y_ungated = ungated.forward(&x);
+        let y_ungated = ungated.forward(&x).expect("ungated forward succeeds");
 
         // Zero gate -> sigmoid(0) = 0.5 -> output halved.
         let gated = SharedExpert::from_projections(
@@ -5908,7 +6629,7 @@ mod tests {
             Some(vec![0.0f32; d_model]),
         )
         .unwrap();
-        let y_gated = gated.forward(&x);
+        let y_gated = gated.forward(&x).expect("gated forward succeeds");
         for (a, b) in y_ungated.iter().zip(y_gated.iter()) {
             assert!(
                 (a * 0.5 - b).abs() < 1e-6,

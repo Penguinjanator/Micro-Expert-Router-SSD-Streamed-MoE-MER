@@ -15,8 +15,8 @@
 use prometheus::{
     register_counter_vec_with_registry, register_counter_with_registry,
     register_histogram_vec_with_registry, register_histogram_with_registry,
-    register_int_gauge_with_registry, Counter, CounterVec, Encoder, Histogram, HistogramVec,
-    IntGauge, Registry, TextEncoder,
+    register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Counter, CounterVec,
+    Encoder, Histogram, HistogramVec, IntGauge, IntGaugeVec, Registry, TextEncoder,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,6 +110,13 @@ struct MetricsInner {
     /// attention path substituted a uniform distribution for a
     /// `NaN`/`±inf`/fully-masked row.
     pub nonfinite_softmax_fallbacks: IntGauge,
+    /// **Gauge** of the resolved per-component compute plane
+    /// (hardening pass, strict GPU behaviour). Labels: `component`
+    /// (`attention` / `experts`) and `plane` (`cpu` / `gpu`); the active
+    /// combination is set to `1`. Makes an intentional hybrid split
+    /// (checked CPU attention + GPU experts) observable instead of a
+    /// single ambiguous "gpu" device string.
+    pub backend_component_plane: IntGaugeVec,
 }
 
 impl Default for Metrics {
@@ -295,6 +302,13 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_nonfinite_softmax_fallbacks");
+        let backend_component_plane = register_int_gauge_vec_with_registry!(
+            "mer_backend_component_plane",
+            "Resolved compute plane per model component (1 = active). Components: attention, experts; planes: cpu, gpu.",
+            &["component", "plane"],
+            registry
+        )
+        .expect("metric registration: mer_backend_component_plane");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -323,6 +337,7 @@ impl Metrics {
                 speculator_disabled_total,
                 gpu_cpu_fallbacks_total,
                 nonfinite_softmax_fallbacks,
+                backend_component_plane,
             }),
         }
     }
@@ -448,6 +463,21 @@ impl Metrics {
         self.inner.vram_capacity_bytes.set(bytes as i64);
     }
 
+    /// Record the resolved per-component compute planes (called once at
+    /// startup after backend resolution). Sets the active
+    /// `{component, plane}` combinations to `1` and the inactive plane
+    /// of each component to `0`.
+    pub fn set_backend_component_planes(&self, attention_plane: &str, expert_plane: &str) {
+        for (component, plane) in [("attention", attention_plane), ("experts", expert_plane)] {
+            for candidate in ["cpu", "gpu"] {
+                self.inner
+                    .backend_component_plane
+                    .with_label_values(&[component, candidate])
+                    .set(i64::from(candidate == plane));
+            }
+        }
+    }
+
     /// Record `n` RAM → VRAM promotions.
     pub fn record_promotions(&self, n: u64) {
         if n > 0 {
@@ -495,6 +525,39 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 5 (strict GPU / hybrid resolution): the per-component
+    /// compute-plane gauge reports the actual resolved attention and
+    /// expert planes — a hybrid resolution is visibly CPU-attention +
+    /// GPU-experts, never reported as full GPU.
+    #[test]
+    fn backend_component_plane_gauge_reports_resolved_planes() {
+        let m = Metrics::new();
+        // Hybrid: checked CPU attention + GPU experts.
+        m.set_backend_component_planes("cpu", "gpu");
+        let body = String::from_utf8(m.render().unwrap()).unwrap();
+        let want_one = [
+            r#"mer_backend_component_plane{component="attention",plane="cpu"} 1"#,
+            r#"mer_backend_component_plane{component="experts",plane="gpu"} 1"#,
+        ];
+        let want_zero = [
+            r#"mer_backend_component_plane{component="attention",plane="gpu"} 0"#,
+            r#"mer_backend_component_plane{component="experts",plane="cpu"} 0"#,
+        ];
+        for needle in want_one.iter().chain(&want_zero) {
+            assert!(body.contains(needle), "missing {needle} in:
+{body}");
+        }
+        // Re-resolution to full CPU flips both components.
+        m.set_backend_component_planes("cpu", "cpu");
+        let body = String::from_utf8(m.render().unwrap()).unwrap();
+        assert!(body.contains(
+            r#"mer_backend_component_plane{component="experts",plane="cpu"} 1"#
+        ));
+        assert!(body.contains(
+            r#"mer_backend_component_plane{component="experts",plane="gpu"} 0"#
+        ));
+    }
 
     #[test]
     fn render_includes_all_metric_names() {

@@ -802,6 +802,12 @@ pub(crate) struct Counters {
     /// `EngineReport::expert_read_failures` so operators can alert on
     /// it from /metrics + /health.
     expert_read_failures: AtomicU64,
+    /// Cumulative routed/shared experts substituted with a zero
+    /// contribution because the development-only
+    /// `allow_degraded_experts` mode is active. Always zero in strict
+    /// production mode. Non-zero values mark every metric and
+    /// benchmark figure of the run as degraded / non-authoritative.
+    degraded_expert_substitutions: AtomicU64,
     /// Number of times a `fetch_with_retry` caller piggy-backed on a
     /// concurrent leader's in-flight read instead of issuing its own
     /// (gist Phase 1 — SSD Read De-Duplication). Each increment maps
@@ -973,6 +979,18 @@ pub struct EngineOptions {
     /// `--profile-out`. `false` (the default) keeps the per-token bump
     /// free when no consumer needs the counts.
     pub collect_route_profile: bool,
+    /// **Fail-closed real inference policies (hardening pass).**
+    /// Independent development-only fail-open switches; all default to
+    /// `false` (strict). See [`crate::inference::RealInferencePolicy`]:
+    /// `allow_degraded_experts` preserves the legacy drop-from-mixture
+    /// behaviour for failed routed/shared/dense experts (counted via
+    /// `degraded_expert_substitutions`), `allow_nonfinite_attention_fallback`
+    /// preserves the legacy uniform-softmax fallback for non-finite
+    /// attention rows, and `allow_truncated_expert_payloads` preserves
+    /// the legacy one-page zero-fill tolerance for short quantised
+    /// payloads. Enabling one never enables another; `bench-real`
+    /// rejects all three.
+    pub policy: crate::inference::RealInferencePolicy,
 }
 
 /// Default semaphore ceiling for `Engine::spawn_prefetch`. Matches a
@@ -1018,6 +1036,7 @@ impl Default for EngineOptions {
             cost_aware_eviction: false,
             pregate_enabled: false,
             collect_route_profile: false,
+            policy: crate::inference::RealInferencePolicy::STRICT,
         }
     }
 }
@@ -1502,6 +1521,64 @@ enum MoeStepResult {
     WeightedInto,
 }
 
+/// Error taxonomy for a failed real-model MoE step (hardening pass,
+/// Part A1). Under strict production mode (the default,
+/// `EngineOptions::policy.allow_degraded_experts == false`) any required
+/// routed expert that fails to load or execute fails the whole step
+/// with one of these variants instead of silently degrading the
+/// mixture. These are recoverable *request-level* failures: callers
+/// map them to an HTTP 500 (server) or a CLI error (bench) — the
+/// process never panics for them.
+#[derive(Debug)]
+pub enum MoeStepError {
+    /// A routed expert could not be read from storage even after
+    /// retries (I/O failure, checksum failure, truncated payload, …).
+    ExpertFetch {
+        layer: u32,
+        expert: u32,
+        source: ExpertReadError,
+    },
+    /// A resident expert failed weight-layout validation, quantized
+    /// preparation, or FFN compute.
+    ExpertCompute {
+        layer: u32,
+        expert: u32,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for MoeStepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoeStepError::ExpertFetch {
+                layer,
+                expert,
+                source,
+            } => write!(
+                f,
+                "routed expert {expert} (layer {layer}) failed to load: {source}"
+            ),
+            MoeStepError::ExpertCompute {
+                layer,
+                expert,
+                detail,
+            } => write!(
+                f,
+                "routed expert {expert} (layer {layer}) failed to execute: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MoeStepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MoeStepError::ExpertFetch { source, .. } => Some(source),
+            MoeStepError::ExpertCompute { .. } => None,
+        }
+    }
+}
+
 /// Dispatch a single per-expert SwiGLU forward pass according to
 /// `dtype`. For `Q4_0` / `Q4K` and `use_qmm = true` the
 /// `QMatMul`-based path is tried first and the dequant path is used
@@ -1518,6 +1595,9 @@ fn dispatch_expert_forward(
     x: &[f32],
     d_model: usize,
     d_ff: usize,
+    // Engine-scoped truncated-payload tolerance in bytes
+    // (`RealInferencePolicy::expert_size_tolerance`); `0` = strict.
+    q4_tolerance: usize,
     timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     // One-time diagnostic: log the actual resident buffer size against
@@ -1573,15 +1653,15 @@ fn dispatch_expert_forward(
         WeightDtype::Q4_0
             if use_qmm && d_model % Q4_0_BLOCK_ELEMS == 0 && d_ff % Q4_0_BLOCK_ELEMS == 0 =>
         {
-            match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff) {
+            match run_inference_q4_0_qmm(token_idx, r, x, d_model, d_ff, q4_tolerance) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     debug!(error = %e, "QMatMul Q4_0 path failed; falling back to dequant");
-                    run_inference_q4_0(token_idx, r, x, d_model, d_ff)
+                    run_inference_q4_0(token_idx, r, x, d_model, d_ff, q4_tolerance)
                 }
             }
         }
-        WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff),
+        WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff, q4_tolerance),
         WeightDtype::Q8_0
             if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
         {
@@ -1803,6 +1883,7 @@ impl Engine {
         let backend = crate::backend::BackendBox::init_blocking(
             /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
             /* num_kv_heads = */ 1, /* head_dim     = */ 1, /* v_head_dim   = */ 1, gpu,
+            self.core.options.policy.expert_size_tolerance(),
         );
         self.core.backend = Arc::new(backend);
     }
@@ -2502,6 +2583,7 @@ impl Engine {
                             x,
                             self.core.shape.d_model,
                             self.core.shape.d_ff,
+                            self.core.options.policy.expert_size_tolerance(),
                             None,
                         )
                     };
@@ -3736,13 +3818,47 @@ impl Engine {
     ///
     /// `token_idx` is used only as a digest seed for `InferenceOutput`;
     /// it has no effect on the activation produced.
+    /// Whether the development-only degraded mode
+    /// (`[real_transformer] allow_degraded_experts`) is active. The
+    /// real-model forward pass consults this for its fail-closed
+    /// numerical checks (Part A3) in addition to the engine's own
+    /// expert-failure handling (Part A1).
+    pub fn allow_degraded_experts(&self) -> bool {
+        self.core.options.policy.allow_degraded_experts
+    }
+
+    /// Whether the development-only uniform fallback for non-finite
+    /// attention rows (`[real_transformer]
+    /// allow_nonfinite_attention_fallback`) is active. Independent of
+    /// [`Self::allow_degraded_experts`] (hardening pass, policy
+    /// separation): degraded experts never enable fabricated attention.
+    pub fn allow_nonfinite_attention_fallback(&self) -> bool {
+        self.core.options.policy.allow_nonfinite_attention_fallback
+    }
+
+    /// The engine-scoped fail-open policy set (all default `false`).
+    pub fn inference_policy(&self) -> crate::inference::RealInferencePolicy {
+        self.core.options.policy
+    }
+
+    /// Record one degraded-mode zero substitution of a required expert
+    /// contribution (routed, shared, or dense FFN). Only ever called
+    /// when `allow_degraded_experts` is active; the counter marks every
+    /// metric and benchmark figure of the run as non-authoritative.
+    pub fn record_degraded_expert_substitution(&self) {
+        self.metrics
+            .counters
+            .degraded_expert_substitutions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn moe_step(
         self: &Arc<Self>,
         token_idx: u64,
         layer: u32,
         x: &HiddenState,
         experts: &[u32],
-    ) -> Vec<HiddenState> {
+    ) -> Result<Vec<HiddenState>, MoeStepError> {
         self.moe_step_with_timing(token_idx, layer, x, experts, None)
             .await
     }
@@ -3840,6 +3956,7 @@ impl Engine {
             x,
             self.core.shape.d_model,
             self.core.shape.d_ff,
+            self.core.options.policy.expert_size_tolerance(),
             timings,
         )
         .map(|(_out, y)| y)
@@ -3852,7 +3969,7 @@ impl Engine {
         x: &HiddenState,
         experts: &[u32],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Vec<HiddenState> {
+    ) -> Result<Vec<HiddenState>, MoeStepError> {
         match self
             .moe_step_inner(
                 token_idx,
@@ -3862,9 +3979,9 @@ impl Engine {
                 MoeStepOutputMode::PerExpert,
                 timings,
             )
-            .await
+            .await?
         {
-            MoeStepResult::PerExpert(outputs) => outputs,
+            MoeStepResult::PerExpert(outputs) => Ok(outputs),
             MoeStepResult::WeightedInto => unreachable!("per-expert moe_step requested"),
         }
     }
@@ -3879,7 +3996,7 @@ impl Engine {
         weights: &[f32],
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) {
+    ) -> Result<(), MoeStepError> {
         assert_eq!(
             experts.len(),
             weights.len(),
@@ -3894,9 +4011,9 @@ impl Engine {
                 MoeStepOutputMode::WeightedInto { weights, out },
                 timings,
             )
-            .await
+            .await?
         {
-            MoeStepResult::WeightedInto => {}
+            MoeStepResult::WeightedInto => Ok(()),
             MoeStepResult::PerExpert(_) => unreachable!("weighted moe_step requested"),
         }
     }
@@ -3909,7 +4026,7 @@ impl Engine {
         experts: &[u32],
         output_mode: MoeStepOutputMode<'a>,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> MoeStepResult {
+    ) -> Result<MoeStepResult, MoeStepError> {
         let cycle_start = Instant::now();
         // Tier 4: fold the previous step's prefetch precision window into
         // the governor's EWMA before issuing this step's speculation.
@@ -4110,13 +4227,16 @@ impl Engine {
             );
         }
         let had_misses = !miss_handles.is_empty();
-        // Track expert slots whose fetch task failed: we'll drop them
-        // from the mixture below and emit a zero contribution, which
-        // is exactly what happens for an expert that returned 0 from
-        // run_inference (the existing "skipping expert" path). This
-        // means a single corrupt expert file no longer takes down the
-        // process — the gist's production-readiness ask.
-        let mut failed_experts: Vec<u32> = Vec::new();
+        // Strict production mode (the default): a routed expert whose
+        // fetch failed after retries fails the whole step — the caller
+        // maps this to a request-level error. Development-only
+        // degraded mode (`allow_degraded_experts = true`) preserves the
+        // legacy behaviour: the failed slot is dropped from the mixture
+        // (a zero contribution below) with a prominent warning and the
+        // `degraded_expert_substitutions` counter marks the run
+        // non-authoritative.
+        let allow_degraded = self.core.options.policy.allow_degraded_experts;
+        let mut first_fetch_error: Option<MoeStepError> = None;
         for (i, h) in miss_handles {
             // `fetch_with_retry` already retried with backoff. A join
             // error means the task itself panicked, which is fatal —
@@ -4141,9 +4261,22 @@ impl Engine {
                         .counters
                         .expert_read_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    warn!(token = token_idx, layer, expert = id, error = %e,
-                        "moe_step: expert fetch failed after retries; skipping from mixture");
-                    failed_experts.push(id);
+                    if allow_degraded {
+                        self.metrics
+                            .counters
+                            .degraded_expert_substitutions
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(token = token_idx, layer, expert = id, error = %e,
+                            "DEGRADED MODE: expert fetch failed after retries; \
+                             dropping from mixture (allow_degraded_experts = true, \
+                             output is non-authoritative)");
+                    } else if first_fetch_error.is_none() {
+                        first_fetch_error = Some(MoeStepError::ExpertFetch {
+                            layer,
+                            expert: id,
+                            source: e,
+                        });
+                    }
                 }
             }
         }
@@ -4158,15 +4291,15 @@ impl Engine {
             io_wait_elapsed,
         );
         let io_wait_us = io_wait_elapsed.as_micros() as u64;
-        // Drop the failed expert slots from the parallel arrays so the
-        // downstream FFN loop only ever sees Some(_). To preserve the
-        // alignment with the caller's mixing weights array, we emit a
-        // zero-vector contribution for every failed slot inline below
-        // (same semantics as `run_inference` failing for a single
-        // expert). The engine itself never panics anymore.
-        let _ = failed_experts; // retained for telemetry below
-                                // Reconstruct a Vec<Option<Arc<ExpertResident>>> aligned with
-                                // `target.len()`; None entries correspond to failed fetches.
+        // Strict mode: surface the first fetch failure now that every
+        // handle has been drained (so no fetch task is left detached
+        // mid-flight holding a pool buffer).
+        if let Some(err) = first_fetch_error {
+            return Err(err);
+        }
+        // Degraded mode only: `None` entries correspond to failed
+        // fetches and are dropped from the mixture below (a zero
+        // contribution keeps the caller's weights[] alignment valid).
         let residents: Vec<Option<Arc<ExpertResident>>> = residents;
 
         // Run the SwiGLU FFN per expert against the hidden state.
@@ -4177,47 +4310,60 @@ impl Engine {
         // above of a worker right when they must overlap this compute.
         let compute_start = Instant::now();
         let expert_policy = self.resolved_expert_execution_policy(residents.len());
-        let step_result: MoeStepResult = crate::stage_timing::time_optional(
+        let step_result: Result<MoeStepResult, MoeStepError> = crate::stage_timing::time_optional(
             timings,
             crate::stage_timing::EXPERT_COMPUTE,
             || {
                 run_compute_donated(|| {
                     match output_mode {
                         MoeStepOutputMode::PerExpert => {
-                            let run_one = |r_opt: &Option<Arc<ExpertResident>>| -> HiddenState {
+                            let run_one = |r_opt: &Option<Arc<ExpertResident>>| -> Result<HiddenState, MoeStepError> {
                                 let Some(r) = r_opt else {
-                                    // Failed fetch: push a zero vector so the caller's
-                                    // weights[] alignment stays valid (combining with
-                                    // weight `w_i * 0 = 0` is equivalent to dropping
-                                    // this expert from the mixture).
-                                    return vec![0.0f32; self.core.shape.d_model];
+                                    // Degraded mode only (strict mode returned above):
+                                    // push a zero vector so the caller's weights[]
+                                    // alignment stays valid (combining with weight
+                                    // `w_i * 0 = 0` is equivalent to dropping this
+                                    // expert from the mixture).
+                                    return Ok(vec![0.0f32; self.core.shape.d_model]);
                                 };
                                 match self.forward_moe_resident(token_idx, layer, r, x, timings) {
-                                    Ok(y) => y,
-                                    Err(e) => {
+                                    Ok(y) => Ok(y),
+                                    Err(e) if allow_degraded => {
+                                        self.metrics
+                                            .counters
+                                            .degraded_expert_substitutions
+                                            .fetch_add(1, Ordering::Relaxed);
                                         warn!(
                                             token = token_idx,
                                             expert = r.id,
                                             error = %e,
-                                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                                            "DEGRADED MODE: expert compute failed; substituting zero \
+                                             contribution (allow_degraded_experts = true, output is \
+                                             non-authoritative)"
                                         );
                                         // Preserve the legacy aligned-vector contract for callers
                                         // that combine outside the engine.
-                                        vec![0.0f32; self.core.shape.d_model]
+                                        Ok(vec![0.0f32; self.core.shape.d_model])
                                     }
+                                    Err(e) => Err(MoeStepError::ExpertCompute {
+                                        layer,
+                                        expert: r.id,
+                                        detail: e.to_string(),
+                                    }),
                                 }
                             };
-                            let per_expert_y = match expert_policy {
-                                ExpertExecutionPolicy::ParallelExpertsSingleThread => {
-                                    use rayon::prelude::*;
-                                    residents.par_iter().map(run_one).collect()
-                                }
-                                ExpertExecutionPolicy::Auto
-                                | ExpertExecutionPolicy::SequentialExpertsRowParallel => {
-                                    residents.iter().map(run_one).collect()
-                                }
-                            };
-                            MoeStepResult::PerExpert(per_expert_y)
+                            let per_expert_y: Result<Vec<HiddenState>, MoeStepError> =
+                                match expert_policy {
+                                    ExpertExecutionPolicy::ParallelExpertsSingleThread => {
+                                        use rayon::prelude::*;
+                                        residents.par_iter().map(run_one).collect()
+                                    }
+                                    ExpertExecutionPolicy::Auto
+                                    | ExpertExecutionPolicy::SequentialExpertsRowParallel => {
+                                        residents.iter().map(run_one).collect()
+                                    }
+                                };
+                            Ok(MoeStepResult::PerExpert(per_expert_y?))
                         }
                         MoeStepOutputMode::WeightedInto { weights, out } => {
                             debug_assert_eq!(residents.len(), weights.len());
@@ -4225,9 +4371,12 @@ impl Engine {
                             out.resize(self.core.shape.d_model, 0.0);
                             let accumulate_one = |slot: usize,
                                                   r_opt: &Option<Arc<ExpertResident>>,
-                                                  acc: &mut [f32]| {
+                                                  acc: &mut [f32]|
+                             -> Result<(), MoeStepError> {
                                 let Some(r) = r_opt else {
-                                    return;
+                                    // Degraded mode only: failed fetch drops out of the
+                                    // mixture (strict mode returned above).
+                                    return Ok(());
                                 };
                                 match self.forward_moe_resident(token_idx, layer, r, x, timings) {
                                     Ok(y) => {
@@ -4237,15 +4386,28 @@ impl Engine {
                                                 *dst += weight * *v;
                                             }
                                         }
+                                        Ok(())
                                     }
-                                    Err(e) => {
+                                    Err(e) if allow_degraded => {
+                                        self.metrics
+                                            .counters
+                                            .degraded_expert_substitutions
+                                            .fetch_add(1, Ordering::Relaxed);
                                         warn!(
                                             token = token_idx,
                                             expert = r.id,
                                             error = %e,
-                                            "skipping expert: failed to reinterpret buffer as SwiGLU weights"
+                                            "DEGRADED MODE: expert compute failed; dropping from \
+                                             mixture (allow_degraded_experts = true, output is \
+                                             non-authoritative)"
                                         );
+                                        Ok(())
                                     }
+                                    Err(e) => Err(MoeStepError::ExpertCompute {
+                                        layer,
+                                        expert: r.id,
+                                        detail: e.to_string(),
+                                    }),
                                 }
                             };
                             match expert_policy {
@@ -4255,7 +4417,8 @@ impl Engine {
                                         residents.len().min(crate::parallel::num_threads()).max(1);
                                     let chunk_len = residents.len().div_ceil(chunks).max(1);
                                     let d_model = self.core.shape.d_model;
-                                    let partials: Vec<Vec<f32>> = (0..chunks)
+                                    let partials: Result<Vec<Vec<f32>>, MoeStepError> = (0
+                                        ..chunks)
                                         .into_par_iter()
                                         .map(|chunk| {
                                             let start = chunk * chunk_len;
@@ -4264,12 +4427,12 @@ impl Engine {
                                             for (offset, r_opt) in
                                                 residents[start..end].iter().enumerate()
                                             {
-                                                accumulate_one(start + offset, r_opt, &mut local);
+                                                accumulate_one(start + offset, r_opt, &mut local)?;
                                             }
-                                            local
+                                            Ok(local)
                                         })
                                         .collect();
-                                    for partial in partials {
+                                    for partial in partials? {
                                         for (dst, v) in out.iter_mut().zip(partial.iter()) {
                                             *dst += *v;
                                         }
@@ -4278,16 +4441,17 @@ impl Engine {
                                 ExpertExecutionPolicy::Auto
                                 | ExpertExecutionPolicy::SequentialExpertsRowParallel => {
                                     for (slot, r_opt) in residents.iter().enumerate() {
-                                        accumulate_one(slot, r_opt, out);
+                                        accumulate_one(slot, r_opt, out)?;
                                     }
                                 }
                             }
-                            MoeStepResult::WeightedInto
+                            Ok(MoeStepResult::WeightedInto)
                         }
                     }
                 })
             },
         );
+        let step_result = step_result?;
         let compute_us = compute_start.elapsed().as_micros() as u64;
         let _ = self.metrics.compute_hist.lock().record(compute_us.max(1));
         self.metrics
@@ -4349,7 +4513,15 @@ impl Engine {
             .tokens_processed
             .fetch_add(1, Ordering::Relaxed);
 
-        step_result
+        Ok(step_result)
+    }
+
+    /// Whether `id` is currently resident in the expert cache. Cheap
+    /// (one sharded-LRU lookup, no recency mutation) — used by the
+    /// batch scheduler's pre-pass profitability gate to count how many
+    /// peeked experts a warm pass would actually fetch.
+    pub fn is_expert_cached(&self, id: u32) -> bool {
+        self.core.cache.contains(id)
     }
 
     /// Force-fetch a specific set of experts and load them into the cache.
@@ -4486,6 +4658,12 @@ impl Engine {
                 .counters
                 .expert_read_failures
                 .load(Ordering::Relaxed),
+            degraded_expert_substitutions: self
+                .metrics
+                .counters
+                .degraded_expert_substitutions
+                .load(Ordering::Relaxed),
+            inference_policy: self.core.options.policy,
             prefetch_dropped_concurrency: self
                 .metrics
                 .counters
@@ -4816,6 +4994,17 @@ pub struct EngineReport {
     /// indicate corrupt weight files or persistent SSD I/O errors;
     /// alert on a non-zero rate from the Prometheus exporter.
     pub expert_read_failures: u64,
+    /// Cumulative zero-vector substitutions performed by the
+    /// development-only `allow_degraded_experts` mode. Always zero in
+    /// strict production mode; any non-zero value marks the run's
+    /// output and benchmark figures as degraded / non-authoritative.
+    pub degraded_expert_substitutions: u64,
+    /// The engine-scoped fail-open policy set active for this run
+    /// (hardening pass, policy separation). Any `true` field marks the
+    /// run's output and every benchmark figure as potentially
+    /// non-authoritative — surfaced here so request/benchmark metadata
+    /// can report whether a degraded policy was used.
+    pub inference_policy: crate::inference::RealInferencePolicy,
     /// Speculative prefetches dropped because
     /// `EngineOptions::max_concurrent_prefetches` was already saturated.
     pub prefetch_dropped_concurrency: u64,
@@ -5142,7 +5331,10 @@ mod tests {
         let hidden = crate::inference::synth_hidden_state(3, d_model, seed);
         let experts = [1, 3, 5];
         let weights = [0.2, 0.3, 0.5];
-        let per_expert = engine.moe_step(0, /*layer=*/ 0, &hidden, &experts).await;
+        let per_expert = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &experts)
+            .await
+            .expect("per-expert moe_step");
         let expected = combine_outputs(&per_expert, &weights);
 
         let mut direct = Vec::new();
@@ -5156,7 +5348,8 @@ mod tests {
                 &mut direct,
                 None,
             )
-            .await;
+            .await
+            .expect("weighted moe_step");
 
         assert_eq!(direct.len(), expected.len());
         for (i, (&a, &b)) in direct.iter().zip(expected.iter()).enumerate() {
@@ -5166,6 +5359,261 @@ mod tests {
                 "weighted moe output diverged at {i}: direct={a} expected={b} tol={tol}"
             );
         }
+    }
+
+    /// Part A1 (fail-closed inference): under strict production mode
+    /// (`allow_degraded_experts = false`, the default), a routed expert
+    /// whose SSD read fails after retries fails the whole `moe_step`
+    /// with `MoeStepError::ExpertFetch` instead of silently substituting
+    /// a zero contribution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_mode_fails_step_on_expert_fetch_failure() {
+        let dir = TempDir::new("strict-fetch-fail");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xDEAD);
+        // Truncate expert 3's backing file: the pre-opened fd now reads
+        // zero bytes, so the fetch fails deterministically after retries.
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xDEAD);
+        let err = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect_err("strict mode must fail the step on a fetch failure");
+        match err {
+            MoeStepError::ExpertFetch { expert, layer, .. } => {
+                assert_eq!(expert, 3);
+                assert_eq!(layer, 0);
+            }
+            other => panic!("expected ExpertFetch, got: {other}"),
+        }
+        let report = engine.report();
+        assert!(report.expert_read_failures >= 1);
+        assert_eq!(
+            report.degraded_expert_substitutions, 0,
+            "strict mode must never substitute"
+        );
+    }
+
+    /// Part A1: the development-only degraded mode
+    /// (`allow_degraded_experts = true`) preserves the legacy behaviour —
+    /// the failed expert is dropped from the mixture (zero contribution)
+    /// and every substitution is counted so the run can be marked
+    /// non-authoritative.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_mode_substitutes_zero_and_counts() {
+        let dir = TempDir::new("degraded-fetch-fail");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xBEEF);
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.policy.allow_degraded_experts = true;
+        let engine = Arc::new(engine_owned);
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xBEEF);
+        let outputs = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect("degraded mode must keep the step alive");
+        assert_eq!(outputs.len(), 1);
+        assert!(
+            outputs[0].iter().all(|&v| v == 0.0),
+            "failed expert must contribute a zero vector in degraded mode"
+        );
+        let report = engine.report();
+        assert!(report.expert_read_failures >= 1);
+        assert!(
+            report.degraded_expert_substitutions >= 1,
+            "degraded substitutions must be counted"
+        );
+    }
+
+    /// A6 audit (validation closure, item 3): a routed expert id
+    /// outside the storage namespace fails the step with a typed
+    /// error in strict mode — no panic, no clamp, no silent miss —
+    /// and does not insert anything into the cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_mode_fails_step_on_out_of_namespace_expert_id() {
+        let dir = TempDir::new("strict-bad-expert-id");
+        let d_model = 16;
+        let num_experts = 8u32;
+        let engine = build_engine(&dir.path, num_experts, d_model, 32, 4, 2, 1, 0xA16);
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA16);
+        for bad in [num_experts, u32::MAX] {
+            let err = engine
+                .moe_step(0, /*layer=*/ 0, &hidden, &[bad])
+                .await
+                .expect_err("out-of-namespace expert id must fail the step");
+            assert!(
+                matches!(err, MoeStepError::ExpertFetch { expert, .. } if expert == bad),
+                "expected ExpertFetch for expert {bad}, got: {err}"
+            );
+            assert!(
+                !engine.core.cache.contains(bad),
+                "a failed out-of-namespace fetch must not mutate the cache"
+            );
+        }
+        assert_eq!(engine.report().degraded_expert_substitutions, 0);
+    }
+
+    /// Policy audit (validation closure, item 4): the *attention*
+    /// fallback policy must not enable expert degradation — an expert
+    /// fetch failure still fails the step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attention_fallback_policy_does_not_enable_expert_degradation() {
+        let dir = TempDir::new("attnfb-no-expert-degrade");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xA11);
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.policy = crate::inference::RealInferencePolicy {
+            allow_nonfinite_attention_fallback: true,
+            ..crate::inference::RealInferencePolicy::STRICT
+        };
+        let engine = Arc::new(engine_owned);
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA11);
+        let err = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect_err("attention fallback policy must not tolerate expert failures");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert_eq!(
+            engine.report().degraded_expert_substitutions,
+            0,
+            "no expert substitution may occur under the attention-only policy"
+        );
+    }
+
+    /// Policy audit (item 4): the truncated-payload policy must not
+    /// enable expert degradation either — a failed expert fetch still
+    /// fails the step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncated_payload_policy_does_not_enable_expert_degradation() {
+        let dir = TempDir::new("trunc-no-expert-degrade");
+        let d_model = 16;
+        let engine = build_engine(&dir.path, 8, d_model, 32, 4, 2, 1, 0xA12);
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        engine_owned.core.options.policy = crate::inference::RealInferencePolicy {
+            allow_truncated_expert_payloads: true,
+            ..crate::inference::RealInferencePolicy::STRICT
+        };
+        let engine = Arc::new(engine_owned);
+        let path = engine.core.storage.expert_path(3);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate expert file");
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA12);
+        let err = engine
+            .moe_step(0, /*layer=*/ 0, &hidden, &[3])
+            .await
+            .expect_err("truncated-payload policy must not tolerate expert fetch failures");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert_eq!(engine.report().degraded_expert_substitutions, 0);
+    }
+
+    /// Policy audit (item 4): `EngineReport` must reflect the exact
+    /// engine-scoped policy, and defaults must be strict (all false).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_report_reflects_configured_policy_and_defaults_strict() {
+        let dir = TempDir::new("policy-report");
+        let engine = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0xA13);
+        let report = engine.report();
+        assert_eq!(
+            report.inference_policy,
+            crate::inference::RealInferencePolicy::STRICT,
+            "default engine policy must be strict"
+        );
+        assert!(!report.inference_policy.any_degraded());
+
+        let mut engine_owned = match Arc::try_unwrap(engine) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        let custom = crate::inference::RealInferencePolicy {
+            allow_degraded_experts: true,
+            allow_nonfinite_attention_fallback: false,
+            allow_truncated_expert_payloads: true,
+        };
+        engine_owned.core.options.policy = custom;
+        let engine = Arc::new(engine_owned);
+        assert_eq!(
+            engine.report().inference_policy,
+            custom,
+            "EngineReport must carry the exact configured policy"
+        );
+        assert!(engine.report().inference_policy.any_degraded());
+    }
+
+    /// Policy audit (item 4): the fail-open policy is engine-scoped,
+    /// never process-global — a strict engine must fail closed even
+    /// while a degraded engine coexists in the same process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_engine_does_not_inherit_policy_from_degraded_engine() {
+        let d_model = 16;
+        let dir_degraded = TempDir::new("policy-scope-degraded");
+        let engine_degraded = build_engine(&dir_degraded.path, 8, d_model, 32, 4, 2, 1, 0xA14);
+        let mut owned = match Arc::try_unwrap(engine_degraded) {
+            Ok(engine) => engine,
+            Err(_) => panic!("test owns the sole engine Arc"),
+        };
+        owned.core.options.policy.allow_degraded_experts = true;
+        let engine_degraded = Arc::new(owned);
+
+        let dir_strict = TempDir::new("policy-scope-strict");
+        let engine_strict = build_engine(&dir_strict.path, 8, d_model, 32, 4, 2, 1, 0xA15);
+
+        // Break expert 3 in both data dirs.
+        for engine in [&engine_degraded, &engine_strict] {
+            let path = engine.core.storage.expert_path(3);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("truncate expert file");
+        }
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA14);
+
+        // The degraded engine substitutes; the strict engine fails —
+        // in either construction/execution order.
+        engine_degraded
+            .moe_step(0, 0, &hidden, &[3])
+            .await
+            .expect("degraded engine substitutes");
+        let err = engine_strict
+            .moe_step(0, 0, &hidden, &[3])
+            .await
+            .expect_err("strict engine must fail closed regardless of the degraded engine");
+        assert!(matches!(err, MoeStepError::ExpertFetch { .. }));
+        assert!(engine_degraded.report().degraded_expert_substitutions >= 1);
+        assert_eq!(
+            engine_strict.report().degraded_expert_substitutions,
+            0,
+            "the strict engine's telemetry must be unaffected by the degraded engine"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

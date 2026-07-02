@@ -560,6 +560,12 @@ pub struct GpuBackend {
     expert_workspaces: ParkingMutex<Vec<ExpertWorkspace>>,
     /// Wakes dispatchers parked on an empty workspace pool.
     expert_workspace_cv: parking_lot::Condvar,
+    /// Engine-scoped truncated-payload tolerance in bytes
+    /// (`RealInferencePolicy::expert_size_tolerance`), fixed at
+    /// construction from config. `0` (strict, the default) requires the
+    /// exact logical Q4_0 payload size on VRAM upload — never a mutable
+    /// process-global switch (hardening pass, policy separation).
+    q4_truncation_tolerance: usize,
 }
 
 impl GpuBackend {
@@ -571,6 +577,7 @@ impl GpuBackend {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Result<Self> {
         // GQA models have num_kv_heads < num_heads; 0 means MHA.
         let num_kv_heads = if num_kv_heads == 0 { num_heads } else { num_kv_heads };
@@ -1098,6 +1105,7 @@ impl GpuBackend {
             gpu_expert_cache,
             expert_workspaces: ParkingMutex::new(expert_workspaces),
             expert_workspace_cv: parking_lot::Condvar::new(),
+            q4_truncation_tolerance,
         })
     }
 
@@ -1252,11 +1260,16 @@ impl GpuBackend {
                 "Q4_0 expert total byte size overflow: 3 × {}B",
                 proj_bytes
             ))?;
-        let tol = crate::inference::EXPERT_SIZE_TOLERANCE_BYTES;
+        // Strict mode requires the exact logical payload; the ≤ one-page
+        // zero-fill shortfall survives only behind the explicitly named
+        // `allow_truncated_expert_payloads` development flag.
+        let tol = self.q4_truncation_tolerance;
         anyhow::ensure!(
             weight_bytes.len() >= need
-                || (need > tol && need - weight_bytes.len() <= tol),
-            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B)",
+                || (need > tol && tol > 0 && need - weight_bytes.len() <= tol),
+            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B); \
+             missing logical bytes are never zero-filled in strict mode \
+             (allow_truncated_expert_payloads = false)",
             weight_bytes.len(), need, blocks_per_proj, Q4_0_BLOCK_BYTES
         );
         anyhow::ensure!(
@@ -2143,8 +2156,9 @@ impl BackendBox {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Self {
-        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, v_head_dim, gpu_expert_cache).await {
+        match GpuBackend::try_new(num_layers, max_seq_len, num_heads, num_kv_heads, head_dim, v_head_dim, gpu_expert_cache, q4_truncation_tolerance).await {
             Ok(gpu) => BackendBox::Gpu(gpu),
             Err(e) => {
                 tracing::warn!(
@@ -2165,6 +2179,7 @@ impl BackendBox {
         head_dim: usize,
         v_head_dim: usize,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        q4_truncation_tolerance: usize,
     ) -> Self {
         pollster::block_on(Self::init(
             num_layers,
@@ -2174,6 +2189,7 @@ impl BackendBox {
             head_dim,
             v_head_dim,
             gpu_expert_cache,
+            q4_truncation_tolerance,
         ))
     }
 
@@ -2302,8 +2318,18 @@ pub enum ComputeOffload {
     Gpu,
     /// Prefer GPU but fall back to CPU if GPU initialization fails. Unlike
     /// an explicit `Gpu` request (which fails closed), `Auto` treats GPU as
-    /// best-effort and records a fallback event when it lands on CPU.
+    /// best-effort and records a fallback event when it lands on CPU. Under
+    /// strict attention numerics `Auto` resolves to CPU with a recorded
+    /// reason (GPU on-device softmax cannot be numerically validated).
     Auto,
+    /// **Explicitly named hybrid mode**: attention runs on the *checked
+    /// CPU* path (strict numerics validated per softmax row) while
+    /// expert/dense FFN compute is offloaded to the GPU. This is the only
+    /// mode in which a GPU backend is installed under strict attention
+    /// numerics — the split is logged at startup and exposed through
+    /// per-component backend metrics, never silently reported as full
+    /// GPU execution.
+    Hybrid,
 }
 
 impl Default for ComputeOffload {
@@ -2318,19 +2344,98 @@ impl Default for ComputeOffload {
 pub enum ResolvedBackend {
     Cpu,
     Gpu,
+    /// CPU (checked) attention + GPU expert compute — the explicitly
+    /// configured [`ComputeOffload::Hybrid`] split.
+    HybridCpuAttentionGpuExperts,
 }
 
 /// Outcome of reconciling an operator's requested [`ComputeOffload`] with
 /// the result of GPU initialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendResolution {
     pub requested: ComputeOffload,
     pub resolved: ResolvedBackend,
     /// True only when GPU was attempted, failed, and `Auto` demoted the run
-    /// to CPU. An explicit `Gpu` request never produces a silent fallback —
-    /// it errors instead.
+    /// to CPU. An explicit `Gpu`/`Hybrid` request never produces a silent
+    /// fallback — it errors instead.
     pub fallback_occurred: bool,
+    /// Human-readable reason recorded whenever the resolution differs from
+    /// a naive reading of the request (e.g. `auto` resolving to CPU under
+    /// strict attention numerics, or after a failed GPU init).
+    pub reason: Option<String>,
 }
+
+impl BackendResolution {
+    /// Compute plane the attention path executes on.
+    pub fn attention_plane(&self) -> &'static str {
+        match self.resolved {
+            ResolvedBackend::Cpu | ResolvedBackend::HybridCpuAttentionGpuExperts => "cpu",
+            ResolvedBackend::Gpu => "gpu",
+        }
+    }
+
+    /// Compute plane the expert/dense FFN path executes on.
+    pub fn expert_plane(&self) -> &'static str {
+        match self.resolved {
+            ResolvedBackend::Cpu => "cpu",
+            ResolvedBackend::Gpu | ResolvedBackend::HybridCpuAttentionGpuExperts => "gpu",
+        }
+    }
+
+    /// Whether a GPU backend should be installed for this resolution.
+    pub fn install_gpu_backend(&self) -> bool {
+        !matches!(self.resolved, ResolvedBackend::Cpu)
+    }
+}
+
+/// Error returned when a requested compute backend cannot be honored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendResolutionError {
+    /// An explicit `gpu`/`hybrid` request but GPU initialization failed.
+    GpuUnavailable {
+        requested: ComputeOffload,
+        detail: String,
+    },
+    /// `compute_offload = "gpu"` combined with strict attention numerics:
+    /// GPU attention performs its softmax on-device where non-finite rows
+    /// cannot be detected, so strict full-GPU inference is unsupported
+    /// until GPU numerical detection exists.
+    StrictGpuUnsupported,
+    /// `compute_offload = "hybrid"` combined with
+    /// `allow_nonfinite_attention_fallback = true`: hybrid pins attention
+    /// to the checked CPU path, which is incompatible with the legacy
+    /// uniform-fallback attention policy.
+    HybridRequiresStrictAttention,
+}
+
+impl std::fmt::Display for BackendResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendResolutionError::GpuUnavailable { requested, detail } => write!(
+                f,
+                "compute_offload = {requested:?} was requested but GPU initialization failed: \
+                 {detail}; set compute_offload = \"auto\" to allow CPU fallback, or \"cpu\" to \
+                 run on CPU"
+            ),
+            BackendResolutionError::StrictGpuUnsupported => write!(
+                f,
+                "compute_offload = \"gpu\" is unsupported under strict attention numerics: the \
+                 GPU attention kernels compute softmax on-device where non-finite rows cannot \
+                 be detected or validated. Use compute_offload = \"hybrid\" (checked CPU \
+                 attention + GPU experts), \"auto\"/\"cpu\", or — development only — set \
+                 real_transformer.allow_nonfinite_attention_fallback = true"
+            ),
+            BackendResolutionError::HybridRequiresStrictAttention => write!(
+                f,
+                "compute_offload = \"hybrid\" pins attention to the checked CPU path and is \
+                 incompatible with real_transformer.allow_nonfinite_attention_fallback = true; \
+                 use compute_offload = \"gpu\" for full-GPU legacy-fallback execution"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BackendResolutionError {}
 
 /// Error returned when an explicit GPU request cannot be honored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2370,31 +2475,99 @@ pub fn resolve_backend_selection<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    resolve_backend_selection_with_numerics(requested, false, gpu_init).map_err(|e| match e {
+        BackendResolutionError::GpuUnavailable { detail, .. } => {
+            ExplicitGpuUnavailable { detail }
+        }
+        other => ExplicitGpuUnavailable {
+            detail: other.to_string(),
+        },
+    })
+}
+
+/// Strict-numerics-aware backend resolution (hardening pass, strict GPU
+/// behaviour).
+///
+/// `strict_attention` is `true` when the run requires validated attention
+/// numerics (the production default: `allow_nonfinite_attention_fallback
+/// = false`). GPU attention performs its softmax on-device where
+/// non-finite rows cannot be detected, so:
+///
+/// * `Gpu` + strict → hard [`BackendResolutionError::StrictGpuUnsupported`]
+///   at startup — never a silent CPU-attention run reported as GPU.
+/// * `Auto` + strict → resolves to CPU with a recorded reason (GPU is not
+///   attempted).
+/// * `Hybrid` → the explicitly named checked-CPU-attention + GPU-experts
+///   split; requires strict attention and a working GPU (fails closed).
+/// * Non-strict behaviour for `Cpu`/`Gpu`/`Auto` matches the legacy
+///   [`resolve_backend_selection`].
+pub fn resolve_backend_selection_with_numerics<F>(
+    requested: ComputeOffload,
+    strict_attention: bool,
+    gpu_init: F,
+) -> Result<BackendResolution, BackendResolutionError>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     match requested {
         ComputeOffload::Cpu => Ok(BackendResolution {
             requested,
             resolved: ResolvedBackend::Cpu,
             fallback_occurred: false,
+            reason: None,
         }),
+        ComputeOffload::Gpu if strict_attention => {
+            Err(BackendResolutionError::StrictGpuUnsupported)
+        }
         ComputeOffload::Gpu => match gpu_init() {
             Ok(()) => Ok(BackendResolution {
                 requested,
                 resolved: ResolvedBackend::Gpu,
                 fallback_occurred: false,
+                reason: None,
             }),
-            Err(detail) => Err(ExplicitGpuUnavailable { detail }),
+            Err(detail) => Err(BackendResolutionError::GpuUnavailable { requested, detail }),
         },
+        ComputeOffload::Auto if strict_attention => Ok(BackendResolution {
+            requested,
+            resolved: ResolvedBackend::Cpu,
+            fallback_occurred: false,
+            reason: Some(
+                "strict attention numerics: GPU on-device softmax cannot be validated, so \
+                 compute_offload = \"auto\" resolved to CPU (use \"hybrid\" for checked CPU \
+                 attention with GPU expert offload)"
+                    .to_string(),
+            ),
+        }),
         ComputeOffload::Auto => match gpu_init() {
             Ok(()) => Ok(BackendResolution {
                 requested,
                 resolved: ResolvedBackend::Gpu,
                 fallback_occurred: false,
+                reason: None,
             }),
-            Err(_) => Ok(BackendResolution {
+            Err(detail) => Ok(BackendResolution {
                 requested,
                 resolved: ResolvedBackend::Cpu,
                 fallback_occurred: true,
+                reason: Some(format!("GPU initialization failed: {detail}")),
             }),
+        },
+        ComputeOffload::Hybrid if !strict_attention => {
+            Err(BackendResolutionError::HybridRequiresStrictAttention)
+        }
+        ComputeOffload::Hybrid => match gpu_init() {
+            Ok(()) => Ok(BackendResolution {
+                requested,
+                resolved: ResolvedBackend::HybridCpuAttentionGpuExperts,
+                fallback_occurred: false,
+                reason: Some(
+                    "hybrid: attention pinned to the checked CPU path; expert/dense FFN \
+                     compute offloaded to the GPU"
+                        .to_string(),
+                ),
+            }),
+            Err(detail) => Err(BackendResolutionError::GpuUnavailable { requested, detail }),
         },
     }
 }
@@ -2534,6 +2707,84 @@ mod tests {
         assert_eq!(out.resolved, ResolvedBackend::Cpu);
         assert!(!out.fallback_occurred);
         assert!(!attempted, "CPU request must not attempt GPU initialization");
+    }
+
+    // ---- Strict GPU behaviour (hardening pass, item 3) ----
+
+    #[test]
+    fn strict_numerics_rejects_explicit_gpu_at_startup() {
+        let mut attempted = false;
+        let out = resolve_backend_selection_with_numerics(ComputeOffload::Gpu, true, || {
+            attempted = true;
+            Ok(())
+        });
+        assert_eq!(out, Err(BackendResolutionError::StrictGpuUnsupported));
+        assert!(
+            !attempted,
+            "unsupported strict-gpu combination must fail before device init"
+        );
+    }
+
+    #[test]
+    fn strict_numerics_auto_resolves_to_cpu_with_reason() {
+        let mut attempted = false;
+        let out = resolve_backend_selection_with_numerics(ComputeOffload::Auto, true, || {
+            attempted = true;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Cpu);
+        assert!(!out.fallback_occurred, "strict auto->cpu is a resolution, not a fallback");
+        assert!(out.reason.is_some(), "the auto->cpu reason must be recorded");
+        assert!(!attempted, "strict auto must not attempt GPU initialization");
+        assert!(!out.install_gpu_backend());
+        assert_eq!(out.attention_plane(), "cpu");
+        assert_eq!(out.expert_plane(), "cpu");
+    }
+
+    #[test]
+    fn hybrid_resolves_to_cpu_attention_gpu_experts() {
+        let out = resolve_backend_selection_with_numerics(ComputeOffload::Hybrid, true, || Ok(()))
+            .unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::HybridCpuAttentionGpuExperts);
+        assert_eq!(out.attention_plane(), "cpu");
+        assert_eq!(out.expert_plane(), "gpu");
+        assert!(out.install_gpu_backend());
+        assert!(out.reason.is_some(), "the hybrid split must be recorded");
+    }
+
+    #[test]
+    fn hybrid_fails_closed_when_gpu_init_fails() {
+        let out = resolve_backend_selection_with_numerics(ComputeOffload::Hybrid, true, || {
+            Err("no device".to_string())
+        });
+        assert!(matches!(
+            out,
+            Err(BackendResolutionError::GpuUnavailable {
+                requested: ComputeOffload::Hybrid,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn hybrid_rejects_legacy_attention_fallback_policy() {
+        let out =
+            resolve_backend_selection_with_numerics(ComputeOffload::Hybrid, false, || Ok(()));
+        assert_eq!(
+            out,
+            Err(BackendResolutionError::HybridRequiresStrictAttention)
+        );
+    }
+
+    #[test]
+    fn non_strict_gpu_resolution_reports_gpu_planes() {
+        let out = resolve_backend_selection_with_numerics(ComputeOffload::Gpu, false, || Ok(()))
+            .unwrap();
+        assert_eq!(out.resolved, ResolvedBackend::Gpu);
+        assert_eq!(out.attention_plane(), "gpu");
+        assert_eq!(out.expert_plane(), "gpu");
+        assert!(out.install_gpu_backend());
     }
 
     #[test]

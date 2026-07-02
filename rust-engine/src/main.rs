@@ -1248,6 +1248,9 @@ fn install_run_gpu_backend(
         1, // head_dim
         1, // v_head_dim
         gpu_expert_cache.clone(),
+        // The synthetic GPU tool path never serves real checkpoints;
+        // strict payload sizing (tolerance 0) always applies here.
+        0,
     );
     if !backend_box.is_gpu() {
         return Err("explicit --gpu request failed: GPU backend initialization did not \
@@ -2159,25 +2162,25 @@ fn bench_sampling_params(
     }
 }
 
-async fn build_bench_real_runtime(
-    config_path: &Path,
-) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
-    use crate::config::Config;
-    use crate::metrics::Metrics;
-    use crate::tokenizer::Tokenizer;
-
-    let mut cfg = Config::from_file(config_path)?;
-    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
+/// Fail-closed policy gate for `bench-real` (hardening pass, item 4):
+/// every development-only fail-open flag is rejected — independently
+/// and in combination — because a benchmark taken under any degraded
+/// policy is not a production measurement. Factored out of
+/// [`build_bench_real_runtime`] so the rejection matrix is directly
+/// unit-testable.
+fn validate_bench_real_policies(cfg: &crate::config::Config) -> Result<(), String> {
     if !cfg.real_transformer.enabled {
         return Err("bench-real requires [real_transformer] enabled = true".into());
     }
     if matches!(
         cfg.real_transformer.compute_offload,
-        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+        crate::backend::ComputeOffload::Gpu
+            | crate::backend::ComputeOffload::Auto
+            | crate::backend::ComputeOffload::Hybrid
     ) || cfg.gpu_cache.enabled
     {
         return Err(
-            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\" and \"auto\" are rejected) and disable [gpu_cache].enabled"
+            "bench-real is CPU-only for this sprint; set real_transformer.compute_offload = \"cpu\" (\"gpu\", \"auto\" and \"hybrid\" are rejected) and disable [gpu_cache].enabled"
                 .into(),
         );
     }
@@ -2196,6 +2199,27 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    if cfg.real_transformer.allow_degraded_experts {
+        return Err(
+            "bench-real rejects real_transformer.allow_degraded_experts = true; degraded-mode \
+             benchmarks are not production measurements"
+                .into(),
+        );
+    }
+    if cfg.real_transformer.allow_nonfinite_attention_fallback {
+        return Err(
+            "bench-real rejects real_transformer.allow_nonfinite_attention_fallback = true; \
+             uniform-attention fallback benchmarks are not production measurements"
+                .into(),
+        );
+    }
+    if cfg.real_transformer.allow_truncated_expert_payloads {
+        return Err(
+            "bench-real rejects real_transformer.allow_truncated_expert_payloads = true; \
+             zero-filled truncated expert payloads are not production measurements"
+                .into(),
+        );
+    }
     if !cfg.real_transformer.strict_weights {
         return Err(
             "bench-real requires real_transformer.strict_weights = true; a benchmark that may \
@@ -2203,6 +2227,19 @@ async fn build_bench_real_runtime(
                 .into(),
         );
     }
+    Ok(())
+}
+
+async fn build_bench_real_runtime(
+    config_path: &Path,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    use crate::config::Config;
+    use crate::metrics::Metrics;
+    use crate::tokenizer::Tokenizer;
+
+    let mut cfg = Config::from_file(config_path)?;
+    crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
+    validate_bench_real_policies(&cfg)?;
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
         reconcile_real_model_config(&mut cfg)?;
@@ -2257,6 +2294,10 @@ async fn build_bench_real_runtime(
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts_for_files)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts_for_files.min(8))?;
 
     let pipeline_depth = cfg.storage.pipeline_depth.max(1) as usize;
     let shadow_slots = cfg.storage.predict_fanout.saturating_mul(pipeline_depth);
@@ -2391,6 +2432,7 @@ async fn build_bench_real_runtime(
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
+            policy: cfg.real_transformer.inference_policy(),
         },
     );
     engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
@@ -2813,7 +2855,7 @@ async fn run_bench_real_once(
     let mut decode_latencies_us = Vec::with_capacity(output_tokens.saturating_sub(1));
 
     for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-        let _ = runtime
+        runtime
             .model
             .forward_token_hidden_with_timing(
                 &runtime.engine,
@@ -2822,7 +2864,7 @@ async fn run_bench_real_once(
                 &mut kv,
                 Some(&stage_timings),
             )
-            .await;
+            .await?;
         forward_evaluations += 1;
         pos += 1;
     }
@@ -2839,7 +2881,7 @@ async fn run_bench_real_once(
             &mut kv,
             Some(&stage_timings),
         )
-        .await;
+        .await?;
     forward_evaluations += 1;
     pos += 1;
     let prompt_elapsed = prompt_started.elapsed();
@@ -2870,7 +2912,7 @@ async fn run_bench_real_once(
                 &params,
                 Some(&stage_timings),
             )
-            .await;
+            .await?;
         forward_evaluations += 1;
         lm_head_evaluations += 1;
         decode_latencies_us.push(step_started.elapsed().as_micros() as u64);
@@ -3341,100 +3383,152 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         ))
     };
     let mut backend_fallback_occurred = false;
+    // Strict attention numerics (the production default) can only be
+    // validated on the checked CPU softmax path, so backend resolution is
+    // strictness-aware (hardening pass, strict GPU behaviour): an explicit
+    // `gpu` request fails startup, `auto` resolves to CPU with a recorded
+    // reason, and the explicitly named `hybrid` mode runs checked CPU
+    // attention with GPU expert offload.
+    let strict_attention = cfg.real_transformer.enabled
+        && !cfg
+            .real_transformer
+            .inference_policy()
+            .allow_nonfinite_attention_fallback;
+    let mut backend_attention_plane: &'static str = "cpu";
+    let mut backend_expert_plane: &'static str = "cpu";
     if matches!(
         cfg.real_transformer.compute_offload,
-        crate::backend::ComputeOffload::Gpu | crate::backend::ComputeOffload::Auto
+        crate::backend::ComputeOffload::Gpu
+            | crate::backend::ComputeOffload::Auto
+            | crate::backend::ComputeOffload::Hybrid
     ) {
-        let num_layers = cfg.model.num_layers;
-        let max_seq_len = if cfg.real_transformer.window_size == 0 {
-            4096
-        } else {
-            cfg.real_transformer.window_size
-        };
-        let num_heads = cfg.real_transformer.num_heads;
-        let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
-            num_heads
-        } else {
-            cfg.real_transformer.num_kv_heads
-        };
-        let head_dim = if cfg.real_transformer.head_dim == 0 {
-            if num_heads > 0 {
-                cfg.model.d_model / num_heads
-            } else {
-                64
-            }
-        } else {
-            cfg.real_transformer.head_dim
-        };
-        let backend_box = crate::backend::BackendBox::init_blocking(
-            num_layers,
-            max_seq_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            // Finding 12: the run path does not surface an asymmetric
-            // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
-            // models force the CPU attention path via the eligibility guard
-            // in transformer.rs, so the symmetric GPU sizing is never used
-            // for them.
-            0,
-            gpu_expert_cache.clone(),
-        );
-        let has_device = backend_box.is_gpu();
-        // Reconcile the operator's request with the observed init result
-        // (Finding 5). An explicit `gpu` request fails closed; `auto`
-        // demotes to CPU and records a fallback. `is_gpu()` is the signal
-        // because `init_blocking` internally swallows GPU errors and returns
-        // a CPU backend.
-        let resolution = crate::backend::resolve_backend_selection(
+        // Resolve the request *before* touching the device so unsupported
+        // combinations (explicit gpu + strict numerics, hybrid + legacy
+        // attention fallback) fail startup without a partial init, and
+        // `auto` under strict numerics skips GPU init entirely.
+        let precheck = crate::backend::resolve_backend_selection_with_numerics(
             cfg.real_transformer.compute_offload,
-            || {
-                if has_device {
-                    Ok(())
-                } else {
-                    Err("GPU backend initialization did not produce a GPU device".to_string())
-                }
-            },
+            strict_attention,
+            || Ok(()),
         )?;
-        backend_fallback_occurred = resolution.fallback_occurred;
-        let device_name = backend_box.device_name().to_string();
-        let compute_plane = backend_box.compute_plane().to_string();
-        if resolution.fallback_occurred {
-            warn!(
-                requested = ?resolution.requested,
-                resolved = ?resolution.resolved,
-                "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
-            );
-        }
-        let gpu = std::sync::Arc::new(backend_box);
-        if let Err(e) = crate::backend::set_backend(gpu) {
-            // Finding 5 (fail-closed GPU): installation failure is fatal for an
-            // explicit `gpu` request — we must never silently continue on CPU.
-            // Under `auto` it is a recorded fallback instead.
-            if matches!(
-                resolution.requested,
-                crate::backend::ComputeOffload::Gpu
-            ) {
-                return Err(format!(
-                    "explicit compute_offload = \"gpu\": GpuBackend installation failed ({e}); \
-                     refusing to fall back to CPU"
-                )
-                .into());
+        if !precheck.install_gpu_backend() {
+            // `auto` resolved to CPU under strict numerics: record why and
+            // keep the CPU backend (never report GPU while strict
+            // attention runs on CPU).
+            if let Some(reason) = precheck.reason.as_deref() {
+                info!(
+                    requested = ?precheck.requested,
+                    resolved = ?precheck.resolved,
+                    reason,
+                    "compute backend resolved to CPU"
+                );
             }
-            backend_fallback_occurred = true;
-            warn!(
-                error = e,
-                "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
-            );
         } else {
-            info!(
-                device = device_name,
-                compute_plane,
-                has_device,
-                requested = ?resolution.requested,
-                resolved = ?resolution.resolved,
-                "math backend installed for dense backbone"
+            let num_layers = cfg.model.num_layers;
+            let max_seq_len = if cfg.real_transformer.window_size == 0 {
+                4096
+            } else {
+                cfg.real_transformer.window_size
+            };
+            let num_heads = cfg.real_transformer.num_heads;
+            let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
+                num_heads
+            } else {
+                cfg.real_transformer.num_kv_heads
+            };
+            let head_dim = if cfg.real_transformer.head_dim == 0 {
+                if num_heads > 0 {
+                    cfg.model.d_model / num_heads
+                } else {
+                    64
+                }
+            } else {
+                cfg.real_transformer.head_dim
+            };
+            let backend_box = crate::backend::BackendBox::init_blocking(
+                num_layers,
+                max_seq_len,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                // Finding 12: the run path does not surface an asymmetric
+                // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
+                // models force the CPU attention path via the eligibility guard
+                // in transformer.rs, so the symmetric GPU sizing is never used
+                // for them.
+                0,
+                gpu_expert_cache.clone(),
+                cfg.real_transformer
+                    .inference_policy()
+                    .expert_size_tolerance(),
             );
+            let has_device = backend_box.is_gpu();
+            // Reconcile the operator's request with the observed init result
+            // (Finding 5). An explicit `gpu`/`hybrid` request fails closed;
+            // `auto` demotes to CPU and records a fallback. `is_gpu()` is the
+            // signal because `init_blocking` internally swallows GPU errors
+            // and returns a CPU backend.
+            let resolution = crate::backend::resolve_backend_selection_with_numerics(
+                cfg.real_transformer.compute_offload,
+                strict_attention,
+                || {
+                    if has_device {
+                        Ok(())
+                    } else {
+                        Err("GPU backend initialization did not produce a GPU device".to_string())
+                    }
+                },
+            )?;
+            backend_fallback_occurred = resolution.fallback_occurred;
+            let device_name = backend_box.device_name().to_string();
+            let compute_plane = backend_box.compute_plane().to_string();
+            if resolution.fallback_occurred {
+                warn!(
+                    requested = ?resolution.requested,
+                    resolved = ?resolution.resolved,
+                    reason = resolution.reason.as_deref().unwrap_or(""),
+                    "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
+                );
+            }
+            if resolution.install_gpu_backend() {
+                let gpu = std::sync::Arc::new(backend_box);
+                if let Err(e) = crate::backend::set_backend(gpu) {
+                    // Finding 5 (fail-closed GPU): installation failure is fatal for an
+                    // explicit `gpu`/`hybrid` request — we must never silently continue
+                    // on CPU. Under `auto` it is a recorded fallback instead.
+                    if matches!(
+                        resolution.requested,
+                        crate::backend::ComputeOffload::Gpu
+                            | crate::backend::ComputeOffload::Hybrid
+                    ) {
+                        return Err(format!(
+                            "explicit compute_offload = {:?}: GpuBackend installation failed \
+                             ({e}); refusing to fall back to CPU",
+                            resolution.requested
+                        )
+                        .into());
+                    }
+                    backend_fallback_occurred = true;
+                    warn!(
+                        error = e,
+                        "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
+                    );
+                } else {
+                    backend_attention_plane = resolution.attention_plane();
+                    backend_expert_plane = resolution.expert_plane();
+                    info!(
+                        device = device_name,
+                        compute_plane,
+                        has_device,
+                        requested = ?resolution.requested,
+                        resolved = ?resolution.resolved,
+                        attention_plane = backend_attention_plane,
+                        expert_plane = backend_expert_plane,
+                        reason = resolution.reason.as_deref().unwrap_or(""),
+                        "math backend installed for dense backbone"
+                    );
+                }
+            }
         }
     }
     crate::backend::install_default();
@@ -3487,6 +3581,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     if !storage.is_packed() {
         storage.warmup_fds(0..total_experts)?;
     }
+    // Root-cause guard (hardening pass, Part A2): reject an
+    // `expert_size` that disagrees with the on-disk file layout before
+    // any truncated payload can be read.
+    storage.validate_expert_file_layout(0..total_experts.min(8))?;
 
     // Double-buffered pool (Parts 1–2): split the RAM buffers into a
     // **primary** (Buffer A) half that backs the resident LRU plus one
@@ -3573,6 +3671,42 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // the gist's "wire `LinearGate` into `serve`" ask.
     let real_model: Option<Arc<crate::model::RealModel>> = if cfg.real_transformer.enabled {
         let rt = &cfg.real_transformer;
+        if rt.allow_degraded_experts {
+            warn!(
+                "DEGRADED MODE ENABLED: real_transformer.allow_degraded_experts = true — a \
+                 failed routed/shared expert is substituted with a zero contribution instead \
+                 of failing the request. Output and all benchmark figures are \
+                 NON-AUTHORITATIVE (see degraded_expert_substitutions)."
+            );
+        }
+        if rt.allow_nonfinite_attention_fallback {
+            warn!(
+                "NON-FINITE-ATTENTION FALLBACK ENABLED: \
+                 real_transformer.allow_nonfinite_attention_fallback = true — a non-finite \
+                 attention softmax row is replaced by a uniform distribution instead of \
+                 failing the request. Output is NON-AUTHORITATIVE."
+            );
+        }
+        if rt.allow_truncated_expert_payloads {
+            warn!(
+                "TRUNCATED-PAYLOAD TOLERANCE ENABLED: \
+                 real_transformer.allow_truncated_expert_payloads = true — quantised expert \
+                 payloads up to one page short are zero-filled instead of failing the \
+                 request. Output is NON-AUTHORITATIVE."
+            );
+        }
+        // Log each resolved fail-open policy explicitly, so the effective
+        // strict/degraded posture of the run is always visible at startup
+        // (hardening pass, policy separation). The policy is engine-scoped
+        // (threaded via `EngineOptions::policy`), not a process global.
+        let policy = rt.inference_policy();
+        info!(
+            allow_degraded_experts = policy.allow_degraded_experts,
+            allow_nonfinite_attention_fallback = policy.allow_nonfinite_attention_fallback,
+            allow_truncated_expert_payloads = policy.allow_truncated_expert_payloads,
+            degraded = policy.any_degraded(),
+            "resolved real-inference fail-open policies"
+        );
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
         } else {
@@ -3723,6 +3857,10 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     if backend_fallback_occurred {
         metrics.record_gpu_cpu_fallback(1);
     }
+    // Per-component compute planes (hardening pass, strict GPU
+    // behaviour): make an intentional hybrid split (checked CPU
+    // attention + GPU experts) observable in /metrics.
+    metrics.set_backend_component_planes(backend_attention_plane, backend_expert_plane);
     let mut engine_builder = Engine::with_options(
         cache,
         pool,
@@ -3749,6 +3887,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cost_aware_eviction: cfg.predictive.cost_aware_eviction,
             pregate_enabled: cfg.predictive.pregate_enabled,
             collect_route_profile: false,
+            policy: cfg.real_transformer.inference_policy(),
         },
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
@@ -4830,6 +4969,13 @@ async fn cmd_run(
                 cost_aware_eviction: args.cost_aware_eviction,
                 pregate_enabled: args.pregate,
                 collect_route_profile: args.profile_out.is_some(),
+                // The synthetic `run` benchmark path keeps the legacy
+                // drop-from-mixture behaviour: a corrupt synthetic
+                // expert must not abort a long streaming benchmark.
+                policy: crate::inference::RealInferencePolicy {
+                    allow_degraded_experts: true,
+                    ..crate::inference::RealInferencePolicy::STRICT
+                },
             },
         );
         if let Some(gpu_cache) = args.gpu_expert_cache.clone() {
@@ -5917,6 +6063,146 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Item 4: bench-real fail-open policy rejection matrix ----
+
+    /// A minimal config that passes every `bench-real` policy gate:
+    /// real transformer enabled, CPU offload, a weights dir, strict
+    /// weights, and every fail-open flag disabled.
+    fn bench_real_ok_cfg() -> crate::config::Config {
+        use std::path::PathBuf;
+        crate::config::Config {
+            server: crate::config::ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                max_tokens: 32,
+                session_ttl_secs: 0,
+                max_concurrent_requests: 0,
+                admission_min_free_blocks: 0,
+            },
+            model: crate::config::ModelConfig {
+                data_dir: PathBuf::from("./data"),
+                num_experts: 8,
+                top_k: 2,
+                d_model: 8,
+                d_ff: 16,
+                expert_size: 4096,
+                num_layers: 1,
+                dtype: crate::inference::WeightDtype::F32,
+            },
+            storage: crate::config::StorageConfigToml {
+                cache_slots: 4,
+                block_align: 4096,
+                no_direct: true,
+                predict_fanout: 2,
+                pipeline_depth: crate::engine::DEFAULT_PIPELINE_DEPTH,
+                predict_min_prob: 0.05,
+                partial_load_fraction: 1.0,
+                pin_after_observations: 0,
+                packed_blob: None,
+                packed_manifest: None,
+            },
+            tokenizer: crate::config::TokenizerConfig::default(),
+            real_transformer: {
+                let mut rt = crate::config::RealTransformerConfig::default();
+                rt.enabled = true;
+                rt.weights_dir = Some(PathBuf::from("./weights"));
+                rt
+            },
+            sampling: crate::config::SamplingConfig::default(),
+            predictive: crate::config::PredictiveConfig::default(),
+            security: crate::config::SecurityConfig::default(),
+            gpu_cache: crate::config::GpuCacheConfig::default(),
+            distributed: crate::config::DistributedConfig::default(),
+        }
+    }
+
+    /// The baseline (strict) config passes the gate; the serde
+    /// defaults keep every fail-open flag disabled.
+    #[test]
+    fn bench_real_accepts_strict_baseline_and_flags_default_false() {
+        let cfg = bench_real_ok_cfg();
+        assert!(!cfg.real_transformer.allow_degraded_experts);
+        assert!(!cfg.real_transformer.allow_nonfinite_attention_fallback);
+        assert!(!cfg.real_transformer.allow_truncated_expert_payloads);
+        assert_eq!(
+            cfg.real_transformer.inference_policy(),
+            crate::inference::RealInferencePolicy::STRICT
+        );
+        validate_bench_real_policies(&cfg).expect("strict baseline must pass");
+    }
+
+    /// Each fail-open flag is rejected independently, with an error
+    /// that names the offending flag.
+    #[test]
+    fn bench_real_rejects_each_fail_open_flag_independently() {
+        let cases: [(&str, fn(&mut crate::config::Config)); 3] = [
+            ("allow_degraded_experts", |c| {
+                c.real_transformer.allow_degraded_experts = true
+            }),
+            ("allow_nonfinite_attention_fallback", |c| {
+                c.real_transformer.allow_nonfinite_attention_fallback = true
+            }),
+            ("allow_truncated_expert_payloads", |c| {
+                c.real_transformer.allow_truncated_expert_payloads = true
+            }),
+        ];
+        for (name, set) in cases {
+            let mut cfg = bench_real_ok_cfg();
+            set(&mut cfg);
+            let err = validate_bench_real_policies(&cfg)
+                .expect_err("bench-real must reject a fail-open policy");
+            assert!(
+                err.contains(name),
+                "rejection for {name} must name the flag; got: {err}"
+            );
+        }
+    }
+
+    /// Combinations of fail-open flags are rejected too (the gate
+    /// fails on the first offending flag; no combination slips
+    /// through).
+    #[test]
+    fn bench_real_rejects_fail_open_flag_combinations() {
+        for mask in 1u8..8 {
+            let mut cfg = bench_real_ok_cfg();
+            cfg.real_transformer.allow_degraded_experts = mask & 1 != 0;
+            cfg.real_transformer.allow_nonfinite_attention_fallback = mask & 2 != 0;
+            cfg.real_transformer.allow_truncated_expert_payloads = mask & 4 != 0;
+            assert!(
+                validate_bench_real_policies(&cfg).is_err(),
+                "flag combination {mask:03b} must be rejected"
+            );
+        }
+    }
+
+    /// The pre-existing gates still hold alongside the policy flags.
+    #[test]
+    fn bench_real_rejects_seeded_fallback_non_strict_and_non_cpu() {
+        let mut cfg = bench_real_ok_cfg();
+        cfg.real_transformer.allow_seeded_fallback = true;
+        assert!(validate_bench_real_policies(&cfg)
+            .expect_err("seeded fallback rejected")
+            .contains("allow_seeded_fallback"));
+
+        let mut cfg = bench_real_ok_cfg();
+        cfg.real_transformer.strict_weights = false;
+        assert!(validate_bench_real_policies(&cfg)
+            .expect_err("non-strict weights rejected")
+            .contains("strict_weights"));
+
+        for offload in [
+            crate::backend::ComputeOffload::Gpu,
+            crate::backend::ComputeOffload::Auto,
+            crate::backend::ComputeOffload::Hybrid,
+        ] {
+            let mut cfg = bench_real_ok_cfg();
+            cfg.real_transformer.compute_offload = offload;
+            assert!(
+                validate_bench_real_policies(&cfg).is_err(),
+                "{offload:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn bench_real_validity_detects_softmax_fallback_delta() {
