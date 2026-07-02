@@ -1012,7 +1012,7 @@ impl Config {
         })?;
         if layers_u32.checked_mul(self.model.num_experts).is_none() {
             return Err(ConfigError::Invalid(format!(
-                "model.num_layers ({}) * model.num_experts ({}) overflows the u32 global                  expert-id namespace",
+                "model.num_layers ({}) * model.num_experts ({}) overflows the u32 global expert-id namespace",
                 self.model.num_layers, self.model.num_experts
             )));
         }
