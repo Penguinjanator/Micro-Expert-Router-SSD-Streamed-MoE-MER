@@ -526,6 +526,39 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// Item 5 (strict GPU / hybrid resolution): the per-component
+    /// compute-plane gauge reports the actual resolved attention and
+    /// expert planes — a hybrid resolution is visibly CPU-attention +
+    /// GPU-experts, never reported as full GPU.
+    #[test]
+    fn backend_component_plane_gauge_reports_resolved_planes() {
+        let m = Metrics::new();
+        // Hybrid: checked CPU attention + GPU experts.
+        m.set_backend_component_planes("cpu", "gpu");
+        let body = String::from_utf8(m.render().unwrap()).unwrap();
+        let want_one = [
+            r#"mer_backend_component_plane{component="attention",plane="cpu"} 1"#,
+            r#"mer_backend_component_plane{component="experts",plane="gpu"} 1"#,
+        ];
+        let want_zero = [
+            r#"mer_backend_component_plane{component="attention",plane="gpu"} 0"#,
+            r#"mer_backend_component_plane{component="experts",plane="cpu"} 0"#,
+        ];
+        for needle in want_one.iter().chain(&want_zero) {
+            assert!(body.contains(needle), "missing {needle} in:
+{body}");
+        }
+        // Re-resolution to full CPU flips both components.
+        m.set_backend_component_planes("cpu", "cpu");
+        let body = String::from_utf8(m.render().unwrap()).unwrap();
+        assert!(body.contains(
+            r#"mer_backend_component_plane{component="experts",plane="cpu"} 1"#
+        ));
+        assert!(body.contains(
+            r#"mer_backend_component_plane{component="experts",plane="gpu"} 0"#
+        ));
+    }
+
     #[test]
     fn render_includes_all_metric_names() {
         let m = Metrics::new();

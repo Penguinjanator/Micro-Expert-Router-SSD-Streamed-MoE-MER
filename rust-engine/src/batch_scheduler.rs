@@ -2059,6 +2059,71 @@ mod tests {
         assert_eq!(sched.remote_fetches_total(), 0);
     }
 
+    /// A5 audit (validation closure, item 3): a request-controlled
+    /// out-of-range token id on the *scheduled* decode path is a typed
+    /// [`BatchError::Inference`] — never a panic — and the request's
+    /// registered KV state is not mutated by the failed step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduled_decode_rejects_out_of_range_token_ids_without_mutating_kv() {
+        let cfg = RealModelConfig {
+            vocab_size: 64,
+            d_model: 16,
+            d_ff: 32,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 4,
+            num_layers: 1,
+            num_experts: 4,
+            top_k: 2,
+            rope_base: 10_000.0,
+            rms_eps: 1e-6,
+            window_size: None,
+            architecture: crate::architecture::Architecture::Mixtral,
+            first_k_dense_replace: 0,
+            advanced: Default::default(),
+        };
+        let (engine, model, _tmp) = build_engine_and_model(cfg.clone());
+        let sched = BatchScheduler::spawn(
+            model.clone(),
+            engine,
+            BatchConfig {
+                max_batch_size: 4,
+                batch_timeout: Duration::from_millis(2),
+                ..Default::default()
+            },
+        );
+        let id = sched.register(model.fresh_kv_caches());
+        for bad in [cfg.vocab_size as u32, u32::MAX] {
+            let err = sched
+                .step_registered(id, bad, 0, crate::sampling::SamplingParams::greedy())
+                .await
+                .expect_err("out-of-range token id must fail the scheduled step");
+            match err {
+                BatchError::Inference(msg) => {
+                    assert!(
+                        msg.contains("token"),
+                        "error must identify the invalid token id; got: {msg}"
+                    );
+                }
+                other => panic!("expected BatchError::Inference, got: {other}"),
+            }
+        }
+        // The failed steps must not have advanced the registered KV.
+        let kv = sched.release(id).expect("request still registered");
+        assert!(
+            kv.iter().all(|c| c.seq_len == 0),
+            "a rejected token id must not mutate the registered KV state"
+        );
+        // The scheduler remains usable for valid ids afterwards.
+        let id = sched.register(model.fresh_kv_caches());
+        let next = sched
+            .step_registered(id, 1, 0, crate::sampling::SamplingParams::greedy())
+            .await
+            .expect("valid token id succeeds after rejected ones");
+        assert!(next < cfg.vocab_size as u32);
+        let _ = sched.release(id);
+    }
+
     /// The default `spawn` keeps the single-node `LocalShardRouter`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn default_spawn_uses_local_shard_router() {

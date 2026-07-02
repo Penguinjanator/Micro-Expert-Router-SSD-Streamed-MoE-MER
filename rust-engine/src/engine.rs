@@ -5439,6 +5439,34 @@ mod tests {
         );
     }
 
+    /// A6 audit (validation closure, item 3): a routed expert id
+    /// outside the storage namespace fails the step with a typed
+    /// error in strict mode — no panic, no clamp, no silent miss —
+    /// and does not insert anything into the cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_mode_fails_step_on_out_of_namespace_expert_id() {
+        let dir = TempDir::new("strict-bad-expert-id");
+        let d_model = 16;
+        let num_experts = 8u32;
+        let engine = build_engine(&dir.path, num_experts, d_model, 32, 4, 2, 1, 0xA16);
+        let hidden = crate::inference::synth_hidden_state(0, d_model, 0xA16);
+        for bad in [num_experts, u32::MAX] {
+            let err = engine
+                .moe_step(0, /*layer=*/ 0, &hidden, &[bad])
+                .await
+                .expect_err("out-of-namespace expert id must fail the step");
+            assert!(
+                matches!(err, MoeStepError::ExpertFetch { expert, .. } if expert == bad),
+                "expected ExpertFetch for expert {bad}, got: {err}"
+            );
+            assert!(
+                !engine.core.cache.contains(bad),
+                "a failed out-of-namespace fetch must not mutate the cache"
+            );
+        }
+        assert_eq!(engine.report().degraded_expert_substitutions, 0);
+    }
+
     /// Policy audit (validation closure, item 4): the *attention*
     /// fallback policy must not enable expert degradation — an expert
     /// fetch failure still fails the step.
