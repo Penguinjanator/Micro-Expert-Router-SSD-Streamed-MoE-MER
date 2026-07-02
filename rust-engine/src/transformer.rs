@@ -2029,6 +2029,60 @@ pub fn add_residual_into(a: &[f32], b: &[f32], out: &mut Vec<f32>) {
 /// linear whose `sigmoid` scales the shared expert output. DeepSeek-MoE
 /// shared experts have no such gate (they are unconditionally added), so
 /// it is optional; absence is treated as a scale of `1.0`.
+/// Typed failure for the resident (shared / dense) expert path
+/// (hardening pass, A1 completion). A shared or dense FFN that fails
+/// to build or execute is an architecturally required component; its
+/// failure must fail the request instead of silently substituting a
+/// zero vector into the residual stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedExpertError {
+    /// The projection matrices handed to
+    /// [`SharedExpert::from_projections`] do not agree with the
+    /// declared `[d_ff, d_model]` / `[d_model, d_ff]` shapes.
+    ShapeMismatch {
+        d_model: usize,
+        d_ff: usize,
+        gate_len: usize,
+        up_len: usize,
+        down_len: usize,
+        gate_inp_len: Option<usize>,
+    },
+    /// The cached Candle tensor execution failed at forward time.
+    Compute { detail: String },
+    /// Rebuilding the weight view via `ExpertWeights::from_floats`
+    /// (the fallback when the one-time tensor build failed) failed.
+    Reconstruction { detail: String },
+}
+
+impl std::fmt::Display for SharedExpertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SharedExpertError::ShapeMismatch {
+                d_model,
+                d_ff,
+                gate_len,
+                up_len,
+                down_len,
+                gate_inp_len,
+            } => write!(
+                f,
+                "shared/dense expert projection shapes are inconsistent: \
+                 d_model={d_model} d_ff={d_ff} gate={gate_len} up={up_len} \
+                 down={down_len} gate_inp={gate_inp_len:?}"
+            ),
+            SharedExpertError::Compute { detail } => {
+                write!(f, "shared/dense expert SwiGLU forward failed: {detail}")
+            }
+            SharedExpertError::Reconstruction { detail } => write!(
+                f,
+                "shared/dense expert weight reconstruction failed: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SharedExpertError {}
+
 #[derive(Debug, Clone)]
 pub struct SharedExpert {
     pub d_model: usize,
@@ -2054,9 +2108,11 @@ impl SharedExpert {
     /// Build a shared expert from its three separate projection matrices
     /// (each row-major) plus an optional sigmoid-gate vector. The
     /// matrices are concatenated into the `[gate || up || down]` layout
-    /// the SwiGLU kernel consumes. Returns `None` if the shapes are
-    /// inconsistent, so a malformed on-disk tensor degrades gracefully
-    /// to "no shared expert" instead of aborting the load.
+    /// the SwiGLU kernel consumes. Returns
+    /// [`SharedExpertError::ShapeMismatch`] if the shapes are
+    /// inconsistent so the caller can decide whether the component is
+    /// architecturally required — a malformed *required* shared or
+    /// dense expert must fail the load, never be silently dropped.
     pub fn from_projections(
         d_model: usize,
         d_ff: usize,
@@ -2064,16 +2120,24 @@ impl SharedExpert {
         up: &[f32],
         down: &[f32],
         gate_inp: Option<Vec<f32>>,
-    ) -> Option<Self> {
+    ) -> Result<Self, SharedExpertError> {
+        let shape_err = || SharedExpertError::ShapeMismatch {
+            d_model,
+            d_ff,
+            gate_len: gate.len(),
+            up_len: up.len(),
+            down_len: down.len(),
+            gate_inp_len: gate_inp.as_ref().map(|g| g.len()),
+        };
         if gate.len() != d_ff * d_model
             || up.len() != d_ff * d_model
             || down.len() != d_model * d_ff
         {
-            return None;
+            return Err(shape_err());
         }
         if let Some(g) = gate_inp.as_ref() {
             if g.len() != d_model {
-                return None;
+                return Err(shape_err());
             }
         }
         let mut weights = Vec::with_capacity(gate.len() + up.len() + down.len());
@@ -2086,7 +2150,7 @@ impl SharedExpert {
         let tensors = ExpertWeights::from_floats(&weights, d_model, d_ff)
             .ok()
             .and_then(|w| w.to_candle_tensors(&Device::Cpu).ok());
-        Some(Self {
+        Ok(Self {
             d_model,
             d_ff,
             weights,
@@ -2095,44 +2159,58 @@ impl SharedExpert {
         })
     }
 
+    /// Drop the cached Candle tensors so [`Self::forward`] exercises the
+    /// per-call reconstruction fallback (test hook for the A1 shared /
+    /// dense expert failure propagation).
+    #[cfg(test)]
+    pub(crate) fn drop_cached_tensors_for_test(&mut self) {
+        self.tensors = None;
+    }
+
+    /// Corrupt the stored weight blob so both the cached-tensor path and
+    /// the reconstruction fallback fail (test hook for the A1 shared /
+    /// dense expert failure propagation).
+    #[cfg(test)]
+    pub(crate) fn corrupt_weights_for_test(&mut self) {
+        self.tensors = None;
+        self.weights.truncate(1);
+    }
+
+    /// Replace the cached Candle tensors with shape-incompatible ones so
+    /// the cached-tensor execution path fails at forward time (test hook
+    /// for the A1 shared / dense expert failure propagation).
+    #[cfg(test)]
+    pub(crate) fn poison_cached_tensors_for_test(&mut self) {
+        let bad = Tensor::from_slice(&[0.0f32], (1, 1), &Device::Cpu).expect("build 1x1 tensor");
+        self.tensors = Some((bad.clone(), bad.clone(), bad));
+    }
+
     /// Run the dense SwiGLU forward over `x` (the MoE-normalised hidden
     /// state) and apply the optional sigmoid gate. Reuses the routed
     /// expert kernel so the math matches the streamed experts exactly.
-    pub fn forward(&self, x: &[f32]) -> HiddenState {
+    ///
+    /// Fails closed (hardening pass, A1 completion): any Candle
+    /// execution or weight-reconstruction failure is returned as a
+    /// typed [`SharedExpertError`] instead of a fabricated zero vector.
+    pub fn forward(&self, x: &[f32]) -> Result<HiddenState, SharedExpertError> {
         // Fast path: reuse the Candle weight tensors built once at
         // construction so the per-token cost is just the matmuls, not a
         // full copy of every weight into Candle storage.
         let mut out = match self.tensors.as_ref() {
             Some((gate_t, up_t, down_t)) => {
-                match forward_candle_tensors(gate_t, up_t, down_t, self.d_model, x) {
-                    Ok(y) => y,
-                    Err(err) => {
-                        tracing::error!(
-                            error = %err,
-                            d_model = self.d_model,
-                            d_ff = self.d_ff,
-                            "shared expert SwiGLU forward failed; skipping shared expert"
-                        );
-                        return vec![0.0f32; self.d_model];
+                forward_candle_tensors(gate_t, up_t, down_t, self.d_model, x).map_err(|err| {
+                    SharedExpertError::Compute {
+                        detail: err.to_string(),
                     }
-                }
+                })?
             }
             None => {
-                // Degraded path: the one-time tensor build failed, so
+                // Fallback path: the one-time tensor build failed, so
                 // rebuild a view per call (still correct, just slower).
-                let weights =
-                    match ExpertWeights::from_floats(&self.weights, self.d_model, self.d_ff) {
-                        Ok(w) => w,
-                        Err(err) => {
-                            tracing::error!(
-                                error = %err,
-                                d_model = self.d_model,
-                                d_ff = self.d_ff,
-                                "shared expert weight view failed; skipping shared expert"
-                            );
-                            return vec![0.0f32; self.d_model];
-                        }
-                    };
+                let weights = ExpertWeights::from_floats(&self.weights, self.d_model, self.d_ff)
+                    .map_err(|err| SharedExpertError::Reconstruction {
+                        detail: err.to_string(),
+                    })?;
                 weights.forward(x)
             }
         };
@@ -2148,7 +2226,7 @@ impl SharedExpert {
                 *v *= scale;
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -2490,9 +2568,13 @@ impl TransformerLayer {
 
     /// Run the layer's optional shared expert over the MoE-normalised
     /// hidden state `normed` (the same input the routed experts consume).
-    /// Returns `None` when the layer has no shared expert (Mixtral), so
-    /// the caller can skip the residual add entirely.
-    pub fn shared_expert_forward(&self, normed: &[f32]) -> Option<HiddenState> {
+    /// Returns `Ok(None)` when the layer has no shared expert (Mixtral),
+    /// so the caller can skip the residual add entirely; a shared expert
+    /// that fails to execute is a typed error (hardening pass, A1).
+    pub fn shared_expert_forward(
+        &self,
+        normed: &[f32],
+    ) -> Result<Option<HiddenState>, SharedExpertError> {
         self.shared_expert_forward_with_timing(normed, None)
     }
 
@@ -2500,12 +2582,16 @@ impl TransformerLayer {
         &self,
         normed: &[f32],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Option<HiddenState> {
-        self.shared_expert.as_ref().map(|se| {
-            crate::stage_timing::time_optional(timings, crate::stage_timing::EXPERT_COMPUTE, || {
-                se.forward(normed)
-            })
-        })
+    ) -> Result<Option<HiddenState>, SharedExpertError> {
+        match self.shared_expert.as_ref() {
+            None => Ok(None),
+            Some(se) => crate::stage_timing::time_optional(
+                timings,
+                crate::stage_timing::EXPERT_COMPUTE,
+                || se.forward(normed),
+            )
+            .map(Some),
+        }
     }
 
     /// `true` if this layer is a **dense** FFN layer (Mistral Small 3,
@@ -2516,12 +2602,13 @@ impl TransformerLayer {
     }
 
     /// Run the resident dense SwiGLU FFN of a dense layer over `hidden`:
-    /// `hidden -> rms_moe -> dense_ffn -> + residual`. Returns `None` for
-    /// sparse (routed-MoE) layers so the caller falls back to the streamed
-    /// expert path. Dense layers never touch the engine's expert cache, so
-    /// they do not exercise SSD streaming (by design — they have no experts
-    /// to stream).
-    pub fn dense_forward(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+    /// `hidden -> rms_moe -> dense_ffn -> + residual`. Returns `Ok(None)`
+    /// for sparse (routed-MoE) layers so the caller falls back to the
+    /// streamed expert path; a dense FFN that fails to execute is a typed
+    /// error (hardening pass, A1). Dense layers never touch the engine's
+    /// expert cache, so they do not exercise SSD streaming (by design —
+    /// they have no experts to stream).
+    pub fn dense_forward(&self, hidden: &[f32]) -> Result<Option<Vec<f32>>, SharedExpertError> {
         self.dense_forward_with_timing(hidden, None)
     }
 
@@ -2529,8 +2616,10 @@ impl TransformerLayer {
         &self,
         hidden: &[f32],
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Option<Vec<f32>> {
-        let ffn = self.dense_ffn.as_ref()?;
+    ) -> Result<Option<Vec<f32>>, SharedExpertError> {
+        let Some(ffn) = self.dense_ffn.as_ref() else {
+            return Ok(None);
+        };
         let normed =
             crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
                 self.rms_moe.forward(hidden)
@@ -2539,8 +2628,8 @@ impl TransformerLayer {
             timings,
             crate::stage_timing::EXPERT_COMPUTE,
             || ffn.forward(&normed),
-        );
-        Some(add_residual(hidden, &out))
+        )?;
+        Ok(Some(add_residual(hidden, &out)))
     }
 }
 

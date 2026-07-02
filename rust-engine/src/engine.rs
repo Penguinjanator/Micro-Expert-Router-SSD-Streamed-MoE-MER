@@ -3821,6 +3821,17 @@ impl Engine {
         self.core.options.allow_degraded_experts
     }
 
+    /// Record one degraded-mode zero substitution of a required expert
+    /// contribution (routed, shared, or dense FFN). Only ever called
+    /// when `allow_degraded_experts` is active; the counter marks every
+    /// metric and benchmark figure of the run as non-authoritative.
+    pub fn record_degraded_expert_substitution(&self) {
+        self.metrics
+            .counters
+            .degraded_expert_substitutions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub async fn moe_step(
         self: &Arc<Self>,
         token_idx: u64,
