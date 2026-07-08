@@ -13,8 +13,9 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PROFILE_VERSION: u32 = 1;
-pub const DEFAULT_PROBE_TOKENS: u64 = 96;
-pub const SLOW_REGIME_P50_US: u64 = 80_000;
+pub const DEFAULT_PROBE_TOKENS: u64 = 256;
+pub const SLOW_REGIME_COMPUTE_US: u64 = 80_000;
+pub const SELECTION_RULE: &str = "prefer candidates with compute_p95_us below slow threshold; then lowest compute_p50_us; tie-break highest sustained_tps; ignore failed/invalid probes";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuAutotuneKey {
@@ -83,9 +84,7 @@ impl CpuAutotuneProfile {
             dtype: key.dtype.clone(),
             cache_slots: key.cache_slots,
             backend: key.backend.clone(),
-            selection_rule:
-                "lowest compute_p50_us; tie-break highest sustained_tps; ignore failed/invalid probes; prefer sub-80000us p50 when any candidate reaches it"
-                    .to_string(),
+            selection_rule: SELECTION_RULE.to_string(),
             created_at: format!("unix:{created_at_unix_secs}"),
             created_at_unix_secs,
         }
@@ -202,9 +201,9 @@ pub fn select_best_candidate(
     }
     if valid
         .iter()
-        .any(|r| r.compute_p50_us.unwrap_or(u64::MAX) < SLOW_REGIME_P50_US)
+        .any(|r| r.compute_p95_us.unwrap_or(u64::MAX) < SLOW_REGIME_COMPUTE_US)
     {
-        valid.retain(|r| r.compute_p50_us.unwrap_or(u64::MAX) < SLOW_REGIME_P50_US);
+        valid.retain(|r| r.compute_p95_us.unwrap_or(u64::MAX) < SLOW_REGIME_COMPUTE_US);
     }
     valid.into_iter().min_by(|a, b| {
         let p50_cmp = a.compute_p50_us.cmp(&b.compute_p50_us);
@@ -506,11 +505,15 @@ mod tests {
     use super::*;
 
     fn ok(candidate: usize, p50: u64, tps: f64) -> CpuAutotuneProbeResult {
+        ok_with_p95(candidate, p50, p50 + 1000, tps)
+    }
+
+    fn ok_with_p95(candidate: usize, p50: u64, p95: u64, tps: f64) -> CpuAutotuneProbeResult {
         CpuAutotuneProbeResult {
             candidate_threads: candidate,
             sustained_tps: Some(tps),
             compute_p50_us: Some(p50),
-            compute_p95_us: Some(p50 + 1000),
+            compute_p95_us: Some(p95),
             hit_rate_pct: Some(95.0),
             tokens: 64,
             cache_slots: 124,
@@ -534,7 +537,17 @@ mod tests {
     }
 
     #[test]
-    fn selection_prefers_lowest_p50_then_highest_tps() {
+    fn selection_prefers_stable_p95_over_slightly_lower_p50() {
+        let results = vec![
+            ok_with_p95(31, 55_711, 99_775, 12.0),
+            ok_with_p95(24, 56_063, 59_007, 11.0),
+        ];
+        let selected = select_best_candidate(&results).unwrap();
+        assert_eq!(selected.candidate_threads, 24);
+    }
+
+    #[test]
+    fn stable_selection_prefers_lowest_p50_then_highest_tps() {
         let results = vec![
             ok(28, 55_000, 12.0),
             ok(29, 54_000, 11.0),
@@ -545,21 +558,25 @@ mod tests {
     }
 
     #[test]
-    fn selection_ignores_failed_invalid_and_slow_when_fast_exists() {
-        let mut failed = ok(24, 40_000, 99.0);
+    fn selection_ignores_failed_invalid_candidates() {
+        let mut failed = ok_with_p95(24, 40_000, 41_000, 99.0);
         failed.success = false;
         let mut invalid = ok(26, 39_000, f64::NAN);
         invalid.sustained_tps = Some(f64::NAN);
-        let results = vec![failed, invalid, ok(32, 98_000, 20.0), ok(30, 56_000, 12.0)];
+        let results = vec![failed, invalid, ok(30, 56_000, 12.0)];
         let selected = select_best_candidate(&results).unwrap();
         assert_eq!(selected.candidate_threads, 30);
     }
 
     #[test]
-    fn selection_uses_slow_results_when_all_candidates_are_slow() {
-        let results = vec![ok(31, 99_000, 11.0), ok(32, 97_000, 10.0)];
+    fn selection_falls_back_to_p50_and_tps_when_all_candidates_have_slow_p95() {
+        let results = vec![
+            ok_with_p95(24, 56_063, 90_000, 15.0),
+            ok_with_p95(31, 55_711, 99_775, 9.0),
+            ok_with_p95(30, 55_711, 95_000, 11.0),
+        ];
         let selected = select_best_candidate(&results).unwrap();
-        assert_eq!(selected.candidate_threads, 32);
+        assert_eq!(selected.candidate_threads, 30);
     }
 
     #[test]
@@ -581,6 +598,7 @@ mod tests {
         assert!(loaded.matches_key(&key));
         assert_eq!(loaded.selected_rayon_threads, 30);
         assert_eq!(loaded.candidate_results.len(), 1);
+        assert_eq!(loaded.selection_rule, SELECTION_RULE);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(dir);
     }

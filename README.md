@@ -1453,7 +1453,7 @@ backend path you plan to benchmark:
   --cache-slots 124 \
   --tokens 10000 \
   --autotune-rayon \
-  --autotune-tokens 128
+  --autotune-tokens 256
 ```
 
 `--autotune-rayon` launches short child-process probes, one per candidate,
@@ -1466,9 +1466,13 @@ visible logical-core count. On a 32-vCPU host this includes at least
 
 Each child emits JSON with the candidate thread count, `sustained_tps`,
 `compute_p50_us`, `compute_p95_us`, hit rate, token count, cache slots,
-dtype, backend/quant path, and success/failure. The parent chooses the
-lowest `compute_p50_us`, breaking ties with higher `sustained_tps`, and
-ignores failed/invalid probes.
+dtype, backend/quant path, and success/failure. The parent avoids
+bimodal candidates by first preferring probes whose tail compute latency
+stays below the slow-regime threshold (`compute_p95_us < 80000`), then
+chooses the lowest `compute_p50_us` and breaks ties with higher
+`sustained_tps`. If every valid candidate has slow-tail p95, it falls
+back to the p50/tps rule rather than claiming the lowest-p50 candidate
+is always best. Failed or invalid probes are ignored.
 
 The selected profile is saved under:
 
@@ -1796,7 +1800,7 @@ micro-expert-router run
   --autotune-rayon           Probe candidate Rayon thread counts in child
                               processes, save the best profile, then run
                               the real benchmark with the selected pool size.
-  --autotune-tokens <N>      Tokens per child probe (default 96)
+  --autotune-tokens <N>      Tokens per child probe (default 256)
   --autotune-candidates <N,..>  Optional comma-separated candidate counts.
                               Defaults to a window around
                               default_compute_threads(logical), plus the
