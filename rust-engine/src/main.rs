@@ -130,8 +130,8 @@ mod batch_scheduler;
 mod block_pool;
 mod buffer_pool;
 mod config;
-mod dequant;
 mod dense_tensor;
+mod dequant;
 mod distributed;
 mod draft;
 mod engine;
@@ -159,6 +159,7 @@ mod packed_storage;
 mod parallel;
 mod prefetch_governor;
 mod pregate;
+mod rayon_autotune;
 mod residency;
 mod router;
 mod rpc;
@@ -341,6 +342,24 @@ enum Cmd {
         /// Number of tokens to simulate.
         #[arg(long, default_value_t = 200)]
         tokens: u64,
+        /// Run short child-process probes to select the best Rayon worker
+        /// count for this host/model/backend before the real benchmark.
+        #[arg(long)]
+        autotune_rayon: bool,
+        /// Number of tokens each child-process Rayon autotune probe runs.
+        #[arg(long, default_value_t = crate::rayon_autotune::DEFAULT_PROBE_TOKENS)]
+        autotune_tokens: u64,
+        /// Optional comma-separated candidate Rayon thread counts. When
+        /// omitted, MER derives a window around default_compute_threads()
+        /// and includes the full visible logical-core count.
+        #[arg(long, value_delimiter = ',')]
+        autotune_candidates: Vec<usize>,
+        /// Hidden child-probe mode used by `--autotune-rayon`.
+        #[arg(long, hide = true)]
+        rayon_autotune_probe: bool,
+        /// Candidate thread count reported by a hidden child probe.
+        #[arg(long, hide = true)]
+        rayon_autotune_candidate: Option<usize>,
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
@@ -850,6 +869,271 @@ fn init_logging(filter: &str) {
         .try_init();
 }
 
+#[derive(Clone, Debug)]
+struct RayonAutotuneStartupContext {
+    key: crate::rayon_autotune::CpuAutotuneKey,
+    cache_slots: usize,
+    dtype: String,
+}
+
+fn resolve_startup_rayon_threads(
+    cmd: &Cmd,
+    logical: usize,
+) -> Result<crate::parallel::RayonThreadSelection, Box<dyn std::error::Error>> {
+    if let Cmd::Run {
+        autotune_rayon: true,
+        rayon_autotune_probe: false,
+        autotune_tokens,
+        autotune_candidates,
+        ..
+    } = cmd
+    {
+        let ctx = rayon_autotune_context_for_cmd(cmd, logical).ok_or_else(|| {
+            "run --autotune-rayon could not build a model/backend fingerprint".to_string()
+        })?;
+        let candidates = sanitize_autotune_candidates(logical, autotune_candidates);
+        info!(
+            logical,
+            candidates = ?candidates,
+            probe_tokens = *autotune_tokens,
+            profile = %ctx.key.profile_path().display(),
+            "CPU/Rayon autotune: probing candidate thread counts in child processes"
+        );
+        let tuned = crate::rayon_autotune::run_cpu_autotune(
+            &ctx.key,
+            logical,
+            &candidates,
+            *autotune_tokens,
+            ctx.cache_slots,
+            &ctx.dtype,
+        )?;
+        info!(
+            selected_rayon_threads = tuned.profile.selected_rayon_threads,
+            profile = %tuned.profile_path.display(),
+            "CPU/Rayon autotune complete; saved selected profile"
+        );
+        return Ok(crate::parallel::RayonThreadSelection::fresh_autotune(
+            logical,
+            tuned.profile.selected_rayon_threads,
+            tuned.profile_path,
+        ));
+    }
+
+    let profile = if crate::parallel::env_thread_override().is_some()
+        || matches!(
+            cmd,
+            Cmd::Run {
+                rayon_autotune_probe: true,
+                ..
+            }
+        ) {
+        None
+    } else {
+        rayon_autotune_context_for_cmd(cmd, logical)
+            .and_then(|ctx| crate::rayon_autotune::load_matching_profile(&ctx.key))
+            .map(|(path, profile)| (profile.selected_rayon_threads, path))
+    };
+    Ok(crate::parallel::resolve_thread_selection(logical, profile))
+}
+
+fn sanitize_autotune_candidates(logical: usize, configured: &[usize]) -> Vec<usize> {
+    let mut candidates: Vec<usize> = if configured.is_empty() {
+        crate::rayon_autotune::candidate_thread_counts(logical)
+    } else {
+        configured.iter().copied().filter(|&n| n > 0).collect()
+    };
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.is_empty() {
+        crate::rayon_autotune::candidate_thread_counts(logical)
+    } else {
+        candidates
+    }
+}
+
+fn rayon_autotune_context_for_cmd(
+    cmd: &Cmd,
+    logical: usize,
+) -> Option<RayonAutotuneStartupContext> {
+    match cmd {
+        Cmd::Run {
+            data_dir,
+            num_experts,
+            expert_size,
+            d_model,
+            d_ff,
+            cache_slots,
+            top_k,
+            dtype,
+            gpu,
+            num_layers,
+            block_align,
+            packed_blob,
+            packed_manifest,
+            ..
+        } => Some(run_rayon_autotune_context(
+            logical,
+            data_dir,
+            *num_experts,
+            *expert_size,
+            *d_model,
+            *d_ff,
+            *cache_slots,
+            *top_k,
+            dtype,
+            *gpu,
+            *num_layers,
+            *block_align,
+            packed_blob.as_deref(),
+            packed_manifest.as_deref(),
+        )),
+        Cmd::Serve { config } => config_rayon_autotune_context(logical, config, "serve").ok(),
+        Cmd::BenchReal { config, .. } => {
+            config_rayon_autotune_context(logical, config, "bench-real").ok()
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rayon_autotune_context(
+    logical: usize,
+    data_dir: &Path,
+    num_experts: u32,
+    expert_size: usize,
+    d_model: usize,
+    d_ff: usize,
+    cache_slots: usize,
+    top_k: usize,
+    dtype: &str,
+    gpu: bool,
+    num_layers: u32,
+    block_align: usize,
+    packed_blob: Option<&Path>,
+    packed_manifest: Option<&Path>,
+) -> RayonAutotuneStartupContext {
+    let mut num_experts = num_experts;
+    let mut expert_size = expert_size;
+    let mut d_model = d_model;
+    let mut d_ff = d_ff;
+    let mut top_k = top_k;
+    let mut dtype = dtype.to_ascii_lowercase();
+    let mut block_align = block_align;
+
+    if let Ok(body) = std::fs::read_to_string(data_dir.join("metadata.json")) {
+        if num_experts == cli_defaults::NUM_EXPERTS {
+            if let Some(v) = parse_json_number(&body, "num_experts") {
+                num_experts = v as u32;
+            }
+        }
+        if d_model == cli_defaults::D_MODEL {
+            if let Some(v) = parse_json_number(&body, "d_model") {
+                d_model = v as usize;
+            }
+        }
+        if d_ff == cli_defaults::D_FF {
+            if let Some(v) = parse_json_number(&body, "d_ff") {
+                d_ff = v as usize;
+            }
+        }
+        if top_k == cli_defaults::TOP_K {
+            if let Some(v) = parse_json_number(&body, "top_k") {
+                top_k = v as usize;
+            }
+        }
+        if expert_size == cli_defaults::EXPERT_SIZE {
+            if let Some(v) = parse_json_number(&body, "expert_size") {
+                expert_size = v as usize;
+            }
+        }
+        if block_align == cli_defaults::BLOCK_ALIGN {
+            if let Some(v) = parse_json_number(&body, "block_align") {
+                block_align = v as usize;
+            }
+        }
+        if dtype == "f32" {
+            if let Some(v) = parse_json_string(&body, "dtype") {
+                dtype = v.to_ascii_lowercase();
+            }
+        }
+    }
+
+    let data_dir_fingerprint = crate::rayon_autotune::make_data_dir_fingerprint(data_dir);
+    let model_fingerprint = crate::rayon_autotune::make_model_fingerprint(
+        data_dir,
+        num_experts,
+        top_k,
+        d_model,
+        d_ff,
+        expert_size,
+        num_layers,
+        &dtype,
+        packed_blob,
+        packed_manifest,
+    );
+    let backend = format!(
+        "run:compute_plane={}:dense_matvec={}:expert_policy=auto:qmm=on:block_align={}",
+        if gpu { "gpu" } else { "cpu" },
+        crate::parallel::default_dense_matvec_backend(),
+        block_align
+    );
+    RayonAutotuneStartupContext {
+        key: crate::rayon_autotune::CpuAutotuneKey {
+            machine_fingerprint: crate::rayon_autotune::make_machine_fingerprint(logical),
+            model_fingerprint,
+            data_dir_fingerprint,
+            dtype: dtype.clone(),
+            cache_slots,
+            backend,
+        },
+        cache_slots,
+        dtype,
+    }
+}
+
+fn config_rayon_autotune_context(
+    logical: usize,
+    config: &Path,
+    command: &str,
+) -> Result<RayonAutotuneStartupContext, crate::config::ConfigError> {
+    let cfg = crate::config::Config::from_file(config)?;
+    let dtype = cfg.model.dtype.as_str().to_string();
+    let data_dir_fingerprint =
+        crate::rayon_autotune::make_data_dir_fingerprint(&cfg.model.data_dir);
+    let model_fingerprint = crate::rayon_autotune::make_model_fingerprint(
+        &cfg.model.data_dir,
+        cfg.model.num_experts,
+        cfg.model.top_k,
+        cfg.model.d_model,
+        cfg.model.d_ff,
+        cfg.model.expert_size,
+        cfg.model.num_layers as u32,
+        &dtype,
+        cfg.storage.packed_blob.as_deref(),
+        cfg.storage.packed_manifest.as_deref(),
+    );
+    let backend = format!(
+        "{}:compute_offload={:?}:dense_matvec={}:expert_policy={:?}:real_transformer={}",
+        command,
+        cfg.real_transformer.compute_offload,
+        cfg.real_transformer.dense_matvec_backend,
+        cfg.real_transformer.expert_execution_policy,
+        cfg.real_transformer.enabled
+    );
+    Ok(RayonAutotuneStartupContext {
+        key: crate::rayon_autotune::CpuAutotuneKey {
+            machine_fingerprint: crate::rayon_autotune::make_machine_fingerprint(logical),
+            model_fingerprint,
+            data_dir_fingerprint,
+            dtype: dtype.clone(),
+            cache_slots: cfg.storage.cache_slots,
+            backend,
+        },
+        cache_slots: cfg.storage.cache_slots,
+        dtype,
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     init_logging(&cli.log);
@@ -872,8 +1156,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it. By default it spans the host's logical cores *minus a small
     // reservation* (`parallel::default_compute_threads`) so a saturated
     // compute fan-out can't starve the async runtime under continuous
-    // batching; an explicit `RAYON_NUM_THREADS` overrides the default.
-    crate::parallel::init_global_pool();
+    // batching; an explicit `RAYON_NUM_THREADS` overrides saved autotune
+    // profiles. `run --autotune-rayon` is the dedicated force-refresh path:
+    // it probes candidates in child processes first, then builds this
+    // process's global pool exactly once with the selected result.
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let rayon_selection = resolve_startup_rayon_threads(&cli.cmd, logical)?;
+    crate::parallel::init_global_pool_with_selection(rayon_selection);
 
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
@@ -978,6 +1269,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_slots,
                     top_k,
                     tokens,
+                    autotune_rayon: _,
+                    autotune_tokens: _,
+                    autotune_candidates: _,
+                    rayon_autotune_probe,
+                    rayon_autotune_candidate,
                     predict_fanout,
                     predict_min_prob,
                     no_direct,
@@ -1035,68 +1331,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "--dtype: unknown value {dtype:?} (supported: {SUPPORTED_RUNTIME_DTYPES})"
                             )
                         })?;
-                    cmd_run(
-                        RunArgs {
-                            data_dir,
-                            num_experts,
-                            expert_size,
-                            d_model,
-                            d_ff,
-                            cache_slots,
-                            top_k,
-                            tokens,
-                            predict_fanout,
-                            predict_min_prob,
-                            no_direct,
-                            block_align,
-                            seed,
-                            dtype,
-                            partial_load_fraction,
-                            pin_after_observations,
-                            alias_map_path: alias_map,
-                            io_uring,
-                            token_pause_us,
-                            first_token,
-                            no_prefetch,
-                            io_only,
-                            force_ssd,
-                            router_clusters,
-                            router_intra_p,
-                            router_matrix,
-                            gate_weights,
-                            trace_out,
-                            gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
-                            pipeline_depth,
-                            speculator,
-                            speculator_hidden_dim,
-                            speculator_top_k,
-                            locality,
-                            locality_window,
-                            locality_threshold_pct,
-                            affinity,
-                            affinity_neighbors_k,
-                            affinity_decay_epoch,
-                            prefetch_governor,
-                            prefetch_precision_floor,
-                            prefetch_contention_weight,
-                            cost_aware_eviction,
-                            pregate,
-                            static_residency_fraction,
-                            static_residency_warmup_tokens,
-                            static_residency_profile,
-                            profile_out,
-                            workload,
-                            zipf_s,
-                            workload_correlation,
-                            replay_trace,
-                            num_layers,
-                            num_experts_per_layer,
-                            packed_blob,
-                            packed_manifest,
-                        },
-                        startup_pinned,
-                    )
-                    .await
+                    let run_args = RunArgs {
+                        data_dir,
+                        num_experts,
+                        expert_size,
+                        d_model,
+                        d_ff,
+                        cache_slots,
+                        top_k,
+                        tokens,
+                        rayon_autotune_probe,
+                        rayon_autotune_candidate,
+                        predict_fanout,
+                        predict_min_prob,
+                        no_direct,
+                        block_align,
+                        seed,
+                        dtype,
+                        partial_load_fraction,
+                        pin_after_observations,
+                        alias_map_path: alias_map,
+                        io_uring,
+                        token_pause_us,
+                        first_token,
+                        no_prefetch,
+                        io_only,
+                        force_ssd,
+                        router_clusters,
+                        router_intra_p,
+                        router_matrix,
+                        gate_weights,
+                        trace_out,
+                        gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
+                        pipeline_depth,
+                        speculator,
+                        speculator_hidden_dim,
+                        speculator_top_k,
+                        locality,
+                        locality_window,
+                        locality_threshold_pct,
+                        affinity,
+                        affinity_neighbors_k,
+                        affinity_decay_epoch,
+                        prefetch_governor,
+                        prefetch_precision_floor,
+                        prefetch_contention_weight,
+                        cost_aware_eviction,
+                        pregate,
+                        static_residency_fraction,
+                        static_residency_warmup_tokens,
+                        static_residency_profile,
+                        profile_out,
+                        workload,
+                        zipf_s,
+                        workload_correlation,
+                        replay_trace,
+                        num_layers,
+                        num_experts_per_layer,
+                        packed_blob,
+                        packed_manifest,
+                    };
+                    let probe_mode = run_args.rayon_autotune_probe;
+                    let failure_candidate = run_args
+                        .rayon_autotune_candidate
+                        .or_else(crate::parallel::env_thread_override)
+                        .unwrap_or(0);
+                    let failure_tokens = run_args.tokens;
+                    let failure_cache_slots = run_args.cache_slots;
+                    let failure_dtype = run_args.dtype.as_str().to_string();
+                    let result = cmd_run(run_args, startup_pinned).await;
+                    if probe_mode {
+                        if let Err(e) = result {
+                            let failure = crate::rayon_autotune::CpuAutotuneProbeResult::failure(
+                                failure_candidate,
+                                failure_tokens,
+                                failure_cache_slots,
+                                failure_dtype,
+                                e.to_string(),
+                            );
+                            println!("{}", serde_json::to_string(&failure)?);
+                        }
+                        Ok(())
+                    } else {
+                        result
+                    }
                 } else {
                     unreachable!()
                 }
@@ -4543,6 +4861,8 @@ struct RunArgs {
     cache_slots: usize,
     top_k: usize,
     tokens: u64,
+    rayon_autotune_probe: bool,
+    rayon_autotune_candidate: Option<usize>,
     predict_fanout: usize,
     predict_min_prob: f64,
     no_direct: bool,
@@ -5297,9 +5617,13 @@ async fn cmd_run(
         hit_rate_pct = (r.hits as f64 / total_lookups as f64) * 100.0,
         "stream complete"
     );
-    engine.print_summary();
+    if args.rayon_autotune_probe {
+        emit_rayon_autotune_probe_result(&args, &r, wall)?;
+    } else {
+        engine.print_summary();
+    }
 
-    if r.misses > 0 && r.io_p50_us == 0 {
+    if !args.rayon_autotune_probe && r.misses > 0 && r.io_p50_us == 0 {
         warn!(
             "I/O latency histogram is empty despite cache misses; check that \
              tracing is enabled and runs are long enough to produce samples."
@@ -5321,6 +5645,54 @@ async fn cmd_run(
     }
 
     Ok(())
+}
+
+fn emit_rayon_autotune_probe_result(
+    args: &RunArgs,
+    report: &crate::engine::EngineReport,
+    wall: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_lookups = (report.hits + report.misses).max(1);
+    let backend = crate::backend::current();
+    let result = crate::rayon_autotune::CpuAutotuneProbeResult {
+        candidate_threads: args
+            .rayon_autotune_candidate
+            .or_else(crate::parallel::env_thread_override)
+            .unwrap_or_else(crate::parallel::num_threads),
+        sustained_tps: Some(args.tokens as f64 / wall.as_secs_f64()),
+        compute_p50_us: Some(report.compute_p50_us),
+        compute_p95_us: Some(report.compute_p95_us),
+        hit_rate_pct: Some((report.hits as f64 / total_lookups as f64) * 100.0),
+        tokens: args.tokens,
+        cache_slots: args.cache_slots,
+        dtype: args.dtype.as_str().to_string(),
+        backend: Some(format!(
+            "{}:{}",
+            backend.compute_plane(),
+            backend.device_name()
+        )),
+        quant_path: Some(quant_path_label(args.dtype).to_string()),
+        success: true,
+        error: None,
+    };
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+fn quant_path_label(dtype: crate::inference::WeightDtype) -> &'static str {
+    match dtype {
+        crate::inference::WeightDtype::Q4_0 => "qmatmul-q4_0",
+        crate::inference::WeightDtype::Q4K => "qmatmul-q4k",
+        crate::inference::WeightDtype::Q8_0 => "qmatmul-q8_0",
+        crate::inference::WeightDtype::Mixed => "mixed-direct-dispatch",
+        crate::inference::WeightDtype::F32 => "f32-candle",
+        crate::inference::WeightDtype::F16 => "f16-dequant-candle",
+        crate::inference::WeightDtype::BF16 => "bf16-dequant-candle",
+        crate::inference::WeightDtype::Int8 => "int8-dequant-candle",
+        crate::inference::WeightDtype::Q5K => "q5k-direct-or-dequant",
+        crate::inference::WeightDtype::Q6K => "q6k-direct-or-dequant",
+        crate::inference::WeightDtype::MXFP4 => "mxfp4-dequant-candle",
+    }
 }
 
 /// Per-CLI defaults. We compare an `args` value to its default to detect

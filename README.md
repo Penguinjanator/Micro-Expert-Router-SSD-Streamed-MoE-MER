@@ -159,6 +159,7 @@ The previous June 25 results remain available as a
     - [Predictive architecture (`[predictive]`)](#predictive-architecture-predictive)
     - [Real-transformer pipeline](#real-transformer-pipeline)
     - [Hardware auto-escalation](#hardware-auto-escalation)
+    - [CPU/Rayon autotune](#cpurayon-autotune)
     - [Decoupled math backend](#decoupled-math-backend)
     - [Speculative engine warm-up](#speculative-engine-warm-up)
     - [Distributed expert sharding](#distributed-expert-sharding)
@@ -379,13 +380,15 @@ when the GPU cache is enabled:
   joins OS threads per call, and — critically — every concurrent
   request under continuous batching shares **one bounded pool** instead
   of each fanning out to `cores` fresh threads and oversubscribing the
-  box. The pool is **sized once at startup to the host's logical cores
-  minus a small reservation** (0 on <=4-core hosts, 1 on 5-8, 2 on 9-31,
-  and `n/16` on 32+; see
+  box. The pool is **sized once at startup**. A matching CPU/Rayon
+  autotune profile is used first when present; otherwise MER falls back
+  to the host's logical cores minus a small reservation (0 on <=4-core
+  hosts, 1 on 5-8, 2 on 9-31, and `n/16` on 32+; see
   [`parallel::default_compute_threads`](rust-engine/src/parallel.rs)) so a
   saturated fan-out can never starve the async runtime — the tokio workers
   driving the scheduler, the gRPC server, and io_uring SSD streaming. Set
-  `RAYON_NUM_THREADS` to override the default on a per-deployment basis.
+  `RAYON_NUM_THREADS` to override both autotune profiles and the default
+  on a per-deployment basis.
   **No cargo feature is required.** The historic `--features simd`
   flag is retained as a deprecated no-op so existing build scripts keep
   working.
@@ -1411,8 +1414,9 @@ without recompilation:
    amortise the fork-join. The pool is created once and reused, so the
    per-token hot path never spawns OS threads per call and concurrent
    requests share one bounded pool instead of oversubscribing the
-   machine. It is sized at startup to the host's logical cores minus a
-   small async-runtime reservation (`RAYON_NUM_THREADS` overrides).
+   machine. It is sized at startup from a matching CPU/Rayon autotune
+   profile when one exists, otherwise to the host's logical cores minus a
+   small async-runtime reservation (`RAYON_NUM_THREADS` overrides both).
    **Replaces the old `--features simd` build-time flag**;
    that feature is now a no-op kept for backwards compatibility.
 3. **Scalar fallback**, single-threaded fused loop, the validation
@@ -1429,6 +1433,63 @@ on. The selected backend is logged once at startup:
 ```
 INFO auto-escalation selected math kernel backend backend=avx2 vendor=GenuineIntel ... avx2=true avx512=true amx_int8=true sapphire_rapids=true
 ```
+
+#### CPU/Rayon autotune
+
+Using every visible vCPU is not always the fastest CPU setting. The Rayon
+pool competes with tokio scheduler workers, SSD completion handling, cache
+traffic, and quantized kernel placement. The fixed
+`default_compute_threads(logical)` fallback keeps async headroom, but VM
+tests showed that a fixed heuristic can still land in a slow regime on a
+new host.
+
+Run the autotuner on the same host, data directory, dtype, cache size, and
+backend path you plan to benchmark:
+
+```bash
+./target/release/micro-expert-router run \
+  --data-dir ./data \
+  --dtype q4_0 \
+  --cache-slots 124 \
+  --tokens 10000 \
+  --autotune-rayon \
+  --autotune-tokens 128
+```
+
+`--autotune-rayon` launches short child-process probes, one per candidate,
+with `RAYON_NUM_THREADS=<candidate>`. The parent process does not build
+Rayon's global pool during probing; after it selects the winner, it builds
+the pool exactly once for the real run. By default the candidate set is a
+window around `parallel::default_compute_threads(logical)` plus the full
+visible logical-core count. On a 32-vCPU host this includes at least
+`24, 26, 27, 28, 29, 30, 31, 32`.
+
+Each child emits JSON with the candidate thread count, `sustained_tps`,
+`compute_p50_us`, `compute_p95_us`, hit rate, token count, cache slots,
+dtype, backend/quant path, and success/failure. The parent chooses the
+lowest `compute_p50_us`, breaking ties with higher `sustained_tps`, and
+ignores failed/invalid probes.
+
+The selected profile is saved under:
+
+```text
+~/.cache/mer/autotune/<machine-and-model-fingerprint>.json
+```
+
+If `XDG_CACHE_HOME` is set, MER uses
+`$XDG_CACHE_HOME/mer/autotune/` instead. Normal `run`, `serve`, and
+`bench-real` startups use a matching saved profile automatically. An
+explicit `RAYON_NUM_THREADS` still wins over a saved profile. Re-run
+`run --autotune-rayon` to force a fresh measurement and replace the saved
+profile for that host/model/backend fingerprint.
+
+The strongest fast/slow evidence so far came from Mixtral 8x7B Q4_0
+expert-streaming runs using the QMatMul path. Do not read any selected
+thread count, including 30, as universal. Qwen-MoE, OLMoE, Q8_0, mixed
+projection dtypes, dense matvec backend choices, and other quant kernels
+should be benchmarked independently because the best count can vary with
+host shape, model shape, dtype, quant kernel, cache size, and runtime
+placement.
 
 ```bash
 cargo build --release                # default, auto-escalation only
@@ -1732,6 +1793,14 @@ micro-expert-router run
                               runs tested 16, 64, and 128 slots.
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
+  --autotune-rayon           Probe candidate Rayon thread counts in child
+                              processes, save the best profile, then run
+                              the real benchmark with the selected pool size.
+  --autotune-tokens <N>      Tokens per child probe (default 96)
+  --autotune-candidates <N,..>  Optional comma-separated candidate counts.
+                              Defaults to a window around
+                              default_compute_threads(logical), plus the
+                              full visible logical-core count.
   --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q5k
                               | q6k | q8_0 | mxfp4 | mixed (default f32).
                               Must match gen-data / gguf-convert / the
