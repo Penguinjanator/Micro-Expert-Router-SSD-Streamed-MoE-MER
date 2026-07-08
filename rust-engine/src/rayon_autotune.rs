@@ -79,6 +79,7 @@ fn detected_cpu_features() -> Vec<&'static str> {
     if std::is_x86_feature_detected!("fma") {
         features.push("fma");
     }
+    #[cfg(feature = "nightly-amx")]
     if std::is_x86_feature_detected!("amx-tile") {
         features.push("amx-tile");
     }
