@@ -402,11 +402,13 @@ pub fn default_profile_dir() -> PathBuf {
 
 pub fn make_machine_fingerprint(logical: usize) -> String {
     let cpu = cpu_model().unwrap_or_else(|| "unknown-cpu".to_string());
+    let affinity = crate::numa::current_affinity_cpulist().unwrap_or_else(|| "unknown".into());
     format!(
-        "{}-{}-logical{}-{}",
+        "{}-{}-logical{}-affinity{}-{}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         logical.max(1),
+        affinity,
         cpu
     )
 }

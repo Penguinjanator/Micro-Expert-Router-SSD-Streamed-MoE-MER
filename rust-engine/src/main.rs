@@ -176,6 +176,7 @@ mod workload;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -204,8 +205,32 @@ struct Cli {
     #[arg(long, global = true, default_value = "info", env = "RUST_LOG")]
     log: String,
 
+    /// Linux cpulist CPU mask applied before Tokio and Rayon start
+    /// (for example, `--cpu-mask 0-24`). Overrides
+    /// `[performance].cpu_mask` and legacy `MER_PIN_CORES`.
+    #[arg(long, global = true, value_parser = parse_cpu_mask_arg)]
+    cpu_mask: Option<String>,
+
+    /// Fail closed if benchmark token progress stalls for this many
+    /// seconds. `0` disables. Overrides
+    /// `[performance].progress_timeout_secs`.
+    #[arg(long, global = true)]
+    progress_timeout_secs: Option<u64>,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+fn parse_cpu_mask_arg(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("CPU mask must not be empty".to_string());
+    }
+    let cpus = crate::numa::parse_cpulist(trimmed)?;
+    if cpus.is_empty() {
+        return Err("CPU mask must name at least one CPU".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -876,6 +901,95 @@ struct RayonAutotuneStartupContext {
     dtype: String,
 }
 
+#[derive(Clone, Debug)]
+struct StartupDiagnostics {
+    requested_cpu_mask: Option<String>,
+    effective_cpu_mask: Option<String>,
+    pin_result: crate::numa::PinResult,
+    logical_cores: usize,
+    rayon_threads: usize,
+    rayon_source: &'static str,
+}
+
+impl StartupDiagnostics {
+    fn startup_pinned(&self) -> bool {
+        matches!(self.pin_result, crate::numa::PinResult::Pinned { .. })
+    }
+
+    fn progress_cpu_mask(&self) -> &str {
+        self.effective_cpu_mask
+            .as_deref()
+            .or(self.requested_cpu_mask.as_deref())
+            .unwrap_or("unknown")
+    }
+}
+
+fn performance_config_for_cmd(
+    cmd: &Cmd,
+) -> Result<Option<crate::config::PerformanceConfig>, Box<dyn std::error::Error>> {
+    match cmd {
+        Cmd::Serve { config } | Cmd::BenchReal { config, .. } => {
+            Ok(Some(crate::config::Config::from_file(config)?.performance))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn requested_cpu_mask(
+    cli: &Cli,
+    performance: Option<&crate::config::PerformanceConfig>,
+) -> Option<String> {
+    cli.cpu_mask
+        .clone()
+        .or_else(|| performance.and_then(|p| p.cpu_mask.clone()))
+        .or_else(|| {
+            std::env::var(crate::numa::MER_PIN_CORES_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("{}={}", crate::numa::MER_PIN_CORES_ENV, s.trim()))
+        })
+}
+
+fn explicit_cpu_mask<'a>(
+    cli: &'a Cli,
+    performance: Option<&'a crate::config::PerformanceConfig>,
+) -> Option<&'a str> {
+    cli.cpu_mask
+        .as_deref()
+        .or_else(|| performance.and_then(|p| p.cpu_mask.as_deref()))
+}
+
+fn progress_timeout_secs(
+    cli: &Cli,
+    performance: Option<&crate::config::PerformanceConfig>,
+) -> Option<u64> {
+    cli.progress_timeout_secs
+        .or_else(|| performance.and_then(|p| p.normalized_progress_timeout_secs()))
+        .filter(|&secs| secs > 0)
+}
+
+fn rayon_source_label(source: &crate::parallel::RayonThreadSource) -> &'static str {
+    match source {
+        crate::parallel::RayonThreadSource::EnvOverride => "env",
+        crate::parallel::RayonThreadSource::AutotuneProfile { .. } => "profile",
+        crate::parallel::RayonThreadSource::FreshAutotune { .. } => "autotune",
+        crate::parallel::RayonThreadSource::DefaultHeuristic => "default",
+    }
+}
+
+fn log_startup_placement(diagnostics: &StartupDiagnostics) {
+    info!(
+        requested_cpu_mask = diagnostics.requested_cpu_mask.as_deref().unwrap_or("none"),
+        effective_cpu_mask = diagnostics.effective_cpu_mask.as_deref().unwrap_or("unknown"),
+        logical_cores = diagnostics.logical_cores,
+        rayon_threads = diagnostics.rayon_threads,
+        rayon_source = diagnostics.rayon_source,
+        pinning_succeeded = diagnostics.startup_pinned(),
+        pinning_status = %diagnostics.pin_result.as_log_line(),
+        "startup CPU placement"
+    );
+}
+
 fn resolve_startup_rayon_threads(
     cmd: &Cmd,
     logical: usize,
@@ -1137,13 +1251,15 @@ fn config_rayon_autotune_context(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     init_logging(&cli.log);
+    let performance = performance_config_for_cmd(&cli.cmd)?;
+    let requested_cpu_mask = requested_cpu_mask(&cli, performance.as_ref());
+    let progress_timeout_secs = progress_timeout_secs(&cli, performance.as_ref());
 
-    // Best-effort NUMA pinning: honoured before any tokio runtime or
+    // Best-effort CPU placement: honoured before any tokio runtime or
     // background thread spawns so child threads inherit the affinity
-    // mask. See `numa::apply_mer_pin_cores_env` for the contract.
-    let pin = crate::numa::apply_mer_pin_cores_env();
-    let startup_pinned = matches!(pin, crate::numa::PinResult::Pinned { .. });
-    info!("{}", pin.as_log_line());
+    // mask. Explicit `--cpu-mask` / `[performance].cpu_mask` wins over
+    // legacy `MER_PIN_CORES`.
+    let pin = crate::numa::apply_startup_cpu_mask(explicit_cpu_mask(&cli, performance.as_ref()));
 
     // `MER_PIN_CORES` is now consumed centrally at process start via the
     // `numa` module. Clear it so any legacy later parsing in subcommands
@@ -1164,7 +1280,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| n.get())
         .unwrap_or(1);
     let rayon_selection = resolve_startup_rayon_threads(&cli.cmd, logical)?;
-    crate::parallel::init_global_pool_with_selection(rayon_selection);
+    let rayon_source = rayon_source_label(&rayon_selection.source);
+    let rayon_threads = crate::parallel::init_global_pool_with_selection(rayon_selection);
+    let startup = StartupDiagnostics {
+        requested_cpu_mask,
+        effective_cpu_mask: crate::numa::current_affinity_cpulist(),
+        pin_result: pin,
+        logical_cores: logical,
+        rayon_threads,
+        rayon_source,
+    };
+    log_startup_placement(&startup);
 
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
@@ -1399,7 +1525,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let failure_tokens = run_args.tokens;
                     let failure_cache_slots = run_args.cache_slots;
                     let failure_dtype = run_args.dtype.as_str().to_string();
-                    let result = cmd_run(run_args, startup_pinned).await;
+                    let result =
+                        cmd_run(run_args, startup.clone(), progress_timeout_secs).await;
                     if probe_mode {
                         if let Err(e) = result {
                             let failure = crate::rayon_autotune::CpuAutotuneProbeResult::failure(
@@ -1450,6 +1577,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_reset,
                 greedy,
                 format,
+                progress_timeout_secs,
+                startup: startup.clone(),
             }))
         }
         Cmd::MatvecMicrobench {
@@ -1645,6 +1774,8 @@ struct BenchRealArgs {
     cache_reset: BenchRealCacheReset,
     greedy: bool,
     format: BenchRealOutputFormat,
+    progress_timeout_secs: Option<u64>,
+    startup: StartupDiagnostics,
 }
 
 struct MatvecMicrobenchArgs {
@@ -1842,15 +1973,31 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         let runtime = build_bench_real_runtime(&args.config).await?;
         let params = bench_sampling_params(&runtime.cfg, args.greedy);
         for i in 0..args.warmup_runs {
-            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                .await?;
+            let _ = run_bench_real_once(
+                &runtime,
+                &input.prompt,
+                input.output_tokens,
+                params,
+                i,
+                args.progress_timeout_secs,
+                &args.startup,
+            )
+            .await?;
         }
         let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             runs.push(
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                    .await?,
+                run_bench_real_once(
+                    &runtime,
+                    &input.prompt,
+                    input.output_tokens,
+                    params,
+                    i,
+                    args.progress_timeout_secs,
+                    &args.startup,
+                )
+                .await?,
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
@@ -1859,8 +2006,16 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         for i in 0..args.warmup_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
-            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                .await?;
+            let _ = run_bench_real_once(
+                &runtime,
+                &input.prompt,
+                input.output_tokens,
+                params,
+                i,
+                args.progress_timeout_secs,
+                &args.startup,
+            )
+            .await?;
         }
         let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
@@ -1868,8 +2023,16 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let runtime = build_bench_real_runtime(&args.config).await?;
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
             runs.push(
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                    .await?,
+                run_bench_real_once(
+                    &runtime,
+                    &input.prompt,
+                    input.output_tokens,
+                    params,
+                    i,
+                    args.progress_timeout_secs,
+                    &args.startup,
+                )
+                .await?,
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
@@ -3156,6 +3319,8 @@ async fn run_bench_real_once(
     output_tokens: usize,
     params: crate::sampling::SamplingParams,
     run_index: usize,
+    progress_timeout_secs: Option<u64>,
+    startup: &StartupDiagnostics,
 ) -> Result<BenchRealRunReport, Box<dyn std::error::Error>> {
     let prompt_ids = runtime.tokenizer.encode(prompt)?;
     if prompt_ids.is_empty() {
@@ -3173,16 +3338,24 @@ async fn run_bench_real_once(
     let mut decode_latencies_us = Vec::with_capacity(output_tokens.saturating_sub(1));
 
     for &tid in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-        runtime
-            .model
-            .forward_token_hidden_with_timing(
-                &runtime.engine,
-                tid,
-                pos,
-                &mut kv,
-                Some(&stage_timings),
-            )
-            .await?;
+        let future = runtime.model.forward_token_hidden_with_timing(
+            &runtime.engine,
+            tid,
+            pos,
+            &mut kv,
+            Some(&stage_timings),
+        );
+        await_with_progress_watchdog(
+            future,
+            progress_timeout_secs,
+            "bench-real:prompt",
+            pos as u64,
+            pos.checked_sub(1).map(|v| v as u64),
+            &runtime.engine,
+            None,
+            startup,
+        )
+        .await?;
         forward_evaluations += 1;
         pos += 1;
     }
@@ -3190,16 +3363,23 @@ async fn run_bench_real_once(
     let final_prompt = *prompt_ids.last().expect("prompt_ids checked non-empty");
     let final_prompt_pos = pos;
     let first_started = Instant::now();
-    let final_hidden = runtime
-        .model
-        .forward_token_hidden_with_timing(
+    let final_hidden = await_with_progress_watchdog(
+        runtime.model.forward_token_hidden_with_timing(
             &runtime.engine,
             final_prompt,
             final_prompt_pos,
             &mut kv,
             Some(&stage_timings),
-        )
-        .await?;
+        ),
+        progress_timeout_secs,
+        "bench-real:prompt-final",
+        final_prompt_pos as u64,
+        final_prompt_pos.checked_sub(1).map(|v| v as u64),
+        &runtime.engine,
+        None,
+        startup,
+    )
+    .await?;
     forward_evaluations += 1;
     pos += 1;
     let prompt_elapsed = prompt_started.elapsed();
@@ -3220,17 +3400,25 @@ async fn run_bench_real_once(
     let mut last = first;
     while completion_ids.len() < output_tokens {
         let step_started = Instant::now();
-        let next = runtime
-            .model
-            .decode_step_with_timing(
+        let current_completion_index = completion_ids.len() as u64;
+        let next = await_with_progress_watchdog(
+            runtime.model.decode_step_with_timing(
                 &runtime.engine,
                 last,
                 pos,
                 &mut kv,
                 &params,
                 Some(&stage_timings),
-            )
-            .await?;
+            ),
+            progress_timeout_secs,
+            "bench-real:decode",
+            current_completion_index,
+            current_completion_index.checked_sub(1),
+            &runtime.engine,
+            None,
+            startup,
+        )
+        .await?;
         forward_evaluations += 1;
         lm_head_evaluations += 1;
         decode_latencies_us.push(step_started.elapsed().as_micros() as u64);
@@ -4913,9 +5101,99 @@ struct RunArgs {
     packed_manifest: Option<PathBuf>,
 }
 
+async fn await_with_progress_watchdog<T, E, F>(
+    future: F,
+    timeout_secs: Option<u64>,
+    stage: &'static str,
+    current_token_index: u64,
+    last_completed_token_index: Option<u64>,
+    engine: &Engine,
+    cache: Option<&MultiLayerExpertCache>,
+    startup: &StartupDiagnostics,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Into<Box<dyn std::error::Error>>,
+{
+    let Some(timeout_secs) = timeout_secs.filter(|&secs| secs > 0) else {
+        return future.await.map_err(Into::into);
+    };
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), future).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => {
+            log_progress_watchdog_timeout(
+                timeout_secs,
+                stage,
+                current_token_index,
+                last_completed_token_index,
+                engine,
+                cache,
+                startup,
+            );
+            Err(format!(
+                "progress watchdog: no token progress for {timeout_secs}s \
+                 at stage {stage} (current_token_index={current_token_index}, \
+                 last_completed_token_index={})",
+                last_completed_token_index
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            )
+            .into())
+        }
+    }
+}
+
+fn log_progress_watchdog_timeout(
+    timeout_secs: u64,
+    stage: &'static str,
+    current_token_index: u64,
+    last_completed_token_index: Option<u64>,
+    engine: &Engine,
+    cache: Option<&MultiLayerExpertCache>,
+    startup: &StartupDiagnostics,
+) {
+    let report = engine.report();
+    let resident_ids = cache.map(|c| c.resident_ids()).unwrap_or_default();
+    warn!(
+        progress_timeout_secs = timeout_secs,
+        stage,
+        current_token_index,
+        last_completed_token_index = last_completed_token_index
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        cache_hits = report.hits,
+        cache_misses = report.misses,
+        cache_capacity = report.cache_capacity,
+        pool_capacity = report.pool_capacity,
+        resident = ?resident_ids,
+        prefetch_completed = report.prefetch_completed,
+        prefetch_used = report.prefetch_used,
+        prefetch_dropped_concurrency = report.prefetch_dropped_concurrency,
+        prefetch_dropped_pool_starved = report.prefetch_dropped_pool_starved,
+        prefetch_dropped_governor = report.prefetch_dropped_governor,
+        governor_admitted = report.governor_admitted,
+        governor_throttled = report.governor_throttled,
+        singleflight_followers = report.singleflight_followers,
+        bytes_read = report.bytes_read,
+        io_count = report.io_count,
+        io_p50_us = report.io_p50_us,
+        io_p95_us = report.io_p95_us,
+        compute_p50_us = report.compute_p50_us,
+        compute_p95_us = report.compute_p95_us,
+        avg_compute_us = report.avg_compute_us,
+        pct_time_io = report.pct_time_io,
+        engine_tokens_processed = report.tokens_processed,
+        rayon_threads = startup.rayon_threads,
+        rayon_source = startup.rayon_source,
+        cpu_mask = startup.progress_cpu_mask(),
+        "progress watchdog timeout: token generation appears stalled"
+    );
+}
+
 async fn cmd_run(
     mut args: RunArgs,
-    startup_pinned: bool,
+    startup: StartupDiagnostics,
+    progress_timeout_secs: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 0) If `metadata.json` exists alongside the expert blobs (e.g. as
     //    written by `scripts/extract_mixtral_experts.py`), use it to fill
@@ -5060,7 +5338,7 @@ async fn cmd_run(
         //
         // Respect startup `MER_PIN_CORES` affinity if it already pinned
         // the process; otherwise fall back to the io_uring default.
-        if startup_pinned {
+        if startup.startup_pinned() {
             info!("startup affinity already applied; skipping io_uring repin");
         } else {
             let n = std::thread::available_parallelism()
@@ -5528,52 +5806,36 @@ async fn cmd_run(
 
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = match workload {
-            // Structured workloads: drive `moe_step` with the harness's
-            // explicit expert set and measure the engine-counter delta.
-            crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
-                let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
-                    crate::workload::Workload::Skewed => (
-                        t,
-                        0,
-                        skewed_stream
-                            .as_mut()
-                            .expect("skewed stream")
-                            .next_experts(),
-                    ),
-                    _ => {
-                        let record = replay_stream
-                            .as_mut()
-                            .expect("replay stream")
-                            .next_record()
-                            .expect("replay stream non-empty");
-                        let layer = u32::try_from(record.layer).map_err(|_| {
-                            format!("replay layer {} does not fit in u32", record.layer)
-                        })?;
-                        (record.token, layer, record.experts)
-                    }
-                };
-                let hidden = crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
-                let pre = engine.report();
-                let _ = engine.moe_step(tok_idx, layer_idx, &hidden, &experts).await;
-                let post = engine.report();
-                crate::engine::CycleStats {
-                    hits: post.hits.saturating_sub(pre.hits),
-                    misses: post.misses.saturating_sub(pre.misses),
-                    prefetch_hits: 0,
-                    bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
-                }
-            }
-            crate::workload::Workload::Synthetic => {
-                if let Some(gate) = gate.as_ref() {
-                    // Real gating-network path. Hidden state is the same
-                    // synthetic activation `Engine::generate` would have
-                    // used, so the only difference relative to the legacy
-                    // path is *which* experts are selected.
-                    let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
-                    let dec = gate.route(&hidden);
+        let token_future = async {
+            let stats = match workload {
+                // Structured workloads: drive `moe_step` with the harness's
+                // explicit expert set and measure the engine-counter delta.
+                crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
+                    let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
+                        crate::workload::Workload::Skewed => (
+                            t,
+                            0,
+                            skewed_stream
+                                .as_mut()
+                                .expect("skewed stream")
+                                .next_experts(),
+                        ),
+                        _ => {
+                            let record = replay_stream
+                                .as_mut()
+                                .expect("replay stream")
+                                .next_record()
+                                .expect("replay stream non-empty");
+                            let layer = u32::try_from(record.layer).map_err(|_| {
+                                format!("replay layer {} does not fit in u32", record.layer)
+                            })?;
+                            (record.token, layer, record.experts)
+                        }
+                    };
+                    let hidden =
+                        crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
                     let pre = engine.report();
-                    let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                    let _ = engine.moe_step(tok_idx, layer_idx, &hidden, &experts).await;
                     let post = engine.report();
                     crate::engine::CycleStats {
                         hits: post.hits.saturating_sub(pre.hits),
@@ -5581,11 +5843,43 @@ async fn cmd_run(
                         prefetch_hits: 0,
                         bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
                     }
-                } else {
-                    engine.generate(t).await?
                 }
-            }
+                crate::workload::Workload::Synthetic => {
+                    if let Some(gate) = gate.as_ref() {
+                        // Real gating-network path. Hidden state is the same
+                        // synthetic activation `Engine::generate` would have
+                        // used, so the only difference relative to the legacy
+                        // path is *which* experts are selected.
+                        let hidden =
+                            crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                        let dec = gate.route(&hidden);
+                        let pre = engine.report();
+                        let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                        let post = engine.report();
+                        crate::engine::CycleStats {
+                            hits: post.hits.saturating_sub(pre.hits),
+                            misses: post.misses.saturating_sub(pre.misses),
+                            prefetch_hits: 0,
+                            bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                        }
+                    } else {
+                        engine.generate(t).await?
+                    }
+                }
+            };
+            Ok::<crate::engine::CycleStats, Box<dyn std::error::Error>>(stats)
         };
+        let stats = await_with_progress_watchdog(
+            token_future,
+            progress_timeout_secs,
+            "run:token",
+            t,
+            t.checked_sub(1),
+            &engine,
+            Some(&cache),
+            &startup,
+        )
+        .await?;
         let elapsed = start.elapsed();
         let throughput = if elapsed.as_secs_f64() > 0.0 {
             1.0 / elapsed.as_secs_f64()
@@ -6436,6 +6730,90 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    fn test_startup_diagnostics() -> StartupDiagnostics {
+        StartupDiagnostics {
+            requested_cpu_mask: None,
+            effective_cpu_mask: None,
+            pin_result: crate::numa::PinResult::NotRequested,
+            logical_cores: 1,
+            rayon_threads: 1,
+            rayon_source: "default",
+        }
+    }
+
+    #[test]
+    fn cpu_mask_cli_overrides_config_for_startup_selection() {
+        let cli = Cli::parse_from(["micro-expert-router", "--cpu-mask", "0-24", "gen-data"]);
+        let performance = crate::config::PerformanceConfig {
+            cpu_mask: Some("4-8".to_string()),
+            progress_timeout_secs: None,
+        };
+
+        assert_eq!(
+            requested_cpu_mask(&cli, Some(&performance)).as_deref(),
+            Some("0-24")
+        );
+        assert_eq!(
+            explicit_cpu_mask(&cli, Some(&performance)).as_deref(),
+            Some("0-24")
+        );
+    }
+
+    #[test]
+    fn cpu_mask_cli_rejects_invalid_cpulist() {
+        let err = Cli::try_parse_from(["micro-expert-router", "--cpu-mask", "8-4", "gen-data"])
+            .expect_err("descending CPU mask must be rejected");
+
+        assert!(
+            err.to_string().contains("descending cpulist range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn performance_cpu_mask_used_when_cli_omits_it() {
+        let cli = Cli::parse_from(["micro-expert-router", "gen-data"]);
+        let performance = crate::config::PerformanceConfig {
+            cpu_mask: Some("2-5".to_string()),
+            progress_timeout_secs: None,
+        };
+
+        assert_eq!(
+            requested_cpu_mask(&cli, Some(&performance)).as_deref(),
+            Some("2-5")
+        );
+        assert_eq!(
+            explicit_cpu_mask(&cli, Some(&performance)).as_deref(),
+            Some("2-5")
+        );
+    }
+
+    #[test]
+    fn progress_timeout_cli_zero_disables_config_timeout() {
+        let cli = Cli::parse_from([
+            "micro-expert-router",
+            "--progress-timeout-secs",
+            "0",
+            "gen-data",
+        ]);
+        let performance = crate::config::PerformanceConfig {
+            cpu_mask: None,
+            progress_timeout_secs: Some(300),
+        };
+
+        assert_eq!(progress_timeout_secs(&cli, Some(&performance)), None);
+    }
+
+    #[test]
+    fn startup_diagnostics_reports_effective_mask_before_requested_mask() {
+        let mut diagnostics = test_startup_diagnostics();
+        diagnostics.requested_cpu_mask = Some("0-24".to_string());
+        assert_eq!(diagnostics.progress_cpu_mask(), "0-24");
+
+        diagnostics.effective_cpu_mask = Some("0-23".to_string());
+        assert_eq!(diagnostics.progress_cpu_mask(), "0-23");
+    }
+
     // ---- Item 4: bench-real fail-open policy rejection matrix ----
 
     /// A minimal config that passes every `bench-real` policy gate:
@@ -6483,6 +6861,7 @@ mod tests {
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
             security: crate::config::SecurityConfig::default(),
+            performance: crate::config::PerformanceConfig::default(),
             gpu_cache: crate::config::GpuCacheConfig::default(),
             distributed: crate::config::DistributedConfig::default(),
         }
@@ -6769,6 +7148,8 @@ mod tests {
             cache_reset: BenchRealCacheReset::Keep,
             greedy: true,
             format: BenchRealOutputFormat::Json,
+            progress_timeout_secs: None,
+            startup: test_startup_diagnostics(),
         };
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.output_tokens, 7);
@@ -6791,6 +7172,8 @@ mod tests {
             cache_reset: BenchRealCacheReset::Keep,
             greedy: true,
             format: BenchRealOutputFormat::Json,
+            progress_timeout_secs: None,
+            startup: test_startup_diagnostics(),
         };
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.prompt, "hello");
@@ -6848,6 +7231,7 @@ mod tests {
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
             security: SecurityConfig::default(),
+            performance: PerformanceConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
             distributed: DistributedConfig::default(),
         }

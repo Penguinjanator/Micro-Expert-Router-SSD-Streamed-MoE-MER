@@ -94,6 +94,31 @@ pub struct SecurityConfig {
     pub tls_key: Option<PathBuf>,
 }
 
+/// Restart-time performance controls.
+///
+/// These options are consumed before Tokio and Rayon are initialized, so
+/// they cannot be hot-reloaded. Keep request-level/runtime knobs out of
+/// this section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    /// Linux cpulist mask applied at process startup, before Tokio and
+    /// Rayon workers are created. Example: `"0-24"`.
+    #[serde(default)]
+    pub cpu_mask: Option<String>,
+
+    /// Benchmark watchdog timeout. `None` or `0` disables the watchdog;
+    /// positive values make `run` / `bench-real` fail closed if a token
+    /// step makes no progress for this many seconds.
+    #[serde(default)]
+    pub progress_timeout_secs: Option<u64>,
+}
+
+impl PerformanceConfig {
+    pub fn normalized_progress_timeout_secs(&self) -> Option<u64> {
+        self.progress_timeout_secs.filter(|&secs| secs > 0)
+    }
+}
+
 /// Server-wide sampling defaults. Each request can override these via
 /// the `temperature` / `top_p` / `top_k` / `seed` JSON fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -957,6 +982,10 @@ pub struct Config {
     /// HTTP) to preserve the legacy behaviour bit-for-bit.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Optional `[performance]` section for startup CPU placement and
+    /// benchmark watchdog settings. Defaults are disabled.
+    #[serde(default)]
+    pub performance: PerformanceConfig,
     /// Optional `[gpu_cache]` section — Phase 1/2 of the 3-tier
     /// heterogeneous memory orchestrator (SSD → RAM → VRAM). Off by
     /// default; the binary behaves identically to the 2-tier engine
@@ -1254,6 +1283,16 @@ impl Config {
                 "security.rate_limit_burst requires rate_limit_rps > 0".into(),
             ));
         }
+        if let Some(mask) = self.performance.cpu_mask.as_ref() {
+            let cpus = crate::numa::parse_cpulist(mask).map_err(|e| {
+                ConfigError::Invalid(format!("performance.cpu_mask is invalid: {e}"))
+            })?;
+            if cpus.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "performance.cpu_mask must name at least one CPU".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1461,6 +1500,7 @@ mod tests {
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
             security: SecurityConfig::default(),
+            performance: PerformanceConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
             distributed: DistributedConfig::default(),
         }
@@ -1469,6 +1509,26 @@ mod tests {
     #[test]
     fn valid_config_passes_validation() {
         minimal_cfg().validate().expect("valid");
+    }
+
+    #[test]
+    fn performance_config_accepts_cpu_mask_and_timeout() {
+        let mut c = minimal_cfg();
+        c.performance.cpu_mask = Some("0-2,4".to_string());
+        c.performance.progress_timeout_secs = Some(300);
+        c.validate().expect("valid performance placement config");
+        assert_eq!(c.performance.normalized_progress_timeout_secs(), Some(300));
+    }
+
+    #[test]
+    fn performance_config_rejects_invalid_cpu_mask() {
+        let mut c = minimal_cfg();
+        c.performance.cpu_mask = Some("4-1".to_string());
+        let err = c.validate().expect_err("descending mask must fail");
+        assert!(
+            err.to_string().contains("performance.cpu_mask"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

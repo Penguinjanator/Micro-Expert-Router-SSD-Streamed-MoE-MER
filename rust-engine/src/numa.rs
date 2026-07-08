@@ -8,9 +8,12 @@
 //! advertises. This module wires the bare minimum we need to keep that
 //! hop out of the inference critical path:
 //!
-//! * [`apply_mer_pin_cores_env`] honours `MER_PIN_CORES=N` at startup
-//!   and calls `sched_setaffinity(2)` to pin **the whole process** to
-//!   the first `N` CPUs of NUMA node 0. Best-effort and Linux-only:
+//! * [`apply_startup_cpu_mask`] honours an explicit kernel cpulist such
+//!   as `0-24` at startup and calls `sched_setaffinity(2)` before
+//!   tokio/Rayon worker threads are created. If no explicit mask is
+//!   supplied, [`apply_mer_pin_cores_env`] keeps the legacy
+//!   `MER_PIN_CORES=N` behaviour and pins **the whole process** to the
+//!   first `N` CPUs of NUMA node 0. Best-effort and Linux-only:
 //!   anywhere else this is a logged no-op so dev machines (macOS,
 //!   Windows) still boot.
 //! * [`pin_current_thread_to_core`] is the lower-level primitive for
@@ -40,12 +43,11 @@ pub const MER_PIN_CORES_ENV: &str = "MER_PIN_CORES";
 /// can log a single human-readable line at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinResult {
-    /// `MER_PIN_CORES` was unset or empty — no pinning was attempted.
+    /// No explicit mask or legacy `MER_PIN_CORES` value was provided.
     NotRequested,
-    /// `MER_PIN_CORES` was set but invalid (non-numeric or `<= 0`).
+    /// A requested CPU mask or legacy `MER_PIN_CORES` value was invalid.
     BadValue(String),
-    /// Linux only: pinned to the listed CPUs (already de-duplicated
-    /// and clamped to what node 0 actually exposes).
+    /// Linux only: pinned to the listed CPUs (already de-duplicated).
     Pinned { cpus: Vec<usize> },
     /// Pinning was requested but the kernel / OS does not support the
     /// primitive (non-Linux, or `sched_setaffinity` returned an error).
@@ -56,13 +58,13 @@ pub enum PinResult {
 impl PinResult {
     pub fn as_log_line(&self) -> String {
         match self {
-            PinResult::NotRequested => format!("{MER_PIN_CORES_ENV} unset, no NUMA pinning"),
-            PinResult::BadValue(s) => format!("{MER_PIN_CORES_ENV}=\"{s}\" invalid, ignored"),
+            PinResult::NotRequested => "no CPU affinity pinning requested".to_string(),
+            PinResult::BadValue(s) => format!("CPU affinity value \"{s}\" invalid, ignored"),
             PinResult::Pinned { cpus } => {
-                format!("pinned process to NUMA node 0 CPUs {:?}", cpus)
+                format!("pinned process to CPUs {:?}", cpus)
             }
             PinResult::Unsupported(why) => {
-                format!("NUMA pinning unsupported on this platform: {why}")
+                format!("CPU affinity pinning unsupported on this platform: {why}")
             }
         }
     }
@@ -91,6 +93,30 @@ pub fn apply_mer_pin_cores_env() -> PinResult {
     pin_first_n_to_node0(n)
 }
 
+/// Apply an explicit kernel cpulist such as `"0-24"` or `"0-7,16-23"`.
+///
+/// When `requested` is `None`, this falls back to the legacy
+/// [`MER_PIN_CORES_ENV`] behaviour. The explicit mask path is the
+/// first-class production placement knob; it runs at process startup so
+/// Tokio and Rayon workers inherit the selected affinity.
+pub fn apply_startup_cpu_mask(requested: Option<&str>) -> PinResult {
+    let raw = match requested {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        Some(s) => return PinResult::BadValue(s.to_string()),
+        None => return apply_mer_pin_cores_env(),
+    };
+    let mut cpus = match parse_cpulist(raw) {
+        Ok(cpus) => cpus,
+        Err(_) => return PinResult::BadValue(raw.to_string()),
+    };
+    cpus.sort_unstable();
+    cpus.dedup();
+    if cpus.is_empty() {
+        return PinResult::BadValue(raw.to_string());
+    }
+    pin_cpu_set(&cpus)
+}
+
 /// Pin the calling process to the first `n` CPUs of NUMA node 0.
 /// On non-Linux this is a logged no-op.
 #[cfg(target_os = "linux")]
@@ -110,14 +136,26 @@ pub fn pin_first_n_to_node0(n: usize) -> PinResult {
             "no CPUs reported for NUMA node 0 and /proc/cpuinfo empty".into(),
         );
     }
-    match set_affinity(&cpus) {
-        Ok(()) => PinResult::Pinned { cpus },
+    pin_cpu_set(&cpus)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pin_first_n_to_node0(_n: usize) -> PinResult {
+    PinResult::Unsupported("sched_setaffinity(2) is Linux-only".into())
+}
+
+#[cfg(target_os = "linux")]
+pub fn pin_cpu_set(cpus: &[usize]) -> PinResult {
+    match set_affinity(cpus) {
+        Ok(()) => PinResult::Pinned {
+            cpus: cpus.to_vec(),
+        },
         Err(e) => PinResult::Unsupported(format!("sched_setaffinity: {e}")),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn pin_first_n_to_node0(_n: usize) -> PinResult {
+pub fn pin_cpu_set(_cpus: &[usize]) -> PinResult {
     PinResult::Unsupported("sched_setaffinity(2) is Linux-only".into())
 }
 
@@ -187,6 +225,65 @@ pub fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+pub fn format_cpulist(cpus: &[usize]) -> String {
+    if cpus.is_empty() {
+        return String::new();
+    }
+    let mut cpus = cpus.to_vec();
+    cpus.sort_unstable();
+    cpus.dedup();
+    let mut ranges = Vec::new();
+    let mut start = cpus[0];
+    let mut prev = cpus[0];
+    for &cpu in cpus.iter().skip(1) {
+        if cpu == prev + 1 {
+            prev = cpu;
+            continue;
+        }
+        ranges.push(format_cpu_range(start, prev));
+        start = cpu;
+        prev = cpu;
+    }
+    ranges.push(format_cpu_range(start, prev));
+    ranges.join(",")
+}
+
+fn format_cpu_range(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_affinity() -> Result<Vec<usize>, String> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        let rc = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut cpus = Vec::new();
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(cpu, &set) {
+                cpus.push(cpu);
+            }
+        }
+        Ok(cpus)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_affinity() -> Result<Vec<usize>, String> {
+    Err("sched_getaffinity(2) is Linux-only".into())
+}
+
+pub fn current_affinity_cpulist() -> Option<String> {
+    current_affinity().ok().map(|cpus| format_cpulist(&cpus))
+}
+
 #[cfg(target_os = "linux")]
 fn set_affinity(cpus: &[usize]) -> Result<(), String> {
     set_affinity_pid(0, cpus)
@@ -241,6 +338,12 @@ mod tests {
     }
 
     #[test]
+    fn formats_cpulist_compactly() {
+        assert_eq!(format_cpulist(&[0, 1, 2, 4, 8, 7, 7]), "0-2,4,7-8");
+        assert_eq!(format_cpulist(&[]), "");
+    }
+
+    #[test]
     fn rejects_descending_range() {
         assert!(parse_cpulist("4-1").is_err());
     }
@@ -253,8 +356,12 @@ mod tests {
 
     #[test]
     fn pin_result_log_line_is_descriptive() {
-        assert!(PinResult::NotRequested.as_log_line().contains(MER_PIN_CORES_ENV));
-        assert!(PinResult::BadValue("xyz".into()).as_log_line().contains("xyz"));
+        assert!(PinResult::NotRequested
+            .as_log_line()
+            .contains("no CPU affinity pinning requested"));
+        assert!(PinResult::BadValue("xyz".into())
+            .as_log_line()
+            .contains("xyz"));
         assert!(PinResult::Pinned { cpus: vec![0, 1] }
             .as_log_line()
             .contains("[0, 1]"));
