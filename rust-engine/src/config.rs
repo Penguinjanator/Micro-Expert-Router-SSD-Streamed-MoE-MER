@@ -94,29 +94,28 @@ pub struct SecurityConfig {
     pub tls_key: Option<PathBuf>,
 }
 
-/// Restart-time performance controls.
-///
-/// These options are consumed before Tokio and Rayon are initialized, so
-/// they cannot be hot-reloaded. Keep request-level/runtime knobs out of
-/// this section.
+/// Process-level runtime/performance controls applied at startup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerformanceConfig {
-    /// Linux cpulist mask applied at process startup, before Tokio and
-    /// Rayon workers are created. Example: `"0-24"`.
+    /// Optional process CPU placement mask in Linux cpulist syntax, e.g.
+    /// `"0-24"` or `"0-15,32-47"`. Leave unset for portable default
+    /// behavior: MER does not apply an artificial placement mask.
     #[serde(default)]
     pub cpu_mask: Option<String>,
 
-    /// Benchmark watchdog timeout. `None` or `0` disables the watchdog;
-    /// positive values make `run` / `bench-real` fail closed if a token
-    /// step makes no progress for this many seconds.
+    /// Explicit worker count for MER's process-wide Rayon compute pool.
+    ///
+    /// `None` preserves portable startup behavior: honor
+    /// `RAYON_NUM_THREADS` when set, otherwise allow autotune/profile/default
+    /// selection under the effective affinity mask.
+    #[serde(default)]
+    pub rayon_threads: Option<usize>,
+
+    /// Progress watchdog timeout in seconds. `0` or unset disables the
+    /// watchdog. A positive value wraps long-running run/bench-real progress
+    /// steps so hangs fail loudly instead of remaining silent.
     #[serde(default)]
     pub progress_timeout_secs: Option<u64>,
-}
-
-impl PerformanceConfig {
-    pub fn normalized_progress_timeout_secs(&self) -> Option<u64> {
-        self.progress_timeout_secs.filter(|&secs| secs > 0)
-    }
 }
 
 /// Server-wide sampling defaults. Each request can override these via
@@ -594,12 +593,10 @@ impl RealTransformerConfig {
     /// inference.
     pub fn resolve_weight_policy(&self) -> Result<RealWeightPolicy, String> {
         if !self.strict_weights && !self.allow_seeded_fallback {
-            return Err(
-                "real_transformer.strict_weights = false requires \
+            return Err("real_transformer.strict_weights = false requires \
                  real_transformer.allow_seeded_fallback = true (development-only). \
                  Production real-model serving must load a strict, complete checkpoint."
-                    .into(),
-            );
+                .into());
         }
         match self.weights_dir.as_ref() {
             Some(_) if self.strict_weights => Ok(RealWeightPolicy::StrictReal),
@@ -967,6 +964,8 @@ impl Default for DistributedConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
     pub model: ModelConfig,
     pub storage: StorageConfigToml,
     #[serde(default)]
@@ -982,10 +981,6 @@ pub struct Config {
     /// HTTP) to preserve the legacy behaviour bit-for-bit.
     #[serde(default)]
     pub security: SecurityConfig,
-    /// Optional `[performance]` section for startup CPU placement and
-    /// benchmark watchdog settings. Defaults are disabled.
-    #[serde(default)]
-    pub performance: PerformanceConfig,
     /// Optional `[gpu_cache]` section — Phase 1/2 of the 3-tier
     /// heterogeneous memory orchestrator (SSD → RAM → VRAM). Off by
     /// default; the binary behaves identically to the 2-tier engine
@@ -1012,6 +1007,21 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.performance.rayon_threads == Some(0) {
+            return Err(ConfigError::Invalid(
+                "performance.rayon_threads must be > 0".into(),
+            ));
+        }
+        if let Some(mask) = self.performance.cpu_mask.as_deref() {
+            let parsed = crate::numa::parse_cpulist(mask).map_err(|e| {
+                ConfigError::Invalid(format!("performance.cpu_mask is invalid: {e}"))
+            })?;
+            if parsed.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "performance.cpu_mask must contain at least one CPU".into(),
+                ));
+            }
+        }
         if self.model.num_experts == 0 {
             return Err(ConfigError::Invalid("model.num_experts must be > 0".into()));
         }
@@ -1283,16 +1293,6 @@ impl Config {
                 "security.rate_limit_burst requires rate_limit_rps > 0".into(),
             ));
         }
-        if let Some(mask) = self.performance.cpu_mask.as_ref() {
-            let cpus = crate::numa::parse_cpulist(mask).map_err(|e| {
-                ConfigError::Invalid(format!("performance.cpu_mask is invalid: {e}"))
-            })?;
-            if cpus.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "performance.cpu_mask must name at least one CPU".into(),
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -1473,6 +1473,7 @@ mod tests {
                 max_concurrent_requests: 0,
                 admission_min_free_blocks: 0,
             },
+            performance: PerformanceConfig::default(),
             model: ModelConfig {
                 data_dir: PathBuf::from("./data"),
                 num_experts: 8,
@@ -1500,7 +1501,6 @@ mod tests {
             sampling: SamplingConfig::default(),
             predictive: PredictiveConfig::default(),
             security: SecurityConfig::default(),
-            performance: PerformanceConfig::default(),
             gpu_cache: GpuCacheConfig::default(),
             distributed: DistributedConfig::default(),
         }
@@ -1512,30 +1512,48 @@ mod tests {
     }
 
     #[test]
-    fn performance_config_accepts_cpu_mask_and_timeout() {
+    fn rejects_top_k_greater_than_num_experts() {
         let mut c = minimal_cfg();
-        c.performance.cpu_mask = Some("0-2,4".to_string());
-        c.performance.progress_timeout_secs = Some(300);
-        c.validate().expect("valid performance placement config");
-        assert_eq!(c.performance.normalized_progress_timeout_secs(), Some(300));
+        c.model.top_k = 99;
+        assert!(c.validate().is_err());
     }
 
     #[test]
-    fn performance_config_rejects_invalid_cpu_mask() {
+    fn performance_rayon_threads_parses_from_toml() {
+        let perf: PerformanceConfig = toml::from_str(
+            r#"
+            cpu_mask = "0-24"
+            rayon_threads = 30
+            progress_timeout_secs = 300
+            "#,
+        )
+        .unwrap();
+        assert_eq!(perf.cpu_mask.as_deref(), Some("0-24"));
+        assert_eq!(perf.rayon_threads, Some(30));
+        assert_eq!(perf.progress_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn rejects_zero_performance_rayon_threads() {
         let mut c = minimal_cfg();
-        c.performance.cpu_mask = Some("4-1".to_string());
-        let err = c.validate().expect_err("descending mask must fail");
+        c.performance.rayon_threads = Some(0);
+        let err = c.validate().expect_err("zero rayon_threads must fail");
         assert!(
-            err.to_string().contains("performance.cpu_mask"),
+            err.to_string()
+                .contains("performance.rayon_threads must be > 0"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn rejects_top_k_greater_than_num_experts() {
+    fn rejects_invalid_performance_cpu_mask() {
         let mut c = minimal_cfg();
-        c.model.top_k = 99;
-        assert!(c.validate().is_err());
+        c.performance.cpu_mask = Some("4-1".to_string());
+        let err = c.validate().expect_err("descending cpu mask must fail");
+        assert!(
+            err.to_string().contains("performance.cpu_mask is invalid"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Part A6: the flat u32 global expert-id namespace
@@ -1602,10 +1620,16 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let c = minimal_cfg();
+        let mut c = minimal_cfg();
+        c.performance.cpu_mask = Some("0-3".to_string());
+        c.performance.rayon_threads = Some(30);
+        c.performance.progress_timeout_secs = Some(300);
         let s = toml::to_string(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         back.validate().unwrap();
+        assert_eq!(back.performance.cpu_mask.as_deref(), Some("0-3"));
+        assert_eq!(back.performance.rayon_threads, Some(30));
+        assert_eq!(back.performance.progress_timeout_secs, Some(300));
         assert_eq!(back.model.num_experts, c.model.num_experts);
         assert_eq!(back.server.bind, c.server.bind);
     }

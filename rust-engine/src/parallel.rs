@@ -53,13 +53,13 @@
 //! once at startup with [`default_compute_threads`] — logical cores minus
 //! a small, bounded reservation — so the engine keeps a couple of cores
 //! free for async work by default. An explicit `RAYON_NUM_THREADS` is
-//! treated as an operator override and wins.
+//! treated as a hard operator override and wins over profile/autotune/default
+//! selection.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{info, warn};
 
 /// Dense matrix-vector backend selected for `transformer::matmul_row_major`.
@@ -134,7 +134,6 @@ impl FromStr for DenseMatvecBackend {
 }
 
 static DENSE_MATVEC_BACKEND: AtomicU8 = AtomicU8::new(DenseMatvecBackend::Auto.code());
-static GLOBAL_POOL_INIT_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_dense_matvec_backend(backend: DenseMatvecBackend) {
     DENSE_MATVEC_BACKEND.store(backend.code(), Ordering::Relaxed);
@@ -212,71 +211,142 @@ pub fn default_compute_threads(logical: usize) -> usize {
 /// A valid, positive `RAYON_NUM_THREADS` is an explicit operator override.
 /// Zero or unparseable values are ignored so the smart default applies
 /// (rayon itself treats `RAYON_NUM_THREADS=0` as "use the default").
-pub(crate) fn env_thread_override() -> Option<usize> {
-    std::env::var("RAYON_NUM_THREADS")
-        .ok()
+fn parse_env_thread_override(value: Option<&str>) -> Option<usize> {
+    value
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RayonThreadSource {
-    EnvOverride,
-    AutotuneProfile { path: PathBuf },
-    FreshAutotune { path: PathBuf },
-    DefaultHeuristic,
+    Env,
+    Cli,
+    Config,
+    Autotune,
+    Profile,
+    RayonDefault,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl RayonThreadSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Cli => "cli",
+            Self::Config => "config",
+            Self::Autotune => "autotune",
+            Self::Profile => "profile",
+            Self::RayonDefault => "rayon_default",
+        }
+    }
+}
+
+/// Resolved Rayon worker-count selection before the global pool exists.
+///
+/// `threads = None` means keep MER's existing default pool sizing policy
+/// (`default_compute_threads`) instead of forcing an explicit worker count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RayonThreadSelection {
-    pub logical: usize,
-    pub threads: usize,
+    pub threads: Option<usize>,
     pub source: RayonThreadSource,
 }
 
 impl RayonThreadSelection {
-    pub fn fresh_autotune(logical: usize, threads: usize, path: PathBuf) -> Self {
+    pub const fn default() -> Self {
         Self {
-            logical: logical.max(1),
-            threads: threads.max(1),
-            source: RayonThreadSource::FreshAutotune { path },
+            threads: None,
+            source: RayonThreadSource::RayonDefault,
         }
     }
 }
 
-pub fn resolve_thread_selection(
-    logical: usize,
-    profile: Option<(usize, PathBuf)>,
-) -> RayonThreadSelection {
-    resolve_thread_selection_from_parts(logical, env_thread_override(), profile)
+fn validate_positive_threads(value: Option<usize>, name: &str) -> Result<Option<usize>, String> {
+    match value {
+        Some(0) => Err(format!("{name} must be > 0")),
+        other => Ok(other),
+    }
 }
 
-pub(crate) fn resolve_thread_selection_from_parts(
-    logical: usize,
-    env_override: Option<usize>,
-    profile: Option<(usize, PathBuf)>,
-) -> RayonThreadSelection {
-    let logical = logical.max(1);
-    if let Some(threads) = env_override {
-        return RayonThreadSelection {
-            logical,
-            threads: threads.max(1),
-            source: RayonThreadSource::EnvOverride,
-        };
+pub fn resolve_rayon_threads(
+    cli: Option<usize>,
+    config: Option<usize>,
+    env_value: Option<&str>,
+    autotune: Option<usize>,
+    profile: Option<usize>,
+) -> Result<RayonThreadSelection, String> {
+    if let Some(n) = parse_env_thread_override(env_value) {
+        return Ok(RayonThreadSelection {
+            threads: Some(n),
+            source: RayonThreadSource::Env,
+        });
     }
-    if let Some((threads, path)) = profile {
-        if threads > 0 {
-            return RayonThreadSelection {
-                logical,
-                threads,
-                source: RayonThreadSource::AutotuneProfile { path },
-            };
-        }
+    if let Some(n) = validate_positive_threads(cli, "--rayon-threads")? {
+        return Ok(RayonThreadSelection {
+            threads: Some(n),
+            source: RayonThreadSource::Cli,
+        });
     }
-    RayonThreadSelection {
+    if let Some(n) = validate_positive_threads(config, "performance.rayon_threads")? {
+        return Ok(RayonThreadSelection {
+            threads: Some(n),
+            source: RayonThreadSource::Config,
+        });
+    }
+    if let Some(n) = validate_positive_threads(autotune, "autotuned rayon threads")? {
+        return Ok(RayonThreadSelection {
+            threads: Some(n),
+            source: RayonThreadSource::Autotune,
+        });
+    }
+    if let Some(n) = validate_positive_threads(profile, "profile rayon threads")? {
+        return Ok(RayonThreadSelection {
+            threads: Some(n),
+            source: RayonThreadSource::Profile,
+        });
+    }
+    Ok(RayonThreadSelection::default())
+}
+
+pub fn resolve_rayon_threads_from_env(
+    cli: Option<usize>,
+    config: Option<usize>,
+    autotune: Option<usize>,
+    profile: Option<usize>,
+) -> Result<RayonThreadSelection, String> {
+    resolve_rayon_threads(
+        cli,
+        config,
+        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        autotune,
+        profile,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RayonPoolInitPlan {
+    pub threads: usize,
+    pub selection: RayonThreadSelection,
+    pub logical: usize,
+}
+
+pub fn rayon_pool_init_plan(selection: RayonThreadSelection, logical: usize) -> RayonPoolInitPlan {
+    let threads = selection
+        .threads
+        .unwrap_or_else(|| default_compute_threads(logical));
+    RayonPoolInitPlan {
+        threads,
+        selection,
         logical,
-        threads: default_compute_threads(logical),
-        source: RayonThreadSource::DefaultHeuristic,
+    }
+}
+
+fn log_rayon_selection(selection: RayonThreadSelection) {
+    match selection.threads {
+        Some(n) => info!(
+            "CPU Rayon threads: {} source={}",
+            n,
+            selection.source.as_str()
+        ),
+        None => info!("CPU Rayon threads: default source=rayon_default"),
     }
 }
 
@@ -287,58 +357,35 @@ pub(crate) fn resolve_thread_selection_from_parts(
 /// Call exactly once at process start — *after* any NUMA/affinity pinning
 /// so the workers inherit the startup affinity mask, and *before* the first
 /// [`par_row_chunks`] touches the pool. The global pool is built eagerly
-/// here in *both* cases: a valid `RAYON_NUM_THREADS` sets the worker count
-/// as an explicit operator override, otherwise the reserved
+/// here in *both* cases: a valid env/CLI/config/autotune/profile selection
+/// sets the worker count explicitly, otherwise the reserved
 /// [`default_compute_threads`] count is used. Building now — rather than
 /// letting rayon lazily initialise on first use — is what guarantees the
 /// workers are spawned at this point and inherit the startup affinity mask.
 /// Deferring (e.g. returning early on the override path) would spawn them at
 /// the first matmul, inheriting whatever affinity the triggering thread
-/// happens to carry by then (such as a later io_uring repin onto ≤8 cores).
-pub fn init_global_pool() -> usize {
-    let logical = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let selection = resolve_thread_selection(logical, None);
-    init_global_pool_with_selection(selection)
-}
+/// happens to carry by then.
+pub fn init_global_pool(selection: RayonThreadSelection, logical: usize) -> usize {
+    let logical = logical.max(1);
+    let plan = rayon_pool_init_plan(selection, logical);
+    log_rayon_selection(plan.selection);
 
-pub fn init_global_pool_with_selection(selection: RayonThreadSelection) -> usize {
-    let logical = selection.logical.max(1);
-    let threads = selection.threads.max(1);
-
-    match &selection.source {
-        RayonThreadSource::EnvOverride => {
+    // Resolve the worker count: an explicit env/CLI/config/autotune/profile
+    // selection wins, otherwise fall back to the reserved headroom default.
+    match plan.selection.threads {
+        Some(n) => {
             info!(
-                threads,
+                threads = n,
                 logical,
-                source = "RAYON_NUM_THREADS",
+                source = plan.selection.source.as_str(),
                 "compute pool: honoring explicit thread-count override"
             );
         }
-        RayonThreadSource::AutotuneProfile { path } => {
+        None => {
             info!(
                 logical,
-                threads,
-                profile = %path.display(),
-                source = "autotune-profile",
-                "compute pool: sizing from saved CPU/Rayon autotune profile"
-            );
-        }
-        RayonThreadSource::FreshAutotune { path } => {
-            info!(
-                logical,
-                threads,
-                profile = %path.display(),
-                source = "fresh-autotune",
-                "compute pool: sizing from freshly measured CPU/Rayon autotune result"
-            );
-        }
-        RayonThreadSource::DefaultHeuristic => {
-            info!(
-                logical,
-                threads,
-                reserved = logical.saturating_sub(threads),
+                threads = plan.threads,
+                reserved = logical - plan.threads,
                 source = "auto",
                 "compute pool: sizing with reserved async-runtime headroom"
             );
@@ -350,37 +397,22 @@ pub fn init_global_pool_with_selection(selection: RayonThreadSelection) -> usize
     // are spawned here and inherit the startup affinity mask. Returning early
     // on the override path (deferring to rayon's lazy init) would instead
     // spawn them at first use, inheriting whatever affinity the triggering
-    // thread carries by then (e.g. a later io_uring repin onto ≤8 cores).
-    if mark_pool_init_attempted() {
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("mer-compute-{i}"))
-            .build_global()
-        {
-            // `build_global` only errors if the global pool was already built
-            // by a rayon use before init. Keep what exists.
-            warn!(
-                error = %e,
-                current_threads = rayon::current_num_threads().max(1),
-                "compute pool already initialised; keeping existing configuration"
-            );
-        }
-    } else {
+    // thread carries by then.
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(plan.threads)
+        .thread_name(|i| format!("mer-compute-{i}"))
+        .build_global()
+    {
+        // `build_global` only errors if the global pool was already built
+        // (a prior call, or a rayon use before init). Keep what exists.
         warn!(
+            error = %e,
             current_threads = rayon::current_num_threads().max(1),
-            "compute pool init was already attempted; not rebuilding Rayon global pool"
+            "compute pool already initialised; keeping existing configuration"
         );
     }
 
     num_threads()
-}
-
-fn mark_pool_init_attempted() -> bool {
-    mark_pool_init_attempted_with(&GLOBAL_POOL_INIT_ATTEMPTED)
-}
-
-fn mark_pool_init_attempted_with(flag: &AtomicBool) -> bool {
-    !flag.swap(true, Ordering::AcqRel)
 }
 
 /// Fill `out` in parallel by computing disjoint row-chunks on the shared
@@ -603,30 +635,102 @@ mod tests {
     }
 
     #[test]
-    fn thread_resolution_precedence_is_env_profile_default() {
-        let profile_path = std::path::PathBuf::from("/tmp/profile.json");
-        let env =
-            resolve_thread_selection_from_parts(32, Some(17), Some((30, profile_path.clone())));
-        assert_eq!(env.threads, 17);
-        assert_eq!(env.source, RayonThreadSource::EnvOverride);
-
-        let profile =
-            resolve_thread_selection_from_parts(32, None, Some((30, profile_path.clone())));
-        assert_eq!(profile.threads, 30);
+    fn rayon_thread_selection_precedence_is_env_cli_config_autotune_profile_default() {
         assert_eq!(
-            profile.source,
-            RayonThreadSource::AutotuneProfile { path: profile_path }
+            resolve_rayon_threads(Some(30), Some(28), Some("26"), Some(24), Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(26),
+                source: RayonThreadSource::Env,
+            }
         );
-
-        let fallback = resolve_thread_selection_from_parts(32, None, None);
-        assert_eq!(fallback.threads, default_compute_threads(32));
-        assert_eq!(fallback.source, RayonThreadSource::DefaultHeuristic);
+        assert_eq!(
+            resolve_rayon_threads(Some(30), Some(28), None, Some(24), Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(30),
+                source: RayonThreadSource::Cli,
+            }
+        );
+        assert_eq!(
+            resolve_rayon_threads(None, Some(28), None, Some(24), Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(28),
+                source: RayonThreadSource::Config,
+            }
+        );
+        assert_eq!(
+            resolve_rayon_threads(None, None, None, Some(24), Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(24),
+                source: RayonThreadSource::Autotune,
+            }
+        );
+        assert_eq!(
+            resolve_rayon_threads(None, None, None, None, Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(22),
+                source: RayonThreadSource::Profile,
+            }
+        );
+        assert_eq!(
+            resolve_rayon_threads(None, None, None, None, None).unwrap(),
+            RayonThreadSelection::default()
+        );
     }
 
     #[test]
-    fn global_pool_init_attempt_guard_allows_only_one_attempt() {
-        let flag = AtomicBool::new(false);
-        assert!(mark_pool_init_attempted_with(&flag));
-        assert!(!mark_pool_init_attempted_with(&flag));
+    fn rayon_thread_selection_rejects_invalid_cli_and_config_zero() {
+        let err = resolve_rayon_threads(Some(0), Some(28), None, None, None).unwrap_err();
+        assert!(
+            err.contains("--rayon-threads must be > 0"),
+            "unexpected error: {err}"
+        );
+        let err = resolve_rayon_threads(None, Some(0), None, None, None).unwrap_err();
+        assert!(
+            err.contains("performance.rayon_threads must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rayon_thread_selection_preserves_existing_env_default_behavior() {
+        // Existing behavior ignores invalid/zero env overrides and falls
+        // through to the engine's startup default sizing policy.
+        assert_eq!(
+            resolve_rayon_threads(None, None, Some("0"), None, None).unwrap(),
+            RayonThreadSelection::default()
+        );
+        assert_eq!(
+            resolve_rayon_threads(None, None, Some("not-a-number"), None, None).unwrap(),
+            RayonThreadSelection::default()
+        );
+    }
+
+    #[test]
+    fn rayon_num_threads_overrides_autotune_profile_and_default() {
+        assert_eq!(
+            resolve_rayon_threads(None, None, Some("25"), Some(23), Some(22)).unwrap(),
+            RayonThreadSelection {
+                threads: Some(25),
+                source: RayonThreadSource::Env,
+            }
+        );
+    }
+
+    #[test]
+    fn selected_thread_count_feeds_pool_init_plan_before_creation() {
+        let selected = RayonThreadSelection {
+            threads: Some(30),
+            source: RayonThreadSource::Cli,
+        };
+        let plan = rayon_pool_init_plan(selected, 32);
+        assert_eq!(plan.threads, 30);
+        assert_eq!(plan.selection, selected);
+
+        let default_plan = rayon_pool_init_plan(RayonThreadSelection::default(), 32);
+        assert_eq!(default_plan.threads, default_compute_threads(32));
+        assert_eq!(
+            default_plan.selection.source,
+            RayonThreadSource::RayonDefault
+        );
     }
 }

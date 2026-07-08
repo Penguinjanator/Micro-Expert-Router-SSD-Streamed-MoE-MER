@@ -1361,8 +1361,7 @@ async fn stream_tokens(
     requested_max: usize,
     params: SamplingParams,
     session_id: Option<String>,
-) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>, GenerateError>
-{
+) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, GenerateError>> + Send>>, GenerateError> {
     if prompt.is_empty() {
         return Err(GenerateError::InvalidRequest(
             "prompt must be non-empty".into(),
@@ -1512,10 +1511,7 @@ async fn stream_tokens(
                 Ok(tail) => tail,
                 Err(e) => {
                     tracing::error!(error = %e, "real stream: decoder failed on final flush");
-                    return Some((
-                        Err(GenerateError::Tokenizer(e.to_string())),
-                        st,
-                    ));
+                    return Some((Err(GenerateError::Tokenizer(e.to_string())), st));
                 }
             };
             return Some((
@@ -1777,8 +1773,8 @@ fn wrap_completion_events(
                             finish_reason: None,
                         }],
                     };
-                    let ev = Event::default()
-                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    let ev =
+                        Event::default().data(serde_json::to_string(&payload).unwrap_or_default());
                     Some((Ok(ev), st))
                 }
             }
@@ -1803,7 +1799,9 @@ fn stream_error_payload(e: &GenerateError) -> String {
             kind,
         },
     })
-    .unwrap_or_else(|_| "{\"error\":{\"message\":\"stream failed\",\"type\":\"server_error\"}}".into())
+    .unwrap_or_else(|_| {
+        "{\"error\":{\"message\":\"stream failed\",\"type\":\"server_error\"}}".into()
+    })
 }
 
 async fn build_chat_stream(
@@ -1961,8 +1959,8 @@ fn wrap_chat_events(
                             finish_reason: None,
                         }],
                     };
-                    let ev = Event::default()
-                        .data(serde_json::to_string(&payload).unwrap_or_default());
+                    let ev =
+                        Event::default().data(serde_json::to_string(&payload).unwrap_or_default());
                     Some((Ok(ev), st))
                 }
             }
@@ -2195,6 +2193,7 @@ mod tests {
                 max_concurrent_requests: 0,
                 admission_min_free_blocks: 0,
             },
+            performance: crate::config::PerformanceConfig::default(),
             model: crate::config::ModelConfig {
                 data_dir: PathBuf::from("./data"),
                 num_experts: 8,
@@ -2222,7 +2221,6 @@ mod tests {
             sampling: crate::config::SamplingConfig::default(),
             predictive: crate::config::PredictiveConfig::default(),
             security: crate::config::SecurityConfig::default(),
-            performance: crate::config::PerformanceConfig::default(),
             gpu_cache: crate::config::GpuCacheConfig::default(),
             distributed: crate::config::DistributedConfig::default(),
         }
@@ -3242,8 +3240,7 @@ mod tests {
         // Terminate the scheduler loop before it executes anything.
         shutdown_runtime(rt).await;
 
-        let mut request =
-            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        let mut request = RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
         // decode_step registers the KV (registry op is synchronous and
         // survives the loop), then the channel send fails with
         // SchedulerClosed — the fallback must recover the registered
@@ -3255,7 +3252,10 @@ mod tests {
         assert_eq!(scheduler.registrations_total(), 1);
         assert_eq!(scheduler.releases_total(), 1);
         let kv = request.finish().expect("recovered KV must be persistable");
-        assert_eq!(kv[0].seq_len, 1, "the direct decode advanced the recovered KV");
+        assert_eq!(
+            kv[0].seq_len, 1,
+            "the direct decode advanced the recovered KV"
+        );
     }
 
     /// A7 item 1: the scheduler's channels close *after* scheduled
@@ -3271,11 +3271,16 @@ mod tests {
         state.batch_scheduler = Some(scheduler.clone());
 
         let greedy = crate::sampling::SamplingParams::greedy();
-        let mut request =
-            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        let mut request = RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
         // Two scheduled decodes mutate the registered KV in place.
-        let n1 = request.decode_step(1, 0, &greedy).await.expect("scheduled step 1");
-        let n2 = request.decode_step(n1, 1, &greedy).await.expect("scheduled step 2");
+        let n1 = request
+            .decode_step(1, 0, &greedy)
+            .await
+            .expect("scheduled step 1");
+        let n2 = request
+            .decode_step(n1, 1, &greedy)
+            .await
+            .expect("scheduled step 2");
         assert_eq!(scheduler.registrations_total(), 1);
 
         shutdown_runtime(rt).await;
@@ -3325,7 +3330,10 @@ mod tests {
         // Wait for the request to register its KV, then steal it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while scheduler.registrations_total() < 1 {
-            assert!(std::time::Instant::now() < deadline, "request never registered");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request never registered"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         let _ = scheduler.release(crate::batch_scheduler::RequestId(0));
@@ -3398,8 +3406,10 @@ mod tests {
         let mut acc = String::new();
         // Pull a couple of content events so the request has
         // registered its KV with the scheduler.
-        read_sse_until(&mut body, &mut acc, |s| s.matches("text_completion").count() >= 2)
-            .await;
+        read_sse_until(&mut body, &mut acc, |s| {
+            s.matches("text_completion").count() >= 2
+        })
+        .await;
         assert!(scheduler.registrations_total() >= 1);
         let _ = scheduler.release(crate::batch_scheduler::RequestId(0));
         // Drain to the end of the stream.
@@ -3468,7 +3478,10 @@ mod tests {
             acc.contains("kv_state_lost"),
             "expected a typed kv_state_lost error event; got:\n{acc}"
         );
-        assert!(!acc.contains("[DONE]"), "no [DONE] after failure; got:\n{acc}");
+        assert!(
+            !acc.contains("[DONE]"),
+            "no [DONE] after failure; got:\n{acc}"
+        );
         assert!(
             !acc.contains(r#""finish_reason":"length""#)
                 && !acc.contains(r#""finish_reason":"stop""#),
@@ -3509,7 +3522,10 @@ mod tests {
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while scheduler.registrations_total() < 2 {
-            assert!(std::time::Instant::now() < deadline, "turn 2 never registered");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "turn 2 never registered"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         let _ = scheduler.release(crate::batch_scheduler::RequestId(1));
@@ -3543,8 +3559,7 @@ mod tests {
         let (state, _tmp) = make_state_with_real_model(cfg).await;
         let model = state.real_model.clone().unwrap();
         let scheduler = state.batch_scheduler.clone().unwrap();
-        let mut request =
-            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        let mut request = RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
         request
             .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
             .await
@@ -3552,7 +3567,11 @@ mod tests {
         assert_eq!(scheduler.registrations_total(), 1);
         assert_eq!(scheduler.active_requests(), 1);
         drop(request);
-        assert_eq!(scheduler.releases_total(), 1, "Drop must release exactly once");
+        assert_eq!(
+            scheduler.releases_total(),
+            1,
+            "Drop must release exactly once"
+        );
         assert_eq!(scheduler.active_requests(), 0);
     }
 
@@ -3564,8 +3583,7 @@ mod tests {
         let (state, _tmp) = make_state_with_real_model(cfg).await;
         let model = state.real_model.clone().unwrap();
         let scheduler = state.batch_scheduler.clone().unwrap();
-        let mut request =
-            RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
+        let mut request = RealRequestState::new(&state, &model, model.fresh_kv_caches(), None);
         request
             .decode_step(1, 0, &crate::sampling::SamplingParams::greedy())
             .await
@@ -3626,7 +3644,9 @@ mod tests {
         let s = wrap_completion_events(inner, "cmpl-t".into(), "m".into(), metrics.clone());
         let body = sse_events_to_string(s).await;
         let tail_idx = body.find("TAIL€").expect("tail chunk must be emitted");
-        let done_idx = body.find("[DONE]").expect("stream must terminate with [DONE]");
+        let done_idx = body
+            .find("[DONE]")
+            .expect("stream must terminate with [DONE]");
         assert!(
             tail_idx < done_idx,
             "the final decoder tail must be delivered before [DONE]:\n{body}"
@@ -3653,9 +3673,13 @@ mod tests {
             ]));
         let s = wrap_chat_events(inner, "chatcmpl-t".into(), "m".into(), metrics.clone());
         let body = sse_events_to_string(s).await;
-        let role_idx = body.find(r#""role":"assistant""#).expect("role event first");
+        let role_idx = body
+            .find(r#""role":"assistant""#)
+            .expect("role event first");
         let tail_idx = body.find("TAIL€").expect("tail chunk must be emitted");
-        let done_idx = body.find("[DONE]").expect("stream must terminate with [DONE]");
+        let done_idx = body
+            .find("[DONE]")
+            .expect("stream must terminate with [DONE]");
         assert!(role_idx < tail_idx && tail_idx < done_idx);
         assert!(body.contains("chat.completion.chunk"));
         assert_eq!(scrape_tokens_generated(&metrics), 2);
@@ -3678,8 +3702,7 @@ mod tests {
                 let s = wrap_chat_events(inner, "chatcmpl-t".into(), "m".into(), metrics.clone());
                 sse_events_to_string(s).await
             } else {
-                let s =
-                    wrap_completion_events(inner, "cmpl-t".into(), "m".into(), metrics.clone());
+                let s = wrap_completion_events(inner, "cmpl-t".into(), "m".into(), metrics.clone());
                 sse_events_to_string(s).await
             };
             assert!(
@@ -3687,7 +3710,10 @@ mod tests {
                 "chat={chat}: expected an error event; got:\n{body}"
             );
             assert!(body.contains("decoder exploded"), "chat={chat}");
-            assert!(!body.contains("[DONE]"), "chat={chat}: no [DONE] after failure");
+            assert!(
+                !body.contains("[DONE]"),
+                "chat={chat}: no [DONE] after failure"
+            );
             assert!(
                 !body.contains(r#""finish_reason":"length""#)
                     && !body.contains(r#""finish_reason":"stop""#),
