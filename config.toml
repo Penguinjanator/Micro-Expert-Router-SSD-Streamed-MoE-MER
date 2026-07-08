@@ -9,8 +9,8 @@
 # subcommand exposes, but driven from one place instead of a long-tail of
 # CLI flags.
 #
-# All sections are required except `[tokenizer]`, which falls back to a
-# byte-level tokenizer when omitted.
+# Optional sections include `[security]`, `[performance]`, and
+# `[tokenizer]`, which falls back to a byte-level tokenizer when omitted.
 
 [server]
 # Address to listen on. `0.0.0.0:8080` to expose to the network.
@@ -57,6 +57,13 @@ admission_min_free_blocks = 0
 # validation error.
 # tls_cert = "/etc/mer/tls/cert.pem"
 # tls_key = "/etc/mer/tls/key.pem"
+
+# Optional CPU placement and benchmark stall diagnostics. CPU affinity is
+# applied at process startup before tokio and Rayon workers are created, so
+# those threads inherit the mask. The timeout is disabled when unset or 0.
+# [performance]
+# cpu_mask = "0-24"
+# progress_timeout_secs = 300
 
 [sampling]
 # Server-wide defaults for the next-token sampler. Each request can
