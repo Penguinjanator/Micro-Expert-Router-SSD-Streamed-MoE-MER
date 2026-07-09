@@ -1615,6 +1615,8 @@ env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
   --autotune-rayon \
   --autotune-repeats 2 \
   --autotune-coarse-tokens 512 \
+  --autotune-slow-p95-ms 110 \
+  --autotune-slow-p99-ms 150 \
   --autotune-tokens 2000 \
   ...
 ```
@@ -1646,12 +1648,17 @@ cloud shapes, bare-metal hosts, containers, models, quantization types,
 or backends.
 
 Autotune runs a short coarse pass over the candidate set, then repeated
-fine probes for the top candidates. The saved profile records the
-effective CPU mask, logical core count, repeats, per-probe metrics,
-candidate summaries, selected confidence, and selection reason. Low
-confidence profiles are retained for auditability, but normal runs do
-not reuse them unless `--reuse-low-confidence-rayon-profile` is passed.
-Use `--autotune-print-table` to emit a concise coarse/fine probe table.
+fine probes for the top candidates plus anchor candidates: MER's default
+compute thread count, all logical cores, logical cores minus one, and any
+previous high-confidence profile for the same placement key. The saved
+profile records the effective CPU mask, logical core count, repeats,
+per-probe metrics, candidate summaries, selected confidence, and
+selection reason. Low-confidence profiles are retained only when
+explicitly allowed, and normal runs do not reuse them unless
+`--reuse-low-confidence-rayon-profile` is passed. Low-confidence
+autotune results are not used for the current run unless
+`--allow-low-confidence-rayon-autotune` is passed. Use
+`--autotune-print-table` to emit a concise coarse/fine probe table.
 
 For config-driven `serve` and `bench-real` runs, placement and watchdog
 controls live under `[performance]`:
@@ -1839,6 +1846,13 @@ micro-expert-router run
                               Coarse winners promoted to fine probes
                               (default 3).
   --autotune-print-table     Print the coarse/fine autotune probe table.
+  --autotune-slow-p95-ms <MS>
+                              Slow-regime worst-p95 cutoff (default 80).
+  --autotune-slow-p99-ms <MS>
+                              Slow-regime worst-p99 cutoff (default 120).
+  --allow-low-confidence-rayon-autotune
+                              Permit a low-confidence autotune result for
+                              this run.
   --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q5k
                               | q6k | q8_0 | mxfp4 | mixed (default f32).
                               Must match gen-data / gguf-convert / the

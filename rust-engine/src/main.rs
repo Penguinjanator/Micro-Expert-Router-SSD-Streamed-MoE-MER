@@ -409,6 +409,29 @@ enum Cmd {
         /// Print a concise coarse/fine Rayon autotune result table.
         #[arg(long)]
         autotune_print_table: bool,
+        /// Slow-regime cutoff for the worst fine-probe p95.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P95_THRESHOLD_MS,
+            value_name = "MS",
+            value_parser = parse_positive_f64_value
+        )]
+        autotune_slow_p95_ms: f64,
+        /// Slow-regime cutoff for the worst fine-probe p99.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P99_THRESHOLD_MS,
+            value_name = "MS",
+            value_parser = parse_positive_f64_value
+        )]
+        autotune_slow_p99_ms: f64,
+        /// Use a low-confidence autotune result for this run.
+        ///
+        /// Without this flag, low-confidence results are treated as failed
+        /// selection and the startup thread resolver falls back to a saved
+        /// profile or MER's default sizing.
+        #[arg(long)]
+        allow_low_confidence_rayon_autotune: bool,
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
@@ -941,6 +964,17 @@ fn parse_positive_u64_value(s: &str) -> Result<u64, String> {
     }
 }
 
+fn parse_positive_f64_value(s: &str) -> Result<f64, String> {
+    let n = s
+        .parse::<f64>()
+        .map_err(|_| format!("expected a positive number, got {s:?}"))?;
+    if n.is_finite() && n > 0.0 {
+        Ok(n)
+    } else {
+        Err("value must be a finite number > 0".to_string())
+    }
+}
+
 fn init_logging(filter: &str) {
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -1047,6 +1081,17 @@ fn load_profiled_rayon_threads(
     Some(profile.threads)
 }
 
+fn load_high_confidence_profile_threads(
+    cli: &Cli,
+    key: Option<&crate::rayon_autotune::CpuAutotuneKey>,
+) -> Option<usize> {
+    let key = key?;
+    let path = run_profile_path(cli)?;
+    let profile = crate::rayon_autotune::load_profile(&path, key)?;
+    (profile.confidence == crate::rayon_autotune::RayonAutotuneConfidence::High)
+        .then_some(profile.threads)
+}
+
 fn maybe_run_startup_rayon_autotune(
     cli: &Cli,
     raw_args: &[OsString],
@@ -1061,6 +1106,9 @@ fn maybe_run_startup_rayon_autotune(
         autotune_coarse_tokens,
         autotune_top_candidates,
         autotune_print_table,
+        autotune_slow_p95_ms,
+        autotune_slow_p99_ms,
+        allow_low_confidence_rayon_autotune,
         ..
     } = &cli.cmd
     else {
@@ -1091,6 +1139,8 @@ fn maybe_run_startup_rayon_autotune(
         fine_tokens = autotune_tokens,
         repeats = autotune_repeats,
         top_candidates = autotune_top_candidates,
+        slow_p95_threshold_ms = autotune_slow_p95_ms,
+        slow_p99_threshold_ms = autotune_slow_p99_ms,
         "starting Rayon autotune probes"
     );
 
@@ -1107,8 +1157,8 @@ fn maybe_run_startup_rayon_autotune(
         probes.push(probe);
     }
 
-    let slow_p95_threshold_ms = crate::rayon_autotune::DEFAULT_SLOW_P95_THRESHOLD_MS;
-    let slow_p99_threshold_ms = crate::rayon_autotune::DEFAULT_SLOW_P99_THRESHOLD_MS;
+    let slow_p95_threshold_ms = *autotune_slow_p95_ms;
+    let slow_p99_threshold_ms = *autotune_slow_p99_ms;
     let coarse_summaries = crate::rayon_autotune::summarize_candidate_results(
         &candidates,
         1,
@@ -1116,13 +1166,13 @@ fn maybe_run_startup_rayon_autotune(
         slow_p95_threshold_ms,
         slow_p99_threshold_ms,
     );
-    let fine_candidates: Vec<usize> =
-        crate::rayon_autotune::ranked_candidate_summaries(&coarse_summaries)
-            .into_iter()
-            .filter(|c| c.successful_repeats > 0)
-            .take(*autotune_top_candidates)
-            .map(|c| c.threads)
-            .collect();
+    let previous_profile_threads = load_high_confidence_profile_threads(cli, key);
+    let fine_candidates = crate::rayon_autotune::fine_thread_candidates(
+        affinity.logical_cores,
+        *autotune_top_candidates,
+        previous_profile_threads,
+        &coarse_summaries,
+    );
     if fine_candidates.is_empty() {
         if *autotune_print_table {
             let table = crate::rayon_autotune::format_autotune_table(&probes, &coarse_summaries);
@@ -1132,6 +1182,7 @@ fn maybe_run_startup_rayon_autotune(
     }
     info!(
         fine_candidates = ?fine_candidates,
+        previous_high_confidence_profile_threads = ?previous_profile_threads,
         repeats = autotune_repeats,
         fine_tokens = autotune_tokens,
         "Rayon autotune coarse pass selected fine candidates"
@@ -1183,47 +1234,80 @@ fn maybe_run_startup_rayon_autotune(
         "Rayon autotune selected worker count"
     );
 
-    if let (Some(path), Some(key)) = (run_profile_path(cli), key) {
-        let median_p50_ms = best.median_p50_ms.unwrap_or(0.0);
-        let worst_p95_ms = best.worst_p95_ms.unwrap_or(0.0);
-        let median_sustained_tps = best.median_sustained_tps.unwrap_or(0.0);
-        let profile = crate::rayon_autotune::RayonAutotuneProfile {
-            threads: best.threads,
-            effective_cpu_mask: affinity.cpus.clone(),
-            effective_cpu_mask_display: Some(affinity.display.clone()),
-            logical_cores: affinity.logical_cores,
-            repeats: *autotune_repeats,
-            p50_ms: median_p50_ms,
-            p95_ms: worst_p95_ms,
-            p99_ms: best.worst_p99_ms,
-            sustained_tps: median_sustained_tps,
-            median_p50_ms,
-            worst_p95_ms,
-            worst_p99_ms: best.worst_p99_ms,
-            median_sustained_tps,
-            confidence: selection.confidence,
-            selection_reason: selection.reason.clone(),
-            candidate_results: candidate_summaries.clone(),
-            probe_results: probes.clone(),
-        };
-        if let Err(e) = crate::rayon_autotune::save_profile(&path, key, profile) {
-            warn!(path = %path.display(), error = %e, "failed to save Rayon autotune profile");
-        } else if selection.confidence == crate::rayon_autotune::RayonAutotuneConfidence::Low {
-            warn!(
-                path = %path.display(),
-                confidence = selection.confidence.as_str(),
-                "saved low-confidence Rayon autotune profile; normal runs will not reuse it without --reuse-low-confidence-rayon-profile"
-            );
-        } else {
-            info!(
-                path = %path.display(),
-                confidence = selection.confidence.as_str(),
-                "saved placement-aware Rayon autotune profile"
-            );
-        }
+    let use_selected = selected_autotune_threads(
+        &selection,
+        *allow_low_confidence_rayon_autotune,
+    );
+    if use_selected.is_none() {
+        warn!(
+            threads = best.threads,
+            confidence = selection.confidence.as_str(),
+            "Rayon autotune result is low-confidence; falling back to saved profile/default threads unless --allow-low-confidence-rayon-autotune is passed"
+        );
     }
 
-    Ok(Some(best.threads))
+    if use_selected.is_some() {
+        if let (Some(path), Some(key)) = (run_profile_path(cli), key) {
+            let median_p50_ms = best.median_p50_ms.unwrap_or(0.0);
+            let worst_p95_ms = best.worst_p95_ms.unwrap_or(0.0);
+            let median_sustained_tps = best.median_sustained_tps.unwrap_or(0.0);
+            let profile = crate::rayon_autotune::RayonAutotuneProfile {
+                threads: best.threads,
+                effective_cpu_mask: affinity.cpus.clone(),
+                effective_cpu_mask_display: Some(affinity.display.clone()),
+                logical_cores: affinity.logical_cores,
+                repeats: *autotune_repeats,
+                p50_ms: median_p50_ms,
+                p95_ms: worst_p95_ms,
+                p99_ms: best.worst_p99_ms,
+                sustained_tps: median_sustained_tps,
+                median_p50_ms,
+                worst_p95_ms,
+                worst_p99_ms: best.worst_p99_ms,
+                median_sustained_tps,
+                confidence: selection.confidence,
+                selection_reason: selection.reason.clone(),
+                candidate_results: candidate_summaries.clone(),
+                probe_results: probes.clone(),
+            };
+            if let Err(e) = crate::rayon_autotune::save_profile(&path, key, profile) {
+                warn!(path = %path.display(), error = %e, "failed to save Rayon autotune profile");
+            } else if selection.confidence == crate::rayon_autotune::RayonAutotuneConfidence::Low {
+                warn!(
+                    path = %path.display(),
+                    confidence = selection.confidence.as_str(),
+                    "saved low-confidence Rayon autotune profile; normal runs will not reuse it without --reuse-low-confidence-rayon-profile"
+                );
+            } else {
+                info!(
+                    path = %path.display(),
+                    confidence = selection.confidence.as_str(),
+                    "saved placement-aware Rayon autotune profile"
+                );
+            }
+        }
+    } else if let Some(path) = run_profile_path(cli) {
+        warn!(
+            path = %path.display(),
+            confidence = selection.confidence.as_str(),
+            "not saving low-confidence Rayon autotune result as the default profile"
+        );
+    }
+
+    Ok(use_selected)
+}
+
+fn selected_autotune_threads(
+    selection: &crate::rayon_autotune::RayonAutotuneSelection,
+    allow_low_confidence: bool,
+) -> Option<usize> {
+    if selection.confidence == crate::rayon_autotune::RayonAutotuneConfidence::Low
+        && !allow_low_confidence
+    {
+        None
+    } else {
+        Some(selection.selected.threads)
+    }
 }
 
 fn run_rayon_autotune_probe_observation(
@@ -1326,7 +1410,10 @@ fn autotune_child_args(
             || s.starts_with("--autotune-repeats=")
             || s.starts_with("--autotune-coarse-tokens=")
             || s.starts_with("--autotune-top-candidates=")
+            || s.starts_with("--autotune-slow-p95-ms=")
+            || s.starts_with("--autotune-slow-p99-ms=")
             || s == "--autotune-print-table"
+            || s == "--allow-low-confidence-rayon-autotune"
             || s.starts_with("--tokens=")
             || s.starts_with("--rayon-threads=")
         {
@@ -1336,6 +1423,8 @@ fn autotune_child_args(
             || s == "--autotune-repeats"
             || s == "--autotune-coarse-tokens"
             || s == "--autotune-top-candidates"
+            || s == "--autotune-slow-p95-ms"
+            || s == "--autotune-slow-p99-ms"
             || s == "--tokens"
             || s == "--rayon-threads"
         {
@@ -5759,6 +5848,7 @@ async fn cmd_run(
         "streaming tokens (latency / throughput logs follow)"
     );
     let mut token_cycle_us = Vec::with_capacity(args.tokens.min(1_000_000) as usize);
+    let autotune_probe = std::env::var_os(crate::rayon_autotune::AUTOTUNE_PROBE_ENV).is_some();
 
     // Optional production gating network. When present, every token's
     // expert ids come from `softmax(W_gate · x) → top-K` (real Mixtral
@@ -5900,16 +5990,18 @@ async fn cmd_run(
         } else {
             f64::INFINITY
         };
-        info!(
-            token = t,
-            cycle_us = elapsed.as_micros() as u64,
-            tps = format!("{throughput:.1}"),
-            hits = stats.hits,
-            misses = stats.misses,
-            kib = stats.bytes_read / 1024,
-            resident = ?cache.resident_ids(),
-            "tick"
-        );
+        if !autotune_probe {
+            info!(
+                token = t,
+                cycle_us = elapsed.as_micros() as u64,
+                tps = format!("{throughput:.1}"),
+                hits = stats.hits,
+                misses = stats.misses,
+                kib = stats.bytes_read / 1024,
+                resident = ?cache.resident_ids(),
+                "tick"
+            );
+        }
         if args.token_pause_us > 0 {
             tokio::time::sleep(Duration::from_micros(args.token_pause_us)).await;
         }
@@ -5925,7 +6017,7 @@ async fn cmd_run(
         hit_rate_pct = (r.hits as f64 / total_lookups as f64) * 100.0,
         "stream complete"
     );
-    if std::env::var_os(crate::rayon_autotune::AUTOTUNE_PROBE_ENV).is_some() {
+    if autotune_probe {
         token_cycle_us.sort_unstable();
         let report = crate::rayon_autotune::RayonAutotuneProbeResult {
             threads: crate::parallel::num_threads(),
@@ -6657,7 +6749,12 @@ mod tests {
             OsString::from("512"),
             OsString::from("--autotune-top-candidates"),
             OsString::from("2"),
+            OsString::from("--autotune-slow-p95-ms"),
+            OsString::from("110"),
+            OsString::from("--autotune-slow-p99-ms"),
+            OsString::from("150"),
             OsString::from("--autotune-print-table"),
+            OsString::from("--allow-low-confidence-rayon-autotune"),
             OsString::from("--tokens"),
             OsString::from("10000"),
         ];
@@ -6674,7 +6771,12 @@ mod tests {
         assert!(!rendered.iter().any(|s| s == "--autotune-repeats"));
         assert!(!rendered.iter().any(|s| s == "--autotune-coarse-tokens"));
         assert!(!rendered.iter().any(|s| s == "--autotune-top-candidates"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-slow-p95-ms"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-slow-p99-ms"));
         assert!(!rendered.iter().any(|s| s == "--autotune-print-table"));
+        assert!(!rendered
+            .iter()
+            .any(|s| s == "--allow-low-confidence-rayon-autotune"));
         assert!(rendered
             .windows(2)
             .any(|w| w[0] == "--tokens" && w[1] == "123"));
@@ -6697,7 +6799,12 @@ mod tests {
             "512",
             "--autotune-top-candidates",
             "2",
+            "--autotune-slow-p95-ms",
+            "110",
+            "--autotune-slow-p99-ms",
+            "150",
             "--autotune-print-table",
+            "--allow-low-confidence-rayon-autotune",
         ])
         .expect("autotune stability flags should parse");
         let Cmd::Run {
@@ -6706,7 +6813,10 @@ mod tests {
             autotune_repeats,
             autotune_coarse_tokens,
             autotune_top_candidates,
+            autotune_slow_p95_ms,
+            autotune_slow_p99_ms,
             autotune_print_table,
+            allow_low_confidence_rayon_autotune,
             ..
         } = cli.cmd
         else {
@@ -6717,7 +6827,10 @@ mod tests {
         assert_eq!(autotune_repeats, 3);
         assert_eq!(autotune_coarse_tokens, 512);
         assert_eq!(autotune_top_candidates, 2);
+        assert_eq!(autotune_slow_p95_ms, 110.0);
+        assert_eq!(autotune_slow_p99_ms, 150.0);
         assert!(autotune_print_table);
+        assert!(allow_low_confidence_rayon_autotune);
     }
 
     #[test]
@@ -6786,6 +6899,31 @@ mod tests {
         .unwrap();
         assert_eq!(load_profiled_rayon_threads(&cli, Some(&key)), Some(25));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn low_confidence_autotune_selection_requires_current_run_opt_in() {
+        let selection = crate::rayon_autotune::RayonAutotuneSelection {
+            selected: crate::rayon_autotune::RayonAutotuneCandidateSummary {
+                threads: 25,
+                requested_repeats: 2,
+                successful_repeats: 2,
+                all_repeats_successful: true,
+                p95_below_slow_threshold: false,
+                p99_below_slow_threshold: true,
+                median_p50_ms: Some(99.0),
+                worst_p95_ms: Some(101.0),
+                worst_p99_ms: Some(120.0),
+                median_sustained_tps: Some(10.0),
+                p50_cv: Some(0.0),
+                confidence: crate::rayon_autotune::RayonAutotuneConfidence::Low,
+                rejection_reason: Some("worst p95 exceeds threshold".to_string()),
+            },
+            confidence: crate::rayon_autotune::RayonAutotuneConfidence::Low,
+            reason: "low confidence".to_string(),
+        };
+        assert_eq!(selected_autotune_threads(&selection, false), None);
+        assert_eq!(selected_autotune_threads(&selection, true), Some(25));
     }
 
     // ---- Item 4: bench-real fail-open policy rejection matrix ----

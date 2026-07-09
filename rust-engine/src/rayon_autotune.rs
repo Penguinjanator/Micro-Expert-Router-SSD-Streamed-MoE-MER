@@ -332,6 +332,44 @@ pub fn ranked_candidate_summaries(
     ranked
 }
 
+pub fn fine_thread_candidates(
+    effective_logical_cores: usize,
+    top_coarse_candidate_count: usize,
+    previous_high_confidence_profile_threads: Option<usize>,
+    coarse_summaries: &[RayonAutotuneCandidateSummary],
+) -> Vec<usize> {
+    let logical = effective_logical_cores.max(1);
+    let mut selected = Vec::new();
+    push_valid_candidate(
+        &mut selected,
+        crate::parallel::default_compute_threads(logical),
+        logical,
+    );
+    push_valid_candidate(&mut selected, logical, logical);
+    if logical > 1 {
+        push_valid_candidate(&mut selected, logical - 1, logical);
+    }
+    if let Some(threads) = previous_high_confidence_profile_threads {
+        push_valid_candidate(&mut selected, threads, logical);
+    }
+
+    for candidate in ranked_candidate_summaries(coarse_summaries)
+        .into_iter()
+        .filter(|c| c.successful_repeats > 0)
+        .take(top_coarse_candidate_count)
+    {
+        push_valid_candidate(&mut selected, candidate.threads, logical);
+    }
+
+    selected
+}
+
+fn push_valid_candidate(out: &mut Vec<usize>, threads: usize, logical: usize) {
+    if (1..=logical).contains(&threads) && !out.contains(&threads) {
+        out.push(threads);
+    }
+}
+
 pub fn select_best_candidate(
     candidates: &[RayonAutotuneCandidateSummary],
 ) -> Option<RayonAutotuneSelection> {
@@ -855,6 +893,25 @@ mod tests {
         let selected = select_best_candidate(&summaries).unwrap();
         assert_eq!(selected.selected.threads, 12);
         assert_eq!(selected.confidence, RayonAutotuneConfidence::High);
+    }
+
+    #[test]
+    fn fine_candidates_include_anchors_regardless_of_coarse_rank() {
+        let probes = [
+            probe(1, 1, 10.0, 12.0, 14.0, 100.0),
+            probe(2, 1, 11.0, 13.0, 15.0, 90.0),
+            probe(5, 1, 80.0, 82.0, 84.0, 12.0),
+            probe(7, 1, 90.0, 92.0, 94.0, 11.0),
+            probe(8, 1, 95.0, 97.0, 99.0, 10.0),
+        ];
+        let summaries = summarize_candidate_results(&[1, 2, 5, 7, 8], 1, &probes, 100.0, 120.0);
+        let fine = fine_thread_candidates(8, 2, Some(5), &summaries);
+        assert!(fine.contains(&crate::parallel::default_compute_threads(8)));
+        assert!(fine.contains(&8));
+        assert!(fine.contains(&7));
+        assert!(fine.contains(&5));
+        assert!(fine.contains(&1));
+        assert!(fine.contains(&2));
     }
 
     #[test]
