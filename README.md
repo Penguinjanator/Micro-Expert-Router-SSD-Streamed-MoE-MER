@@ -1597,6 +1597,8 @@ env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
   --progress-timeout-secs 300 \
   run \
   --autotune-rayon \
+  --autotune-repeats 2 \
+  --autotune-coarse-tokens 512 \
   --autotune-tokens 2000 \
   ...
 ```
@@ -1611,6 +1613,8 @@ env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
   --progress-timeout-secs 300 \
   run \
   --autotune-rayon \
+  --autotune-repeats 2 \
+  --autotune-coarse-tokens 512 \
   --autotune-tokens 2000 \
   ...
 ```
@@ -1640,6 +1644,14 @@ reproduction. A known-good setting on one VM, such as `25` Rayon threads
 inside CPU mask `0-24`, is not a universal recommendation for other
 cloud shapes, bare-metal hosts, containers, models, quantization types,
 or backends.
+
+Autotune runs a short coarse pass over the candidate set, then repeated
+fine probes for the top candidates. The saved profile records the
+effective CPU mask, logical core count, repeats, per-probe metrics,
+candidate summaries, selected confidence, and selection reason. Low
+confidence profiles are retained for auditability, but normal runs do
+not reuse them unless `--reuse-low-confidence-rayon-profile` is passed.
+Use `--autotune-print-table` to emit a concise coarse/fine probe table.
 
 For config-driven `serve` and `bench-real` runs, placement and watchdog
 controls live under `[performance]`:
@@ -1819,7 +1831,14 @@ micro-expert-router run
   --tokens <N>               Stream length
   --autotune-rayon           Probe Rayon worker counts before startup pool
                               initialization and run with the winner.
-  --autotune-tokens <N>      Tokens per autotune probe (default 2000).
+  --autotune-tokens <N>      Tokens per fine autotune probe (default 2000).
+  --autotune-repeats <N>     Repeated fine probes per finalist (default 2).
+  --autotune-coarse-tokens <N>
+                              Tokens per coarse probe (default 512).
+  --autotune-top-candidates <N>
+                              Coarse winners promoted to fine probes
+                              (default 3).
+  --autotune-print-table     Print the coarse/fine autotune probe table.
   --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q5k
                               | q6k | q8_0 | mxfp4 | mixed (default f32).
                               Must match gen-data / gguf-convert / the
