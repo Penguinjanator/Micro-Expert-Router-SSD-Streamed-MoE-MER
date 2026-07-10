@@ -32,6 +32,11 @@ use std::env;
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
+#[cfg(target_os = "linux")]
+const MAX_CPULIST_CPUS: usize = libc::CPU_SETSIZE as usize;
+#[cfg(not(target_os = "linux"))]
+const MAX_CPULIST_CPUS: usize = 4096;
+
 /// Environment variable that, if set to a positive integer `N`, pins
 /// the process to the first `N` CPUs of NUMA node 0 at startup.
 pub const MER_PIN_CORES_ENV: &str = "MER_PIN_CORES";
@@ -312,6 +317,21 @@ pub fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
             if b < a {
                 return Err(format!("descending cpulist range: {a}-{b}"));
             }
+            let len = b
+                .checked_sub(a)
+                .and_then(|delta| delta.checked_add(1))
+                .ok_or_else(|| format!("cpulist range is too large: {a}-{b}"))?;
+            if len > MAX_CPULIST_CPUS {
+                return Err(format!(
+                    "cpulist range {a}-{b} expands to {len} CPUs, exceeding supported maximum {MAX_CPULIST_CPUS}"
+                ));
+            }
+            if b >= MAX_CPULIST_CPUS {
+                return Err(format!(
+                    "cpu {b} exceeds supported maximum CPU id {}",
+                    MAX_CPULIST_CPUS - 1
+                ));
+            }
             for c in a..=b {
                 out.push(c);
             }
@@ -319,6 +339,12 @@ pub fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
             let c: usize = part
                 .parse()
                 .map_err(|_| format!("bad cpulist cpu: {part:?}"))?;
+            if c >= MAX_CPULIST_CPUS {
+                return Err(format!(
+                    "cpu {c} exceeds supported maximum CPU id {}",
+                    MAX_CPULIST_CPUS - 1
+                ));
+            }
             out.push(c);
         }
     }
@@ -505,6 +531,12 @@ mod tests {
     #[test]
     fn rejects_descending_range() {
         assert!(parse_cpulist("4-1").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_range_before_expansion() {
+        let err = parse_cpulist("0-999999999").unwrap_err();
+        assert!(err.contains("exceeding supported maximum"));
     }
 
     #[test]

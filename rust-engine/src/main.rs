@@ -1505,6 +1505,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `MER_PIN_CORES` is now consumed centrally at process start via the
     // `numa` module. Clear it so later code cannot re-apply affinity and
     // drift from this startup contract.
+    // SAFETY: this runs during single-threaded startup, before the Tokio
+    // runtime or Rayon worker pool is created and before this process
+    // introduces any concurrent environment access.
     unsafe {
         std::env::remove_var(crate::numa::MER_PIN_CORES_ENV);
     }
@@ -5847,8 +5850,9 @@ async fn cmd_run(
         tokens = args.tokens,
         "streaming tokens (latency / throughput logs follow)"
     );
-    let mut token_cycle_us = Vec::with_capacity(args.tokens.min(1_000_000) as usize);
     let autotune_probe = std::env::var_os(crate::rayon_autotune::AUTOTUNE_PROBE_ENV).is_some();
+    let mut token_cycle_us =
+        autotune_probe.then(|| Vec::with_capacity(args.tokens.min(1_000_000) as usize));
 
     // Optional production gating network. When present, every token's
     // expert ids come from `softmax(W_gate · x) → top-K` (real Mixtral
@@ -5984,7 +5988,9 @@ async fn cmd_run(
         })
         .await?;
         let elapsed = start.elapsed();
-        token_cycle_us.push(elapsed.as_micros() as u64);
+        if let Some(samples) = token_cycle_us.as_mut() {
+            samples.push(elapsed.as_micros() as u64);
+        }
         let throughput = if elapsed.as_secs_f64() > 0.0 {
             1.0 / elapsed.as_secs_f64()
         } else {
@@ -6018,6 +6024,9 @@ async fn cmd_run(
         "stream complete"
     );
     if autotune_probe {
+        let token_cycle_us = token_cycle_us
+            .as_mut()
+            .expect("autotune probe samples initialized");
         token_cycle_us.sort_unstable();
         let report = crate::rayon_autotune::RayonAutotuneProbeResult {
             threads: crate::parallel::num_threads(),

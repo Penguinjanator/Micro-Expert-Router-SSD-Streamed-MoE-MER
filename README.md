@@ -1615,11 +1615,21 @@ env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
   --autotune-rayon \
   --autotune-repeats 2 \
   --autotune-coarse-tokens 512 \
-  --autotune-slow-p95-ms 110 \
-  --autotune-slow-p99-ms 150 \
+  --autotune-slow-p95-ms 180 \
+  --autotune-slow-p99-ms 320 \
   --autotune-tokens 2000 \
   ...
 ```
+
+`--autotune-rayon` improves thread-count discovery and observability; it
+does not guarantee stable throughput on noisy VMs. The autotune p95/p99
+thresholds are based on end-to-end token cycle latency, so they should be
+looser than the compute-only FFN latency reported in the final run
+summary. On VMs, child-process autotune probes may find a fast regime
+that the final parent run does not always reproduce. On bare metal or
+dedicated pinned hosts, a high-confidence saved profile is more likely to
+remain reusable. On noisy VMs, per-run autotune is recommended for
+benchmark runs.
 
 For exact benchmark reproduction, pin both the placement and the worker
 count:

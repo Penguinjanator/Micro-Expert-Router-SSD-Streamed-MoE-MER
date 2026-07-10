@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::numa::{format_cpulist, EffectiveCpuAffinity};
 
@@ -737,14 +738,51 @@ pub fn save_profile(
     key: &CpuAutotuneKey,
     profile: RayonAutotuneProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
     let mut store = match std::fs::read_to_string(path) {
-        Ok(body) => serde_json::from_str::<RayonAutotuneProfileStore>(&body).unwrap_or_default(),
-        Err(_) => RayonAutotuneProfileStore::default(),
+        Ok(body) => serde_json::from_str::<RayonAutotuneProfileStore>(&body).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse existing Rayon autotune profile store {}: {e}; refusing to overwrite",
+                    path.display()
+                ),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RayonAutotuneProfileStore::default(),
+        Err(e) => return Err(e.into()),
     };
     store.profiles.insert(key.cache_key(), profile);
-    let body = serde_json::to_string_pretty(&store)?;
-    std::fs::write(path, body)?;
-    Ok(())
+    let body = serde_json::to_vec_pretty(&store)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("profile path {} has no file name", path.display()),
+        )
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut tmp = std::fs::File::create(&tmp_path)?;
+        tmp.write_all(&body)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
 }
 
 pub fn percentile_ms(sorted_us: &[u64], q: f64) -> f64 {
@@ -961,6 +999,52 @@ mod tests {
         let profile: RayonAutotuneProfile = serde_json::from_str(legacy).unwrap();
         assert_eq!(profile.confidence, RayonAutotuneConfidence::Low);
         assert!(!profile.reusable_by_default());
+    }
+
+    #[test]
+    fn save_profile_refuses_to_clobber_unparseable_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "mer-rayon-autotune-save-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.json");
+        std::fs::write(&path, "{not-json").unwrap();
+        let key = CpuAutotuneKey {
+            machine_fingerprint: "machine".to_string(),
+            model_fingerprint: "model".to_string(),
+            backend_fingerprint: "backend".to_string(),
+        };
+        let probes = vec![probe(25, 1, 58.0, 61.0, 70.0, 17.0)];
+        let candidates = summarize_candidate_results(&[25], 1, &probes, 80.0, 120.0);
+        let profile = RayonAutotuneProfile {
+            threads: 25,
+            effective_cpu_mask: Some((0..25).collect()),
+            effective_cpu_mask_display: Some("0-24".to_string()),
+            logical_cores: 25,
+            repeats: 1,
+            p50_ms: 58.0,
+            p95_ms: 61.0,
+            p99_ms: Some(70.0),
+            sustained_tps: 17.0,
+            median_p50_ms: 58.0,
+            worst_p95_ms: 61.0,
+            worst_p99_ms: Some(70.0),
+            median_sustained_tps: 17.0,
+            confidence: RayonAutotuneConfidence::Low,
+            selection_reason: "test".to_string(),
+            candidate_results: candidates,
+            probe_results: probes,
+        };
+
+        assert!(save_profile(&path, &key, profile).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
