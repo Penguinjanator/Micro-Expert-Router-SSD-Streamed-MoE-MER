@@ -1,200 +1,168 @@
 # Micro-Expert-Router, SSD-Streamed MoE Execution Engine
 
-A Rust execution engine for **Mixture-of-Experts** models that treats SSD
-as the backing store for expert weights and RAM/VRAM as cache tiers. The
-engine streams routed expert blobs into page-aligned buffers with
-`O_DIRECT` positional reads, then executes a real SwiGLU FFN over those
-bytes. The current verified path is the `run` expert-streaming benchmark
-on **Mixtral 8x7B Q4_0** expert blobs.
+Micro-Expert-Router (MER) is a Rust execution engine for
+Mixture-of-Experts models that treats SSD as the backing store for
+expert weights and RAM/VRAM as cache tiers. It streams routed expert
+blobs into page-aligned buffers with `O_DIRECT` positional reads, then
+executes a real SwiGLU FFN over those bytes.
 
-The core question this repository measures is cache pressure: how routing
-locality, cache size, prefetching, and foreground SSD reads affect a real
-expert-FFN workload. PCIe-4/5 SSD sequential bandwidth is useful context,
-but the measured workload is shaped by random expert access, queue
-contention, VM storage virtualization, speculative traffic, and CPU
-compute. The benchmark numbers below are therefore observed workload
-throughput, not theoretical drive bandwidth and not full LLM generation
-throughput.
+The core measurement question is cache pressure: how routing locality,
+cache size, prefetching, foreground SSD reads, and CPU compute interact
+when expert weights do not all fit in memory. Benchmark throughput in
+this repository is observed workload throughput, not theoretical NVMe
+bandwidth. For the `run` benchmark, `sustained_tps` means benchmark
+iterations per second; it is not full autoregressive LLM generated
+tokens per second.
 
 The engine lives under [`rust-engine/`](./rust-engine).
+
+## Current verified path
+
+The current verified path remains the CPU-only `run` expert-streaming
+benchmark on **Mixtral 8x7B Instruct Q4_0** expert blobs converted from
+GGUF with `gguf-convert --native-quant`. The verified dataset shape is
+256 layer-qualified experts, 32 layers, 8 experts per layer, top-2
+routing, `d_model = 4096`, `d_ff = 14336`, and Q4_0 expert payloads.
+
+That benchmark exercises real Q4_0 SwiGLU expert FFN execution, the RAM
+expert cache, SSD reads, routing, prefetching, and run-summary telemetry.
+It does not exercise the full autoregressive decoder pipeline unless
+`[real_transformer].enabled = true` is configured and measured through
+the serving or `bench-real` path.
 
 ## Supported model status
 
 The loader has architecture-aware tensor-name and config handling for
-several families, but validation is not the same thing as parsing support.
-Current status:
+several families, but parsing support is not the same as benchmark
+validation.
 
 | Status | Scope |
 |---|---|
 | **Verified expert-streaming benchmark target** | Mixtral 8x7B Q4_0 expert blobs from `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`, run on the CPU path with 256 layer-qualified experts and top-2 routing. |
-| **Implemented, not benchmark-validated here** | Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for the implementation details and limitations. |
+| **Implemented, not benchmark-validated here** | Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for implementation details and limitations. |
 | **Dense model support only** | Qwen3 dense, Mistral Small 3, and Phi-4 load dense decoder tensors but do not exercise SSD expert streaming. |
 | **Unsupported or known limitation** | Arbitrary sparse MoEs and arbitrary GGUF quantization recipes are not automatically supported. Mixed expert projection dtypes are supported only when every projection maps to an executable CPU kernel and the dataset carries UTH2 metadata. |
 
----
+## Latest benchmark status
 
-## Verified CPU-Only Expert-Cache Scaling — Mixtral 8x7B
+The newest supplied observations are the July 2026 CPU/Rayon autotune
+validation runs on a GCP `g2-standard-32` VM after the Rayon/autotune
+work merged. Treat them as VM observations, not universal performance
+claims.
 
-These are the latest observed **CPU-only** results for the `run`
-expert-streaming benchmark. The benchmark performs real Q4_0 SwiGLU
-expert FFN execution while exercising the cache, SSD reads, routing, and
-prefetch infrastructure. It is **not** full autoregressive decoder inference:
-benchmark iterations per second are not end-to-end generated language
-tokens per second. The CPU-only expert path uses the synthetic benchmark
-router and does not derive labels from the neural speculator's hidden
-state.
+Observed 3,000-iteration Mixtral Q4_0 runs reached 15.85 benchmark
+iterations per second with fallback/default auto sizing and 15.60
+benchmark iterations per second with a high-confidence autotuned
+21-thread Rayon pool. A
+profile-reuse run on the same VM also showed a slow regime at 11.43
+benchmark iterations per second, and a later high-confidence autotune
+final run diverged to 10.01 benchmark iterations per second even though
+its probes had been fast. On this VM, the fast compute regime was around
+55-60 ms and the slow regime was around 95-100 ms.
 
-In the latest verified CPU-only run, MER sustained 11.78 real Q4_0
-expert-FFN benchmark iterations per second with only a 16-slot,
-approximately 1.48 GiB expert cache. That configuration cached 6.25% of
-the 256-expert namespace while retaining 78.1% of the throughput
-measured with a 124-slot cache. The best observed 10,000-iteration run
-reached 15.08 benchmark iterations per second with 124 slots.
+Rayon/autotune is useful for safer thread-count discovery, confidence
+handling, profile reuse, and observability. It can land in the fast
+compute regime and can reject low-confidence selections, but it does not
+guarantee stable throughput on noisy VMs. Full measured results,
+commands, and limitations are in
+[`docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md`](docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md).
 
-Hardware and model: 2026-06-27, GCP `g2-standard-32`, 32 vCPUs / 16
-physical cores, 128 GB RAM, GCP local NVMe SSD,
-`mixtral-8x7b-instruct-v0.1.Q4_0.gguf`. An NVIDIA L4 was attached to
-the VM but was not used for these CPU benchmark runs. The GGUF was
-converted by `gguf-convert` to native Q4_0 expert blobs: 256
-layer-qualified experts, 32 layers, 8 experts per layer, top-2 routing,
-`d_model = 4096`, `d_ff = 14336`, 99,090,432 bytes per expert
-(approximately 94.5 MiB). The primary runs used 10,000 benchmark
-iterations, the skewed workload, Zipf `s = 1.2`, workload correlation
-`0.7`, seed `42`, locality, affinity, the adaptive prefetch governor,
-`io_uring`, and `--force-ssd`. The neural speculator was disabled.
+The latest full cache-scaling suite remains the 2026-06-27 CPU-only
+Mixtral report. It is retained as historical cache-scaling evidence, not
+as the current post-autotune headline. The 2026-06-25 report is an older
+historical baseline.
 
-| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark iterations/s | Hit rate | Avg. compute/iteration | Avg. I/O wait/iteration | I/O share |
-| -----------: | ---------------: | ---------------------------: | ---------: | -------------------------------: | -------: | ---------------------: | ----------------------: | --------: |
-|     16 slots |            6.25% |                     1.48 GiB |     10,000 |                            11.78 |   86.78% |               56.09 ms |                28.58 ms |    33.74% |
-|     32 slots |           12.50% |                     2.95 GiB |     10,000 |                            13.50 |   91.63% |               55.49 ms |                18.37 ms |    24.86% |
-|     64 slots |           25.00% |                     5.91 GiB |     10,000 |                             8.87 |   94.62% |               96.33 ms |                11.96 ms |    11.04% |
-|    124 slots |           48.44% |                    11.44 GiB |     10,000 |                            15.08 |   96.68% |               58.36 ms |                 7.52 ms |    11.41% |
+## Historical benchmark links
 
-The defensible central result is that MER retained most of the measured
-expert-FFN benchmark throughput while caching only a small fraction of
-the expert namespace. The 16-slot run is the most important low-memory
-result: it cached only 6.25% of the 256-expert namespace, used about
-1.48 GiB of expert payload, sustained 11.78 benchmark iterations per
-second, and reached an 86.78% cache hit rate. Relative to 124 slots, the
-16-slot configuration used 12.9% as much cache capacity and retained
-78.1% of the measured throughput. The 32-slot configuration used 25.8%
-as much cache capacity as 124 slots and retained 89.5% of the measured
-throughput.
+| Document | What it contains |
+|---|---|
+| [`docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md`](docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md) | July 2026 observed VM validation for Rayon/autotune, including fast/slow compute-regime caveats. |
+| [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md) | Historical full cache-scaling suite for Mixtral Q4_0 on GCP local NVMe. |
+| [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md) | Older historical Mixtral cache-scaling baseline. |
+| [`docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md`](docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md) | Qwen3-Coder CPU-production sprint status; real checkpoint throughput benchmark was blocked by missing weights. |
 
-This supports MER's intended design goal: useful expert execution
-without keeping most of the expert namespace in RAM. High routing
-locality lets a small resident working set serve most lookups, while SSD
-reads handle the remaining cold expert activations.
+## Build/run quickstart
 
-### Known bimodal FFN compute anomaly
+Build the Rust engine:
 
-Do not read the table above as a normal monotonic cache-scaling curve.
-The 64-slot cache achieved a healthy 94.62% hit rate and average
-foreground I/O wait was only 11.96 ms, but the result dropped to 8.87
-benchmark iterations per second because average FFN compute time rose to
-96.33 ms. Normal fast-state FFN compute in the 16-, 32-, and mostly the
-124-slot runs was approximately 55-58 ms.
+```bash
+cd rust-engine
+cargo build --release
+```
 
-Repeated short tests between 60 and 68 slots showed compute p50 values
-near 98-100 ms. A 32-slot control remained fully in the fast state. A
-124-slot control was bimodal: p50 remained fast while p95 approached
-99 ms. The issue is under investigation. Possible memory placement,
-buffer identity, worker scheduling, NUMA locality, or kernel behavior
-remain hypotheses, not established conclusions. The 64-slot result is
-included for transparency and should not be interpreted as proof that
-larger caches inherently reduce performance.
+On Linux, include `io_uring` when using `--io-uring`:
 
-Compared cautiously with the non-identical June 25 configuration, the
-June 27 16-slot run improved from `sustained_tps=2.9101667108676104`,
-79.635% hit rate, 251.5833 ms average I/O wait, 21,353 completed
-prefetches, and the speculator enabled to
-`sustained_tps=11.78248398546161`, 86.775% hit rate, 28.5783 ms average
-I/O wait, 30 completed prefetches, speculator disabled, and the adaptive
-governor enabled. That is approximately 4.05x the historical 16-slot
-throughput while dramatically reducing speculative SSD traffic and
-foreground I/O wait. This difference is attributed to the updated
-benchmark configuration and much stricter speculative-I/O behavior, not
-to one isolated code change.
+```bash
+cargo build --release --features "avx512,blas,tokenizer,io_uring"
+```
 
-Hardware ceiling footnote: these measurements ran inside a GCP VM on
-GCP local SSD. Bare-metal PCIe-4/5 NVMe devices can advertise higher
-sequential-read ceilings, commonly in the single-digit to low-teens
-GB/s range per drive, and striping can raise that ceiling further.
-Those ceilings are not directly comparable to this table because the
-benchmark issues routed expert reads with cache misses, foreground
-contention, speculative reads, and CPU FFN work in the loop. Use them as
-capacity-planning context, not as claimed benchmark iterations per second.
+Current CPU-only Mixtral benchmark command shape:
 
-Full June 27 summaries, boundary controls, and metric definitions are
-recorded in
-[`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md).
-The previous June 25 results remain available as a
-[historical baseline](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md).
+```bash
+env -u RAYON_NUM_THREADS \
+./target/release/micro-expert-router \
+  --cpu-mask 0-24 \
+  --progress-timeout-secs 300 \
+  run \
+  --data-dir /mnt/localssd/data/mixtral-q4 \
+  --dtype q4_0 \
+  --cache-slots 124 \
+  --tokens 3000 \
+  --autotune-rayon \
+  --autotune-coarse-tokens 512 \
+  --autotune-tokens 1000 \
+  --autotune-repeats 2 \
+  --autotune-top-candidates 3 \
+  --autotune-slow-p95-ms 180 \
+  --autotune-slow-p99-ms 320 \
+  --autotune-print-table \
+  --predict-fanout 4 \
+  --pipeline-depth 4 \
+  --io-uring \
+  --locality \
+  --affinity \
+  --affinity-neighbors-k 2 \
+  --affinity-decay-epoch 4096 \
+  --num-layers 32 \
+  --num-experts-per-layer 8 \
+  --workload skewed \
+  --zipf-s 1.2 \
+  --workload-correlation 0.7 \
+  --prefetch-governor \
+  --seed 42 \
+  --force-ssd
+```
 
----
+This command is CPU-only; do not add `--gpu` unless you intentionally
+want the explicit fail-closed GPU path. On non-Linux builds, omit
+`--io-uring` and the `io_uring` cargo feature.
+
+## Deeper docs
+
+- [`docs/production.md`](docs/production.md): production deployment,
+  config, observability, security, and load testing.
+- [`docs/audit-findings.md`](docs/audit-findings.md): model-loading and
+  runtime-dispatch audit disposition.
+- [`docs/distributed.md`](docs/distributed.md): distributed expert
+  sharding over gRPC.
+- [`docs/benchmarks/`](docs/benchmarks/): measured benchmark notes,
+  historical reports, and blocked-benchmark records.
 
 ## Table of Contents
 
+- [Current verified path](#current-verified-path)
 - [Supported model status](#supported-model-status)
-- [Verified CPU-Only Expert-Cache Scaling — Mixtral 8x7B](#verified-cpu-only-expert-cache-scaling--mixtral-8x7b)
+- [Latest benchmark status](#latest-benchmark-status)
+- [Historical benchmark links](#historical-benchmark-links)
+- [Build/run quickstart](#buildrun-quickstart)
+- [Deeper docs](#deeper-docs)
 - [What it actually does](#what-it-actually-does)
-  - [End-to-end pipeline](#end-to-end-pipeline)
-  - [What "running" actually does](#what-running-actually-does)
 - [Architecture](#architecture)
-  - [Key design decisions](#key-design-decisions)
-  - [`pread` + `block_in_place` *or* io_uring (`--features io_uring`)](#pread--block_in_place-or-io_uring---features-io_uring)
-    - [Fault-tolerant I/O ("Hardened" MER)](#fault-tolerant-io-hardened-mer)
-    - [SSD Read De-Duplication (continuous batching)](#ssd-read-de-duplication-continuous-batching)
-    - [Speculative verification (draft model)](#speculative-verification-draft-model)
 - [Building and running](#building-and-running)
-  - [Quickstart (Docker / docker-compose)](#quickstart-docker--docker-compose)
-  - [Prerequisites](#prerequisites)
-  - [Build](#build)
-  - [Generate synthetic expert files](#generate-synthetic-expert-files)
-  - [Run the simulation](#run-the-simulation)
-  - [Run as an OpenAI-compatible HTTP server](#run-as-an-openai-compatible-http-server)
-    - [Sampling](#sampling)
-    - [Session API](#session-api)
-    - [Continuous batching](#continuous-batching)
-    - [Predictive architecture (`[predictive]`)](#predictive-architecture-predictive)
-    - [Real-transformer pipeline](#real-transformer-pipeline)
-    - [Hardware auto-escalation](#hardware-auto-escalation)
-    - [Decoupled math backend](#decoupled-math-backend)
-    - [Speculative engine warm-up](#speculative-engine-warm-up)
-    - [Distributed expert sharding](#distributed-expert-sharding)
-  - [Sample output](#sample-output)
-    - [Enabling the predictive prefetcher (and A/B testing it)](#enabling-the-predictive-prefetcher-and-ab-testing-it)
-  - [CLI reference](#cli-reference)
-  - [Running on real MoE weights](#running-on-real-moe-weights)
-  - [Routing model, Markov chain, transition matrix, or LinearGate](#routing-model-markov-chain-transition-matrix-or-lineargate)
-  - [macOS](#macos)
 - [What can it actually run today?](#what-can-it-actually-run-today)
-  - [Agents](#agents)
-  - [Sharding granularity](#sharding-granularity)
-  - [Picking a tensor backend](#picking-a-tensor-backend)
 - [Tests](#tests)
-  - [Property-based tests](#property-based-tests)
-  - [GPU promotion regression test](#gpu-promotion-regression-test)
 - [Energy Efficiency Features](#energy-efficiency-features)
-  - [1. On-disk quantization (`--dtype`)](#1-on-disk-quantization---dtype)
-  - [Page-aligned KV cache buffer](#page-aligned-kv-cache-buffer)
-  - [Cold-start manifest](#cold-start-manifest)
-  - [2. 2nd-order Markov + gate-lookahead prefetching](#2-2nd-order-markov--gate-lookahead-prefetching)
-  - [3. Partial weight loading (`--partial-load-fraction`)](#3-partial-weight-loading---partial-load-fraction)
-  - [4. io_uring with registered fixed buffers (`--features io_uring`, `--io-uring`)](#4-io_uring-with-registered-fixed-buffers---features-io_uring---io-uring)
-  - [5. Frequency-based expert pinning (`--pin-after-observations N`)](#5-frequency-based-expert-pinning---pin-after-observations-n)
-  - [6. Expert deduplication via alias map (`--alias-map`)](#6-expert-deduplication-via-alias-map---alias-map)
-  - [7. Predictive architecture (`S ∪ L ∪ M` speculative I/O)](#7-predictive-architecture-s--l--m-speculative-io)
-  - [How to combine them](#how-to-combine-them)
-- [Defeating the cache-fraction wall (streaming Tiers 1–4)](#defeating-the-cache-fraction-wall-streaming-tiers-14)
-  - [The wall](#the-wall)
-  - [Benchmark workload harness (`--workload`)](#benchmark-workload-harness---workload)
-  - [Tier 1 — skew-aware static residency](#tier-1--skew-aware-static-residency)
-  - [Tier 2 — packed expert storage + coalesced vectored reads](#tier-2--packed-expert-storage--coalesced-vectored-reads)
-  - [Tier 3 — per-layer pre-gate (cross-layer prefetch)](#tier-3--per-layer-pre-gate-cross-layer-prefetch)
-  - [Tier 4 — adaptive prefetch governor + cost-aware eviction](#tier-4--adaptive-prefetch-governor--cost-aware-eviction)
-  - [Putting it together](#putting-it-together)
-  - [`monitor` subcommand](#monitor-subcommand)
+- [Defeating the cache-fraction wall (streaming Tiers 1-4)](#defeating-the-cache-fraction-wall-streaming-tiers-14)
 - [Limitations / next steps](#limitations--next-steps)
 
 ---
@@ -951,8 +919,9 @@ verified end-to-end.
 ```bash
 # 200-iteration stream, top-2 routing. Tiny synthetic examples can use
 # 4 cache slots. Full Mixtral cache-scaling runs should sweep cache size
-# against hit rate, I/O share, and TPS; larger caches do not invalidate
-# the experiment. d_model / d_ff MUST match what was passed to gen-data.
+# against hit rate, I/O share, and benchmark iterations/s; larger caches
+# do not invalidate the experiment. d_model / d_ff MUST match what was
+# passed to gen-data.
 ./target/release/micro-expert-router run \
   --data-dir ./data \
   --num-experts 64 \
@@ -1842,8 +1811,9 @@ micro-expert-router run
   --d-model <N>              Must match gen-data
   --d-ff <N>                 Must match gen-data
   --cache-slots <N>          Resident experts. Tiny synthetic examples often
-                              use 4; full 256-expert Mixtral cache-scaling
-                              runs tested 16, 64, and 128 slots.
+                              use 4; historical 256-expert Mixtral
+                              cache-scaling runs tested 16, 32, 64, and
+                              124 slots, with an older 128-slot baseline.
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
   --autotune-rayon           Probe Rayon worker counts before startup pool
@@ -1898,8 +1868,10 @@ micro-expert-router run
                               benchmark so the FFN forward uses GPU matmul
                               where available, and install a bounded VRAM
                               `GpuExpertCache` so hot experts can promote and
-                              be served from device memory. Falls back to the
-                              CPU backend with a warning if GPU init fails.
+                              be served from device memory. This is an
+                              explicit fail-closed request: GPU init or
+                              backend installation failure aborts the run
+                              rather than silently measuring the CPU path.
   --force-ssd                Refuse to run with anything that lets the OS serve
                               experts from RAM (requires O_DIRECT on Linux)
   --router-clusters <N>      Markov router cluster count (default 4)
@@ -2459,7 +2431,7 @@ plug in through the backend trait:
 | Backend | Language | MoE support | Notes |
 |---|---|---|---|
 | **`candle-core` / CPU fallback** *(in tree, default)* | Rust | Used here for the per-expert SwiGLU | Default execution path when GPU init is disabled or unavailable. |
-| **`GpuBackend`** *(in tree, wgpu)* | Rust/WGSL | Runtime-selected expert and dense compute path | Enabled through `[real_transformer].compute_offload = "gpu"`; falls back to CPU when no suitable device is acquired. |
+| **`GpuBackend`** *(in tree, wgpu)* | Rust/WGSL | Runtime-selected expert and dense compute path | Enabled through `[real_transformer].compute_offload = "gpu"` or `"auto"`. Explicit `"gpu"` fails closed when no suitable device is acquired; `"auto"` falls back to CPU and records the fallback. |
 | **`mistral.rs`** | Rust | First-class (Mixtral, DeepSeek, Phi-MoE, Qwen-MoE) | Closest fit if you want a higher-level engine; replace its weight loader with this engine's `ExpertCache::get`. |
 | **`burn`** | Rust | Generic; community Mixtral | Pluggable compute backends (wgpu, cuda, ndarray). |
 | **`llama.cpp` (GGUF MoE)** | C++ | Mixtral, DeepSeek, Qwen-MoE, OLMoE | FFI required. GGUF stores experts contiguously per layer, easy to map to per-expert files. |
@@ -3281,12 +3253,14 @@ The genuinely open items are:
   inference numbers.
 
 - **GPU validation scope.** `GpuBackend` uses wgpu and is selected at
-  runtime through `[real_transformer].compute_offload = "gpu"`. GPU
-  initialization can fail and fall back to CPU, and the CPU-only Mixtral
-  benchmark above does not validate the attached NVIDIA L4 path. The
-  separate `cuda` feature unlocks `inference::run_inference_gpu` through
-  candle CUDA; CUDA validation requires appropriate GPU hardware and is
-  tracked separately from the wgpu runtime path.
+  runtime through `[real_transformer].compute_offload = "gpu"` or
+  `"auto"`. Explicit `"gpu"` fails closed when initialization or backend
+  installation fails; `"auto"` can fall back to CPU and records the
+  fallback. The CPU-only Mixtral benchmark above does not validate the
+  attached NVIDIA L4 path. The separate `cuda` feature unlocks
+  `inference::run_inference_gpu` through candle CUDA; CUDA validation
+  requires appropriate GPU hardware and is tracked separately from the
+  wgpu runtime path.
 - **AMX tile intrinsics.** `--features amx` compiles in the Intel
   AMX tile skeleton in `src/kernels/`, but currently routes back to
   the AVX-512 / scalar path on stable Rust until the tile intrinsics

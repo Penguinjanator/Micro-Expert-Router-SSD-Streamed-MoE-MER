@@ -1,6 +1,6 @@
 # Mixtral 8x7B CPU Cache Scaling, 2026-06-25
 
-This note preserves the latest observed CPU-only `run` benchmark results
+This note preserves historical observed CPU-only `run` benchmark results
 for Mixtral 8x7B expert streaming. These are not full autoregressive
 decoder-inference numbers. The `run` benchmark executes real Q4_0
 SwiGLU expert FFNs while exercising routing, RAM cache lookup, SSD
@@ -26,17 +26,17 @@ second.
 
 ## Results
 
-| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark TPS | Hit rate | Avg. I/O wait/token | I/O share |
+| Expert cache | Namespace cached | Approx. expert-cache payload | Iterations | Sustained benchmark iterations/s | Hit rate | Avg. I/O wait/iteration | I/O share |
 | -----------: | ---------------: | ---------------------------: | ---------: | ----------------------: | -------: | ------------------: | --------: |
 |     16 slots |            6.25% |                     1.48 GiB |     10,000 |      2.9101667108676104 |   79.64% |            251.6 ms |    73.86% |
 |     64 slots |              25% |                     5.91 GiB |     30,000 |       7.780785593717826 |   94.71% |             16.0 ms |    12.99% |
 |    128 slots |              50% |                    11.81 GiB |     10,000 |       9.445934926474694 |   96.83% |              7.7 ms |     7.55% |
 
 The 64-slot run used 30,000 iterations, while the 16- and 128-slot
-runs used 10,000. Treat these as latest observed runs, not a perfectly
-controlled benchmark suite. A formal comparison should rerun every cache
-size with the same commit, seed, flags, workload trace, warm-up policy,
-and iteration count.
+runs used 10,000. Treat these as historical observations, not a
+perfectly controlled benchmark suite or current headline result. A
+formal comparison should rerun every cache size with the same commit,
+seed, flags, workload trace, warm-up policy, and iteration count.
 
 The synthetic benchmark router uses Markov-style routing labels that are
 not derived from `synth_hidden_state`. The neural speculator top-1
@@ -50,12 +50,12 @@ These definitions are based on the current Rust implementation:
 
 | Metric | Meaning |
 |---|---|
-| Sustained TPS | `tokens_processed / wall_time` for the `run` benchmark. It is benchmark iterations per second, not generated-token throughput. |
+| `sustained_tps` | `tokens_processed / wall_time` for the `run` benchmark. It is benchmark iterations per second, not generated language token throughput. |
 | Hit rate | `hits / (hits + misses)` across routed expert activations. |
 | I/O reads | Foreground critical-path read samples recorded in the I/O latency histogram. The `reads` field printed in the run summary comes from `r.io_count`. |
-| Bytes | Engine-wide `bytes_read`, including foreground bytes and speculative prefetch bytes. Do not treat `avg_throughput_mibps` or bytes alone as a higher-is-better score because speculative traffic can raise bytes while lowering TPS. |
+| Bytes | Engine-wide `bytes_read`, including foreground bytes and speculative prefetch bytes. Do not treat `avg_throughput_mibps` or bytes alone as a higher-is-better score because speculative traffic can raise bytes while lowering benchmark throughput. |
 | Foreground I/O latency | Histogram samples for SSD reads that block routed work, recorded around `fetch_once`. |
-| Avg. I/O wait/token | Aggregate critical-path wait for routed misses divided by processed benchmark iterations. |
+| Avg. I/O wait/iteration | Aggregate critical-path wait for routed misses divided by processed benchmark iterations. |
 | I/O share | `total_io_wait_us / total_cycle_us`, the percentage of benchmark cycle time spent waiting on foreground SSD reads. |
 | Governor precision | EWMA of recent `prefetch_used / prefetch_completed`, folded by the prefetch governor over measurement windows, not a lifetime ratio. |
 
