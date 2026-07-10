@@ -130,7 +130,7 @@ dtype = "f32"
 [storage]
 # LRU cache slots (per layer). Tiny synthetic examples often use 4 slots.
 # Full model experiments should sweep cache size and compare hit rate,
-# foreground I/O share, and benchmark TPS.
+# foreground I/O share, and benchmark iterations/s.
 cache_slots = 4
 # O_DIRECT block alignment, bytes. 4096 on most NVMe drives.
 block_align = 4096
@@ -348,10 +348,13 @@ static_residency_warmup_tokens = 0
 #   * extended `/v1/admin/health/experts` JSON
 #
 # With `[real_transformer].compute_offload = "gpu"`, the wgpu backend can
-# materialize promoted experts as device buffers. If GPU init is disabled
-# or unavailable, inference falls back to the CPU path and this cache is
-# only a RAM-side promotion/observability tier. The optional `cuda` feature
-# is a separate candle CUDA path.
+# materialize promoted experts as device buffers. Explicit GPU mode fails
+# closed if a device cannot be acquired. Use
+# `[real_transformer].compute_offload = "auto"` when CPU fallback should be
+# allowed and recorded.
+# If GPU init is disabled, this cache is only a RAM-side
+# promotion/observability tier. The optional `cuda` feature is a separate
+# candle CUDA path.
 [gpu_cache]
 enabled = false
 # VRAM budget in MiB. 0 ⇒ cache created with zero capacity, every

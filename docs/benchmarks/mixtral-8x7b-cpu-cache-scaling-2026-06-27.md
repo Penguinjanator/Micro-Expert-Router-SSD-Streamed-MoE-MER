@@ -162,7 +162,7 @@ caches inherently reduce performance.
 
 ### Boundary Tests
 
-| Cache slots | Iterations |     TPS | Hit rate | Compute p50 | Avg. compute | Avg. I/O wait |
+| Cache slots | Iterations | Benchmark iterations/s | Hit rate | Compute p50 | Avg. compute | Avg. I/O wait |
 | ----------: | ---------: | ------: | -------: | ----------: | -----------: | ------------: |
 |          60 |      2,000 | 10.3950 |   94.05% |  100.415 ms |    80.779 ms |     12.825 ms |
 |          63 |      2,000 |  9.2282 |   94.15% |   98.047 ms |    91.571 ms |     12.683 ms |
@@ -175,7 +175,7 @@ state covers at least the tested 60-68 range.
 
 ### Interleaved Controls
 
-| Cache slots | Iterations |     TPS | Hit rate | Compute p50 | Compute p95 | Compute p99 | Avg. compute | Avg. I/O wait |
+| Cache slots | Iterations | Benchmark iterations/s | Hit rate | Compute p50 | Compute p95 | Compute p99 | Avg. compute | Avg. I/O wait |
 | ----------: | ---------: | ------: | -------: | ----------: | ----------: | ----------: | -----------: | ------------: |
 |          32 |      2,000 | 12.5221 |   90.30% |   55.359 ms |   57.951 ms |   59.615 ms |    55.923 ms |     23.700 ms |
 |         124 |      2,000 | 12.8629 |   95.65% |   56.447 ms |   99.007 ms |  100.351 ms |    66.500 ms |      9.977 ms |
@@ -356,7 +356,7 @@ governor_throttled=21457
 prefetch_dropped_governor=21457
 ```
 
-## Current Conclusions
+## Conclusions From This Run
 
 MER retained most of the measured expert-FFN benchmark throughput while
 caching only a small fraction of the expert namespace. The 16-slot
@@ -366,11 +366,14 @@ expert payload and only 6.25% of the namespace resident. The best
 observed primary run was the 124-slot run at 15.080930209605933
 benchmark iterations per second.
 
-The 64-slot result is transparent evidence of the current bimodal FFN
+The 64-slot result is transparent evidence of an observed bimodal FFN
 compute anomaly, not evidence that larger caches inherently reduce
 performance. Until the anomaly is explained, the primary table should be
 read as observed benchmark evidence rather than as a smooth cache-size
-scaling curve.
+scaling curve. The later
+[`mixtral-8x7b-rayon-autotune-2026-07.md`](mixtral-8x7b-rayon-autotune-2026-07.md)
+note records Rayon/autotune observations but does not prove this VM
+compute-regime behavior is eliminated.
 
 ## Reproducibility Limitations And Next Investigation Steps
 

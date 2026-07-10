@@ -46,11 +46,12 @@ ulimit -l unlimited  # for pinned/registered buffers
 ulimit -n 65535      # one fd per expert file when warmup is enabled
 ```
 
-NUMA-pinning: set `MER_PIN_CORES=N` in the environment to ask the
-engine to bind its tokio runtime to the first `N` cores of the
-process's allowed CPU set. On a 2-socket machine, prefer running one
-instance per NUMA node (with `numactl --cpunodebind=0 --membind=0
-…`) over a single process spanning both sockets.
+CPU placement: prefer `[performance].cpu_mask = "..."` in
+`config.toml` for `serve`, or the global `--cpu-mask <CPULIST>` flag
+for one-off CLI runs. The legacy `MER_PIN_CORES=N` environment variable
+remains a lower-precedence fallback. On a 2-socket machine, prefer
+running one instance per NUMA node (with `numactl --cpunodebind=0
+--membind=0 ...`) over a single process spanning both sockets.
 
 ## 2. Running under systemd
 
