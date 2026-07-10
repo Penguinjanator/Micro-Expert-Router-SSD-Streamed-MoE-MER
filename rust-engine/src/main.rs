@@ -130,8 +130,8 @@ mod batch_scheduler;
 mod block_pool;
 mod buffer_pool;
 mod config;
-mod dequant;
 mod dense_tensor;
+mod dequant;
 mod distributed;
 mod draft;
 mod engine;
@@ -159,6 +159,7 @@ mod packed_storage;
 mod parallel;
 mod prefetch_governor;
 mod pregate;
+mod rayon_autotune;
 mod residency;
 mod router;
 mod rpc;
@@ -175,7 +176,9 @@ mod workload;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -202,6 +205,32 @@ struct Cli {
     /// Logging filter (e.g. `info`, `debug`, `micro_expert_router=debug`).
     #[arg(long, global = true, default_value = "info", env = "RUST_LOG")]
     log: String,
+
+    /// Worker count for MER's process-wide CPU Rayon compute pool.
+    ///
+    /// Precedence: RAYON_NUM_THREADS > CLI > performance.rayon_threads >
+    /// autotune/profile > MER's startup default.
+    #[arg(long, global = true, value_name = "N", value_parser = parse_positive_rayon_threads)]
+    rayon_threads: Option<usize>,
+
+    /// Optional CPU placement mask in Linux cpulist syntax, e.g. `0-24`.
+    ///
+    /// Leave unset for portable default behavior: MER does not apply an
+    /// artificial CPU mask. Precedence: CLI > performance.cpu_mask >
+    /// legacy MER_PIN_CORES.
+    #[arg(long, global = true, value_name = "CPULIST")]
+    cpu_mask: Option<String>,
+
+    /// Progress watchdog timeout in seconds. `0` disables the watchdog.
+    #[arg(long, global = true, value_name = "SECS")]
+    progress_timeout_secs: Option<u64>,
+
+    /// Reuse a saved low-confidence Rayon autotune profile.
+    ///
+    /// By default low-confidence profiles are kept for auditability but are
+    /// not applied to normal runs.
+    #[arg(long, global = true)]
+    reuse_low_confidence_rayon_profile: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -341,6 +370,68 @@ enum Cmd {
         /// Number of tokens to simulate.
         #[arg(long, default_value_t = 200)]
         tokens: u64,
+        /// Probe Rayon worker counts on this machine/model/backend before
+        /// initializing the process-wide pool, then run with the winner.
+        #[arg(long)]
+        autotune_rayon: bool,
+        /// Number of tokens each Rayon autotune probe runs.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOKENS,
+            value_name = "N",
+            value_parser = parse_positive_u64_value
+        )]
+        autotune_tokens: u64,
+        /// Number of repeated fine probes for each finalist candidate.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_REPEATS,
+            value_name = "N",
+            value_parser = parse_positive_usize_value
+        )]
+        autotune_repeats: usize,
+        /// Number of tokens for the cheap coarse autotune pass.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_COARSE_TOKENS,
+            value_name = "N",
+            value_parser = parse_positive_u64_value
+        )]
+        autotune_coarse_tokens: u64,
+        /// Number of coarse winners promoted to repeated fine probes.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_AUTOTUNE_TOP_CANDIDATES,
+            value_name = "N",
+            value_parser = parse_positive_usize_value
+        )]
+        autotune_top_candidates: usize,
+        /// Print a concise coarse/fine Rayon autotune result table.
+        #[arg(long)]
+        autotune_print_table: bool,
+        /// Slow-regime cutoff for the worst fine-probe p95.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P95_THRESHOLD_MS,
+            value_name = "MS",
+            value_parser = parse_positive_f64_value
+        )]
+        autotune_slow_p95_ms: f64,
+        /// Slow-regime cutoff for the worst fine-probe p99.
+        #[arg(
+            long,
+            default_value_t = crate::rayon_autotune::DEFAULT_SLOW_P99_THRESHOLD_MS,
+            value_name = "MS",
+            value_parser = parse_positive_f64_value
+        )]
+        autotune_slow_p99_ms: f64,
+        /// Use a low-confidence autotune result for this run.
+        ///
+        /// Without this flag, low-confidence results are treated as failed
+        /// selection and the startup thread resolver falls back to a saved
+        /// profile or MER's default sizing.
+        #[arg(long)]
+        allow_low_confidence_rayon_autotune: bool,
         /// Predictive prefetch fanout (how many candidates to issue per token).
         #[arg(long, default_value_t = 2)]
         predict_fanout: usize,
@@ -841,6 +932,49 @@ fn resolve_predict_min_prob(configured: f64, num_experts: u32) -> f64 {
     }
 }
 
+fn parse_positive_rayon_threads(s: &str) -> Result<usize, String> {
+    parse_positive_usize_value(s).map_err(|e| {
+        if e == "value must be > 0" {
+            "--rayon-threads must be > 0".to_string()
+        } else {
+            e
+        }
+    })
+}
+
+fn parse_positive_usize_value(s: &str) -> Result<usize, String> {
+    let n = s
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got {s:?}"))?;
+    if n == 0 {
+        Err("value must be > 0".to_string())
+    } else {
+        Ok(n)
+    }
+}
+
+fn parse_positive_u64_value(s: &str) -> Result<u64, String> {
+    let n = s
+        .parse::<u64>()
+        .map_err(|_| format!("expected a positive integer, got {s:?}"))?;
+    if n == 0 {
+        Err("value must be > 0".to_string())
+    } else {
+        Ok(n)
+    }
+}
+
+fn parse_positive_f64_value(s: &str) -> Result<f64, String> {
+    let n = s
+        .parse::<f64>()
+        .map_err(|_| format!("expected a positive number, got {s:?}"))?;
+    if n.is_finite() && n > 0.0 {
+        Ok(n)
+    } else {
+        Err("value must be a finite number > 0".to_string())
+    }
+}
+
 fn init_logging(filter: &str) {
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -850,30 +984,579 @@ fn init_logging(filter: &str) {
         .try_init();
 }
 
+fn rayon_env_override_present() -> bool {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .is_some_and(|n| n > 0)
+}
+
+fn rayon_hard_override_present(cli: Option<usize>, config: Option<usize>) -> bool {
+    rayon_env_override_present() || cli.is_some() || config.is_some()
+}
+
+fn rayon_autotune_key_for_cli(
+    cli: &Cli,
+    affinity: &crate::numa::EffectiveCpuAffinity,
+) -> Option<crate::rayon_autotune::CpuAutotuneKey> {
+    match &cli.cmd {
+        Cmd::Run {
+            data_dir,
+            num_experts,
+            expert_size,
+            d_model,
+            d_ff,
+            top_k,
+            dtype,
+            workload,
+            gate_weights,
+            gpu,
+            pipeline_depth,
+            ..
+        } => Some(crate::rayon_autotune::CpuAutotuneKey {
+            machine_fingerprint: crate::rayon_autotune::machine_fingerprint_from_affinity(
+                affinity,
+            ),
+            model_fingerprint: format!(
+                "run;data_dir={};experts={};expert_size={};d_model={};d_ff={};top_k={};dtype={};workload={};gate={};pipeline_depth={}",
+                data_dir.display(),
+                num_experts,
+                expert_size,
+                d_model,
+                d_ff,
+                top_k,
+                dtype,
+                workload,
+                gate_weights
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                pipeline_depth,
+            ),
+            backend_fingerprint: format!(
+                "dense={};gpu={};features={}",
+                crate::parallel::default_dense_matvec_backend(),
+                gpu,
+                build_features().join(",")
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn run_profile_path(cli: &Cli) -> Option<PathBuf> {
+    match &cli.cmd {
+        Cmd::Run { data_dir, .. } => Some(crate::rayon_autotune::default_profile_path(data_dir)),
+        _ => None,
+    }
+}
+
+fn load_profiled_rayon_threads(
+    cli: &Cli,
+    key: Option<&crate::rayon_autotune::CpuAutotuneKey>,
+) -> Option<usize> {
+    let key = key?;
+    let path = run_profile_path(cli)?;
+    let profile = crate::rayon_autotune::load_profile(&path, key)?;
+    if !profile.reusable_by_default() && !cli.reuse_low_confidence_rayon_profile {
+        warn!(
+            path = %path.display(),
+            threads = profile.threads,
+            confidence = profile.confidence.as_str(),
+            reason = %profile.selection_reason,
+            "skipping low-confidence Rayon autotune profile; pass --reuse-low-confidence-rayon-profile to opt in"
+        );
+        return None;
+    }
+    info!(
+        path = %path.display(),
+        threads = profile.threads,
+        confidence = profile.confidence.as_str(),
+        median_p50_ms = profile.median_p50_ms,
+        worst_p95_ms = profile.worst_p95_ms,
+        worst_p99_ms = ?profile.worst_p99_ms,
+        median_sustained_tps = profile.median_sustained_tps,
+        "loaded placement-aware Rayon autotune profile"
+    );
+    Some(profile.threads)
+}
+
+fn load_high_confidence_profile_threads(
+    cli: &Cli,
+    key: Option<&crate::rayon_autotune::CpuAutotuneKey>,
+) -> Option<usize> {
+    let key = key?;
+    let path = run_profile_path(cli)?;
+    let profile = crate::rayon_autotune::load_profile(&path, key)?;
+    (profile.confidence == crate::rayon_autotune::RayonAutotuneConfidence::High)
+        .then_some(profile.threads)
+}
+
+fn maybe_run_startup_rayon_autotune(
+    cli: &Cli,
+    raw_args: &[OsString],
+    affinity: &crate::numa::EffectiveCpuAffinity,
+    key: Option<&crate::rayon_autotune::CpuAutotuneKey>,
+    config_threads: Option<usize>,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    let Cmd::Run {
+        autotune_rayon,
+        autotune_tokens,
+        autotune_repeats,
+        autotune_coarse_tokens,
+        autotune_top_candidates,
+        autotune_print_table,
+        autotune_slow_p95_ms,
+        autotune_slow_p99_ms,
+        allow_low_confidence_rayon_autotune,
+        ..
+    } = &cli.cmd
+    else {
+        return Ok(None);
+    };
+    if !*autotune_rayon {
+        return Ok(None);
+    }
+    if std::env::var_os(crate::rayon_autotune::AUTOTUNE_PROBE_ENV).is_some() {
+        return Ok(None);
+    }
+    if rayon_hard_override_present(cli.rayon_threads, config_threads) {
+        info!(
+            "Rayon autotune requested, but an explicit thread-count override is present; skipping probes"
+        );
+        return Ok(None);
+    }
+
+    let candidates = crate::rayon_autotune::default_thread_candidates(affinity.logical_cores);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    info!(
+        effective_cpu_mask = %affinity.display,
+        logical_cores = affinity.logical_cores,
+        candidates = ?candidates,
+        coarse_tokens = autotune_coarse_tokens,
+        fine_tokens = autotune_tokens,
+        repeats = autotune_repeats,
+        top_candidates = autotune_top_candidates,
+        slow_p95_threshold_ms = autotune_slow_p95_ms,
+        slow_p99_threshold_ms = autotune_slow_p99_ms,
+        "starting Rayon autotune probes"
+    );
+
+    let mut probes = Vec::new();
+    for threads in candidates.iter().copied() {
+        let probe = run_rayon_autotune_probe_observation(
+            raw_args,
+            *autotune_coarse_tokens,
+            threads,
+            crate::rayon_autotune::RayonAutotuneProbeStage::Coarse,
+            1,
+        );
+        log_rayon_autotune_probe_observation(&probe);
+        probes.push(probe);
+    }
+
+    let slow_p95_threshold_ms = *autotune_slow_p95_ms;
+    let slow_p99_threshold_ms = *autotune_slow_p99_ms;
+    let coarse_summaries = crate::rayon_autotune::summarize_candidate_results(
+        &candidates,
+        1,
+        &probes,
+        slow_p95_threshold_ms,
+        slow_p99_threshold_ms,
+    );
+    let previous_profile_threads = load_high_confidence_profile_threads(cli, key);
+    let fine_candidates = crate::rayon_autotune::fine_thread_candidates(
+        affinity.logical_cores,
+        *autotune_top_candidates,
+        previous_profile_threads,
+        &coarse_summaries,
+    );
+    if fine_candidates.is_empty() {
+        if *autotune_print_table {
+            let table = crate::rayon_autotune::format_autotune_table(&probes, &coarse_summaries);
+            info!("Rayon autotune table\n{table}");
+        }
+        return Err("Rayon autotune coarse pass did not produce any successful probe".into());
+    }
+    info!(
+        fine_candidates = ?fine_candidates,
+        previous_high_confidence_profile_threads = ?previous_profile_threads,
+        repeats = autotune_repeats,
+        fine_tokens = autotune_tokens,
+        "Rayon autotune coarse pass selected fine candidates"
+    );
+
+    for threads in fine_candidates.iter().copied() {
+        for repeat in 1..=*autotune_repeats {
+            let probe = run_rayon_autotune_probe_observation(
+                raw_args,
+                *autotune_tokens,
+                threads,
+                crate::rayon_autotune::RayonAutotuneProbeStage::Fine,
+                repeat,
+            );
+            log_rayon_autotune_probe_observation(&probe);
+            probes.push(probe);
+        }
+    }
+
+    let fine_probes: Vec<_> = probes
+        .iter()
+        .filter(|p| p.stage == crate::rayon_autotune::RayonAutotuneProbeStage::Fine)
+        .cloned()
+        .collect();
+    let candidate_summaries = crate::rayon_autotune::summarize_candidate_results(
+        &fine_candidates,
+        *autotune_repeats,
+        &fine_probes,
+        slow_p95_threshold_ms,
+        slow_p99_threshold_ms,
+    );
+    let selection = crate::rayon_autotune::select_best_candidate(&candidate_summaries)
+        .ok_or("Rayon autotune did not produce any successful fine probe")?;
+    if *autotune_print_table {
+        let table = crate::rayon_autotune::format_autotune_table(&probes, &candidate_summaries);
+        info!("Rayon autotune table\n{table}");
+    }
+    let best = selection.selected.clone();
+    info!(
+        threads = best.threads,
+        confidence = selection.confidence.as_str(),
+        median_p50_ms = ?best.median_p50_ms,
+        worst_p95_ms = ?best.worst_p95_ms,
+        worst_p99_ms = ?best.worst_p99_ms,
+        median_sustained_tps = ?best.median_sustained_tps,
+        slow_p95_threshold_ms,
+        slow_p99_threshold_ms,
+        reason = %selection.reason,
+        "Rayon autotune selected worker count"
+    );
+
+    let use_selected = selected_autotune_threads(
+        &selection,
+        *allow_low_confidence_rayon_autotune,
+    );
+    if use_selected.is_none() {
+        warn!(
+            threads = best.threads,
+            confidence = selection.confidence.as_str(),
+            "Rayon autotune result is low-confidence; falling back to saved profile/default threads unless --allow-low-confidence-rayon-autotune is passed"
+        );
+    }
+
+    if use_selected.is_some() {
+        if let (Some(path), Some(key)) = (run_profile_path(cli), key) {
+            let median_p50_ms = best.median_p50_ms.unwrap_or(0.0);
+            let worst_p95_ms = best.worst_p95_ms.unwrap_or(0.0);
+            let median_sustained_tps = best.median_sustained_tps.unwrap_or(0.0);
+            let profile = crate::rayon_autotune::RayonAutotuneProfile {
+                threads: best.threads,
+                effective_cpu_mask: affinity.cpus.clone(),
+                effective_cpu_mask_display: Some(affinity.display.clone()),
+                logical_cores: affinity.logical_cores,
+                repeats: *autotune_repeats,
+                p50_ms: median_p50_ms,
+                p95_ms: worst_p95_ms,
+                p99_ms: best.worst_p99_ms,
+                sustained_tps: median_sustained_tps,
+                median_p50_ms,
+                worst_p95_ms,
+                worst_p99_ms: best.worst_p99_ms,
+                median_sustained_tps,
+                confidence: selection.confidence,
+                selection_reason: selection.reason.clone(),
+                candidate_results: candidate_summaries.clone(),
+                probe_results: probes.clone(),
+            };
+            if let Err(e) = crate::rayon_autotune::save_profile(&path, key, profile) {
+                warn!(path = %path.display(), error = %e, "failed to save Rayon autotune profile");
+            } else if selection.confidence == crate::rayon_autotune::RayonAutotuneConfidence::Low {
+                warn!(
+                    path = %path.display(),
+                    confidence = selection.confidence.as_str(),
+                    "saved low-confidence Rayon autotune profile; normal runs will not reuse it without --reuse-low-confidence-rayon-profile"
+                );
+            } else {
+                info!(
+                    path = %path.display(),
+                    confidence = selection.confidence.as_str(),
+                    "saved placement-aware Rayon autotune profile"
+                );
+            }
+        }
+    } else if let Some(path) = run_profile_path(cli) {
+        warn!(
+            path = %path.display(),
+            confidence = selection.confidence.as_str(),
+            "not saving low-confidence Rayon autotune result as the default profile"
+        );
+    }
+
+    Ok(use_selected)
+}
+
+fn selected_autotune_threads(
+    selection: &crate::rayon_autotune::RayonAutotuneSelection,
+    allow_low_confidence: bool,
+) -> Option<usize> {
+    if selection.confidence == crate::rayon_autotune::RayonAutotuneConfidence::Low
+        && !allow_low_confidence
+    {
+        None
+    } else {
+        Some(selection.selected.threads)
+    }
+}
+
+fn run_rayon_autotune_probe_observation(
+    raw_args: &[OsString],
+    autotune_tokens: u64,
+    threads: usize,
+    stage: crate::rayon_autotune::RayonAutotuneProbeStage,
+    repeat: usize,
+) -> crate::rayon_autotune::RayonAutotuneProbeObservation {
+    match run_rayon_autotune_probe(raw_args, autotune_tokens, threads) {
+        Ok(Some(result)) => {
+            crate::rayon_autotune::RayonAutotuneProbeObservation::from_probe_result(
+                stage,
+                repeat,
+                autotune_tokens,
+                result,
+            )
+        }
+        Ok(None) => crate::rayon_autotune::RayonAutotuneProbeObservation::invalid(
+            threads,
+            stage,
+            repeat,
+            autotune_tokens,
+            "probe produced no parseable result",
+        ),
+        Err(e) => crate::rayon_autotune::RayonAutotuneProbeObservation::invalid(
+            threads,
+            stage,
+            repeat,
+            autotune_tokens,
+            e.to_string(),
+        ),
+    }
+}
+
+fn log_rayon_autotune_probe_observation(
+    probe: &crate::rayon_autotune::RayonAutotuneProbeObservation,
+) {
+    if probe.valid {
+        info!(
+            stage = probe.stage.as_str(),
+            threads = probe.threads,
+            repeat = probe.repeat,
+            tokens = probe.tokens,
+            p50_ms = ?probe.p50_ms,
+            p95_ms = ?probe.p95_ms,
+            p99_ms = ?probe.p99_ms,
+            sustained_tps = ?probe.sustained_tps,
+            "Rayon autotune probe complete"
+        );
+    } else {
+        warn!(
+            stage = probe.stage.as_str(),
+            threads = probe.threads,
+            repeat = probe.repeat,
+            tokens = probe.tokens,
+            reason = %probe.reason.as_deref().unwrap_or("invalid"),
+            "Rayon autotune probe failed"
+        );
+    }
+}
+
+fn run_rayon_autotune_probe(
+    raw_args: &[OsString],
+    autotune_tokens: u64,
+    threads: usize,
+) -> Result<Option<crate::rayon_autotune::RayonAutotuneProbeResult>, Box<dyn std::error::Error>> {
+    let exe = raw_args
+        .first()
+        .ok_or("missing argv[0] for Rayon autotune probe")?;
+    let child_args = autotune_child_args(raw_args, autotune_tokens, threads);
+    let output = Command::new(exe)
+        .args(&child_args)
+        .env(crate::rayon_autotune::AUTOTUNE_PROBE_ENV, "1")
+        .env("RAYON_NUM_THREADS", threads.to_string())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "probe exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(parse_autotune_probe_output(&output.stdout))
+}
+
+fn autotune_child_args(
+    raw_args: &[OsString],
+    autotune_tokens: u64,
+    threads: usize,
+) -> Vec<OsString> {
+    let mut out = Vec::new();
+    let mut iter = raw_args.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        let s = arg.to_string_lossy();
+        if s == "--autotune-rayon"
+            || s.starts_with("--autotune-rayon=")
+            || s.starts_with("--autotune-tokens=")
+            || s.starts_with("--autotune-repeats=")
+            || s.starts_with("--autotune-coarse-tokens=")
+            || s.starts_with("--autotune-top-candidates=")
+            || s.starts_with("--autotune-slow-p95-ms=")
+            || s.starts_with("--autotune-slow-p99-ms=")
+            || s == "--autotune-print-table"
+            || s == "--allow-low-confidence-rayon-autotune"
+            || s.starts_with("--tokens=")
+            || s.starts_with("--rayon-threads=")
+        {
+            continue;
+        }
+        if s == "--autotune-tokens"
+            || s == "--autotune-repeats"
+            || s == "--autotune-coarse-tokens"
+            || s == "--autotune-top-candidates"
+            || s == "--autotune-slow-p95-ms"
+            || s == "--autotune-slow-p99-ms"
+            || s == "--tokens"
+            || s == "--rayon-threads"
+        {
+            let _ = iter.next();
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out.push(OsString::from("--tokens"));
+    out.push(OsString::from(autotune_tokens.to_string()));
+    out.push(OsString::from("--rayon-threads"));
+    out.push(OsString::from(threads.to_string()));
+    out
+}
+
+fn parse_autotune_probe_output(
+    stdout: &[u8],
+) -> Option<crate::rayon_autotune::RayonAutotuneProbeResult> {
+    let body = String::from_utf8_lossy(stdout);
+    for line in body.lines() {
+        let Some(json) = line.strip_prefix("MER_RAYON_AUTOTUNE_RESULT ") else {
+            continue;
+        };
+        if let Ok(result) = serde_json::from_str(json) {
+            return Some(result);
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
     init_logging(&cli.log);
 
-    // Best-effort NUMA pinning: honoured before any tokio runtime or
-    // background thread spawns so child threads inherit the affinity
-    // mask. See `numa::apply_mer_pin_cores_env` for the contract.
-    let pin = crate::numa::apply_mer_pin_cores_env();
+    // Load only enough startup configuration to resolve process-level
+    // runtime controls before CPU placement / Rayon exist. The command
+    // handlers still own their normal config reconciliation and runtime
+    // construction below.
+    let startup_config = match &cli.cmd {
+        Cmd::Serve { config } | Cmd::BenchReal { config, .. } => {
+            Some(crate::config::Config::from_file(config)?)
+        }
+        _ => None,
+    };
+
+    let config_cpu_mask = startup_config
+        .as_ref()
+        .and_then(|cfg| cfg.performance.cpu_mask.as_deref());
+    let legacy_mer_pin_cores = std::env::var(crate::numa::MER_PIN_CORES_ENV).ok();
+    let cpu_mask_request = crate::numa::resolve_cpu_mask_request(
+        cli.cpu_mask.as_deref(),
+        config_cpu_mask,
+        legacy_mer_pin_cores.as_deref(),
+    )
+    .map_err(|e| format!("CPU mask selection: {e}"))?;
+
+    // Apply explicit placement before any Tokio runtime or Rayon worker is
+    // spawned, then read the effective affinity that the OS actually gave us.
+    let pin = crate::numa::apply_cpu_mask_request(cpu_mask_request.as_ref());
     let startup_pinned = matches!(pin, crate::numa::PinResult::Pinned { .. });
-    info!("{}", pin.as_log_line());
+    let effective_affinity = crate::numa::effective_cpu_affinity();
+    info!(
+        requested_cpu_mask = cpu_mask_request
+            .as_ref()
+            .map(|r| r.display.as_str())
+            .unwrap_or("none"),
+        requested_cpu_mask_source = cpu_mask_request
+            .as_ref()
+            .map(|r| r.source.as_str())
+            .unwrap_or("none"),
+        effective_cpu_mask = %effective_affinity.display,
+        logical_cores = effective_affinity.logical_cores,
+        pinning_result = %pin.as_log_line(),
+        "startup CPU placement"
+    );
 
     // `MER_PIN_CORES` is now consumed centrally at process start via the
-    // `numa` module. Clear it so any legacy later parsing in subcommands
-    // (for example, `cmd_serve`) does not attempt to re-apply affinity
-    // and drift from the startup contract.
-    std::env::remove_var("MER_PIN_CORES");
+    // `numa` module. Clear it so later code cannot re-apply affinity and
+    // drift from this startup contract.
+    // SAFETY: this runs during single-threaded startup, before the Tokio
+    // runtime or Rayon worker pool is created and before this process
+    // introduces any concurrent environment access.
+    unsafe {
+        std::env::remove_var(crate::numa::MER_PIN_CORES_ENV);
+    }
+
+    let progress_config_secs = startup_config
+        .as_ref()
+        .and_then(|cfg| cfg.performance.progress_timeout_secs);
+    let progress_watchdog = crate::rayon_autotune::normalize_progress_timeout_secs(
+        cli.progress_timeout_secs,
+        progress_config_secs,
+    );
+    match progress_watchdog.timeout {
+        Some(timeout) => info!(
+            progress_timeout_secs = timeout.as_secs(),
+            "progress watchdog enabled"
+        ),
+        None => info!("progress watchdog disabled"),
+    }
 
     // Size the shared compute (`rayon`) pool now: after affinity pinning so
-    // its workers inherit the startup mask, and before any matmul touches
-    // it. By default it spans the host's logical cores *minus a small
-    // reservation* (`parallel::default_compute_threads`) so a saturated
-    // compute fan-out can't starve the async runtime under continuous
-    // batching; an explicit `RAYON_NUM_THREADS` overrides the default.
-    crate::parallel::init_global_pool();
+    // its workers inherit the startup mask, after CLI/config/env precedence
+    // is resolved, and before any matmul touches it. By default it preserves
+    // MER's existing logical-core-minus-headroom policy under the effective
+    // affinity mask; `RAYON_NUM_THREADS` remains the hard reproduction
+    // override above autotune/profile/default selection.
+    let rayon_config_threads = startup_config
+        .as_ref()
+        .and_then(|cfg| cfg.performance.rayon_threads);
+    let run_autotune_key = rayon_autotune_key_for_cli(&cli, &effective_affinity);
+    let profile_threads = if rayon_hard_override_present(cli.rayon_threads, rayon_config_threads) {
+        None
+    } else {
+        load_profiled_rayon_threads(&cli, run_autotune_key.as_ref())
+    };
+    let autotuned_threads = maybe_run_startup_rayon_autotune(
+        &cli,
+        &raw_args,
+        &effective_affinity,
+        run_autotune_key.as_ref(),
+        rayon_config_threads,
+    )?;
+    let rayon_selection = crate::parallel::resolve_rayon_threads_from_env(
+        cli.rayon_threads,
+        rayon_config_threads,
+        autotuned_threads,
+        profile_threads,
+    )
+    .map_err(|e| format!("rayon thread selection: {e}"))?;
+    crate::parallel::init_global_pool(rayon_selection, effective_affinity.logical_cores);
 
     // Log the selected math kernel backend once. The dispatcher itself
     // is lazy, but emitting this at startup gives ops a single line in
@@ -978,6 +1661,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_slots,
                     top_k,
                     tokens,
+                    autotune_rayon: _,
+                    autotune_tokens: _,
                     predict_fanout,
                     predict_min_prob,
                     no_direct,
@@ -1027,6 +1712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     num_experts_per_layer,
                     packed_blob,
                     packed_manifest,
+                    ..
                 } = cli.cmd
                 {
                     let dtype =
@@ -1095,6 +1781,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             packed_manifest,
                         },
                         startup_pinned,
+                        progress_watchdog,
                     )
                     .await
                 } else {
@@ -1132,6 +1819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_reset,
                 greedy,
                 format,
+                progress_watchdog,
             }))
         }
         Cmd::MatvecMicrobench {
@@ -1253,10 +1941,12 @@ fn install_run_gpu_backend(
         0,
     );
     if !backend_box.is_gpu() {
-        return Err("explicit --gpu request failed: GPU backend initialization did not \
+        return Err(
+            "explicit --gpu request failed: GPU backend initialization did not \
                     produce a GPU device; refusing to run on CPU (use serving \
                     compute_offload = \"auto\" for best-effort GPU with CPU fallback)"
-            .into());
+                .into(),
+        );
     }
     let device_name = backend_box.device_name().to_string();
     let compute_plane = backend_box.compute_plane().to_string();
@@ -1327,6 +2017,7 @@ struct BenchRealArgs {
     cache_reset: BenchRealCacheReset,
     greedy: bool,
     format: BenchRealOutputFormat,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
 struct MatvecMicrobenchArgs {
@@ -1524,15 +2215,23 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         let runtime = build_bench_real_runtime(&args.config).await?;
         let params = bench_sampling_params(&runtime.cfg, args.greedy);
         for i in 0..args.warmup_runs {
-            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                .await?;
+            let _ = with_progress_timeout(
+                format!("bench-real warmup run {i}"),
+                args.progress_watchdog,
+                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+            )
+            .await?;
         }
         let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
         for i in 0..args.measured_runs {
             runs.push(
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                    .await?,
+                with_progress_timeout(
+                    format!("bench-real measured run {i}"),
+                    args.progress_watchdog,
+                    run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                )
+                .await?,
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
@@ -1541,8 +2240,12 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         for i in 0..args.warmup_runs {
             let runtime = build_bench_real_runtime(&args.config).await?;
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
-            let _ = run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                .await?;
+            let _ = with_progress_timeout(
+                format!("bench-real warmup run {i}"),
+                args.progress_watchdog,
+                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+            )
+            .await?;
         }
         let softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
         let mut runs = Vec::with_capacity(args.measured_runs);
@@ -1550,14 +2253,40 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
             let runtime = build_bench_real_runtime(&args.config).await?;
             let params = bench_sampling_params(&runtime.cfg, args.greedy);
             runs.push(
-                run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i)
-                    .await?,
+                with_progress_timeout(
+                    format!("bench-real measured run {i}"),
+                    args.progress_watchdog,
+                    run_bench_real_once(&runtime, &input.prompt, input.output_tokens, params, i),
+                )
+                .await?,
             );
         }
         assert_no_softmax_fallbacks(softmax_before)?;
         emit_bench_real_report(&args, input, runs)?;
     }
     Ok(())
+}
+
+async fn with_progress_timeout<T, F>(
+    label: String,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    fut: F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    if let Some(timeout) = watchdog.timeout {
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "progress watchdog fired after {}s while waiting for {label}",
+                timeout.as_secs()
+            )
+            .into()),
+        }
+    } else {
+        fut.await
+    }
 }
 
 /// Strict real-model benchmarks must not emit attention-softmax non-finite
@@ -1734,16 +2463,8 @@ fn cmd_scratch_alloc_microbench(
 
         let backend = crate::backend::current();
         let results = vec![
-            run_scratch_alloc_variant(
-                &args,
-                ScratchAllocVariant::CompatibilityWrappers,
-                &backend,
-            ),
-            run_scratch_alloc_variant(
-                &args,
-                ScratchAllocVariant::ScratchBuffers,
-                &backend,
-            ),
+            run_scratch_alloc_variant(&args, ScratchAllocVariant::CompatibilityWrappers, &backend),
+            run_scratch_alloc_variant(&args, ScratchAllocVariant::ScratchBuffers, &backend),
         ];
 
         let report = ScratchAllocMicrobenchReport {
@@ -2496,11 +3217,9 @@ async fn build_bench_real_runtime(
         Some(p) => match Tokenizer::from_file(p) {
             Ok(t) => Arc::new(t),
             Err(e) => {
-                return Err(format!(
-                    "bench-real failed to load tokenizer {}: {e}",
-                    p.display()
-                )
-                .into());
+                return Err(
+                    format!("bench-real failed to load tokenizer {}: {e}", p.display()).into(),
+                );
             }
         },
         None => {
@@ -2807,9 +3526,7 @@ fn validate_resolved_real_model_config(
         ));
     }
     if num_experts > u32::MAX as usize {
-        errs.push(format!(
-            "num_experts ({num_experts}) does not fit in u32"
-        ));
+        errs.push(format!("num_experts ({num_experts}) does not fit in u32"));
     }
 
     if errs.is_empty() {
@@ -4596,6 +5313,7 @@ struct RunArgs {
 async fn cmd_run(
     mut args: RunArgs,
     startup_pinned: bool,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 0) If `metadata.json` exists alongside the expert blobs (e.g. as
     //    written by `scripts/extract_mixtral_experts.py`), use it to fill
@@ -4734,22 +5452,16 @@ async fn cmd_run(
     args.data_dir = primary_dir.clone();
 
     if args.io_uring {
-        // Best-effort affinity: keep the engine on the NUMA node that
-        // owns CPU 0 to avoid cross-socket DRAM hops on every io_uring
-        // completion. Honored only on Linux.
-        //
-        // Respect startup `MER_PIN_CORES` affinity if it already pinned
-        // the process; otherwise fall back to the io_uring default.
+        // CPU placement is a startup-level decision now. If the operator
+        // supplied `--cpu-mask` / `[performance].cpu_mask` / legacy
+        // `MER_PIN_CORES`, Rayon, Tokio, and io_uring setup all inherit that
+        // same mask. With no startup mask, do not repin here: a late repin
+        // would make the already-created Rayon pool disagree with the main
+        // thread's placement.
         if startup_pinned {
-            info!("startup affinity already applied; skipping io_uring repin");
+            info!("startup CPU placement already applied; io_uring inherits it");
         } else {
-            let n = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(8);
-            if let Err(e) = pin_to_local_cores(n) {
-                warn!(error = %e, "could not set CPU affinity (continuing without pinning)");
-            }
+            info!("no startup CPU mask requested; io_uring will not apply a late process repin");
         }
         #[cfg(all(target_os = "linux", feature = "io_uring"))]
         {
@@ -5138,6 +5850,9 @@ async fn cmd_run(
         tokens = args.tokens,
         "streaming tokens (latency / throughput logs follow)"
     );
+    let autotune_probe = std::env::var_os(crate::rayon_autotune::AUTOTUNE_PROBE_ENV).is_some();
+    let mut token_cycle_us =
+        autotune_probe.then(|| Vec::with_capacity(args.tokens.min(1_000_000) as usize));
 
     // Optional production gating network. When present, every token's
     // expert ids come from `softmax(W_gate · x) → top-K` (real Mixtral
@@ -5208,52 +5923,36 @@ async fn cmd_run(
 
     for t in 0..args.tokens {
         let start = Instant::now();
-        let stats = match workload {
-            // Structured workloads: drive `moe_step` with the harness's
-            // explicit expert set and measure the engine-counter delta.
-            crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
-                let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
-                    crate::workload::Workload::Skewed => (
-                        t,
-                        0,
-                        skewed_stream
-                            .as_mut()
-                            .expect("skewed stream")
-                            .next_experts(),
-                    ),
-                    _ => {
-                        let record = replay_stream
-                            .as_mut()
-                            .expect("replay stream")
-                            .next_record()
-                            .expect("replay stream non-empty");
-                        let layer = u32::try_from(record.layer).map_err(|_| {
-                            format!("replay layer {} does not fit in u32", record.layer)
-                        })?;
-                        (record.token, layer, record.experts)
-                    }
-                };
-                let hidden = crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
-                let pre = engine.report();
-                let _ = engine.moe_step(tok_idx, layer_idx, &hidden, &experts).await;
-                let post = engine.report();
-                crate::engine::CycleStats {
-                    hits: post.hits.saturating_sub(pre.hits),
-                    misses: post.misses.saturating_sub(pre.misses),
-                    prefetch_hits: 0,
-                    bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
-                }
-            }
-            crate::workload::Workload::Synthetic => {
-                if let Some(gate) = gate.as_ref() {
-                    // Real gating-network path. Hidden state is the same
-                    // synthetic activation `Engine::generate` would have
-                    // used, so the only difference relative to the legacy
-                    // path is *which* experts are selected.
-                    let hidden = crate::inference::synth_hidden_state(t, args.d_model, args.seed);
-                    let dec = gate.route(&hidden);
+        let stats = with_progress_timeout(format!("run token {t}"), progress_watchdog, async {
+            let stats = match workload {
+                // Structured workloads: drive `moe_step` with the harness's
+                // explicit expert set and measure the engine-counter delta.
+                crate::workload::Workload::Skewed | crate::workload::Workload::Replay => {
+                    let (tok_idx, layer_idx, experts): (u64, u32, Vec<u32>) = match workload {
+                        crate::workload::Workload::Skewed => (
+                            t,
+                            0,
+                            skewed_stream
+                                .as_mut()
+                                .expect("skewed stream")
+                                .next_experts(),
+                        ),
+                        _ => {
+                            let record = replay_stream
+                                .as_mut()
+                                .expect("replay stream")
+                                .next_record()
+                                .expect("replay stream non-empty");
+                            let layer = u32::try_from(record.layer).map_err(|_| {
+                                format!("replay layer {} does not fit in u32", record.layer)
+                            })?;
+                            (record.token, layer, record.experts)
+                        }
+                    };
+                    let hidden =
+                        crate::inference::synth_hidden_state(tok_idx, args.d_model, args.seed);
                     let pre = engine.report();
-                    let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                    let _ = engine.moe_step(tok_idx, layer_idx, &hidden, &experts).await;
                     let post = engine.report();
                     crate::engine::CycleStats {
                         hits: post.hits.saturating_sub(pre.hits),
@@ -5261,27 +5960,54 @@ async fn cmd_run(
                         prefetch_hits: 0,
                         bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
                     }
-                } else {
-                    engine.generate(t).await?
                 }
-            }
-        };
+                crate::workload::Workload::Synthetic => {
+                    if let Some(gate) = gate.as_ref() {
+                        // Real gating-network path. Hidden state is the same
+                        // synthetic activation `Engine::generate` would have
+                        // used, so the only difference relative to the legacy
+                        // path is *which* experts are selected.
+                        let hidden =
+                            crate::inference::synth_hidden_state(t, args.d_model, args.seed);
+                        let dec = gate.route(&hidden);
+                        let pre = engine.report();
+                        let _ = engine.moe_step(t, 0, &hidden, &dec.experts).await;
+                        let post = engine.report();
+                        crate::engine::CycleStats {
+                            hits: post.hits.saturating_sub(pre.hits),
+                            misses: post.misses.saturating_sub(pre.misses),
+                            prefetch_hits: 0,
+                            bytes_read: post.bytes_read.saturating_sub(pre.bytes_read),
+                        }
+                    } else {
+                        engine.generate(t).await?
+                    }
+                }
+            };
+            Ok::<crate::engine::CycleStats, Box<dyn std::error::Error>>(stats)
+        })
+        .await?;
         let elapsed = start.elapsed();
+        if let Some(samples) = token_cycle_us.as_mut() {
+            samples.push(elapsed.as_micros() as u64);
+        }
         let throughput = if elapsed.as_secs_f64() > 0.0 {
             1.0 / elapsed.as_secs_f64()
         } else {
             f64::INFINITY
         };
-        info!(
-            token = t,
-            cycle_us = elapsed.as_micros() as u64,
-            tps = format!("{throughput:.1}"),
-            hits = stats.hits,
-            misses = stats.misses,
-            kib = stats.bytes_read / 1024,
-            resident = ?cache.resident_ids(),
-            "tick"
-        );
+        if !autotune_probe {
+            info!(
+                token = t,
+                cycle_us = elapsed.as_micros() as u64,
+                tps = format!("{throughput:.1}"),
+                hits = stats.hits,
+                misses = stats.misses,
+                kib = stats.bytes_read / 1024,
+                resident = ?cache.resident_ids(),
+                "tick"
+            );
+        }
         if args.token_pause_us > 0 {
             tokio::time::sleep(Duration::from_micros(args.token_pause_us)).await;
         }
@@ -5297,6 +6023,24 @@ async fn cmd_run(
         hit_rate_pct = (r.hits as f64 / total_lookups as f64) * 100.0,
         "stream complete"
     );
+    if autotune_probe {
+        let token_cycle_us = token_cycle_us
+            .as_mut()
+            .expect("autotune probe samples initialized");
+        token_cycle_us.sort_unstable();
+        let report = crate::rayon_autotune::RayonAutotuneProbeResult {
+            threads: crate::parallel::num_threads(),
+            valid: true,
+            p50_ms: crate::rayon_autotune::percentile_ms(&token_cycle_us, 0.50),
+            p95_ms: crate::rayon_autotune::percentile_ms(&token_cycle_us, 0.95),
+            p99_ms: Some(crate::rayon_autotune::percentile_ms(&token_cycle_us, 0.99)),
+            sustained_tps: args.tokens as f64 / wall.as_secs_f64(),
+        };
+        println!(
+            "MER_RAYON_AUTOTUNE_RESULT {}",
+            serde_json::to_string(&report)?
+        );
+    }
     engine.print_summary();
 
     if r.misses > 0 && r.io_p50_us == 0 {
@@ -5656,98 +6400,6 @@ fn total_ram_bytes() -> Option<u64> {
     }
 }
 
-/// Best-effort NUMA / CPU-affinity hint.
-///
-/// On Linux, when `num_cores > 0`, pin the current process to the first
-/// `num_cores` CPUs of the NUMA node owning CPU 0 (via
-/// `sched_setaffinity(2)`). The intent is to keep io_uring completion
-/// processing, the engine's matmul threads, and the tokio runtime on
-/// the same memory controller — for an SSD-streaming MoE this avoids
-/// cross-socket DRAM hops on every cache fill, which dominate latency
-/// at high QPS.
-///
-/// We deliberately don't pull in a NUMA crate: this function picks the
-/// CPUs from `/sys/devices/system/node/node0/cpulist` (a kernel-exposed
-/// comma+dash list). When that file isn't available we fall back to
-/// CPUs `0..num_cores`. On non-Linux targets this is a no-op that
-/// returns `Ok(())` so callers can always invoke it unconditionally.
-fn pin_to_local_cores(num_cores: usize) -> std::io::Result<()> {
-    if num_cores == 0 {
-        return Ok(());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let cpus = read_local_node_cpus().unwrap_or_else(|| (0..num_cores).collect());
-        let chosen: Vec<usize> = cpus.into_iter().take(num_cores).collect();
-        if chosen.is_empty() {
-            return Ok(());
-        }
-        // SAFETY: `cpu_set_t` is a POD bitset; we zero it with
-        // `mem::zeroed`, fill in valid CPU bits with the libc helpers,
-        // then hand it to `sched_setaffinity` which only reads.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            for cpu in &chosen {
-                libc::CPU_SET(*cpu, &mut set);
-            }
-            let rc = libc::sched_setaffinity(
-                0, // current process
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &set as *const _,
-            );
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        info!(
-            cores = ?chosen,
-            "pinned process to NUMA-local CPU set (best-effort; sched_setaffinity)"
-        );
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        warn!(
-            "core affinity hint requested ({} cores) but pinning is Linux-only; \
-             continuing without affinity",
-            num_cores
-        );
-        Ok(())
-    }
-}
-
-/// Parse `/sys/devices/system/node/node0/cpulist` into an ordered
-/// `Vec<usize>` of CPU ids (e.g. `"0-3,8,10-11"` -> `[0,1,2,3,8,10,11]`).
-/// Returns `None` if the file is missing / unparseable — callers fall
-/// back to a contiguous `0..N` range in that case.
-#[cfg(target_os = "linux")]
-fn read_local_node_cpus() -> Option<Vec<usize>> {
-    let body = std::fs::read_to_string("/sys/devices/system/node/node0/cpulist").ok()?;
-    let mut out: Vec<usize> = Vec::new();
-    for part in body.trim().split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((lo, hi)) = part.split_once('-') {
-            let lo: usize = lo.parse().ok()?;
-            let hi: usize = hi.parse().ok()?;
-            if hi < lo {
-                return None;
-            }
-            out.extend(lo..=hi);
-        } else {
-            out.push(part.parse().ok()?);
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
 /// Detect the NUMA node of the block device backing `data_dir`.
 ///
 /// Returns `Some(node)` when both probes succeed:
@@ -6064,6 +6716,225 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cli_parses_rayon_threads_after_run_subcommand() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "run",
+            "--rayon-threads",
+            "30",
+        ])
+        .expect("global --rayon-threads should parse after subcommand");
+        assert_eq!(cli.rayon_threads, Some(30));
+    }
+
+    #[test]
+    fn cli_parses_cpu_mask_after_run_subcommand() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "run",
+            "--cpu-mask",
+            "0-24",
+        ])
+        .expect("global --cpu-mask should parse after subcommand");
+        assert_eq!(cli.cpu_mask.as_deref(), Some("0-24"));
+    }
+
+    #[test]
+    fn autotune_child_args_preserve_cpu_mask_and_strip_recursive_flags() {
+        let raw = vec![
+            OsString::from("micro-expert-router"),
+            OsString::from("--log"),
+            OsString::from("info"),
+            OsString::from("run"),
+            OsString::from("--cpu-mask"),
+            OsString::from("0-24"),
+            OsString::from("--autotune-rayon"),
+            OsString::from("--autotune-tokens"),
+            OsString::from("2000"),
+            OsString::from("--autotune-repeats"),
+            OsString::from("3"),
+            OsString::from("--autotune-coarse-tokens"),
+            OsString::from("512"),
+            OsString::from("--autotune-top-candidates"),
+            OsString::from("2"),
+            OsString::from("--autotune-slow-p95-ms"),
+            OsString::from("110"),
+            OsString::from("--autotune-slow-p99-ms"),
+            OsString::from("150"),
+            OsString::from("--autotune-print-table"),
+            OsString::from("--allow-low-confidence-rayon-autotune"),
+            OsString::from("--tokens"),
+            OsString::from("10000"),
+        ];
+        let args = autotune_child_args(&raw, 123, 25);
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert!(rendered
+            .windows(2)
+            .any(|w| w[0] == "--cpu-mask" && w[1] == "0-24"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-rayon"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-tokens"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-repeats"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-coarse-tokens"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-top-candidates"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-slow-p95-ms"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-slow-p99-ms"));
+        assert!(!rendered.iter().any(|s| s == "--autotune-print-table"));
+        assert!(!rendered
+            .iter()
+            .any(|s| s == "--allow-low-confidence-rayon-autotune"));
+        assert!(rendered
+            .windows(2)
+            .any(|w| w[0] == "--tokens" && w[1] == "123"));
+        assert!(rendered
+            .windows(2)
+            .any(|w| w[0] == "--rayon-threads" && w[1] == "25"));
+    }
+
+    #[test]
+    fn cli_parses_autotune_stability_flags() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "run",
+            "--autotune-rayon",
+            "--autotune-tokens",
+            "2000",
+            "--autotune-repeats",
+            "3",
+            "--autotune-coarse-tokens",
+            "512",
+            "--autotune-top-candidates",
+            "2",
+            "--autotune-slow-p95-ms",
+            "110",
+            "--autotune-slow-p99-ms",
+            "150",
+            "--autotune-print-table",
+            "--allow-low-confidence-rayon-autotune",
+        ])
+        .expect("autotune stability flags should parse");
+        let Cmd::Run {
+            autotune_rayon,
+            autotune_tokens,
+            autotune_repeats,
+            autotune_coarse_tokens,
+            autotune_top_candidates,
+            autotune_slow_p95_ms,
+            autotune_slow_p99_ms,
+            autotune_print_table,
+            allow_low_confidence_rayon_autotune,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected run command");
+        };
+        assert!(autotune_rayon);
+        assert_eq!(autotune_tokens, 2000);
+        assert_eq!(autotune_repeats, 3);
+        assert_eq!(autotune_coarse_tokens, 512);
+        assert_eq!(autotune_top_candidates, 2);
+        assert_eq!(autotune_slow_p95_ms, 110.0);
+        assert_eq!(autotune_slow_p99_ms, 150.0);
+        assert!(autotune_print_table);
+        assert!(allow_low_confidence_rayon_autotune);
+    }
+
+    #[test]
+    fn cli_rejects_zero_rayon_threads() {
+        let err = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "run",
+            "--rayon-threads",
+            "0",
+        ])
+        .expect_err("zero rayon threads must be rejected");
+        assert!(
+            err.to_string().contains("--rayon-threads must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_rayon_profile_is_not_reused_without_opt_in() {
+        let dir = tempdir_unique("rayon-low-confidence-profile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = crate::rayon_autotune::CpuAutotuneKey {
+            machine_fingerprint: "machine".to_string(),
+            model_fingerprint: "model".to_string(),
+            backend_fingerprint: "backend".to_string(),
+        };
+        let profile = crate::rayon_autotune::RayonAutotuneProfile {
+            threads: 25,
+            effective_cpu_mask: Some((0..25).collect()),
+            effective_cpu_mask_display: Some("0-24".to_string()),
+            logical_cores: 25,
+            repeats: 1,
+            p50_ms: 99.0,
+            p95_ms: 101.0,
+            p99_ms: Some(120.0),
+            sustained_tps: 10.0,
+            median_p50_ms: 99.0,
+            worst_p95_ms: 101.0,
+            worst_p99_ms: Some(120.0),
+            median_sustained_tps: 10.0,
+            confidence: crate::rayon_autotune::RayonAutotuneConfidence::Low,
+            selection_reason: "slow-regime profile".to_string(),
+            candidate_results: Vec::new(),
+            probe_results: Vec::new(),
+        };
+        let path = crate::rayon_autotune::default_profile_path(&dir);
+        crate::rayon_autotune::save_profile(&path, &key, profile).unwrap();
+
+        let dir_arg = dir.to_string_lossy().to_string();
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "run",
+            "--data-dir",
+            dir_arg.as_str(),
+        ])
+        .unwrap();
+        assert_eq!(load_profiled_rayon_threads(&cli, Some(&key)), None);
+
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "--reuse-low-confidence-rayon-profile",
+            "run",
+            "--data-dir",
+            dir_arg.as_str(),
+        ])
+        .unwrap();
+        assert_eq!(load_profiled_rayon_threads(&cli, Some(&key)), Some(25));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn low_confidence_autotune_selection_requires_current_run_opt_in() {
+        let selection = crate::rayon_autotune::RayonAutotuneSelection {
+            selected: crate::rayon_autotune::RayonAutotuneCandidateSummary {
+                threads: 25,
+                requested_repeats: 2,
+                successful_repeats: 2,
+                all_repeats_successful: true,
+                p95_below_slow_threshold: false,
+                p99_below_slow_threshold: true,
+                median_p50_ms: Some(99.0),
+                worst_p95_ms: Some(101.0),
+                worst_p99_ms: Some(120.0),
+                median_sustained_tps: Some(10.0),
+                p50_cv: Some(0.0),
+                confidence: crate::rayon_autotune::RayonAutotuneConfidence::Low,
+                rejection_reason: Some("worst p95 exceeds threshold".to_string()),
+            },
+            confidence: crate::rayon_autotune::RayonAutotuneConfidence::Low,
+            reason: "low confidence".to_string(),
+        };
+        assert_eq!(selected_autotune_threads(&selection, false), None);
+        assert_eq!(selected_autotune_threads(&selection, true), Some(25));
+    }
+
     // ---- Item 4: bench-real fail-open policy rejection matrix ----
 
     /// A minimal config that passes every `bench-real` policy gate:
@@ -6079,6 +6950,7 @@ mod tests {
                 max_concurrent_requests: 0,
                 admission_min_free_blocks: 0,
             },
+            performance: crate::config::PerformanceConfig::default(),
             model: crate::config::ModelConfig {
                 data_dir: PathBuf::from("./data"),
                 num_experts: 8,
@@ -6211,7 +7083,9 @@ mod tests {
         // Share the transformer softmax-fallback test lock so this mutation of
         // the process-wide counter cannot race with the transformer tests that
         // assert exact before/after deltas.
-        let _g = crate::transformer::SOFTMAX_FALLBACK_TEST_LOCK.lock().unwrap();
+        let _g = crate::transformer::SOFTMAX_FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap();
         let snapshot = crate::transformer::nonfinite_softmax_fallbacks();
         crate::transformer::record_nonfinite_softmax_fallback();
         assert!(
@@ -6245,7 +7119,11 @@ mod tests {
             Ok(t) => t,
             Err(_) => panic!("synthetic mode must keep the byte-tokenizer fallback"),
         };
-        assert_eq!(tok.vocab_size(), 256, "byte tokenizer expected in synthetic mode");
+        assert_eq!(
+            tok.vocab_size(),
+            256,
+            "byte tokenizer expected in synthetic mode"
+        );
     }
 
     #[test]
@@ -6397,6 +7275,7 @@ mod tests {
             cache_reset: BenchRealCacheReset::Keep,
             greedy: true,
             format: BenchRealOutputFormat::Json,
+            progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig::disabled(),
         };
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.output_tokens, 7);
@@ -6419,6 +7298,7 @@ mod tests {
             cache_reset: BenchRealCacheReset::Keep,
             greedy: true,
             format: BenchRealOutputFormat::Json,
+            progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig::disabled(),
         };
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.prompt, "hello");
@@ -6449,6 +7329,7 @@ mod tests {
                 max_concurrent_requests: 0,
                 admission_min_free_blocks: 0,
             },
+            performance: PerformanceConfig::default(),
             model: ModelConfig {
                 data_dir: PathBuf::from("./data"),
                 num_experts: 8,

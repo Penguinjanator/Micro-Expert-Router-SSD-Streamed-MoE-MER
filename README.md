@@ -379,13 +379,16 @@ when the GPU cache is enabled:
   joins OS threads per call, and — critically — every concurrent
   request under continuous batching shares **one bounded pool** instead
   of each fanning out to `cores` fresh threads and oversubscribing the
-  box. The pool is **sized once at startup to the host's logical cores
-  minus a small reservation** (0 on <=4-core hosts, 1 on 5-8, 2 on 9-31,
-  and `n/16` on 32+; see
+  box. The pool is **sized once at startup to the effective logical cores
+  visible after any process affinity/cpuset limit, minus a small
+  reservation** (0 on <=4-core hosts, 1 on 5-8, 2 on 9-31, and `n/16` on
+  32+; see
   [`parallel::default_compute_threads`](rust-engine/src/parallel.rs)) so a
   saturated fan-out can never starve the async runtime — the tokio workers
-  driving the scheduler, the gRPC server, and io_uring SSD streaming. Set
-  `RAYON_NUM_THREADS` to override the default on a per-deployment basis.
+  driving the scheduler, the gRPC server, and io_uring SSD streaming. Use
+  `--autotune-rayon` to choose a worker count for the current placement, or
+  `--rayon-threads`, `[performance].rayon_threads`, or `RAYON_NUM_THREADS`
+  for explicit reproduction/debug overrides.
   **No cargo feature is required.** The historic `--features simd`
   flag is retained as a deprecated no-op so existing build scripts keep
   working.
@@ -537,7 +540,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `gating` | Production routing path: `LinearGate` computes `softmax(W_gate · x) → top-K` exactly the way Mixtral does. `Router` is an enum the engine holds polymorphically, `Router::Linear` in the real-transformer path, `Router::Markov` for the benchmark / `--io-only` path. |
 | `inference` | SwiGLU expert FFN (`y = down · (silu(gate·x) ⊙ (up·x))`), executed through the **`candle-core`** tensor backend. Implemented per dtype: `run_inference` (F32, zero-copy reinterpret + Candle matmul), `run_inference_f16` / `_int8` / `_q8_0` (dequantise to `f32` then the same Candle SwiGLU kernel), and `run_inference_partial` (load only the top-M input columns by magnitude). For homogeneous GGUF block-quantised dtypes the engine prefers a **`QMatMul` fast path** (`run_inference_q4_0_qmm` / `run_inference_q4k_qmm` / `run_inference_q8_0_qmm`) that hands the on-disk quantised blocks straight to candle's GGML kernels, no F32 dequantise of the weights. For `dtype=mixed`, UTH2 supplies independent gate/up/down dtype+range metadata and the CPU path executes each projection directly from its quantised bytes (`Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, plus float projections) without materialising full F32 matrices per activation. The legacy dequant kernels remain as reference/debug paths. All variants run directly over the bytes streamed off NVMe; the proprietary `ExpertResident` / `BufferPool` / `expert_cache` / O_DIRECT I/O substrate is untouched. |
 | `transformer` | Scalar `f32` dense pieces of the Mixtral / Llama decoder layer: `RmsNorm`, `apply_rope_inplace`, `MultiHeadSelfAttention` (with **GQA** when `num_kv_heads < num_heads` and optional **sliding-window** attention, resolved **per layer** so hybrid SWA/global families like MiMo-V2 and GPT-OSS mix modes within one model), `TransformerLayer`, `KvCache` (16-token blocks, can be backed by the `block_pool` slab; `evict_before` drops leading blocks to bound sliding-window caches), `LMHead`, and the `matmul_row_major` dispatch. `matmul_row_major` auto-escalates: scalar → runtime row-parallel (always compiled, via `parallel::par_row_chunks`) → `matrixmultiply` SGEMV under `--features blas`. |
-| `parallel` | Architecture-agnostic **row-parallel execution helper** shared by every dense kernel across every supported family (`matmul_row_major`, the per-expert `gate_up_swiglu` / `down_proj`, the MoE router gate, DeepSeek MLA projections, the LM head). `par_row_chunks` fans disjoint output-row chunks onto a **shared, process-wide `rayon` work-stealing pool** that is created once and reused, so the per-token hot path never spawns/joins OS threads per call (the previous `std::thread::scope` design spawned fresh threads on every matmul), and concurrent requests under continuous batching contend for **one bounded pool** instead of each oversubscribing the box by `N × cores`. The pool is sized at startup by `init_global_pool` to the host's logical cores **minus a small reservation** (`default_compute_threads`: 0 on ≤4-core hosts, 1 on 5–8, two from 9 up, growing by one per extra 16 cores) so a saturated fan-out cannot starve the tokio async runtime; `RAYON_NUM_THREADS` overrides it. Matmuls below an element threshold run inline on the caller; output is bit-identical to the serial reference. |
+| `parallel` | Architecture-agnostic **row-parallel execution helper** shared by every dense kernel across every supported family (`matmul_row_major`, the per-expert `gate_up_swiglu` / `down_proj`, the MoE router gate, DeepSeek MLA projections, the LM head). `par_row_chunks` fans disjoint output-row chunks onto a **shared, process-wide `rayon` work-stealing pool** that is created once and reused, so the per-token hot path never spawns/joins OS threads per call (the previous `std::thread::scope` design spawned fresh threads on every matmul), and concurrent requests under continuous batching contend for **one bounded pool** instead of each oversubscribing the box by `N × cores`. The pool is sized at startup by `init_global_pool` from the effective logical cores visible after affinity/cpuset placement **minus a small reservation** (`default_compute_threads`: 0 on ≤4-core hosts, 1 on 5–8, two from 9 up, growing by one per extra 16 cores) so a saturated fan-out cannot starve the tokio async runtime; `--autotune-rayon` can probe the current placement, while `--rayon-threads`, `performance.rayon_threads`, or `RAYON_NUM_THREADS` can override it. Matmuls below an element threshold run inline on the caller; output is bit-identical to the serial reference. |
 | `model` | `RealModel`, full multi-layer decoder built on top of `transformer`. Owns the dense (resident) weights, drives the per-token forward (`embedding → stacked layers → final RMSNorm → LM head`), and addresses experts as `global_id = layer * num_experts + local_id` so the existing single-namespace cache + storage layers work unchanged. Loads dense weights from per-tensor `.bin` files (`from_dir`) **or** HuggingFace `.safetensors` shards (`from_safetensors`); `from_dir_auto` picks the right one. Missing tensors fall back to a deterministic seeded init. Also exposes `peek_experts` (cheap, side-effect-free routing pre-pass) and `step_speculative` (verify K draft tokens with a unified expert prefetch, gist Phase 2; the preview KV growth for positions `k ≥ 1` is now seeded from a layer-0 draft-token embedding + RoPE projection rather than zero vectors so the verifier's lookahead is not routed on garbage activations, gist Part 2 fix #3). |
 | `draft` | Speculative-decoding "draft" model (gist Phase 2). `DraftLike` trait + `DraftEngine` (a small, deterministic, RAM-resident dense head tied to the main model's embedding). `predict_next` runs through `kernels::dot_f32` over a 64-byte-aligned hidden-state scratch (gist Part 2 fix #1) so the draft path auto-escalates AVX-512 → AVX2 → scalar exactly like the main matmul; the K-token loop reuses one allocation. Generates K candidate tokens with no SSD I/O so `RealModel::step_speculative` can verify them in a single batched-prefetch wave. |
 | `sampling` | OpenAI-compatible next-token sampler, temperature, top-K, top-P (nucleus), `(seed, position)`-driven RNG. `temperature == 0.0` short-circuits to greedy `argmax`. |
@@ -551,7 +554,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `kernels` | Runtime CPU-feature dispatcher (`mod.rs::detect()` + `current()` + `cpu_features()`), with `scalar.rs` (always on, also home of the `swiglu_f32` reference oracle plus the `dot_int8_int8` scalar reference for VNNI), `avx2.rs` (always compiled on x86_64, no cargo feature; the `#[target_feature]` entry points are gated on the runtime probe), `avx512.rs` (`--features avx512`, `#[target_feature]` fused int8 dequant + dot, the 4×-unrolled `dot_f32_avx512`, the fused per-row `swiglu_f32_avx512` kernel, **and** the AVX-512 VNNI int8×int8 dot `dot_int8_int8_avx512_vnni` built on `_mm512_dpbusd_epi32`, gist Part 2 fix #8, with the i8→u8 bias-trick correction so the inner reduction stays in i32 integer registers), and `amx.rs` (`--features amx`, skeleton until tile intrinsics stabilise on stable Rust). The dispatcher also exposes `swiglu_f32_into(gate_w, up_w, x, rows, cols, y)` which routes to the AVX-512 fused kernel on capable hosts and the scalar reference elsewhere, caller owns `y`, no allocation on the hot path. The probe reads `/proc/cpuinfo` to recognise Sapphire-Rapids-class Xeons so AMX can be preferred on the chips it ships on. The selected backend is logged once at startup. |
 | `backend` | Plugin-system math `Backend` trait (`matmul`, `matmul_into`, `swiglu_into`, `softmax`, `silu_inplace`) with three built-in implementations: `ScalarBackend` (pure Rust reference), `CandleBackend` (default CPU executor, dispatches through `kernels::dot_f32` / `kernels::swiglu_f32_into`, no `candle_core::Tensor` rebuild on the hot path, **zero allocation** in either call), and `GpuBackend` (gist Part 2 fix #5, budget-GPU executor selected by `[real_transformer].compute_offload = "gpu"`; both the integration seam and the `wgpu` compute pipeline compile on every build, the `gpu` cargo feature is now a no-op kept only for backwards compatibility). Both CPU backends override `matmul_into` to dispatch through `kernels::dot_f32` (auto-escalates AVX-512 → AVX2 → scalar). The active backend is installed once at startup via `backend::install_default()` (or, when `compute_offload = "gpu"`, `set_backend(GpuBackend::try_new())` runs first) and resolved on the hot path through `backend::current()`, a single `OnceLock` load, no `cfg!` dispatch. New executors (Burn, Tract, custom CUDA) implement `Backend` and call `set_backend(Arc<dyn Backend>)` before the first token is generated. |
 | `io_reactor` | **Actor-pattern I/O reactor** (gist Part 5 doc fix). Wraps an `NvmeStorage` behind a single-owner tokio task that runs a **bounded serial loop**: it dequeues read requests from a bounded `mpsc` channel one at a time, `await`s the read inline, replies over the per-request `oneshot`, and only then pulls the next request, the bounded queue therefore also bounds active I/O concurrency. `IoReactorHandle` is cheaply cloneable (the sender side is reference-counted by tokio); workers issue `read_expert(id, buf)` without ever touching a shared `DashMap` shard / `RwLock` write guard. Backpressure is automatic, when the I/O substrate saturates, callers park on `mpsc::send` instead of overflowing a per-thread queue. Exposed as a standalone helper alongside the legacy `engine` path so the in-flight `DashMap<u32, Notify>` deduplicator can retire one subsystem at a time. |
-| `numa` | `MER_PIN_CORES=N` env honoured at startup → `sched_setaffinity(2)` first `N` CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn elsewhere). |
+| `numa` | Startup CPU placement helpers. By default MER applies no artificial CPU mask. Operators can opt in with global `--cpu-mask <CPULIST>` or `[performance].cpu_mask`; legacy `MER_PIN_CORES=N` remains a lower-precedence fallback. On Linux this uses `sched_setaffinity(2)` best-effort; elsewhere MER logs and continues. |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
 | `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
@@ -1411,8 +1414,10 @@ without recompilation:
    amortise the fork-join. The pool is created once and reused, so the
    per-token hot path never spawns OS threads per call and concurrent
    requests share one bounded pool instead of oversubscribing the
-   machine. It is sized at startup to the host's logical cores minus a
-   small async-runtime reservation (`RAYON_NUM_THREADS` overrides).
+   machine. It is sized at startup to the effective logical cores after
+   affinity/cpuset placement minus a small async-runtime reservation
+   (`--autotune-rayon` can probe; `RAYON_NUM_THREADS`, `--rayon-threads`,
+   or `performance.rayon_threads` can override).
    **Replaces the old `--features simd` build-time flag**;
    that feature is now a no-op kept for backwards compatibility.
 3. **Scalar fallback**, single-threaded fused loop, the validation
@@ -1572,6 +1577,110 @@ To run on a filesystem that doesn't support `O_DIRECT` (CI, tmpfs, macOS dev):
 ./target/release/micro-expert-router run --no-direct ...
 ```
 
+#### Portable CPU/Rayon Autotune
+
+MER's CPU dense paths use one process-wide Rayon pool for row-parallel
+matmul and expert FFN work. The pool is initialized once at startup, so
+CPU placement and thread-count selection must be resolved before the
+first CPU compute path touches Rayon.
+
+`--autotune-rayon` chooses the Rayon worker count for the current
+machine, model/config, backend, and effective CPU affinity. `--cpu-mask`
+controls CPU placement/visibility. They solve different problems:
+autotune decides how many Rayon workers to use; a CPU mask bounds where
+the process and its workers may run.
+
+On most machines, start with no CPU mask and use autotune:
+
+```bash
+env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
+  --progress-timeout-secs 300 \
+  run \
+  --autotune-rayon \
+  --autotune-repeats 2 \
+  --autotune-coarse-tokens 512 \
+  --autotune-tokens 2000 \
+  ...
+```
+
+On noisy cloud VMs, NUMA hosts, or container/cpuset deployments where you
+need placement control, bound placement first and autotune inside that
+mask:
+
+```bash
+env -u RAYON_NUM_THREADS ./target/release/micro-expert-router \
+  --cpu-mask 0-24 \
+  --progress-timeout-secs 300 \
+  run \
+  --autotune-rayon \
+  --autotune-repeats 2 \
+  --autotune-coarse-tokens 512 \
+  --autotune-slow-p95-ms 180 \
+  --autotune-slow-p99-ms 320 \
+  --autotune-tokens 2000 \
+  ...
+```
+
+`--autotune-rayon` improves thread-count discovery and observability; it
+does not guarantee stable throughput on noisy VMs. The autotune p95/p99
+thresholds are based on end-to-end token cycle latency, so they should be
+looser than the compute-only FFN latency reported in the final run
+summary. On VMs, child-process autotune probes may find a fast regime
+that the final parent run does not always reproduce. On bare metal or
+dedicated pinned hosts, a high-confidence saved profile is more likely to
+remain reusable. On noisy VMs, per-run autotune is recommended for
+benchmark runs.
+
+For exact benchmark reproduction, pin both the placement and the worker
+count:
+
+```bash
+RAYON_NUM_THREADS=25 ./target/release/micro-expert-router \
+  --cpu-mask 0-24 \
+  --progress-timeout-secs 300 \
+  run \
+  ...
+```
+
+Selection precedence is:
+
+1. `RAYON_NUM_THREADS`
+2. `--rayon-threads <N>`
+3. `performance.rayon_threads = N`
+4. `--autotune-rayon` result
+5. saved placement-aware autotune profile
+6. MER's default startup sizing under the effective affinity mask
+
+`RAYON_NUM_THREADS` is mainly for debugging or exact benchmark
+reproduction. A known-good setting on one VM, such as `25` Rayon threads
+inside CPU mask `0-24`, is not a universal recommendation for other
+cloud shapes, bare-metal hosts, containers, models, quantization types,
+or backends.
+
+Autotune runs a short coarse pass over the candidate set, then repeated
+fine probes for the top candidates plus anchor candidates: MER's default
+compute thread count, all logical cores, logical cores minus one, and any
+previous high-confidence profile for the same placement key. The saved
+profile records the effective CPU mask, logical core count, repeats,
+per-probe metrics, candidate summaries, selected confidence, and
+selection reason. Low-confidence profiles are retained only when
+explicitly allowed, and normal runs do not reuse them unless
+`--reuse-low-confidence-rayon-profile` is passed. Low-confidence
+autotune results are not used for the current run unless
+`--allow-low-confidence-rayon-autotune` is passed. Use
+`--autotune-print-table` to emit a concise coarse/fine probe table.
+
+For config-driven `serve` and `bench-real` runs, placement and watchdog
+controls live under `[performance]`:
+
+```toml
+[performance]
+# Optional; unset means no artificial CPU mask.
+cpu_mask = "0-24"
+# Optional; 0/unset disables the watchdog.
+progress_timeout_secs = 300
+```
+
 Increase log verbosity:
 
 ```bash
@@ -1718,6 +1827,11 @@ micro-expert-router repack    # Tier 2: build a packed expert blob + manifest
                               --profile; only the listed experts are packed.
 
 micro-expert-router run
+  --cpu-mask <CPULIST>      Optional global CPU placement mask, e.g. 0-24.
+                              Leave unset for no artificial placement.
+  --progress-timeout-secs <S>  Optional global progress watchdog. 0 disables.
+  --rayon-threads <N>       Worker count for the process-wide CPU Rayon pool.
+                              Global flag; may also be written before `run`.
   --data-dir <PATH>          Directory with expert_<id>.bin files
                               (auto-loads metadata.json if present).
                               Accepts a comma-separated list to shard
@@ -1732,6 +1846,23 @@ micro-expert-router run
                               runs tested 16, 64, and 128 slots.
   --top-k <K>                Active experts per token (default 2, distinct)
   --tokens <N>               Stream length
+  --autotune-rayon           Probe Rayon worker counts before startup pool
+                              initialization and run with the winner.
+  --autotune-tokens <N>      Tokens per fine autotune probe (default 2000).
+  --autotune-repeats <N>     Repeated fine probes per finalist (default 2).
+  --autotune-coarse-tokens <N>
+                              Tokens per coarse probe (default 512).
+  --autotune-top-candidates <N>
+                              Coarse winners promoted to fine probes
+                              (default 3).
+  --autotune-print-table     Print the coarse/fine autotune probe table.
+  --autotune-slow-p95-ms <MS>
+                              Slow-regime worst-p95 cutoff (default 80).
+  --autotune-slow-p99-ms <MS>
+                              Slow-regime worst-p99 cutoff (default 120).
+  --allow-low-confidence-rayon-autotune
+                              Permit a low-confidence autotune result for
+                              this run.
   --dtype <DTYPE>            f32 | f16 | bf16 | int8 | q4k | q4_0 | q5k
                               | q6k | q8_0 | mxfp4 | mixed (default f32).
                               Must match gen-data / gguf-convert / the
@@ -1785,12 +1916,11 @@ micro-expert-router run
                               selected experts still streamed from the SSD
                               by Engine::moe_step.
   --io-uring                 Probe the IoUringStorage backend (Linux,
-                              --features io_uring); also pins the process
-                              to NUMA-local cores (min(8, available
-                              parallelism)). To override the pin count,
-                              set the MER_PIN_CORES env var, it is
-                              honoured globally at startup before any
-                              subcommand-specific pinning runs.
+                              --features io_uring). It inherits startup
+                              CPU placement if `--cpu-mask`,
+                              `[performance].cpu_mask`, or legacy
+                              MER_PIN_CORES was provided; otherwise it
+                              does not apply a late process repin.
   --token-pause-us <N>       Sleep between tokens to throttle the stream
   --seed <U64>               PRNG seed for reproducibility
   --trace-out <PATH>         Append a JSONL routing trace (one record per
@@ -1921,7 +2051,7 @@ micro-expert-router serve
                               metrics on `GET /metrics`. All engine flags
                               that `run` accepts on the CLI are configured
                               here under `[server]`, `[model]`, `[storage]`,
-                              `[tokenizer]`, `[real_transformer]`,
+                              `[performance]`, `[tokenizer]`, `[real_transformer]`,
                               `[predictive]`, and `[gpu_cache]`.
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
@@ -3170,12 +3300,13 @@ The genuinely open items are:
   kernel. The runtime dispatcher already selects between the scalar
   reference path, AVX2+FMA (always compiled on x86_64), and AVX-512
   (`--features avx512`); AMX slots into the same dispatcher.
-- **Per-NUMA-node io_uring rings.** `MER_PIN_CORES=N` is honoured at
-  startup to `sched_setaffinity(2)` the process to the first `N`
-  CPUs of NUMA node 0 (Linux only, best-effort; no-op + warn
-  elsewhere, see `src/numa.rs`). Real per-ring per-node pinning
-  would still need one io_uring ring per node and per-node buffer
-  pools, a deeper refactor of `IoUringStorage` and `BufferPool`.
+- **Per-NUMA-node io_uring rings.** Startup placement is explicit:
+  `--cpu-mask <CPULIST>` or `[performance].cpu_mask` bounds the whole
+  process before Tokio/Rayon/io_uring setup, while legacy
+  `MER_PIN_CORES=N` remains a lower-precedence fallback. Real per-ring
+  per-node pinning would still need one io_uring ring per node and
+  per-node buffer pools, a deeper refactor of `IoUringStorage` and
+  `BufferPool`.
 
 
 ---

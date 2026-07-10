@@ -1323,7 +1323,9 @@ async fn scheduler_loop(
         }
         if prepass_ran {
             let prepass_ns = prepass_started.elapsed().as_nanos() as u64;
-            prepass.time_ns_total.fetch_add(prepass_ns, Ordering::Relaxed);
+            prepass
+                .time_ns_total
+                .fetch_add(prepass_ns, Ordering::Relaxed);
             prepass_gate.record(useful_fetches, prepass_ns);
         }
 
@@ -1455,7 +1457,10 @@ mod tests {
     use crate::multi_layer_cache::MultiLayerExpertCache;
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir {
         path: PathBuf,
@@ -1467,8 +1472,9 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            let unique = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             path.push(format!(
-                "mer-batch-test-{tag}-{}-{nanos}",
+                "mer-batch-test-{tag}-{}-{nanos}-{unique}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).unwrap();

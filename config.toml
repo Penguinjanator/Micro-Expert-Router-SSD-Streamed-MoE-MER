@@ -36,6 +36,22 @@ max_concurrent_requests = 0
 # configured with a block pool. `0` (default) disables.
 admission_min_free_blocks = 0
 
+[performance]
+# Optional CPU placement mask in Linux cpulist syntax. Leave unset for the
+# portable default: MER does not apply an artificial CPU mask. Use this only
+# when you need to bound placement for a noisy VM, NUMA domain, or container.
+# cpu_mask = "0-24"
+
+# Optional explicit worker count for MER's process-wide CPU Rayon compute
+# pool. Leave unset to preserve portable behavior: `RAYON_NUM_THREADS` wins
+# when supplied, otherwise CLI `--rayon-threads`, otherwise autotune/profile,
+# otherwise MER sizes the pool at startup with async-runtime headroom.
+# rayon_threads = 30
+
+# Optional progress watchdog. `0` or unset disables. A positive value makes
+# `run` and `bench-real` fail loudly if a token/probe stops making progress.
+# progress_timeout_secs = 300
+
 # Optional API-key gate + simple in-process rate limiting. The whole
 # section is optional; when omitted (or when `api_keys` is empty) the
 # server runs with no auth, matching the legacy behaviour. See
