@@ -4,31 +4,45 @@ Micro-Expert-Router (MER) is a Rust execution engine for
 Mixture-of-Experts models that treats SSD as the backing store for
 expert weights and RAM/VRAM as cache tiers. It streams routed expert
 blobs into page-aligned buffers with `O_DIRECT` positional reads, then
-executes a real SwiGLU FFN over those bytes.
+executes a real SwiGLU FFN over those bytes. The currently documented
+verified paths are:
 
-The core measurement question is cache pressure: how routing locality,
-cache size, prefetching, foreground SSD reads, and CPU compute interact
-when expert weights do not all fit in memory. Benchmark throughput in
-this repository is observed workload throughput, not theoretical NVMe
-bandwidth. For the `run` benchmark, `sustained_tps` means benchmark
-iterations per second; it is not full autoregressive LLM generated
-tokens per second.
+* the `run` expert-streaming benchmark on **Mixtral 8x7B Q4_0** expert
+  blobs, where throughput is reported as synthetic benchmark iterations
+  per second; and
+* a narrow `bench-real` validation of
+  **Qwen3-Coder-30B-A3B-Instruct Q8_0**, where throughput is reported as
+  autoregressive generated tokens per second.
+
+The core question this repository measures is cache pressure: how routing
+locality, cache size, prefetching, and foreground SSD reads affect a real
+expert-FFN workload. PCIe-4/5 SSD sequential bandwidth is useful context,
+but the measured workload is shaped by random expert access, queue
+contention, VM storage virtualization, speculative traffic, and CPU
+compute. The benchmark numbers below are therefore observed workload
+throughput, not theoretical drive bandwidth. `run` results are not full
+LLM generation throughput; `bench-real` results are full decoder
+generation throughput for the specific checkpoint and configuration
+listed.
 
 The engine lives under [`rust-engine/`](./rust-engine).
 
 ## Current verified path
 
-The current verified path remains the CPU-only `run` expert-streaming
-benchmark on **Mixtral 8x7B Instruct Q4_0** expert blobs converted from
+The current verified expert-streaming benchmark remains the CPU-only
+`run` path on **Mixtral 8x7B Instruct Q4_0** expert blobs converted from
 GGUF with `gguf-convert --native-quant`. The verified dataset shape is
 256 layer-qualified experts, 32 layers, 8 experts per layer, top-2
 routing, `d_model = 4096`, `d_ff = 14336`, and Q4_0 expert payloads.
 
 That benchmark exercises real Q4_0 SwiGLU expert FFN execution, the RAM
 expert cache, SSD reads, routing, prefetching, and run-summary telemetry.
-It does not exercise the full autoregressive decoder pipeline unless
-`[real_transformer].enabled = true` is configured and measured through
-the serving or `bench-real` path.
+It does not exercise the full autoregressive decoder pipeline.
+
+The current verified full-transformer path is narrower: one CPU-only
+`bench-real` validation of
+**Qwen3-Coder-30B-A3B-Instruct Q8_0** with strict dense checkpoint
+loading, real learned `LinearGate` routing, and SSD-streamed experts.
 
 ## Supported model status
 
@@ -38,27 +52,188 @@ validation.
 
 | Status | Scope |
 |---|---|
-| **Verified expert-streaming benchmark target** | Mixtral 8x7B Q4_0 expert blobs from `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`, run on the CPU path with 256 layer-qualified experts and top-2 routing. |
-| **Implemented, not benchmark-validated here** | Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for implementation details and limitations. |
+| **Verified expert-streaming benchmark target** | Mixtral 8x7B Q4_0 expert blobs from `mixtral-8x7b-instruct-v0.1.Q4_0.gguf`, run on the CPU `run` path with 256 layer-qualified experts and top-2 routing. `run` reports synthetic benchmark iterations/s, not generated tokens/s. |
+| **Verified strict full-transformer path** | One specific Qwen checkpoint: `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` from `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`, architecture `qwen3_moe`, CPU-only `bench-real`, strict converted checkpoint, 435/435 required dense tensors loaded, real learned `LinearGate`, SSD-streamed experts, top-8 routing. This does not validate every Qwen3-MoE checkpoint or GGUF quantization recipe. |
+| **Implemented, broader than benchmark validation** | General Mixtral/Llama-MoE `mixtral`, Qwen3-MoE `qwen3_moe`, DeepSeek-V3/V3.1 `deepseek_v3`, MiMo-V2-Flash `mimo_v2_flash`, and GPT-OSS `gpt_oss` source paths. See [Supported model architectures](#supported-model-architectures) for implementation details and limitations. |
 | **Dense model support only** | Qwen3 dense, Mistral Small 3, and Phi-4 load dense decoder tensors but do not exercise SSD expert streaming. |
 | **Unsupported or known limitation** | Arbitrary sparse MoEs and arbitrary GGUF quantization recipes are not automatically supported. Mixed expert projection dtypes are supported only when every projection maps to an executable CPU kernel and the dataset carries UTH2 metadata. |
 
 ## Latest benchmark status
 
-The newest supplied observations are the July 2026 CPU/Rayon autotune
-validation runs on a GCP `g2-standard-32` VM after the Rayon/autotune
-work merged. Treat them as VM observations, not universal performance
-claims.
+### Qwen3-Coder Q8_0 CPU bench-real - 2026-07-11
+
+The latest documented real-inference result is a narrow CPU-only
+`bench-real` validation of `Qwen3-Coder-30B-A3B-Instruct` using
+`Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` from
+`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`. This section records
+user-supplied output from completed VM runs; this documentation update
+did not inspect raw VM logs.
+
+Validated scope:
+
+| Field | Observed value |
+|---|---|
+| Architecture | `qwen3_moe` |
+| Expert quantization | `Q8_0` |
+| Execution | CPU-only full autoregressive inference through `bench-real` |
+| Strict checkpoint status | `strict_weights=true`, 435/435 required dense tensors loaded |
+| Seeded fallback | `fallback_seeded=false`, `seeded_fallback_remained=false` |
+| Routing | Real learned `LinearGate`, top-8 |
+| Geometry | 48 layers, 128 experts/layer, 6,144 layer-qualified experts |
+| Dimensions | `d_model=2048`, `d_ff=768` |
+| Weight residency | Dense transformer weights resident in RAM; expert weights managed by MER's SSD-backed expert cache |
+| Output parity | Generated-output parity across measured runs: true |
+
+Environment: GCP `g2-standard-32`, 32 vCPUs, 128 GB RAM, Intel Xeon CPU
+reported at 2.20 GHz, AVX-512 available, CPU-only execution. The build
+features were `tokenizer,io_uring,blas,avx512,tui`; the dense matvec
+backend was `rayon-matrixmultiply`; expert dtype was `Q8_0`; expert
+payload was 5,013,504 bytes; the physical expert slot was 5,017,600
+bytes; and the converted model directory was approximately 31 GB. The
+Qwen model was tested from its current boot-disk-backed path, not from
+the GCP local NVMe path used by the earlier Mixtral experiments, so
+these are not local-NVMe performance numbers.
+
+### Real 1,536-slot baseline
+
+This is the current measured Qwen real-inference performance baseline:
+1,536 cache slots out of 6,144 experts, 25% expert residency,
+approximately 7.18 GiB raw expert-cache capacity, automatically sized
+30-thread compute pool (`rayon_default` with compute source `auto`),
+neural speculator disabled, greedy decoding, cache reset `keep`, 31
+prompt tokens, 128 completion tokens, 158 full transformer forwards per
+run, one warmup run, and three measured runs. A helper script originally
+described this as using a saved Rayon autotune profile, but startup
+reported default Rayon threads and an automatically sized 30-thread
+compute pool, so this is not documented as an autotuned real-inference
+result.
+
+| Metric | Observed result |
+|---|---:|
+| Prompt throughput mean | 0.502 tokens/s |
+| Decode throughput mean | 0.551 generated tokens/s |
+| TTFT p50 | 61.780 s |
+| Mean total runtime | 292.135 s |
+| Cache hit rate | approximately 71.9% |
+| Expert misses per measured run | approximately 17,043 |
+| Expert data read per measured run | approximately 85.7 GB |
+| Foreground expert SSD stall per run | approximately 231.9 s |
+| RSS | approximately 17.8-18.1 GiB |
+| Expert compute per run | approximately 29.7 s |
+| Output parity | true |
+
+This verifies correct strict full-transformer execution, but the
+measured throughput is heavily limited by foreground expert I/O. It is
+not production-ready throughput and should not be compared with GPU
+inference without a controlled benchmark.
+
+### Real 768-slot lower-memory run
+
+The lower-memory operating tier used 768 cache slots out of 6,144
+experts, 12.5% expert residency, approximately 3.59 GiB raw
+expert-cache capacity, explicit 16 Rayon threads, neural speculator
+disabled, locality enabled, affinity enabled, the prefetch governor
+enabled, predict fanout 4, pipeline depth 4, greedy decoding, cache
+reset `keep`, 31 prompt tokens, 128 completion tokens, 158 full
+transformer forwards per run, one warmup run, and three measured runs.
+
+| Metric | Observed result |
+|---|---:|
+| Prompt throughput mean | 0.306 tokens/s |
+| Decode throughput mean | 0.330 generated tokens/s |
+| TTFT p50 | 101.513 s |
+| Mean total runtime | 486.922 s |
+| Cache hit rate | approximately 53.04% |
+| Expert misses per measured run | approximately 28,492 |
+| Expert data read per measured run | approximately 142.96 GB |
+| Foreground expert SSD stall per run | approximately 429.98 s |
+| RSS | approximately 9.9-10.2 GiB |
+| Expert compute per run | approximately 28.2 s |
+| Output parity | true |
+
+Compared with the 1,536-slot baseline, total RSS fell by approximately
+44%, while decode throughput fell by approximately 40%, prompt
+throughput fell by approximately 39%, TTFT increased by approximately
+64%, expert misses increased by approximately 67%, and foreground SSD
+stall increased by approximately 85%. The regression is therefore
+primarily associated with cache capacity and foreground I/O, not slower
+expert computation. The 768-slot setup is documented as a lower-memory
+comparison, not as the preferred performance configuration.
+
+### Synthetic cache matrix
+
+The separate `run` synthetic benchmark reports `sustained_tps` as
+synthetic benchmark iterations per second. It does not mean
+autoregressive generated tokens per second. Shared setup: 10,000
+synthetic iterations, 6,144 layer-qualified experts, 48 layers, 128
+experts per layer, top-8, `Q8_0`, 16 Rayon threads selected by autotune
+in each final case, neural speculator disabled, locality enabled,
+affinity enabled, prefetch governor enabled, `io_uring`, `force_ssd`,
+skewed workload, Zipf `s=1.2`, workload correlation `0.7`, seed `42`.
+
+| Cache slots | Residency | Approx. raw cache | Synthetic iterations/s | Hit rate | Misses | I/O share | SSD stall |
+| ----------: | --------: | ----------------: | ---------------------: | -------: | -----: | --------: | --------: |
+| 384 | 6.25% | 1.79 GiB | 101.502 | 92.79875% | 5,761 | 65.58% | 63.5101 s |
+| 768 | 12.50% | 3.59 GiB | 125.761 | 94.68625% | 4,251 | 49.05% | 31.9680 s |
+| 1,536 | 25.00% | 7.18 GiB | 76.703 | 96.13625% | 3,091 | 29.54% | 14.1372 s |
+| 2,976 | 48.44% | 13.91 GiB | 60.212 | 96.6575% | 2,674 | 27.27% | 12.9498 s |
+
+The 768-slot synthetic run produced the highest synthetic iteration
+throughput for this particular skewed and correlated workload, while
+larger caches reduced misses and SSD stall but had lower synthetic
+iteration throughput. The cause of the larger-cache synthetic slowdown
+has not been proven. The synthetic winner did not transfer to real
+learned Qwen routing: at 768 slots, synthetic routing produced a 94.69%
+hit rate while real Qwen routing produced approximately 53.04%. Synthetic
+cache tuning cannot replace `bench-real` validation.
+
+### Qwen predictor and follow-up status
+
+The neural speculator has the highest configured weighting in the
+optional unified predictor, but that weighting is an architectural design
+choice, not benchmark proof that it improves every model or workload. In
+the tested Qwen3-Coder configuration, the current global-output neural
+speculator introduced substantial overhead and no end-to-end throughput
+improvement was established, so the reported Qwen benchmarks keep it
+disabled. The feature remains experimental and workload-dependent; a
+future layer-local design may be evaluated, but that redesign is not
+currently implemented.
+
+Limitations and next steps for this Qwen result: foreground expert I/O
+dominates real throughput; prompt ingestion and TTFT remain major
+bottlenecks; local NVMe performance remains unmeasured; intermediate real
+cache capacities between 768 and 1,536 remain to be tested; a controlled
+1,536-slot explicit 16-thread real run remains to be performed;
+lightweight prefetch and governor behavior need direct ablation; the
+larger-cache synthetic throughput regression requires profiling; the
+current global neural speculator is not recommended for this Qwen
+benchmark configuration; and real coding-agent task evaluation remains
+future work.
+
+The full report is
+[`docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md).
+The earlier
+[`qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md`](docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md)
+remains preserved as a blocked-benchmark record and is superseded, for
+this specific Q8_0 checkpoint, by the July 11 strict `bench-real`
+benchmark.
+
+### Mixtral Rayon/autotune CPU observations - July 2026
+
+The newest supplied Mixtral observations are the July 2026 CPU/Rayon
+autotune validation runs on a GCP `g2-standard-32` VM after the
+Rayon/autotune work merged. Treat them as VM observations, not universal
+performance claims.
 
 Observed 3,000-iteration Mixtral Q4_0 runs reached 15.85 benchmark
 iterations per second with fallback/default auto sizing and 15.60
 benchmark iterations per second with a high-confidence autotuned
-21-thread Rayon pool. A
-profile-reuse run on the same VM also showed a slow regime at 11.43
-benchmark iterations per second, and a later high-confidence autotune
-final run diverged to 10.01 benchmark iterations per second even though
-its probes had been fast. On this VM, the fast compute regime was around
-55-60 ms and the slow regime was around 95-100 ms.
+21-thread Rayon pool. A profile-reuse run on the same VM also showed a
+slow regime at 11.43 benchmark iterations per second, and a later
+high-confidence autotune final run diverged to 10.01 benchmark iterations
+per second even though its probes had been fast. On this VM, the fast
+compute regime was around 55-60 ms and the slow regime was around
+95-100 ms.
 
 Rayon/autotune is useful for safer thread-count discovery, confidence
 handling, profile reuse, and observability. It can land in the fast
@@ -76,10 +251,11 @@ historical baseline.
 
 | Document | What it contains |
 |---|---|
+| [`docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md) | Strict CPU-only `bench-real` validation for one Qwen3-Coder 30B-A3B Q8_0 checkpoint, with generated tokens/s and cache-capacity caveats. |
 | [`docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md`](docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md) | July 2026 observed VM validation for Rayon/autotune, including fast/slow compute-regime caveats. |
 | [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md) | Historical full cache-scaling suite for Mixtral Q4_0 on GCP local NVMe. |
 | [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-25.md) | Older historical Mixtral cache-scaling baseline. |
-| [`docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md`](docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md) | Qwen3-Coder CPU-production sprint status; real checkpoint throughput benchmark was blocked by missing weights. |
+| [`docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md`](docs/benchmarks/qwen3-coder-30b-a3b-cpu-production-sprint-2026-06-30.md) | Earlier Qwen3-Coder CPU-production sprint status; superseded for `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` by the July 11 strict `bench-real` report. |
 
 ## Build/run quickstart
 
@@ -230,11 +406,11 @@ After every token the engine updates **three predictors in parallel**:
 All three feed `PredictiveLoader::predict_unified`, which sums a
 weighted score per candidate id (speculator × 0.42, Markov × 0.33,
 locality × 0.25) and returns the top-fanout union `E = S ∪ L ∪ M` for
-speculative I/O. The weights encode the intent that the **speculator
-is the strongest signal** (it conditions on the actual hidden state),
-the **Markov chain is next** (statistical smoothing of transitions),
-and **locality is the weakest tiebreaker** (a coarse "recently hot"
-prior). The constants live once, as module-level `pub const`s
+speculative I/O. The weights encode an architectural preference to give
+the hidden-state-conditioned speculator the largest configured score,
+followed by the Markov transition model and then locality as a coarse
+"recently hot" prior. They are not benchmark proof that the speculator
+improves every model or workload. The constants live once, as module-level `pub const`s
 (`W_SPECULATOR`/`W_MARKOV`/`W_LOCALITY`/`W_AFFINITY`/`W_SPATIAL`), and
 the scoring core is factored into `PredictiveLoader::combine_unified_arms`
 so the engine's hot path can apply the **exact same weighting** without
@@ -1191,7 +1367,8 @@ grows the window up to `speculation_base_depth + MAX_LATENCY_BUMP`
 (= base + 2) when SSD stall is rising. The benchmark in
 [`rust-engine/tests/concurrency_stress.rs`](./rust-engine/tests/concurrency_stress.rs)
 exercises this fair-share + pressure ladder end-to-end with four
-concurrent audit streams and asserts every stream sustains ≥ 8 TPS.
+concurrent audit streams and asserts every stream sustains at least
+eight scheduler steps per second.
 
 #### Predictive architecture (`[predictive]`)
 
@@ -1650,6 +1827,36 @@ cpu_mask = "0-24"
 progress_timeout_secs = 300
 ```
 
+#### Full real-transformer bench-real
+
+To run the full real-transformer benchmark path, use `bench-real` with a
+repository-relative config path that points at your converted checkpoint
+directory. Substitute your own committed or local config file paths in
+the examples below. The July 11 Qwen report measures 1,536 slots as the
+current Qwen real-inference performance baseline and 768 slots as a
+lower-memory comparison; neither should be treated as universally
+optimal.
+
+```bash
+./target/release/micro-expert-router bench-real \
+  --config ./path/to/qwen3-coder-q8-1536.toml \
+  --prompt "Write a small Rust function that checks whether a string is a palindrome." \
+  --output-tokens 128 \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --cache-reset keep \
+  --greedy
+
+./target/release/micro-expert-router bench-real \
+  --config ./path/to/qwen3-coder-q8-768.toml \
+  --prompt "Write a small Rust function that checks whether a string is a palindrome." \
+  --output-tokens 128 \
+  --warmup-runs 1 \
+  --measured-runs 3 \
+  --cache-reset keep \
+  --greedy
+```
+
 Increase log verbosity:
 
 ```bash
@@ -1659,6 +1866,9 @@ RUST_LOG=micro_expert_router=debug ./target/release/micro-expert-router run ...
 ```
 
 ### Sample output
+
+In this `run` sample, per-tick `tps` and final `sustained_tps` mean
+benchmark iterations per second, not generated tokens/s.
 
 ```
 INFO starting engine num_experts=16 top_k=2 cache_slots=4 expert_mib=16 d_model=512 d_ff=2048 weight_mib=12 direct_io=false io_only=false force_ssd=false
@@ -2026,6 +2236,20 @@ micro-expert-router serve
                               `[performance]`, `[tokenizer]`, `[real_transformer]`,
                               `[predictive]`, and `[gpu_cache]`.
 
+micro-expert-router bench-real
+  --config <PATH>            TOML config file using `[real_transformer]`
+                              enabled and a real `weights_dir`.
+  --prompt <TEXT>            Prompt text to encode and benchmark.
+  --request-json <PATH>      OpenAI-style request JSON; conflicts with
+                              --prompt.
+  --output-tokens <N>        Completion tokens to generate.
+  --warmup-runs <N>          Warmup runs before measurement (default 1).
+  --measured-runs <N>        Measured runs to report (default 1).
+  --cache-reset <keep|fresh-runtime>
+                              Cache reset policy between runs.
+  --greedy                   Force deterministic greedy decoding.
+  --format <human|json>      Output format.
+
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance
                               (default `http://127.0.0.1:8080`). Polls
@@ -2072,9 +2296,11 @@ cargo run --release --manifest-path rust-engine/Cargo.toml -- \
 
 **2. From a GGUF checkpoint (`gguf-convert`).** No Python required,
 the engine's built-in GGUF reader handles llama.cpp / Ollama-style
-files directly. The currently verified Mixtral conversion and benchmark
-path is **Q4_0**. Native passthrough supports homogeneous expert
-projection triples in `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, or `Q8_0`.
+files directly. The verified Mixtral expert-streaming benchmark path is
+**Q4_0**. The verified Qwen3-Coder full-transformer `bench-real` path is
+the specific `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` checkpoint listed
+above. Native passthrough supports homogeneous expert projection triples
+in `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, or `Q8_0`.
 When gate, up, and down use different executable projection dtypes, the
 converter writes `dtype=mixed` experts with UTH2 range metadata and the
 runtime dispatches each projection independently. Arbitrary model-level
@@ -2168,7 +2394,7 @@ SSD expert streaming).
 | Family | `model_type` | Status | Notes |
 |---|---|---|---|
 | Mixtral / Llama-MoE | `mixtral` | ✅ Full | `block_sparse_moe.{gate,experts.*}` names, softmax top-K routing. The original, fully streamed path. |
-| Qwen3-MoE | `qwen3_moe` | ✅ Loadable | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is applied (per-head `head_dim` RMSNorm on Q and K before RoPE). |
+| Qwen3-MoE | `qwen3_moe` | ✅ Loadable; one checkpoint benchmark-verified | `mlp.{gate,experts.{i}.{gate,up,down}_proj}` names; explicit `head_dim` (≠ `d_model/num_heads`) supported. QK-Norm attention is applied (per-head `head_dim` RMSNorm on Q and K before RoPE). `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` has been validated through strict CPU-only `bench-real`; this is not universal validation of every Qwen3-MoE checkpoint or quantization recipe. |
 | Qwen3 (dense) | `qwen3` | ✅ Full (dense) | Attention + QK-Norm + norms + embeddings map and run; the dense SwiGLU FFN is executed from resident weights. Being dense it does **not** exercise SSD expert streaming. |
 | Mistral Small 3 | `mistral3` | ✅ Full (dense) | Multimodal checkpoint: LM tensors carry a `language_model.` prefix (stripped automatically) and the vision tower is ignored. The dense SwiGLU FFN is executed; dense models do **not** exercise SSD expert streaming. |
 | Phi-4 | `phi3` | ✅ Full (dense) | Fused `qkv_proj` is split into separate Q/K/V at load; the fused `gate_up_proj` dense FFN is split and executed. Dense models do **not** exercise SSD expert streaming. |
@@ -2239,14 +2465,17 @@ Per-family specifics:
   tensors. Q4_0 is the currently verified Mixtral GGUF conversion and
   benchmark path; homogeneous `Q4_K` passthrough is supported only when
   the expert projection triples are eligible.
-* **Qwen3-MoE (`qwen3_moe`) — ✅ loadable.** Just set `weights_dir`; the
-  128-expert router and `mlp.experts.*` names load automatically. Expert
-  FFNs still stream from `--data-dir`; extract them with
-  `scripts/extract_mixtral_experts.py`, which auto-detects Qwen3-MoE and
-  emits the `mlp.experts.*` per-expert blobs plus the `gate_<L>.bin`
-  router gate (see the extractor notes above). Attention applies QK-Norm
-  (per-head RMSNorm on Q and K before RoPE), matching the reference
-  architecture.
+* **Qwen3-MoE (`qwen3_moe`) — ✅ loadable; one strict `bench-real`
+  checkpoint verified.** The 128-expert router and `mlp.experts.*` names
+  load automatically. Expert FFNs still stream from `--data-dir`; extract
+  them with `scripts/extract_mixtral_experts.py` or `gguf-convert`, which
+  auto-detects Qwen3-MoE and emits the per-expert blobs plus the
+  `gate_<L>.bin` router gate. Attention applies QK-Norm (per-head
+  RMSNorm on Q and K before RoPE), matching the reference architecture.
+  The verified scope is specifically
+  `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` on CPU-only `bench-real`;
+  keep other Qwen3-MoE checkpoints in the loadable category until they
+  have their own strict benchmark evidence.
 * **Qwen3 dense (`qwen3`) — ✅ runs, dense.** Loads attention + QK-Norm +
   norms + embeddings and executes the dense SwiGLU FFN from resident
   weights. Being dense it does **not** exercise SSD streaming.
@@ -2375,8 +2604,8 @@ the learned per-layer `LinearGate` driven by hidden state.
 
 | Category | What is present today | Validation status |
 |---|---|---|
-| Verified end-to-end benchmark | Mixtral 8x7B Q4_0 expert blobs, 256 layer-qualified experts, top-2 routing, CPU path | Latest observed cache-scaling results are in the benchmark section above. |
-| Implemented but not benchmark-validated here | Mixtral/Llama-MoE, Qwen3-MoE, DeepSeek-V3/V3.1, MiMo-V2-Flash, GPT-OSS source paths | Architecture parsing, model construction, routing, and runtime hooks exist, but this README should not imply published throughput/quality validation for each family. |
+| Verified benchmark targets | Mixtral 8x7B Q4_0 expert blobs on the synthetic `run` path; `Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf` on strict CPU-only `bench-real` | Mixtral validates the expert-streaming benchmark path and reports synthetic benchmark iterations/s. Qwen validates full autoregressive transformer inference for one checkpoint and reports generated tokens/s. |
+| Implemented but not broadly benchmark-validated here | General Mixtral/Llama-MoE, Qwen3-MoE beyond the one verified Qwen3-Coder Q8_0 checkpoint, DeepSeek-V3/V3.1, MiMo-V2-Flash, GPT-OSS source paths | Architecture parsing, model construction, routing, and runtime hooks exist, but this README should not imply published throughput/quality validation for each family or every quantization recipe. |
 | Loader/schema or dense support | Qwen3 dense, Mistral Small 3, Phi-4 | Useful for tensor-name coverage and dense smoke runs; they do not exercise SSD expert streaming. |
 | Known limitations | Arbitrary sparse MoE families, unsupported projection dtypes, dense quantized GGUF transformer kernels, and unvalidated quantization recipes outside the executable projection set | Require separate implementation or validation before being documented as usable. |
 
@@ -2857,9 +3086,11 @@ therefore prioritised over one that lights up in only one. The engine
 calls `combine_unified_arms` directly (rather than `predict_unified`) so
 it reuses the speculator output it already computed for this token
 instead of running a second forward pass. The weighting encodes
-"speculator is the strongest signal, Markov is next, locality is the
-weakest tiebreaker", see the `W_SPECULATOR`/`W_MARKOV`/`W_LOCALITY`
-`pub const`s in `router.rs` for the canonical constants. When
+an implementation preference for the speculator's score to carry the
+largest configured weight, followed by Markov and then locality; this is
+an architectural design choice that still needs workload-specific
+validation. See the `W_SPECULATOR`/`W_MARKOV`/`W_LOCALITY` `pub const`s
+in `router.rs` for the canonical constants. When
 `[predictive] affinity_enabled` is set, `union_prefetch` additionally
 folds in the per-layer expert-affinity neighbours and UTH-spatial
 neighbours (`W_AFFINITY` = +0.10, `W_SPATIAL` = +0.05) for the seeds it
@@ -3242,6 +3473,20 @@ per-layer pre-gate, and the prefetch governor + cost-aware eviction)
 plus the `--workload` harness are likewise shipped, all opt-in, see
 [Defeating the cache-fraction wall](#defeating-the-cache-fraction-wall-streaming-tiers-14).
 The genuinely open items are:
+
+- **Qwen3-Coder Q8_0 real-inference bottlenecks.** The July 11, 2026
+  `bench-real` runs verify strict full-transformer CPU execution for one
+  Qwen3-Coder checkpoint, but real throughput is currently dominated by
+  foreground expert I/O. Prompt ingestion and TTFT remain major
+  bottlenecks. The supplied Qwen tests used boot-disk-backed storage, so
+  local NVMe performance remains unmeasured. Intermediate real cache
+  capacities between 768 and 1,536 slots remain to be tested, as does a
+  controlled 1,536-slot explicit 16-thread real run. Lightweight prefetch
+  and governor behavior require direct ablation, the larger-cache
+  synthetic throughput regression requires profiling, the current global
+  neural speculator is not recommended for this Qwen benchmark
+  configuration, and real coding-agent task evaluation remains future
+  work.
 
 - **Tier 3 pre-gate is exercised only on the multi-layer path.** The
   per-layer pre-gate learns a layer-L→L+1 conditional, so it only
