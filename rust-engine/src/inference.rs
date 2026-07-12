@@ -2530,6 +2530,41 @@ static UNSUPPORTED_QUANT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q4K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q5K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q6K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static Q8_DIRECT_KERNEL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static Q8_REFERENCE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static Q8_PREPARATION_NANOS: AtomicU64 = AtomicU64::new(0);
+static Q8_GATE_UP_NANOS: AtomicU64 = AtomicU64::new(0);
+static Q8_DOWN_NANOS: AtomicU64 = AtomicU64::new(0);
+static Q8_PREPARED_DUPLICATE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn add_elapsed(counter: &AtomicU64, elapsed: std::time::Duration) {
+    counter.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+}
+
+pub fn q8_direct_kernel_dispatches() -> u64 {
+    Q8_DIRECT_KERNEL_DISPATCHES.load(Ordering::Relaxed)
+}
+
+pub fn q8_reference_fallbacks() -> u64 {
+    Q8_REFERENCE_FALLBACKS.load(Ordering::Relaxed)
+}
+
+pub fn q8_preparation_seconds() -> f64 {
+    Q8_PREPARATION_NANOS.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+pub fn q8_gate_up_kernel_seconds() -> f64 {
+    Q8_GATE_UP_NANOS.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+pub fn q8_down_kernel_seconds() -> f64 {
+    Q8_DOWN_NANOS.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+pub fn q8_prepared_duplicate_bytes() -> u64 {
+    Q8_PREPARED_DUPLICATE_BYTES.load(Ordering::Relaxed)
+}
 
 pub fn quantized_projection_dispatches() -> u64 {
     QUANTIZED_PROJECTION_DISPATCHES.load(Ordering::Relaxed)
@@ -3245,18 +3280,16 @@ pub fn run_inference_q4_0(
     Ok((out, y))
 }
 
-/// Q8_0 counterpart of [`run_inference`]: dequantises the resident
+/// Legacy Q8_0 dequantisation reference: materialises the resident
 /// bytes (a stream of GGUF Q8_0 34-byte blocks, each holding an `f16`
 /// scale and 32 signed `i8` weights) into an owned `Vec<f32>` (via
 /// [`OwnedExpertWeights::from_bytes_q8_0`]) and runs the same SwiGLU
 /// forward pass. The block-local `f16` scales bound dynamic-range
 /// error to a 32-weight neighbourhood, so this dtype is the
 /// preferred middle ground when 4-bit is too aggressive but per-tensor
-/// `Int8` doesn't have enough scale headroom for the model. The
-/// dispatch in [`crate::engine::dispatch_expert_forward`] picks the
-/// prepared `QMatMul` fast path
-/// ([`run_inference_q8_0_qmm_with_timing`]) when block alignment
-/// allows it, and falls back here otherwise.
+/// `Int8` doesn't have enough scale headroom for the model. Production
+/// dispatch uses [`run_inference_q8_0_direct_with_timing`]; this helper is
+/// retained as an independent numerical reference.
 pub fn run_inference_q8_0(
     token_idx: u64,
     resident: &ExpertResident,
@@ -3266,6 +3299,354 @@ pub fn run_inference_q8_0(
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     let weights = OwnedExpertWeights::from_bytes_q8_0(resident.data(), d_model, d_ff)?;
     let y = weights.forward(x);
+    let out = summarise_output(token_idx, resident.id, &y);
+    Ok((out, y))
+}
+
+/// Reusable activation storage for the native Q8_0 path. It contains no
+/// weights and is safe to retain independently of an expert resident.
+#[derive(Default)]
+pub struct Q8DirectScratch {
+    gate: Vec<f32>,
+    gated: Vec<f32>,
+}
+
+struct Q8DirectLayout<'a> {
+    gate: &'a [u8],
+    up: &'a [u8],
+    down: &'a [u8],
+    d_model: usize,
+    d_ff: usize,
+    row_aligned: bool,
+}
+
+fn validate_q8_direct_layout<'a>(
+    bytes: &'a [u8],
+    x_len: usize,
+    y_len: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> Result<Q8DirectLayout<'a>, ExpertWeightsError> {
+    if d_model == 0 || d_ff == 0 {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "Q8_0 dimensions must be non-zero, got d_model={d_model}, d_ff={d_ff}"
+        )));
+    }
+    if x_len != d_model || y_len != d_model {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "Q8_0 activation dimensions mismatch: x={x_len}, y={y_len}, d_model={d_model}"
+        )));
+    }
+    let weights = d_model.checked_mul(d_ff).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout("Q8_0 projection element count overflow".to_string())
+    })?;
+    let blocks = weights.checked_add(Q8_0_BLOCK_ELEMS - 1).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout("Q8_0 block count overflow".to_string())
+    })? / Q8_0_BLOCK_ELEMS;
+    let projection_bytes = blocks.checked_mul(Q8_0_BLOCK_BYTES).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout("Q8_0 projection byte count overflow".to_string())
+    })?;
+    let need = projection_bytes.checked_mul(3).ok_or_else(|| {
+        ExpertWeightsError::InvalidLayout("Q8_0 expert byte count overflow".to_string())
+    })?;
+    if bytes.len() < need {
+        let err = if need > EXPERT_SIZE_TOLERANCE_BYTES
+            && need - bytes.len() <= EXPERT_SIZE_TOLERANCE_BYTES
+        {
+            ExpertWeightsError::TruncatedPayload {
+                have: bytes.len(),
+                need,
+                d_model,
+                d_ff,
+            }
+        } else {
+            ExpertWeightsError::BufferTooSmall {
+                have: bytes.len(),
+                need,
+                d_model,
+                d_ff,
+            }
+        };
+        return Err(err);
+    }
+    // Slice only the logical payload. Physical O_DIRECT page padding is
+    // permitted after it, but no kernel can observe that padding.
+    let logical = &bytes[..need];
+    let (gate, rest) = logical.split_at(projection_bytes);
+    let (up, down) = rest.split_at(projection_bytes);
+    if gate.len() % Q8_0_BLOCK_BYTES != 0
+        || up.len() % Q8_0_BLOCK_BYTES != 0
+        || down.len() % Q8_0_BLOCK_BYTES != 0
+    {
+        return Err(ExpertWeightsError::InvalidLayout(
+            "Q8_0 projection range does not end on a 34-byte block boundary".to_string(),
+        ));
+    }
+    Ok(Q8DirectLayout {
+        gate,
+        up,
+        down,
+        d_model,
+        d_ff,
+        row_aligned: d_model.is_multiple_of(Q8_0_BLOCK_ELEMS)
+            && d_ff.is_multiple_of(Q8_0_BLOCK_ELEMS),
+    })
+}
+
+/// Row-kernel selection is resolved once per projection traversal, never per
+/// quantization block. Every unsafe implementation is entered only after the
+/// safe layout validator has established exact row and activation lengths.
+#[derive(Clone, Copy)]
+enum Q8RowKernel {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+    Avx512,
+}
+
+#[inline]
+fn select_q8_0_row_kernel() -> Q8RowKernel {
+    #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+    {
+        let features = crate::kernels::cpu_features();
+        if features.avx512f && features.avx512bw {
+            return Q8RowKernel::Avx512;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let features = crate::kernels::cpu_features();
+        if features.avx2 && features.fma {
+            return Q8RowKernel::Avx2;
+        }
+    }
+    Q8RowKernel::Scalar
+}
+
+/// Runtime-selected native Q8_0 row backend, exposed for benchmark reports.
+pub fn q8_direct_kernel_backend() -> &'static str {
+    match select_q8_0_row_kernel() {
+        Q8RowKernel::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        Q8RowKernel::Avx2 => "avx2-fma",
+        #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+        Q8RowKernel::Avx512 => "avx512f-bw",
+    }
+}
+
+fn q8_0_row_dot_scalar(row_blocks: &[u8], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (block, activations) in row_blocks
+        .chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(x.chunks_exact(Q8_0_BLOCK_ELEMS))
+    {
+        let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        for i in 0..Q8_0_BLOCK_ELEMS {
+            sum += scale * (block[2 + i] as i8 as f32) * activations[i];
+        }
+    }
+    sum
+}
+
+fn q8_0_gate_up_row_scalar(gate_blocks: &[u8], up_blocks: &[u8], x: &[f32]) -> (f32, f32) {
+    let mut gate = 0.0f32;
+    let mut up = 0.0f32;
+    for ((gate_block, up_block), activations) in gate_blocks
+        .chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(up_blocks.chunks_exact(Q8_0_BLOCK_BYTES))
+        .zip(x.chunks_exact(Q8_0_BLOCK_ELEMS))
+    {
+        let gate_scale =
+            half::f16::from_bits(u16::from_le_bytes([gate_block[0], gate_block[1]])).to_f32();
+        let up_scale =
+            half::f16::from_bits(u16::from_le_bytes([up_block[0], up_block[1]])).to_f32();
+        for i in 0..Q8_0_BLOCK_ELEMS {
+            let activation = activations[i];
+            gate += gate_scale * (gate_block[2 + i] as i8 as f32) * activation;
+            up += up_scale * (up_block[2 + i] as i8 as f32) * activation;
+        }
+    }
+    (gate, up)
+}
+
+fn q8_0_row_dot(kernel: Q8RowKernel, row_blocks: &[u8], x: &[f32]) -> f32 {
+    debug_assert!(x.len().is_multiple_of(Q8_0_BLOCK_ELEMS));
+    debug_assert_eq!(
+        row_blocks.len(),
+        x.len() / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES
+    );
+    match kernel {
+        #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+        Q8RowKernel::Avx512 => unsafe {
+            crate::kernels::avx512::q8_0_row_dot_avx512(row_blocks, x)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Q8RowKernel::Avx2 => unsafe {
+            crate::kernels::avx2::q8_0_row_dot_avx2(row_blocks, x)
+        },
+        _ => q8_0_row_dot_scalar(row_blocks, x),
+    }
+}
+
+fn q8_0_gate_up_row(
+    kernel: Q8RowKernel,
+    gate_blocks: &[u8],
+    up_blocks: &[u8],
+    x: &[f32],
+) -> (f32, f32) {
+    debug_assert!(x.len().is_multiple_of(Q8_0_BLOCK_ELEMS));
+    debug_assert_eq!(gate_blocks.len(), up_blocks.len());
+    debug_assert_eq!(
+        gate_blocks.len(),
+        x.len() / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES
+    );
+    match kernel {
+        #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+        Q8RowKernel::Avx512 => unsafe {
+            crate::kernels::avx512::q8_0_gate_up_row_avx512(gate_blocks, up_blocks, x)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Q8RowKernel::Avx2 => unsafe {
+            crate::kernels::avx2::q8_0_gate_up_row_avx2(gate_blocks, up_blocks, x)
+        },
+        _ => q8_0_gate_up_row_scalar(gate_blocks, up_blocks, x),
+    }
+}
+
+fn q8_0_matvec_scalar_flat(bytes: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
+    debug_assert_eq!(y.len(), rows);
+    debug_assert_eq!(x.len(), cols);
+    let weights = rows * cols;
+    y.fill(0.0);
+    for (block_index, block) in bytes.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
+        let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        let base = block_index * Q8_0_BLOCK_ELEMS;
+        let count = (weights - base).min(Q8_0_BLOCK_ELEMS);
+        for i in 0..count {
+            let flat = base + i;
+            y[flat / cols] += scale * (block[2 + i] as i8 as f32) * x[flat % cols];
+        }
+    }
+}
+
+/// Execute a native Q8_0 expert into caller-owned output and scratch.
+/// This is the allocation-free API used by benchmarks and reusable callers.
+pub fn forward_q8_0_direct_into(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    scratch: &mut Q8DirectScratch,
+    y: &mut [f32],
+    timings: Option<&crate::stage_timing::StageTimings>,
+) -> Result<(), ExpertWeightsError> {
+    let preparation_started = Instant::now();
+    let layout = validate_q8_direct_layout(bytes, x.len(), y.len(), d_model, d_ff);
+    if layout.is_ok() {
+        scratch.gate.resize(d_ff, 0.0);
+        scratch.gated.resize(d_ff, 0.0);
+    }
+    let preparation_elapsed = preparation_started.elapsed();
+    add_elapsed(&Q8_PREPARATION_NANOS, preparation_elapsed);
+    crate::stage_timing::record_optional(
+        timings,
+        crate::stage_timing::Q8_PREPARATION,
+        preparation_elapsed,
+    );
+    let layout = layout?;
+
+    let gate_up_started = Instant::now();
+    if layout.row_aligned {
+        let kernel = select_q8_0_row_kernel();
+        let row_bytes = layout.d_model / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES;
+        let limit = swiglu_limit();
+        crate::parallel::par_row_chunks(&mut scratch.gated, layout.d_model, |start, out| {
+            for (local, slot) in out.iter_mut().enumerate() {
+                let row = start + local;
+                let range = row * row_bytes..(row + 1) * row_bytes;
+                let (mut gate, up) = q8_0_gate_up_row(
+                    kernel,
+                    &layout.gate[range.clone()],
+                    &layout.up[range],
+                    x,
+                );
+                if let Some(limit) = limit {
+                    gate = gate.clamp(-limit, limit);
+                }
+                *slot = silu(gate) * up;
+            }
+        });
+        Q8_DIRECT_KERNEL_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        Q8_REFERENCE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        q8_0_matvec_scalar_flat(layout.gate, layout.d_ff, layout.d_model, x, &mut scratch.gate);
+        q8_0_matvec_scalar_flat(layout.up, layout.d_ff, layout.d_model, x, &mut scratch.gated);
+        let limit = swiglu_limit();
+        for (gate, up) in scratch.gate.iter().copied().zip(scratch.gated.iter_mut()) {
+            let gate = limit.map_or(gate, |limit| gate.clamp(-limit, limit));
+            *up = silu(gate) * *up;
+        }
+    }
+    let gate_up_elapsed = gate_up_started.elapsed();
+    add_elapsed(&Q8_GATE_UP_NANOS, gate_up_elapsed);
+    crate::stage_timing::record_optional(
+        timings,
+        crate::stage_timing::Q8_GATE_UP_KERNEL,
+        gate_up_elapsed,
+    );
+
+    let down_started = Instant::now();
+    if layout.row_aligned {
+        let kernel = select_q8_0_row_kernel();
+        let row_bytes = layout.d_ff / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES;
+        crate::parallel::par_row_chunks(y, layout.d_ff, |start, out| {
+            for (local, slot) in out.iter_mut().enumerate() {
+                let row = start + local;
+                let range = row * row_bytes..(row + 1) * row_bytes;
+                *slot = q8_0_row_dot(kernel, &layout.down[range], &scratch.gated);
+            }
+        });
+    } else {
+        q8_0_matvec_scalar_flat(layout.down, layout.d_model, layout.d_ff, &scratch.gated, y);
+    }
+    let down_elapsed = down_started.elapsed();
+    add_elapsed(&Q8_DOWN_NANOS, down_elapsed);
+    crate::stage_timing::record_optional(
+        timings,
+        crate::stage_timing::Q8_DOWN_KERNEL,
+        down_elapsed,
+    );
+    Ok(())
+}
+
+thread_local! {
+    static Q8_DIRECT_SCRATCH: std::cell::RefCell<Q8DirectScratch> =
+        const { std::cell::RefCell::new(Q8DirectScratch { gate: Vec::new(), gated: Vec::new() }) };
+}
+
+/// Default Q8_0 expert path: direct execution over resident bytes with no
+/// persistent weight preparation or duplicate quantized storage.
+pub fn run_inference_q8_0_direct_with_timing(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    timings: Option<&crate::stage_timing::StageTimings>,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    let mut y = vec![0.0f32; d_model];
+    Q8_DIRECT_SCRATCH.with(|cell| {
+        forward_q8_0_direct_into(
+            resident.data(),
+            x,
+            d_model,
+            d_ff,
+            &mut cell.borrow_mut(),
+            &mut y,
+            timings,
+        )
+    })?;
     let out = summarise_output(token_idx, resident.id, &y);
     Ok((out, y))
 }
@@ -3597,13 +3978,22 @@ fn forward_qmm(
     y.to_vec1::<f32>().map_err(map_err)
 }
 
-#[derive(Clone, Debug)]
+#[cfg(feature = "q8-candle-reference")]
+#[derive(Debug)]
 pub(crate) struct PreparedQ8_0Expert {
     d_model: usize,
     d_ff: usize,
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+    duplicate_bytes: usize,
+}
+
+#[cfg(feature = "q8-candle-reference")]
+impl Drop for PreparedQ8_0Expert {
+    fn drop(&mut self) {
+        Q8_PREPARED_DUPLICATE_BYTES.fetch_sub(self.duplicate_bytes as u64, Ordering::Relaxed);
+    }
 }
 
 /// **Q4_0 SwiGLU forward pass via candle's `QMatMul`** — no F32
@@ -3775,11 +4165,14 @@ pub fn run_inference_q4k_qmm(
     Ok((out, y))
 }
 
-/// **Q8_0 SwiGLU forward pass via candle's `QMatMul`** — no F32
+/// Test/benchmark-only **Q8_0 SwiGLU via Candle `QMatMul`**. This retains
+/// a copied `QStorage` and is compiled only with `q8-candle-reference`; it
+/// is never selected by production expert dispatch. There is no F32
 /// dequant of the weights. Same shape conventions as
 /// [`run_inference_q4_0_qmm`]; per-block stride is 34 bytes / 32
 /// weights instead of 18 / 32. Activation stays F32 (`[1, d_model]`),
 /// only the output `Vec` is allocated per call.
+#[cfg(feature = "q8-candle-reference")]
 pub fn run_inference_q8_0_qmm_with_timing(
     token_idx: u64,
     resident: &ExpertResident,
@@ -3810,6 +4203,7 @@ pub fn run_inference_q8_0_qmm_with_timing(
     Ok((out, y))
 }
 
+#[cfg(feature = "q8-candle-reference")]
 fn prepare_q8_0_qmm(
     bytes: &[u8],
     d_model: usize,
@@ -3853,15 +4247,18 @@ fn prepare_q8_0_qmm(
     )?))
     .map_err(|e| ExpertWeightsError::Candle(e.to_string()))?;
 
+    Q8_PREPARED_DUPLICATE_BYTES.fetch_add(need as u64, Ordering::Relaxed);
     Ok(PreparedQ8_0Expert {
         d_model,
         d_ff,
         gate,
         up,
         down,
+        duplicate_bytes: need,
     })
 }
 
+#[cfg(feature = "q8-candle-reference")]
 fn forward_q8_0_qmm_prepared(
     prepared: &PreparedQ8_0Expert,
     x: &[f32],
@@ -5187,6 +5584,7 @@ mod tests {
         assert!(y.iter().all(|v| v.is_finite()));
     }
 
+    #[cfg(feature = "q8-candle-reference")]
     #[test]
     fn prepared_q8_0_qmm_matches_dequant_and_prepares_once() {
         let d_model = Q8_0_BLOCK_ELEMS;
@@ -5257,6 +5655,225 @@ mod tests {
             .expect("missing expert preparation timing");
         assert_eq!(prep.count, 1);
         assert!(prep.total_seconds.is_finite());
+    }
+
+    fn randomized_q8_expert(d_model: usize, d_ff: usize, mut state: u64) -> Vec<u8> {
+        let weights = d_model.checked_mul(d_ff).unwrap();
+        let blocks = weights.div_ceil(Q8_0_BLOCK_ELEMS);
+        let mut bytes = Vec::with_capacity(3 * blocks * Q8_0_BLOCK_BYTES);
+        for projection in 0..3 {
+            for block in 0..blocks {
+                let count = (weights - block * Q8_0_BLOCK_ELEMS).min(Q8_0_BLOCK_ELEMS);
+                let mut values = [0.0f32; Q8_0_BLOCK_ELEMS];
+                for value in &mut values[..count] {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *value = (((state >> 40) as u32 as f32) / ((1u32 << 24) - 1) as f32 - 0.5)
+                        * (0.08 + projection as f32 * 0.01);
+                }
+                let mut encoded = [0u8; Q8_0_BLOCK_BYTES];
+                quantize_q8_0_block(&values[..count], &mut encoded);
+                bytes.extend_from_slice(&encoded);
+            }
+        }
+        bytes
+    }
+
+    fn direct_q8_bytes(
+        bytes: &[u8],
+        x: &[f32],
+        d_model: usize,
+        d_ff: usize,
+    ) -> Result<Vec<f32>, ExpertWeightsError> {
+        let mut scratch = Q8DirectScratch::default();
+        let mut y = vec![0.0; d_model];
+        forward_q8_0_direct_into(bytes, x, d_model, d_ff, &mut scratch, &mut y, None)?;
+        Ok(y)
+    }
+
+    fn assert_q8_close_with_tolerance(
+        label: &str,
+        expected: &[f32],
+        actual: &[f32],
+        relative: f32,
+    ) {
+        assert_eq!(expected.len(), actual.len(), "{label}: output length");
+        for (i, (&a, &b)) in expected.iter().zip(actual).enumerate() {
+            let tolerance = relative * a.abs().max(1.0) + 3e-5;
+            assert!(
+                (a - b).abs() <= tolerance,
+                "{label}: index {i}, expected {a}, got {b}, tolerance {tolerance}"
+            );
+        }
+    }
+
+    fn assert_q8_close(label: &str, expected: &[f32], actual: &[f32]) {
+        assert_q8_close_with_tolerance(label, expected, actual, 3e-3);
+    }
+
+    #[test]
+    fn direct_q8_supports_non_multiple_matrix_rows() {
+        let (d_model, d_ff) = (37, 45);
+        let bytes = randomized_q8_expert(d_model, d_ff, 0x51a1_a11e);
+        let x = synth_hidden_state(9, d_model, 3);
+        let expected = OwnedExpertWeights::from_bytes_q8_0(&bytes, d_model, d_ff)
+            .unwrap()
+            .forward(&x);
+        let actual = direct_q8_bytes(&bytes, &x, d_model, d_ff).unwrap();
+        assert_q8_close("non-multiple", &expected, &actual);
+    }
+
+    #[test]
+    fn direct_q8_rejects_truncated_and_overflowed_layouts() {
+        let (d_model, d_ff) = (32, 64);
+        let bytes = randomized_q8_expert(d_model, d_ff, 3);
+        let x = vec![0.25; d_model];
+        let err = direct_q8_bytes(&bytes[..bytes.len() - 1], &x, d_model, d_ff).unwrap_err();
+        assert!(matches!(
+            err,
+            ExpertWeightsError::TruncatedPayload { .. }
+                | ExpertWeightsError::BufferTooSmall { .. }
+        ));
+
+        let mut scratch = Q8DirectScratch::default();
+        let mut y = Vec::new();
+        let err = forward_q8_0_direct_into(
+            &[],
+            &[],
+            usize::MAX,
+            2,
+            &mut scratch,
+            &mut y,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExpertWeightsError::InvalidLayout(_)));
+    }
+
+    #[test]
+    fn direct_q8_dimension_checks_are_runtime_checks() {
+        let bytes = randomized_q8_expert(32, 32, 4);
+        let mut scratch = Q8DirectScratch::default();
+        let mut y = vec![0.0; 32];
+        let err = forward_q8_0_direct_into(
+            &bytes,
+            &[0.0; 31],
+            32,
+            32,
+            &mut scratch,
+            &mut y,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExpertWeightsError::InvalidLayout(_)));
+    }
+
+    #[test]
+    fn direct_q8_propagates_nonfinite_activations() {
+        let (d_model, d_ff) = (32, 32);
+        let bytes = randomized_q8_expert(d_model, d_ff, 5);
+        let mut x = vec![0.25; d_model];
+        x[3] = f32::NAN;
+        x[17] = f32::INFINITY;
+        let y = direct_q8_bytes(&bytes, &x, d_model, d_ff).unwrap();
+        assert!(y.iter().any(|v| !v.is_finite()));
+    }
+
+    #[test]
+    fn direct_q8_same_resident_is_concurrent() {
+        let (d_model, d_ff) = (64, 96);
+        let bytes = randomized_q8_expert(d_model, d_ff, 6);
+        let slot = bytes.len().div_ceil(4096) * 4096;
+        let pool = crate::buffer_pool::BufferPool::new(1, slot, 4096);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        let resident = std::sync::Arc::new(crate::expert_cache::ExpertResident::new(7, buffer));
+        let x = std::sync::Arc::new(synth_hidden_state(11, d_model, 2));
+        let expected = run_inference_q8_0_direct_with_timing(
+            0, &resident, &x, d_model, d_ff, None,
+        )
+        .unwrap()
+        .1;
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let resident = resident.clone();
+                let x = x.clone();
+                std::thread::spawn(move || {
+                    run_inference_q8_0_direct_with_timing(
+                        0, &resident, &x, d_model, d_ff, None,
+                    )
+                    .unwrap()
+                    .1
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(expected, thread.join().unwrap());
+        }
+    }
+
+    #[cfg(not(feature = "q8-candle-reference"))]
+    #[test]
+    fn direct_q8_execution_retains_no_expert_sized_preparation() {
+        let (d_model, d_ff) = (64, 96);
+        let bytes = randomized_q8_expert(d_model, d_ff, 7);
+        let before = q8_prepared_duplicate_bytes();
+        let x = synth_hidden_state(13, d_model, 4);
+        let slot = bytes.len().div_ceil(4096) * 4096;
+        let pool = crate::buffer_pool::BufferPool::new(1, slot, 4096);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer.as_mut_slice()[..bytes.len()].copy_from_slice(&bytes);
+        let resident = crate::expert_cache::ExpertResident::new(8, buffer);
+        let resident_ptr = resident.data().as_ptr();
+        let mut scratch = Q8DirectScratch::default();
+        let mut y = vec![0.0; d_model];
+        for _ in 0..3 {
+            forward_q8_0_direct_into(
+                resident.data(),
+                &x,
+                d_model,
+                d_ff,
+                &mut scratch,
+                &mut y,
+                None,
+            )
+            .unwrap();
+            assert_eq!(resident.data().as_ptr(), resident_ptr);
+        }
+        let retained_activation_bytes =
+            (scratch.gate.capacity() + scratch.gated.capacity() + y.capacity()) * 4;
+        assert!(
+            retained_activation_bytes < bytes.len() / 2,
+            "activation scratch {retained_activation_bytes} unexpectedly approaches expert bytes {}",
+            bytes.len()
+        );
+        assert_eq!(q8_prepared_duplicate_bytes(), before);
+        assert_eq!(before, 0);
+    }
+
+    #[cfg(feature = "q8-candle-reference")]
+    #[test]
+    fn direct_q8_matches_candle_tiny_medium_and_qwen_shapes() {
+        for &(label, d_model, d_ff) in &[
+            ("tiny", 32, 32),
+            ("medium", 128, 96),
+            ("qwen", 2048, 768),
+        ] {
+            let bytes = randomized_q8_expert(d_model, d_ff, d_model as u64 ^ d_ff as u64);
+            let x = synth_hidden_state(17, d_model, 5);
+            let direct = direct_q8_bytes(&bytes, &x, d_model, d_ff).unwrap();
+            let dequant = OwnedExpertWeights::from_bytes_q8_0(&bytes, d_model, d_ff)
+                .unwrap()
+                .forward(&x);
+            assert_q8_close(&format!("{label}-dequant"), &dequant, &direct);
+            let prepared = prepare_q8_0_qmm(&bytes, d_model, d_ff).unwrap();
+            let candle = forward_q8_0_qmm_prepared(&prepared, &x).unwrap();
+            // Candle quantizes the activation operand internally for its
+            // Q8 QMatMul kernel, so its Qwen-width accumulation has a wider
+            // envelope than the direct F32-activation/dequant reference.
+            assert_q8_close_with_tolerance(label, &candle, &direct, 1e-2);
+        }
     }
 
     #[test]

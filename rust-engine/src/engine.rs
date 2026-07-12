@@ -22,7 +22,7 @@ use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
     run_inference_q4k, run_inference_q4k_qmm, run_inference_q5k, run_inference_q6k,
-    run_inference_q8_0, run_inference_q8_0_qmm_with_timing, synth_hidden_state, uniform_scores,
+    run_inference_q8_0_direct_with_timing, synth_hidden_state, uniform_scores,
     ExpertWeightsError, HiddenState, InferenceOutput, WeightDtype, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_ELEMS,
     Q8_0_BLOCK_ELEMS,
 };
@@ -1584,8 +1584,8 @@ impl std::error::Error for MoeStepError {
 /// `QMatMul`-based path is tried first and the dequant path is used
 /// as a fallback when QMM returns an error (this can happen on a
 /// corrupt block stream where dequant has more lenient bounds
-/// checks). For every other dtype the legacy entry point is called
-/// directly.
+/// checks). Q8_0 always uses the validated native resident-byte path;
+/// every other dtype calls its normal entry point directly.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_expert_forward(
     dtype: WeightDtype,
@@ -1662,18 +1662,12 @@ fn dispatch_expert_forward(
             }
         }
         WeightDtype::Q4_0 => run_inference_q4_0(token_idx, r, x, d_model, d_ff, q4_tolerance),
-        WeightDtype::Q8_0
-            if use_qmm && d_model % Q8_0_BLOCK_ELEMS == 0 && d_ff % Q8_0_BLOCK_ELEMS == 0 =>
-        {
-            match run_inference_q8_0_qmm_with_timing(token_idx, r, x, d_model, d_ff, timings) {
-                Ok(v) => Ok(v),
-                Err(e) => {
-                    debug!(error = %e, "QMatMul Q8_0 path failed; falling back to dequant");
-                    run_inference_q8_0(token_idx, r, x, d_model, d_ff)
-                }
-            }
+        // Native Q8_0 is always the production path. It validates the full
+        // payload before dispatch and handles non-row-aligned shapes with a
+        // scalar block-stream reference; malformed residents remain errors.
+        WeightDtype::Q8_0 => {
+            run_inference_q8_0_direct_with_timing(token_idx, r, x, d_model, d_ff, timings)
         }
-        WeightDtype::Q8_0 => run_inference_q8_0(token_idx, r, x, d_model, d_ff),
         WeightDtype::Q5K => run_inference_q5k(token_idx, r, x, d_model, d_ff),
         WeightDtype::Q6K => run_inference_q6k(token_idx, r, x, d_model, d_ff),
         WeightDtype::BF16 => run_inference_bf16(token_idx, r, x, d_model, d_ff),
@@ -4756,6 +4750,13 @@ impl Engine {
                 .counters
                 .singleflight_followers
                 .load(Ordering::Relaxed),
+            raw_expert_cache_bytes: crate::expert_cache::raw_expert_resident_bytes(),
+            prepared_expert_bytes: crate::inference::q8_prepared_duplicate_bytes(),
+            q8_direct_kernel_dispatches: crate::inference::q8_direct_kernel_dispatches(),
+            q8_reference_fallbacks: crate::inference::q8_reference_fallbacks(),
+            q8_preparation_seconds: crate::inference::q8_preparation_seconds(),
+            q8_gate_up_kernel_seconds: crate::inference::q8_gate_up_kernel_seconds(),
+            q8_down_kernel_seconds: crate::inference::q8_down_kernel_seconds(),
         }
     }
 
@@ -5080,6 +5081,16 @@ pub struct EngineReport {
     /// issuing their own (Phase 1 — SSD read de-duplication). Each one
     /// maps directly to one disk read that was avoided.
     pub singleflight_followers: u64,
+    /// Bytes held by live CPU resident expert buffers.
+    pub raw_expert_cache_bytes: u64,
+    /// Bytes retained by prepared duplicate expert representations. Zero for
+    /// the production native Q8_0 path.
+    pub prepared_expert_bytes: u64,
+    pub q8_direct_kernel_dispatches: u64,
+    pub q8_reference_fallbacks: u64,
+    pub q8_preparation_seconds: f64,
+    pub q8_gate_up_kernel_seconds: f64,
+    pub q8_down_kernel_seconds: f64,
 }
 
 #[cfg(test)]

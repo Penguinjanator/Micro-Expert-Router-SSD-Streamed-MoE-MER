@@ -869,6 +869,23 @@ enum Cmd {
         json: bool,
     },
 
+    /// Compare native zero-copy Q8_0 experts with the retained Candle reference.
+    /// Build with `--features q8-candle-reference` to include both paths.
+    Q8ExpertMicrobench {
+        /// Expert hidden width (Qwen3-Coder-30B-A3B: 2048).
+        #[arg(long, default_value_t = 2048)]
+        d_model: usize,
+        /// Expert intermediate width (Qwen3-Coder-30B-A3B: 768).
+        #[arg(long, default_value_t = 768)]
+        d_ff: usize,
+        /// Warmup resident-hit iterations per path.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured resident-hit iterations per path.
+        #[arg(long, default_value_t = 5)]
+        measured_runs: usize,
+    },
+
     /// Count heap allocations for the old transformer wrappers vs request scratch buffers.
     ///
     /// Requires `--features alloc-count`. The synthetic layer keeps this
@@ -1835,6 +1852,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             skip_lm_head,
             json,
         }),
+        Cmd::Q8ExpertMicrobench {
+            d_model,
+            d_ff,
+            warmup_runs,
+            measured_runs,
+        } => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs),
         Cmd::ScratchAllocMicrobench {
             d_model,
             num_experts,
@@ -2304,6 +2327,173 @@ fn assert_no_softmax_fallbacks(before: u64) -> Result<(), Box<dyn std::error::Er
         .into());
     }
     Ok(())
+}
+
+fn cmd_q8_expert_microbench(
+    d_model: usize,
+    d_ff: usize,
+    warmup_runs: usize,
+    measured_runs: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "q8-candle-reference"))]
+    {
+        let _ = (d_model, d_ff, warmup_runs, measured_runs);
+        return Err(
+            "q8-expert-microbench compares against Candle; on the AVX-512 baseline rebuild with \
+             `cargo run --release --features avx512,q8-candle-reference -- q8-expert-microbench`"
+                .into(),
+        );
+    }
+
+    #[cfg(feature = "q8-candle-reference")]
+    {
+        if d_model == 0
+            || d_ff == 0
+            || !d_model.is_multiple_of(crate::inference::Q8_0_BLOCK_ELEMS)
+            || !d_ff.is_multiple_of(crate::inference::Q8_0_BLOCK_ELEMS)
+        {
+            return Err("Q8 Candle comparison requires positive dimensions divisible by 32".into());
+        }
+        if measured_runs == 0 {
+            return Err("q8-expert-microbench requires --measured-runs > 0".into());
+        }
+        let weights = d_model.checked_mul(d_ff).ok_or("Q8 benchmark shape overflow")?;
+        let blocks = weights.div_ceil(crate::inference::Q8_0_BLOCK_ELEMS);
+        let logical_bytes = blocks
+            .checked_mul(crate::inference::Q8_0_BLOCK_BYTES)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or("Q8 benchmark byte size overflow")?;
+        let mut bytes = Vec::with_capacity(logical_bytes);
+        let mut state = 0x9182_7364_55aa_f00du64;
+        for _ in 0..blocks * 3 {
+            let mut values = [0.0f32; crate::inference::Q8_0_BLOCK_ELEMS];
+            for value in &mut values {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *value = (((state >> 40) as u32 as f32) / ((1u32 << 24) - 1) as f32 - 0.5)
+                    * 0.08;
+            }
+            let mut block = [0u8; crate::inference::Q8_0_BLOCK_BYTES];
+            crate::inference::quantize_q8_0_block(&values, &mut block);
+            bytes.extend_from_slice(&block);
+        }
+        let x = crate::inference::synth_hidden_state(0, d_model, 0x51);
+        let slot = logical_bytes.div_ceil(4096) * 4096;
+        type Forward = fn(
+            u64,
+            &crate::expert_cache::ExpertResident,
+            &[f32],
+            usize,
+            usize,
+            Option<&crate::stage_timing::StageTimings>,
+        ) -> Result<
+            (crate::inference::InferenceOutput, crate::inference::HiddenState),
+            crate::inference::ExpertWeightsError,
+        >;
+
+        fn residents(
+            count: usize,
+            slot: usize,
+            bytes: &[u8],
+        ) -> Vec<crate::expert_cache::ExpertResident> {
+            let pool = crate::buffer_pool::BufferPool::new(count, slot, 4096);
+            (0..count)
+                .map(|id| {
+                    let mut buffer = pool.try_acquire().expect("benchmark buffer slot");
+                    buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+                    crate::expert_cache::ExpertResident::new(id as u32, buffer)
+                })
+                .collect()
+        }
+
+        fn cold_ms(
+            forward: Forward,
+            count: usize,
+            slot: usize,
+            bytes: &[u8],
+            x: &[f32],
+            d_model: usize,
+            d_ff: usize,
+        ) -> Result<f64, crate::inference::ExpertWeightsError> {
+            let experts = residents(count, slot, bytes);
+            let started = Instant::now();
+            for resident in &experts {
+                let output = forward(0, resident, x, d_model, d_ff, None)?;
+                std::hint::black_box(output);
+            }
+            Ok(started.elapsed().as_secs_f64() * 1000.0)
+        }
+
+        fn hit_ms(
+            forward: Forward,
+            count: usize,
+            slot: usize,
+            bytes: &[u8],
+            x: &[f32],
+            d_model: usize,
+            d_ff: usize,
+            warmup: usize,
+            measured: usize,
+        ) -> Result<f64, crate::inference::ExpertWeightsError> {
+            let experts = residents(count, slot, bytes);
+            for iteration in 0..warmup {
+                for resident in &experts {
+                    std::hint::black_box(forward(
+                        iteration as u64,
+                        resident,
+                        x,
+                        d_model,
+                        d_ff,
+                        None,
+                    )?);
+                }
+            }
+            let started = Instant::now();
+            for iteration in 0..measured {
+                for resident in &experts {
+                    std::hint::black_box(forward(
+                        iteration as u64,
+                        resident,
+                        x,
+                        d_model,
+                        d_ff,
+                        None,
+                    )?);
+                }
+            }
+            Ok(started.elapsed().as_secs_f64() * 1000.0 / measured as f64)
+        }
+
+        let paths: [(&str, Forward); 2] = [
+            ("candle-qstorage", crate::inference::run_inference_q8_0_qmm_with_timing),
+            ("direct-native", crate::inference::run_inference_q8_0_direct_with_timing),
+        ];
+        println!(
+            "q8-expert-microbench d_model={d_model} d_ff={d_ff} expert_bytes={logical_bytes} q8_kernel={}",
+            crate::inference::q8_direct_kernel_backend()
+        );
+        println!("{:<18} {:>14} {:>14} {:>14} {:>14}", "path", "single-cold-ms", "single-hit-ms", "top8-cold-ms", "top8-hit-ms");
+        for (name, forward) in paths {
+            let single_cold = cold_ms(forward, 1, slot, &bytes, &x, d_model, d_ff)?;
+            let single_hit = hit_ms(
+                forward, 1, slot, &bytes, &x, d_model, d_ff, warmup_runs, measured_runs,
+            )?;
+            let top8_cold = cold_ms(forward, 8, slot, &bytes, &x, d_model, d_ff)?;
+            let top8_hit = hit_ms(
+                forward, 8, slot, &bytes, &x, d_model, d_ff, warmup_runs, measured_runs,
+            )?;
+            println!(
+                "{name:<18} {single_cold:>14.3} {single_hit:>14.3} {top8_cold:>14.3} {top8_hit:>14.3}"
+            );
+        }
+        println!(
+            "retained bytes: raw={} prepared_duplicate={}",
+            crate::expert_cache::raw_expert_resident_bytes(),
+            crate::inference::q8_prepared_duplicate_bytes()
+        );
+        Ok(())
+    }
 }
 
 fn cmd_matvec_microbench(args: MatvecMicrobenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -3885,6 +4075,9 @@ fn build_features() -> Vec<&'static str> {
     }
     if cfg!(feature = "avx512") {
         features.push("avx512");
+    }
+    if cfg!(feature = "q8-candle-reference") {
+        features.push("q8-candle-reference");
     }
     if cfg!(feature = "amx") {
         features.push("amx");

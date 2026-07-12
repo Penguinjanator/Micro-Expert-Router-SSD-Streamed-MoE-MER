@@ -16,6 +16,9 @@ pub const EXPERT_CACHE_LOOKUP: &str = "expert_cache_lookup";
 pub const FOREGROUND_EXPERT_IO_WAIT: &str = "foreground_expert_io_wait";
 #[allow(dead_code)]
 pub const EXPERT_PREPARATION: &str = "expert_preparation";
+pub const Q8_PREPARATION: &str = "q8_preparation";
+pub const Q8_GATE_UP_KERNEL: &str = "q8_gate_up_kernel";
+pub const Q8_DOWN_KERNEL: &str = "q8_down_kernel";
 pub const EXPERT_COMPUTE: &str = "expert_compute";
 pub const MOE_WEIGHTED_COMBINATION: &str = "moe_weighted_combination";
 pub const FINAL_RMS_NORM: &str = "final_rms_norm";
