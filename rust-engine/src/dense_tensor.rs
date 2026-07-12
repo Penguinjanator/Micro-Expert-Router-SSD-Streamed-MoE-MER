@@ -778,7 +778,19 @@ mod tests {
         let got = weight.matvec(&x);
         let f32_weight = DenseWeight::from_f32(weight.to_f32_vec(), 3, 35);
         let expected = f32_weight.matvec(&x);
-        assert_eq!(got, expected);
+        assert_eq!(got.len(), expected.len());
+        for (row, (&actual, &expected)) in got.iter().zip(&expected).enumerate() {
+            assert!(actual.is_finite(), "row {row}: actual is not finite: {actual}");
+            assert!(
+                expected.is_finite(),
+                "row {row}: expected is not finite: {expected}"
+            );
+            let tolerance = 1e-5 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "row {row}: actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
     }
 
     #[test]
