@@ -869,7 +869,7 @@ pub fn dequantize_q4_0_to_f32(src: &[u8], n_weights: usize, dst: &mut Vec<f32>) 
 // ---------------------------------------------------------------------
 
 /// Number of weights per Q8_0 block. Matches llama.cpp's `QK8_0`.
-pub const Q8_0_BLOCK_ELEMS: usize = 32;
+pub use crate::kernels::Q8_0_BLOCK_ELEMS;
 
 /// Bytes per Q8_0 block on disk.
 ///
@@ -884,7 +884,7 @@ pub const Q8_0_BLOCK_ELEMS: usize = 32;
 /// the smallest quantisation error of any single-byte format: each
 /// block carries its own f16 scale, so dynamic range stays bounded
 /// inside every 32-weight neighbourhood.
-pub const Q8_0_BLOCK_BYTES: usize = 2 + Q8_0_BLOCK_ELEMS;
+pub use crate::kernels::Q8_0_BLOCK_BYTES;
 
 /// Dequantise one Q8_0 block into `dst` (must hold exactly
 /// [`Q8_0_BLOCK_ELEMS`] floats).
@@ -2531,7 +2531,7 @@ static MIXED_Q4K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q5K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static MIXED_Q6K_OPTIMIZED_PROJECTION_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static Q8_DIRECT_KERNEL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
-static Q8_REFERENCE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static Q8_SCALAR_LAYOUT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static Q8_PREPARATION_NANOS: AtomicU64 = AtomicU64::new(0);
 static Q8_GATE_UP_NANOS: AtomicU64 = AtomicU64::new(0);
 static Q8_DOWN_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -2546,8 +2546,8 @@ pub fn q8_direct_kernel_dispatches() -> u64 {
     Q8_DIRECT_KERNEL_DISPATCHES.load(Ordering::Relaxed)
 }
 
-pub fn q8_reference_fallbacks() -> u64 {
-    Q8_REFERENCE_FALLBACKS.load(Ordering::Relaxed)
+pub fn q8_scalar_layout_fallbacks() -> u64 {
+    Q8_SCALAR_LAYOUT_FALLBACKS.load(Ordering::Relaxed)
 }
 
 pub fn q8_preparation_seconds() -> f64 {
@@ -2562,7 +2562,7 @@ pub fn q8_down_kernel_seconds() -> f64 {
     Q8_DOWN_NANOS.load(Ordering::Relaxed) as f64 / 1e9
 }
 
-pub fn q8_prepared_duplicate_bytes() -> u64 {
+pub fn prepared_duplicate_expert_bytes() -> u64 {
     Q8_PREPARED_DUPLICATE_BYTES.load(Ordering::Relaxed)
 }
 
@@ -3317,7 +3317,8 @@ struct Q8DirectLayout<'a> {
     down: &'a [u8],
     d_model: usize,
     d_ff: usize,
-    row_aligned: bool,
+    gate_up_row_aligned: bool,
+    down_row_aligned: bool,
 }
 
 fn validate_q8_direct_layout<'a>(
@@ -3340,9 +3341,7 @@ fn validate_q8_direct_layout<'a>(
     let weights = d_model.checked_mul(d_ff).ok_or_else(|| {
         ExpertWeightsError::InvalidLayout("Q8_0 projection element count overflow".to_string())
     })?;
-    let blocks = weights.checked_add(Q8_0_BLOCK_ELEMS - 1).ok_or_else(|| {
-        ExpertWeightsError::InvalidLayout("Q8_0 block count overflow".to_string())
-    })? / Q8_0_BLOCK_ELEMS;
+    let blocks = weights.div_ceil(Q8_0_BLOCK_ELEMS);
     let projection_bytes = blocks.checked_mul(Q8_0_BLOCK_BYTES).ok_or_else(|| {
         ExpertWeightsError::InvalidLayout("Q8_0 projection byte count overflow".to_string())
     })?;
@@ -3388,9 +3387,19 @@ fn validate_q8_direct_layout<'a>(
         down,
         d_model,
         d_ff,
-        row_aligned: d_model.is_multiple_of(Q8_0_BLOCK_ELEMS)
-            && d_ff.is_multiple_of(Q8_0_BLOCK_ELEMS),
+        gate_up_row_aligned: d_model.is_multiple_of(Q8_0_BLOCK_ELEMS),
+        down_row_aligned: d_ff.is_multiple_of(Q8_0_BLOCK_ELEMS),
     })
+}
+
+/// Explicit native Q8 backend request used by the microbenchmark. Production
+/// always passes [`Q8DirectKernelChoice::Auto`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8DirectKernelChoice {
+    Auto,
+    Scalar,
+    Avx2,
+    Avx512,
 }
 
 /// Row-kernel selection is resolved once per projection traversal, never per
@@ -3424,15 +3433,60 @@ fn select_q8_0_row_kernel() -> Q8RowKernel {
     Q8RowKernel::Scalar
 }
 
-/// Runtime-selected native Q8_0 row backend, exposed for benchmark reports.
-pub fn q8_direct_kernel_backend() -> &'static str {
-    match select_q8_0_row_kernel() {
+fn resolve_q8_0_row_kernel(
+    choice: Q8DirectKernelChoice,
+) -> Result<Q8RowKernel, ExpertWeightsError> {
+    match choice {
+        Q8DirectKernelChoice::Auto => Ok(select_q8_0_row_kernel()),
+        Q8DirectKernelChoice::Scalar => Ok(Q8RowKernel::Scalar),
+        Q8DirectKernelChoice::Avx2 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let features = crate::kernels::cpu_features();
+                if features.avx2 && features.fma {
+                    return Ok(Q8RowKernel::Avx2);
+                }
+            }
+            Err(ExpertWeightsError::InvalidLayout(
+                "requested Q8 AVX2 backend requires x86_64 runtime AVX2+FMA support".to_string(),
+            ))
+        }
+        Q8DirectKernelChoice::Avx512 => {
+            #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+            {
+                let features = crate::kernels::cpu_features();
+                if features.avx512f && features.avx512bw {
+                    return Ok(Q8RowKernel::Avx512);
+                }
+            }
+            Err(ExpertWeightsError::InvalidLayout(
+                "requested Q8 AVX-512 backend requires an avx512 build on x86_64 with runtime AVX512F+BW support".to_string(),
+            ))
+        }
+    }
+}
+
+/// Return the exact backend name for a requested benchmark choice, or a
+/// descriptive error when that explicit ISA is unavailable.
+pub fn q8_direct_kernel_backend_for(
+    choice: Q8DirectKernelChoice,
+) -> Result<&'static str, ExpertWeightsError> {
+    Ok(q8_row_kernel_name(resolve_q8_0_row_kernel(choice)?))
+}
+
+fn q8_row_kernel_name(kernel: Q8RowKernel) -> &'static str {
+    match kernel {
         Q8RowKernel::Scalar => "scalar",
         #[cfg(target_arch = "x86_64")]
         Q8RowKernel::Avx2 => "avx2-fma",
         #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
         Q8RowKernel::Avx512 => "avx512f-bw",
     }
+}
+
+/// Runtime-selected native Q8_0 row backend, exposed for benchmark reports.
+pub fn q8_direct_kernel_backend() -> &'static str {
+    q8_row_kernel_name(select_q8_0_row_kernel())
 }
 
 fn q8_0_row_dot_scalar(row_blocks: &[u8], x: &[f32]) -> f32 {
@@ -3541,6 +3595,30 @@ pub fn forward_q8_0_direct_into(
     y: &mut [f32],
     timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(), ExpertWeightsError> {
+    forward_q8_0_direct_into_with_kernel(
+        bytes,
+        x,
+        d_model,
+        d_ff,
+        scratch,
+        y,
+        timings,
+        Q8DirectKernelChoice::Auto,
+    )
+}
+
+/// Benchmark/test entry point with an explicit, runtime-validated backend.
+/// No global dispatch override is mutated.
+pub(crate) fn forward_q8_0_direct_into_with_kernel(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    scratch: &mut Q8DirectScratch,
+    y: &mut [f32],
+    timings: Option<&crate::stage_timing::StageTimings>,
+    kernel_choice: Q8DirectKernelChoice,
+) -> Result<(), ExpertWeightsError> {
     let preparation_started = Instant::now();
     let layout = validate_q8_direct_layout(bytes, x.len(), y.len(), d_model, d_ff);
     if layout.is_ok() {
@@ -3555,10 +3633,11 @@ pub fn forward_q8_0_direct_into(
         preparation_elapsed,
     );
     let layout = layout?;
+    let kernel = resolve_q8_0_row_kernel(kernel_choice)?;
+    Q8_DIRECT_KERNEL_DISPATCHES.fetch_add(1, Ordering::Relaxed);
 
     let gate_up_started = Instant::now();
-    if layout.row_aligned {
-        let kernel = select_q8_0_row_kernel();
+    if layout.gate_up_row_aligned {
         let row_bytes = layout.d_model / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES;
         let limit = swiglu_limit();
         crate::parallel::par_row_chunks(&mut scratch.gated, layout.d_model, |start, out| {
@@ -3577,9 +3656,8 @@ pub fn forward_q8_0_direct_into(
                 *slot = silu(gate) * up;
             }
         });
-        Q8_DIRECT_KERNEL_DISPATCHES.fetch_add(1, Ordering::Relaxed);
     } else {
-        Q8_REFERENCE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        Q8_SCALAR_LAYOUT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         q8_0_matvec_scalar_flat(layout.gate, layout.d_ff, layout.d_model, x, &mut scratch.gate);
         q8_0_matvec_scalar_flat(layout.up, layout.d_ff, layout.d_model, x, &mut scratch.gated);
         let limit = swiglu_limit();
@@ -3597,8 +3675,7 @@ pub fn forward_q8_0_direct_into(
     );
 
     let down_started = Instant::now();
-    if layout.row_aligned {
-        let kernel = select_q8_0_row_kernel();
+    if layout.down_row_aligned {
         let row_bytes = layout.d_ff / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES;
         crate::parallel::par_row_chunks(y, layout.d_ff, |start, out| {
             for (local, slot) in out.iter_mut().enumerate() {
@@ -3608,6 +3685,7 @@ pub fn forward_q8_0_direct_into(
             }
         });
     } else {
+        Q8_SCALAR_LAYOUT_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         q8_0_matvec_scalar_flat(layout.down, layout.d_model, layout.d_ff, &scratch.gated, y);
     }
     let down_elapsed = down_started.elapsed();
@@ -3635,9 +3713,31 @@ pub fn run_inference_q8_0_direct_with_timing(
     d_ff: usize,
     timings: Option<&crate::stage_timing::StageTimings>,
 ) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
+    run_inference_q8_0_direct_with_timing_and_kernel(
+        token_idx,
+        resident,
+        x,
+        d_model,
+        d_ff,
+        timings,
+        Q8DirectKernelChoice::Auto,
+    )
+}
+
+/// Benchmark/test wrapper that selects an explicit backend without changing
+/// the process-wide production dispatcher.
+pub(crate) fn run_inference_q8_0_direct_with_timing_and_kernel(
+    token_idx: u64,
+    resident: &ExpertResident,
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    timings: Option<&crate::stage_timing::StageTimings>,
+    kernel_choice: Q8DirectKernelChoice,
+) -> Result<(InferenceOutput, HiddenState), ExpertWeightsError> {
     let mut y = vec![0.0f32; d_model];
     Q8_DIRECT_SCRATCH.with(|cell| {
-        forward_q8_0_direct_into(
+        forward_q8_0_direct_into_with_kernel(
             resident.data(),
             x,
             d_model,
@@ -3645,6 +3745,7 @@ pub fn run_inference_q8_0_direct_with_timing(
             &mut cell.borrow_mut(),
             &mut y,
             timings,
+            kernel_choice,
         )
     })?;
     let out = summarise_output(token_idx, resident.id, &y);
@@ -5692,6 +5793,28 @@ mod tests {
         Ok(y)
     }
 
+    fn direct_q8_bytes_with_kernel(
+        bytes: &[u8],
+        x: &[f32],
+        d_model: usize,
+        d_ff: usize,
+        kernel: Q8DirectKernelChoice,
+    ) -> Result<Vec<f32>, ExpertWeightsError> {
+        let mut scratch = Q8DirectScratch::default();
+        let mut y = vec![0.0; d_model];
+        forward_q8_0_direct_into_with_kernel(
+            bytes,
+            x,
+            d_model,
+            d_ff,
+            &mut scratch,
+            &mut y,
+            None,
+            kernel,
+        )?;
+        Ok(y)
+    }
+
     fn assert_q8_close_with_tolerance(
         label: &str,
         expected: &[f32],
@@ -5725,6 +5848,85 @@ mod tests {
     }
 
     #[test]
+    fn direct_q8_gate_up_and_down_alignment_fallbacks_are_independent() {
+        for &(label, d_model, d_ff) in &[
+            ("aligned-gate-up", 64, 45),
+            ("aligned-down", 37, 64),
+        ] {
+            let bytes = randomized_q8_expert(d_model, d_ff, d_model as u64 ^ d_ff as u64);
+            let x = synth_hidden_state(19, d_model, 7);
+            let expected = OwnedExpertWeights::from_bytes_q8_0(&bytes, d_model, d_ff)
+                .unwrap()
+                .forward(&x);
+            let actual = direct_q8_bytes_with_kernel(
+                &bytes,
+                &x,
+                d_model,
+                d_ff,
+                Q8DirectKernelChoice::Scalar,
+            )
+            .unwrap();
+            assert_q8_close(label, &expected, &actual);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn direct_q8_avx2_full_qwen_output_matches_scalar_when_supported() {
+        if q8_direct_kernel_backend_for(Q8DirectKernelChoice::Avx2).is_err() {
+            return;
+        }
+        let (d_model, d_ff) = (2048, 768);
+        let bytes = randomized_q8_expert(d_model, d_ff, 0x2048_0768);
+        let x = synth_hidden_state(23, d_model, 11);
+        let expected = direct_q8_bytes_with_kernel(
+            &bytes,
+            &x,
+            d_model,
+            d_ff,
+            Q8DirectKernelChoice::Scalar,
+        )
+        .unwrap();
+        let actual = direct_q8_bytes_with_kernel(
+            &bytes,
+            &x,
+            d_model,
+            d_ff,
+            Q8DirectKernelChoice::Avx2,
+        )
+        .unwrap();
+        assert_q8_close_with_tolerance("qwen-avx2-vs-scalar", &expected, &actual, 2e-5);
+    }
+
+    #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+    #[test]
+    fn direct_q8_avx512_full_qwen_output_matches_scalar_when_supported() {
+        if q8_direct_kernel_backend_for(Q8DirectKernelChoice::Avx512).is_err() {
+            return;
+        }
+        let (d_model, d_ff) = (2048, 768);
+        let bytes = randomized_q8_expert(d_model, d_ff, 0x5120_0768);
+        let x = synth_hidden_state(29, d_model, 13);
+        let expected = direct_q8_bytes_with_kernel(
+            &bytes,
+            &x,
+            d_model,
+            d_ff,
+            Q8DirectKernelChoice::Scalar,
+        )
+        .unwrap();
+        let actual = direct_q8_bytes_with_kernel(
+            &bytes,
+            &x,
+            d_model,
+            d_ff,
+            Q8DirectKernelChoice::Avx512,
+        )
+        .unwrap();
+        assert_q8_close_with_tolerance("qwen-avx512-vs-scalar", &expected, &actual, 2e-5);
+    }
+
+    #[test]
     fn direct_q8_rejects_truncated_and_overflowed_layouts() {
         let (d_model, d_ff) = (32, 64);
         let bytes = randomized_q8_expert(d_model, d_ff, 3);
@@ -5736,18 +5938,16 @@ mod tests {
                 | ExpertWeightsError::BufferTooSmall { .. }
         ));
 
-        let mut scratch = Q8DirectScratch::default();
-        let mut y = Vec::new();
-        let err = forward_q8_0_direct_into(
-            &[],
+        let err = match validate_q8_direct_layout(
             &[],
             usize::MAX,
+            usize::MAX,
+            usize::MAX,
             2,
-            &mut scratch,
-            &mut y,
-            None,
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("overflowed Q8 layout unexpectedly validated"),
+        };
         assert!(matches!(err, ExpertWeightsError::InvalidLayout(_)));
     }
 
@@ -5818,7 +6018,7 @@ mod tests {
     fn direct_q8_execution_retains_no_expert_sized_preparation() {
         let (d_model, d_ff) = (64, 96);
         let bytes = randomized_q8_expert(d_model, d_ff, 7);
-        let before = q8_prepared_duplicate_bytes();
+        let before = prepared_duplicate_expert_bytes();
         let x = synth_hidden_state(13, d_model, 4);
         let slot = bytes.len().div_ceil(4096) * 4096;
         let pool = crate::buffer_pool::BufferPool::new(1, slot, 4096);
@@ -5848,7 +6048,7 @@ mod tests {
             "activation scratch {retained_activation_bytes} unexpectedly approaches expert bytes {}",
             bytes.len()
         );
-        assert_eq!(q8_prepared_duplicate_bytes(), before);
+        assert_eq!(prepared_duplicate_expert_bytes(), before);
         assert_eq!(before, 0);
     }
 

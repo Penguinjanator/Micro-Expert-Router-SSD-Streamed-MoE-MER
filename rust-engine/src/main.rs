@@ -252,6 +252,15 @@ enum BenchRealOutputFormat {
     Json,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Q8BenchKernel {
+    Auto,
+    Scalar,
+    Avx2,
+    Avx512,
+    All,
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Generate synthetic expert files for testing on local disk.
@@ -884,6 +893,10 @@ enum Cmd {
         /// Measured resident-hit iterations per path.
         #[arg(long, default_value_t = 5)]
         measured_runs: usize,
+        /// Native backend to exercise. `all` includes every supported native
+        /// backend plus the Candle reference.
+        #[arg(long, value_enum, default_value_t = Q8BenchKernel::Auto)]
+        kernel: Q8BenchKernel,
     },
 
     /// Count heap allocations for the old transformer wrappers vs request scratch buffers.
@@ -1857,7 +1870,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             d_ff,
             warmup_runs,
             measured_runs,
-        } => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs),
+            kernel,
+        } => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs, kernel),
         Cmd::ScratchAllocMicrobench {
             d_model,
             num_experts,
@@ -2334,10 +2348,11 @@ fn cmd_q8_expert_microbench(
     d_ff: usize,
     warmup_runs: usize,
     measured_runs: usize,
+    kernel: Q8BenchKernel,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "q8-candle-reference"))]
     {
-        let _ = (d_model, d_ff, warmup_runs, measured_runs);
+        let _ = (d_model, d_ff, warmup_runs, measured_runs, kernel);
         return Err(
             "q8-expert-microbench compares against Candle; on the AVX-512 baseline rebuild with \
              `cargo run --release --features avx512,q8-candle-reference -- q8-expert-microbench`"
@@ -2380,53 +2395,99 @@ fn cmd_q8_expert_microbench(
         }
         let x = crate::inference::synth_hidden_state(0, d_model, 0x51);
         let slot = logical_bytes.div_ceil(4096) * 4096;
-        type Forward = fn(
-            u64,
-            &crate::expert_cache::ExpertResident,
-            &[f32],
-            usize,
-            usize,
-            Option<&crate::stage_timing::StageTimings>,
-        ) -> Result<
-            (crate::inference::InferenceOutput, crate::inference::HiddenState),
-            crate::inference::ExpertWeightsError,
-        >;
+
+        #[derive(Clone, Copy)]
+        enum BenchPath {
+            Candle,
+            Direct(crate::inference::Q8DirectKernelChoice),
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct MemorySnapshot {
+            resident: u64,
+            pool_allocated: u64,
+            pool_primary: u64,
+            pool_shadow: u64,
+            prepared_duplicate: u64,
+        }
+
+        impl MemorySnapshot {
+            fn capture() -> Self {
+                Self {
+                    resident: crate::expert_cache::resident_expert_buffer_bytes(),
+                    pool_allocated: crate::buffer_pool::expert_buffer_pool_allocated_bytes(),
+                    pool_primary: crate::buffer_pool::expert_buffer_pool_primary_bytes(),
+                    pool_shadow: crate::buffer_pool::expert_buffer_pool_shadow_bytes(),
+                    prepared_duplicate: crate::inference::prepared_duplicate_expert_bytes(),
+                }
+            }
+
+            fn delta(self, baseline: Self) -> Self {
+                Self {
+                    resident: self.resident.saturating_sub(baseline.resident),
+                    pool_allocated: self.pool_allocated.saturating_sub(baseline.pool_allocated),
+                    pool_primary: self.pool_primary.saturating_sub(baseline.pool_primary),
+                    pool_shadow: self.pool_shadow.saturating_sub(baseline.pool_shadow),
+                    prepared_duplicate: self
+                        .prepared_duplicate
+                        .saturating_sub(baseline.prepared_duplicate),
+                }
+            }
+        }
+
+        struct LifecycleResult {
+            first_exec_ms: f64,
+            repeated_ms: f64,
+            after_construction: MemorySnapshot,
+            after_first: MemorySnapshot,
+            after_repeated: MemorySnapshot,
+            after_drop: MemorySnapshot,
+        }
 
         fn residents(
             count: usize,
             slot: usize,
             bytes: &[u8],
-        ) -> Vec<crate::expert_cache::ExpertResident> {
+        ) -> (
+            crate::buffer_pool::BufferPool,
+            Vec<crate::expert_cache::ExpertResident>,
+        ) {
             let pool = crate::buffer_pool::BufferPool::new(count, slot, 4096);
-            (0..count)
+            let experts = (0..count)
                 .map(|id| {
                     let mut buffer = pool.try_acquire().expect("benchmark buffer slot");
                     buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
                     crate::expert_cache::ExpertResident::new(id as u32, buffer)
                 })
-                .collect()
+                .collect();
+            (pool, experts)
         }
 
-        fn cold_ms(
-            forward: Forward,
-            count: usize,
-            slot: usize,
-            bytes: &[u8],
+        fn execute(
+            path: BenchPath,
+            token_idx: u64,
+            resident: &crate::expert_cache::ExpertResident,
             x: &[f32],
             d_model: usize,
             d_ff: usize,
-        ) -> Result<f64, crate::inference::ExpertWeightsError> {
-            let experts = residents(count, slot, bytes);
-            let started = Instant::now();
-            for resident in &experts {
-                let output = forward(0, resident, x, d_model, d_ff, None)?;
-                std::hint::black_box(output);
+        ) -> Result<
+            (crate::inference::InferenceOutput, crate::inference::HiddenState),
+            crate::inference::ExpertWeightsError,
+        > {
+            match path {
+                BenchPath::Candle => crate::inference::run_inference_q8_0_qmm_with_timing(
+                    token_idx, resident, x, d_model, d_ff, None,
+                ),
+                BenchPath::Direct(choice) => {
+                    crate::inference::run_inference_q8_0_direct_with_timing_and_kernel(
+                        token_idx, resident, x, d_model, d_ff, None, choice,
+                    )
+                }
             }
-            Ok(started.elapsed().as_secs_f64() * 1000.0)
         }
 
-        fn hit_ms(
-            forward: Forward,
+        fn lifecycle(
+            path: BenchPath,
             count: usize,
             slot: usize,
             bytes: &[u8],
@@ -2435,63 +2496,164 @@ fn cmd_q8_expert_microbench(
             d_ff: usize,
             warmup: usize,
             measured: usize,
-        ) -> Result<f64, crate::inference::ExpertWeightsError> {
-            let experts = residents(count, slot, bytes);
+            logical_bytes: usize,
+        ) -> Result<LifecycleResult, Box<dyn std::error::Error>> {
+            let baseline = MemorySnapshot::capture();
+            let (pool, experts) = residents(count, slot, bytes);
+            let after_construction = MemorySnapshot::capture();
+            let started = Instant::now();
+            for resident in &experts {
+                let output = execute(path, 0, resident, x, d_model, d_ff)?;
+                std::hint::black_box(output);
+            }
+            let first_exec_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let after_first = MemorySnapshot::capture();
+            let expected_prepared = match path {
+                BenchPath::Candle => (count as u64).saturating_mul(logical_bytes as u64),
+                BenchPath::Direct(_) => 0,
+            };
+            let prepared_delta = after_first
+                .prepared_duplicate
+                .saturating_sub(baseline.prepared_duplicate);
+            if prepared_delta != expected_prepared {
+                return Err(format!(
+                    "prepared duplicate bytes after first execution: got {prepared_delta}, expected {expected_prepared}"
+                )
+                .into());
+            }
             for iteration in 0..warmup {
                 for resident in &experts {
-                    std::hint::black_box(forward(
+                    std::hint::black_box(execute(
+                        path,
                         iteration as u64,
                         resident,
                         x,
                         d_model,
                         d_ff,
-                        None,
                     )?);
                 }
             }
             let started = Instant::now();
             for iteration in 0..measured {
                 for resident in &experts {
-                    std::hint::black_box(forward(
+                    std::hint::black_box(execute(
+                        path,
                         iteration as u64,
                         resident,
                         x,
                         d_model,
                         d_ff,
-                        None,
                     )?);
                 }
             }
-            Ok(started.elapsed().as_secs_f64() * 1000.0 / measured as f64)
+            let repeated_ms = started.elapsed().as_secs_f64() * 1000.0 / measured as f64;
+            let after_repeated = MemorySnapshot::capture();
+            drop(experts);
+            drop(pool);
+            let after_drop = MemorySnapshot::capture();
+            if after_drop != baseline {
+                return Err(format!(
+                    "Q8 benchmark memory counters did not return to baseline: baseline={baseline:?}, after_drop={after_drop:?}"
+                )
+                .into());
+            }
+            Ok(LifecycleResult {
+                first_exec_ms,
+                repeated_ms,
+                after_construction: after_construction.delta(baseline),
+                after_first: after_first.delta(baseline),
+                after_repeated: after_repeated.delta(baseline),
+                after_drop: after_drop.delta(baseline),
+            })
         }
 
-        let paths: [(&str, Forward); 2] = [
-            ("candle-qstorage", crate::inference::run_inference_q8_0_qmm_with_timing),
-            ("direct-native", crate::inference::run_inference_q8_0_direct_with_timing),
-        ];
-        println!(
-            "q8-expert-microbench d_model={d_model} d_ff={d_ff} expert_bytes={logical_bytes} q8_kernel={}",
-            crate::inference::q8_direct_kernel_backend()
-        );
-        println!("{:<18} {:>14} {:>14} {:>14} {:>14}", "path", "single-cold-ms", "single-hit-ms", "top8-cold-ms", "top8-hit-ms");
-        for (name, forward) in paths {
-            let single_cold = cold_ms(forward, 1, slot, &bytes, &x, d_model, d_ff)?;
-            let single_hit = hit_ms(
-                forward, 1, slot, &bytes, &x, d_model, d_ff, warmup_runs, measured_runs,
-            )?;
-            let top8_cold = cold_ms(forward, 8, slot, &bytes, &x, d_model, d_ff)?;
-            let top8_hit = hit_ms(
-                forward, 8, slot, &bytes, &x, d_model, d_ff, warmup_runs, measured_runs,
-            )?;
-            println!(
-                "{name:<18} {single_cold:>14.3} {single_hit:>14.3} {top8_cold:>14.3} {top8_hit:>14.3}"
-            );
+        let selected = match kernel {
+            Q8BenchKernel::Auto => vec![crate::inference::Q8DirectKernelChoice::Auto],
+            Q8BenchKernel::Scalar => vec![crate::inference::Q8DirectKernelChoice::Scalar],
+            Q8BenchKernel::Avx2 => vec![crate::inference::Q8DirectKernelChoice::Avx2],
+            Q8BenchKernel::Avx512 => vec![crate::inference::Q8DirectKernelChoice::Avx512],
+            Q8BenchKernel::All => vec![
+                crate::inference::Q8DirectKernelChoice::Scalar,
+                crate::inference::Q8DirectKernelChoice::Avx2,
+                crate::inference::Q8DirectKernelChoice::Avx512,
+            ],
+        };
+        let mut paths = vec![("candle-qstorage", "candle-qmatmul", BenchPath::Candle)];
+        for choice in selected {
+            match crate::inference::q8_direct_kernel_backend_for(choice) {
+                Ok(backend) => paths.push(("direct-native", backend, BenchPath::Direct(choice))),
+                Err(error) if kernel == Q8BenchKernel::All => {
+                    println!("SKIPPED backend={choice:?}: {error}");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         println!(
-            "retained bytes: raw={} prepared_duplicate={}",
-            crate::expert_cache::raw_expert_resident_bytes(),
-            crate::inference::q8_prepared_duplicate_bytes()
+            "q8-expert-microbench d_model={d_model} d_ff={d_ff} expert_bytes={logical_bytes} production_auto_backend={}",
+            crate::inference::q8_direct_kernel_backend()
         );
+        println!(
+            "{:<18} {:<16} {:>22} {:>20} {:>28} {:>26}",
+            "path",
+            "backend",
+            "single-first-exec-ms",
+            "single-repeated-ms",
+            "top8-serial-first-exec-ms",
+            "top8-serial-repeated-ms"
+        );
+        println!(
+            "memory rows are deltas from the baseline captured before resident/pool construction"
+        );
+        for (name, backend, path) in paths {
+            let single = lifecycle(
+                path,
+                1,
+                slot,
+                &bytes,
+                &x,
+                d_model,
+                d_ff,
+                warmup_runs,
+                measured_runs,
+                logical_bytes,
+            )?;
+            let top8 = lifecycle(
+                path,
+                8,
+                slot,
+                &bytes,
+                &x,
+                d_model,
+                d_ff,
+                warmup_runs,
+                measured_runs,
+                logical_bytes,
+            )?;
+            println!(
+                "{name:<18} {backend:<16} {:>22.3} {:>20.3} {:>28.3} {:>26.3}",
+                single.first_exec_ms,
+                single.repeated_ms,
+                top8.first_exec_ms,
+                top8.repeated_ms,
+            );
+            for (count, result) in [(1, &single), (8, &top8)] {
+                for (stage, memory) in [
+                    ("after-construction", result.after_construction),
+                    ("after-first-exec", result.after_first),
+                    ("after-repeated", result.after_repeated),
+                    ("after-explicit-drop", result.after_drop),
+                ] {
+                    println!(
+                        "memory path={name} backend={backend} experts={count} stage={stage} resident_expert_buffer_bytes={} expert_buffer_pool_allocated_bytes={} expert_buffer_pool_primary_bytes={} expert_buffer_pool_shadow_bytes={} prepared_duplicate_expert_bytes={}",
+                        memory.resident,
+                        memory.pool_allocated,
+                        memory.pool_primary,
+                        memory.pool_shadow,
+                        memory.prepared_duplicate,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

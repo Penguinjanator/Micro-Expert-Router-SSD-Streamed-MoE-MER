@@ -118,10 +118,13 @@ struct MetricsInner {
     /// (checked CPU attention + GPU experts) observable instead of a
     /// single ambiguous "gpu" device string.
     pub backend_component_plane: IntGaugeVec,
-    pub raw_expert_cache_bytes: IntGauge,
-    pub prepared_expert_bytes: IntGauge,
+    pub resident_expert_buffer_bytes: IntGauge,
+    pub expert_buffer_pool_allocated_bytes: IntGauge,
+    pub expert_buffer_pool_primary_bytes: IntGauge,
+    pub expert_buffer_pool_shadow_bytes: IntGauge,
+    pub prepared_duplicate_expert_bytes: IntGauge,
     pub q8_direct_kernel_dispatches: IntGauge,
-    pub q8_reference_fallbacks: IntGauge,
+    pub q8_scalar_layout_fallbacks: IntGauge,
     pub q8_preparation_seconds: Gauge,
     pub q8_gate_up_kernel_seconds: Gauge,
     pub q8_down_kernel_seconds: Gauge,
@@ -317,30 +320,48 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_backend_component_plane");
-        let raw_expert_cache_bytes = register_int_gauge_with_registry!(
-            "mer_raw_expert_cache_bytes",
-            "Bytes owned by live raw CPU expert residents.",
+        let resident_expert_buffer_bytes = register_int_gauge_with_registry!(
+            "mer_resident_expert_buffer_bytes",
+            "Bytes held by live expert residents; occupancy, not total pool allocation.",
             registry
         )
-        .expect("metric registration: mer_raw_expert_cache_bytes");
-        let prepared_expert_bytes = register_int_gauge_with_registry!(
-            "mer_prepared_expert_bytes",
+        .expect("metric registration: mer_resident_expert_buffer_bytes");
+        let expert_buffer_pool_allocated_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_allocated_bytes",
+            "Bytes preallocated across all live primary and shadow expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_allocated_bytes");
+        let expert_buffer_pool_primary_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_primary_bytes",
+            "Bytes preallocated across all live primary expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_primary_bytes");
+        let expert_buffer_pool_shadow_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_shadow_bytes",
+            "Bytes preallocated across all live speculative shadow expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_shadow_bytes");
+        let prepared_duplicate_expert_bytes = register_int_gauge_with_registry!(
+            "mer_prepared_duplicate_expert_bytes",
             "Bytes retained in duplicated prepared expert representations.",
             registry
         )
-        .expect("metric registration: mer_prepared_expert_bytes");
+        .expect("metric registration: mer_prepared_duplicate_expert_bytes");
         let q8_direct_kernel_dispatches = register_int_gauge_with_registry!(
             "mer_q8_direct_kernel_dispatches",
             "Cumulative native direct Q8_0 expert dispatches.",
             registry
         )
         .expect("metric registration: mer_q8_direct_kernel_dispatches");
-        let q8_reference_fallbacks = register_int_gauge_with_registry!(
-            "mer_q8_reference_fallbacks",
-            "Cumulative Q8_0 scalar reference fallbacks.",
+        let q8_scalar_layout_fallbacks = register_int_gauge_with_registry!(
+            "mer_q8_scalar_layout_fallbacks",
+            "Cumulative Q8_0 projection stages using the scalar layout fallback.",
             registry
         )
-        .expect("metric registration: mer_q8_reference_fallbacks");
+        .expect("metric registration: mer_q8_scalar_layout_fallbacks");
         let q8_preparation_seconds = register_gauge_with_registry!(
             "mer_q8_preparation_seconds",
             "Cumulative Q8_0 validation and scratch preparation time.",
@@ -388,10 +409,13 @@ impl Metrics {
                 gpu_cpu_fallbacks_total,
                 nonfinite_softmax_fallbacks,
                 backend_component_plane,
-                raw_expert_cache_bytes,
-                prepared_expert_bytes,
+                resident_expert_buffer_bytes,
+                expert_buffer_pool_allocated_bytes,
+                expert_buffer_pool_primary_bytes,
+                expert_buffer_pool_shadow_bytes,
+                prepared_duplicate_expert_bytes,
                 q8_direct_kernel_dispatches,
-                q8_reference_fallbacks,
+                q8_scalar_layout_fallbacks,
                 q8_preparation_seconds,
                 q8_gate_up_kernel_seconds,
                 q8_down_kernel_seconds,
@@ -572,17 +596,26 @@ impl Metrics {
         self.inner
             .nonfinite_softmax_fallbacks
             .set(crate::transformer::nonfinite_softmax_fallbacks().min(i64::MAX as u64) as i64);
-        self.inner.raw_expert_cache_bytes.set(
-            crate::expert_cache::raw_expert_resident_bytes().min(i64::MAX as u64) as i64,
+        self.inner.resident_expert_buffer_bytes.set(
+            crate::expert_cache::resident_expert_buffer_bytes().min(i64::MAX as u64) as i64,
         );
-        self.inner.prepared_expert_bytes.set(
-            crate::inference::q8_prepared_duplicate_bytes().min(i64::MAX as u64) as i64,
+        self.inner.expert_buffer_pool_allocated_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_allocated_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.expert_buffer_pool_primary_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_primary_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.expert_buffer_pool_shadow_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_shadow_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.prepared_duplicate_expert_bytes.set(
+            crate::inference::prepared_duplicate_expert_bytes().min(i64::MAX as u64) as i64,
         );
         self.inner.q8_direct_kernel_dispatches.set(
             crate::inference::q8_direct_kernel_dispatches().min(i64::MAX as u64) as i64,
         );
-        self.inner.q8_reference_fallbacks.set(
-            crate::inference::q8_reference_fallbacks().min(i64::MAX as u64) as i64,
+        self.inner.q8_scalar_layout_fallbacks.set(
+            crate::inference::q8_scalar_layout_fallbacks().min(i64::MAX as u64) as i64,
         );
         self.inner
             .q8_preparation_seconds
@@ -608,10 +641,13 @@ mod tests {
     fn q8_direct_telemetry_is_exported() {
         let body = String::from_utf8(Metrics::new().render().unwrap()).unwrap();
         for metric in [
-            "mer_raw_expert_cache_bytes",
-            "mer_prepared_expert_bytes",
+            "mer_resident_expert_buffer_bytes",
+            "mer_expert_buffer_pool_allocated_bytes",
+            "mer_expert_buffer_pool_primary_bytes",
+            "mer_expert_buffer_pool_shadow_bytes",
+            "mer_prepared_duplicate_expert_bytes",
             "mer_q8_direct_kernel_dispatches",
-            "mer_q8_reference_fallbacks",
+            "mer_q8_scalar_layout_fallbacks",
             "mer_q8_preparation_seconds",
             "mer_q8_gate_up_kernel_seconds",
             "mer_q8_down_kernel_seconds",

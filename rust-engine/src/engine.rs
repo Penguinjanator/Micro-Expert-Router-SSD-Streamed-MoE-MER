@@ -4750,10 +4750,14 @@ impl Engine {
                 .counters
                 .singleflight_followers
                 .load(Ordering::Relaxed),
-            raw_expert_cache_bytes: crate::expert_cache::raw_expert_resident_bytes(),
-            prepared_expert_bytes: crate::inference::q8_prepared_duplicate_bytes(),
+            resident_expert_buffer_bytes: crate::expert_cache::resident_expert_buffer_bytes(),
+            expert_buffer_pool_allocated_bytes: self.core.pool.allocated_bytes() as u64,
+            expert_buffer_pool_primary_bytes: self.core.pool.primary_allocated_bytes() as u64,
+            expert_buffer_pool_shadow_bytes: self.core.pool.shadow_allocated_bytes() as u64,
+            prepared_duplicate_expert_bytes:
+                crate::inference::prepared_duplicate_expert_bytes(),
             q8_direct_kernel_dispatches: crate::inference::q8_direct_kernel_dispatches(),
-            q8_reference_fallbacks: crate::inference::q8_reference_fallbacks(),
+            q8_scalar_layout_fallbacks: crate::inference::q8_scalar_layout_fallbacks(),
             q8_preparation_seconds: crate::inference::q8_preparation_seconds(),
             q8_gate_up_kernel_seconds: crate::inference::q8_gate_up_kernel_seconds(),
             q8_down_kernel_seconds: crate::inference::q8_down_kernel_seconds(),
@@ -4797,6 +4801,24 @@ impl Engine {
                 crate::inference::mixed_scalar_fallbacks(),
                 crate::inference::mixed_dequant_fallbacks(),
                 crate::inference::unsupported_quant_dispatches()
+            );
+        }
+        if r.dtype == WeightDtype::Q8_0 || r.q8_direct_kernel_dispatches > 0 {
+            info!(
+                "q8 memory:    resident_buffers={} bytes  pool={} bytes (primary={} shadow={})  prepared_duplicates={} bytes",
+                r.resident_expert_buffer_bytes,
+                r.expert_buffer_pool_allocated_bytes,
+                r.expert_buffer_pool_primary_bytes,
+                r.expert_buffer_pool_shadow_bytes,
+                r.prepared_duplicate_expert_bytes,
+            );
+            info!(
+                "q8 kernels:   direct_dispatches={}  scalar_layout_fallbacks={}  preparation={:.6}s  gate_up={:.6}s  down={:.6}s",
+                r.q8_direct_kernel_dispatches,
+                r.q8_scalar_layout_fallbacks,
+                r.q8_preparation_seconds,
+                r.q8_gate_up_kernel_seconds,
+                r.q8_down_kernel_seconds,
             );
         }
         info!(
@@ -5081,13 +5103,19 @@ pub struct EngineReport {
     /// issuing their own (Phase 1 — SSD read de-duplication). Each one
     /// maps directly to one disk read that was avoided.
     pub singleflight_followers: u64,
-    /// Bytes held by live CPU resident expert buffers.
-    pub raw_expert_cache_bytes: u64,
+    /// Bytes held by live CPU resident expert buffers (occupancy, not pool allocation).
+    pub resident_expert_buffer_bytes: u64,
+    /// Bytes preallocated by all primary and shadow expert-buffer slots.
+    pub expert_buffer_pool_allocated_bytes: u64,
+    /// Bytes preallocated by primary expert-buffer slots.
+    pub expert_buffer_pool_primary_bytes: u64,
+    /// Bytes preallocated by speculative shadow expert-buffer slots.
+    pub expert_buffer_pool_shadow_bytes: u64,
     /// Bytes retained by prepared duplicate expert representations. Zero for
     /// the production native Q8_0 path.
-    pub prepared_expert_bytes: u64,
+    pub prepared_duplicate_expert_bytes: u64,
     pub q8_direct_kernel_dispatches: u64,
-    pub q8_reference_fallbacks: u64,
+    pub q8_scalar_layout_fallbacks: u64,
     pub q8_preparation_seconds: f64,
     pub q8_gate_up_kernel_seconds: f64,
     pub q8_down_kernel_seconds: f64,

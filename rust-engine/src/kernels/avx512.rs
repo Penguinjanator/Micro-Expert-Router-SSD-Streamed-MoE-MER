@@ -15,6 +15,7 @@
 
 #![cfg(all(feature = "avx512", target_arch = "x86_64"))]
 
+use super::{q8_0_scale_from_ptr, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
 use std::arch::x86_64::*;
 
 /// AVX-512 f32 dot product.
@@ -86,14 +87,6 @@ pub unsafe fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-const Q8_0_BLOCK_ELEMS: usize = 32;
-const Q8_0_BLOCK_BYTES: usize = 34;
-
-#[inline]
-unsafe fn q8_scale(block: *const u8) -> f32 {
-    half::f16::from_bits(u16::from_le_bytes([*block, *block.add(1)])).to_f32()
-}
-
 /// Row-wide GGUF Q8_0 × F32 dot product. Two vector accumulators span the
 /// complete row and are horizontally reduced once.
 ///
@@ -112,7 +105,7 @@ pub unsafe fn q8_0_row_dot_avx512(row_blocks: &[u8], x: &[f32]) -> f32 {
         let block = row_blocks.as_ptr().add(block_index * Q8_0_BLOCK_BYTES);
         let q = block.add(2);
         let xv = x.as_ptr().add(block_index * Q8_0_BLOCK_ELEMS);
-        let scale = _mm512_set1_ps(q8_scale(block));
+        let scale = _mm512_set1_ps(q8_0_scale_from_ptr(block));
         for lane in 0..2 {
             let offset = lane * 16;
             let packed = _mm_loadu_si128(q.add(offset).cast::<__m128i>());
@@ -156,8 +149,8 @@ pub unsafe fn q8_0_gate_up_row_avx512(
         let gate_q = gate_block.add(2);
         let up_q = up_block.add(2);
         let xv = x.as_ptr().add(block_index * Q8_0_BLOCK_ELEMS);
-        let gate_scale = _mm512_set1_ps(q8_scale(gate_block));
-        let up_scale = _mm512_set1_ps(q8_scale(up_block));
+        let gate_scale = _mm512_set1_ps(q8_0_scale_from_ptr(gate_block));
+        let up_scale = _mm512_set1_ps(q8_0_scale_from_ptr(up_block));
         for lane in 0..2 {
             let offset = lane * 16;
             let activations = _mm512_loadu_ps(xv.add(offset));
@@ -498,18 +491,44 @@ pub unsafe fn dot_int8_int8_avx512_vnni(out_scale: f32, qw: &[i8], qx: &[i8]) ->
 mod tests {
     use super::*;
 
-    fn q8_row(seed: i32, blocks: usize) -> Vec<u8> {
+    fn q8_row(width: usize, case: usize, seed: u64) -> Vec<u8> {
+        let blocks = width / Q8_0_BLOCK_ELEMS;
         let mut out = vec![0u8; blocks * Q8_0_BLOCK_BYTES];
+        let mut state = seed;
         for block in 0..blocks {
             let start = block * Q8_0_BLOCK_BYTES;
-            let scale = half::f16::from_f32(0.003 + block as f32 * 0.0001);
-            out[start..start + 2].copy_from_slice(&scale.to_bits().to_le_bytes());
+            let scale_bits = match case {
+                0 => 0,
+                1 => 1,
+                2 => 0x7bff,
+                6 => 0x0400,
+                _ => half::f16::from_f32(0.003 + block as f32 * 0.00001).to_bits(),
+            };
+            out[start..start + 2].copy_from_slice(&scale_bits.to_le_bytes());
             for i in 0..Q8_0_BLOCK_ELEMS {
-                out[start + 2 + i] = (((i as i32 * 17 + block as i32 * 11 + seed) % 251)
-                    - 125) as i8 as u8;
+                let q = match case {
+                    3 => 0,
+                    4 => if (i + block) % 2 == 0 { i8::MIN } else { i8::MAX },
+                    5 => if (i + block) % 2 == 0 { -1 } else { 1 },
+                    _ => {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as i8
+                    }
+                };
+                out[start + 2 + i] = q as u8;
             }
         }
         out
+    }
+
+    fn assert_close(name: &str, actual: f32, expected: f32) {
+        let tolerance = 2e-4 + expected.abs() * 2e-5;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{name}: actual={actual} expected={expected} tolerance={tolerance}"
+        );
     }
 
     fn q8_scalar(row: &[u8], x: &[f32]) -> f32 {
@@ -546,26 +565,27 @@ mod tests {
         {
             return;
         }
-        let blocks = 64;
-        let gate = q8_row(7, blocks);
-        let up = q8_row(29, blocks);
-        let x: Vec<f32> = (0..blocks * Q8_0_BLOCK_ELEMS)
-            .map(|i| ((i as f32) * 0.013).sin())
-            .collect();
-        let gate_ref = q8_scalar(&gate, &x);
-        let up_ref = q8_scalar(&up, &x);
-        let gate_dot = unsafe { q8_0_row_dot_avx512(&gate, &x) };
-        let (gate_fused, up_fused) = unsafe { q8_0_gate_up_row_avx512(&gate, &up, &x) };
-        for (name, actual, expected) in [
-            ("gate-dot", gate_dot, gate_ref),
-            ("gate-fused", gate_fused, gate_ref),
-            ("up-fused", up_fused, up_ref),
-        ] {
-            let tolerance = 1e-3 + expected.abs() * 2e-5;
-            assert!(
-                (actual - expected).abs() <= tolerance,
-                "{name}: actual={actual} expected={expected} tolerance={tolerance}"
-            );
+        for width in [32usize, 64, 96, 768, 2048] {
+            for case in 0..7 {
+                for seed in [1u64, 0x1234_5678, 0xfeed_beef] {
+                    let gate = q8_row(width, case, seed);
+                    let up = q8_row(width, case, seed ^ 0xa5a5_5a5a);
+                    let x: Vec<f32> = (0..width)
+                        .map(|i| ((i as f32) * 0.013).sin() * 0.01)
+                        .collect();
+                    let gate_ref = q8_scalar(&gate, &x);
+                    let up_ref = q8_scalar(&up, &x);
+                    let gate_dot = unsafe { q8_0_row_dot_avx512(&gate, &x) };
+                    let up_dot = unsafe { q8_0_row_dot_avx512(&up, &x) };
+                    let (gate_fused, up_fused) =
+                        unsafe { q8_0_gate_up_row_avx512(&gate, &up, &x) };
+                    let label = format!("width={width} case={case} seed={seed}");
+                    assert_close(&format!("gate-dot {label}"), gate_dot, gate_ref);
+                    assert_close(&format!("up/down-dot {label}"), up_dot, up_ref);
+                    assert_close(&format!("gate-fused {label}"), gate_fused, gate_ref);
+                    assert_close(&format!("up-fused {label}"), up_fused, up_ref);
+                }
+            }
         }
     }
 

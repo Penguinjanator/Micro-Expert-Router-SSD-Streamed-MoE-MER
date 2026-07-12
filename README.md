@@ -1831,14 +1831,62 @@ progress_timeout_secs = 300
 
 The production Q8_0 path reads the resident GGUF blocks directly. Build the
 test/benchmark-only Candle reference feature to compare both implementations
-at the Qwen expert shape. The command reports single-expert and top-eight
-cold-first execution separately from repeated resident hits.
+at the Qwen expert shape. `--kernel auto|scalar|avx2|avx512|all` controls only
+the benchmark wrapper; production remains runtime-selected `auto`. Explicit
+ISA choices are runtime-checked and fail or print `SKIPPED` rather than
+entering an unsupported kernel. The top-eight columns are a serial aggregation
+and do not represent the engine's expert-parallel scheduling policy.
 
 ```bash
 cargo run --manifest-path rust-engine/Cargo.toml --release \
-  --features "avx512,q8-candle-reference" -- q8-expert-microbench \
-  --d-model 2048 --d-ff 768 --warmup-runs 1 --measured-runs 5
+  --features "avx512,blas,tokenizer,io_uring,q8-candle-reference" \
+  -- q8-expert-microbench \
+  --d-model 2048 \
+  --d-ff 768 \
+  --warmup-runs 3 \
+  --measured-runs 20 \
+  --kernel all
 ```
+
+Each path records memory deltas after resident construction, first execution,
+repeated execution, and explicit drop. `resident_expert_buffer_bytes` is live
+resident occupancy. `expert_buffer_pool_allocated_bytes` is the fixed primary
+plus shadow pool allocation, with separate primary/shadow gauges.
+`prepared_duplicate_expert_bytes` is the retained copied representation: it
+should be approximately one logical expert per live Candle resident and zero
+for every direct backend. All counters must return to their pre-construction
+baseline after the residents and pool are dropped.
+
+The native kernels are implemented, and portable macOS compilation/tests can
+check the scalar path and layout validation. That is not x86 qualification.
+Before describing this path as performance-qualified, run the following on the
+target x86 GCP host:
+
+```bash
+cargo test --manifest-path rust-engine/Cargo.toml \
+  --release \
+  --features "avx512,blas,tokenizer,io_uring,q8-candle-reference"
+```
+
+The minimum x86 compile-only gate is:
+
+```bash
+cargo test --manifest-path rust-engine/Cargo.toml \
+  --release \
+  --no-run \
+  --features "avx512,q8-candle-reference"
+```
+
+Qualification status for this native Q8 change:
+
+| Gate | Status |
+|---|---|
+| Native scalar, AVX2+FMA, and optional AVX-512F+BW implementations | Implemented |
+| x86 release compile with `avx512,q8-candle-reference` | Pending target-host run |
+| AVX2 numerical tests executed | Pending target-host run |
+| AVX-512 numerical tests executed | Pending target-host run |
+| Native-vs-Candle performance qualified | Pending target-host benchmark |
+| End-to-end strict Qwen inference with the new native path | Pending target-host run |
 
 #### Full real-transformer bench-real
 
@@ -2826,7 +2874,7 @@ read. Seven on-disk modes are first-class in the energy table:
 | `int8` | 1 | 12 B (`[gate, up, down]: [f32; 3]` per-tensor scales) | symmetric per-tensor dequant + Candle matmul | ~4× less SSD energy than `f32` |
 | `q4k` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over a homogeneous on-disk `Q4_K` 256-block stream, no F32 dequant of the weights. **Fallback**: 256-block dequant (f16 super-scale + 6-bit sub-scales + 4-bit weights) when `cols % 256 != 0`. | GGUF-compatible 4-bit expert blob; do not confuse with arbitrary model-level `Q4_K_M` recipes |
 | `q4_0` | ~0.5625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q4_0` 32-block stream, no F32 dequant of the weights. **Fallback**: 32-block dequant (f16 scale, symmetric 4-bit nibbles) when `cols % 32 != 0`. | the most widely-used 4-bit format; chosen by the predictive-controller spec |
-| `q8_0` | ~1.0625 | none (block-internal) | **default**: candle `QMatMul` directly over the on-disk `Q8_0` 32-block stream (one `f16` scale + 32 signed `i8` weights per block). **Fallback**: 32-block dequant when `cols % 32 != 0`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
+| `q8_0` | ~1.0625 | none (block-internal) | **default**: native matvec directly over resident `Q8_0` blocks, with portable scalar execution and runtime-gated AVX2+FMA / optional AVX-512F+BW row kernels. Gate/up and down fall back independently to the scalar flat-layout kernel when their input width is not divisible by 32. Candle `QMatMul` is reference-only behind `q8-candle-reference`. | GGUF-compatible 8-bit; same density as `int8` but with **per-block** scales, so dynamic range stays bounded inside each 32-weight neighbourhood |
 | `mixed` | varies by projection | UTH2 required | CPU direct projection dispatch over gate/up/down ranges without full-weight F32 expansion. Supported projection dtypes include `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `F32`, `F16`, and `BF16`; unsupported projection dtypes fail before execution. | GGUF mixed expert triples such as `Q4_K/Q4_K/Q6_K`; GPU execution is not advertised for Q5_K/Q6_K |
 
 Selectable on **`gen-data`** for the synthetic generator dtypes (`f32`,
@@ -2842,16 +2890,12 @@ preflight instead of silently expanding experts to F32. The forward pass
 dispatches to `inference::run_inference_*` per dtype, all producing
 scalar `f32` SwiGLU output, so a benchmark run is a one-flag diff.
 
-**Quantised fast path.** For `q4k`, `q4_0`, and `q8_0` the engine
-prefers the `QMatMul` path (`run_inference_q4_0_qmm` /
-`run_inference_q4k_qmm` / `run_inference_q8_0_qmm`), which keeps the
-weights in their on-disk packed form throughout the matmul, only
-the `d_model`-sized activation is materialised as F32. This roughly
-halves per-token allocator pressure vs the legacy dequant-then-Candle
-path on real Mixtral shapes (`d_model=4096`, `d_ff=14336`, all three
-formats block-aligned). The dequant kernel remains as a graceful
-fallback for shapes that aren't block-aligned and is always selected
-when `EngineOptions::use_qmm_for_q4 = false`.
+**Quantised fast path.** For `q4k` and `q4_0`, the engine prefers the
+existing `QMatMul` path. Homogeneous `q8_0` instead uses the native direct
+resident-block kernel, retaining no prepared weight representation. Only
+the test/benchmark reference feature can construct Candle's copied Q8
+`QStorage`. The Q4 dequant kernel remains a fallback and is selected when
+`EngineOptions::use_qmm_for_q4 = false`.
 
 **Mixed quantized path.** For `mixed`, UTH2 is parsed when the expert
 becomes resident using the dataset's configured `block_align`; the hot

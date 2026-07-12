@@ -23,13 +23,13 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-static RAW_EXPERT_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_EXPERT_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes owned by all live CPU expert residents. This includes residents
 /// temporarily held by an in-flight activation after LRU eviction, which is
 /// the useful definition for process memory accounting.
-pub fn raw_expert_resident_bytes() -> u64 {
-    RAW_EXPERT_RESIDENT_BYTES.load(Ordering::Relaxed)
+pub fn resident_expert_buffer_bytes() -> u64 {
+    RESIDENT_EXPERT_BUFFER_BYTES.load(Ordering::Relaxed)
 }
 
 /// Pack/unpack an `f64` heat score into the bits of an `AtomicU64` so it
@@ -124,7 +124,7 @@ impl ExpertResident {
             debug_assert!(payload_offset <= raw.len());
             (payload_offset, mixed)
         };
-        RAW_EXPERT_RESIDENT_BYTES.fetch_add(buffer.as_slice().len() as u64, Ordering::Relaxed);
+        RESIDENT_EXPERT_BUFFER_BYTES.fetch_add(buffer.as_slice().len() as u64, Ordering::Relaxed);
         Self {
             id,
             buffer,
@@ -254,7 +254,7 @@ impl ExpertResident {
 
 impl Drop for ExpertResident {
     fn drop(&mut self) {
-        RAW_EXPERT_RESIDENT_BYTES.fetch_sub(
+        RESIDENT_EXPERT_BUFFER_BYTES.fetch_sub(
             self.buffer.as_slice().len() as u64,
             Ordering::Relaxed,
         );
