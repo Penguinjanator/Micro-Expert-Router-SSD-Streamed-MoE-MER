@@ -252,6 +252,15 @@ enum BenchRealOutputFormat {
     Json,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum Q8BenchKernel {
+    Auto,
+    Scalar,
+    Avx2,
+    Avx512,
+    All,
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Generate synthetic expert files for testing on local disk.
@@ -867,6 +876,28 @@ enum Cmd {
         /// Emit JSON instead of human-readable rows.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Compare native zero-copy Q8_0 experts with the retained Candle reference.
+    /// Build with `--features q8-candle-reference` to include both paths.
+    Q8ExpertMicrobench {
+        /// Expert hidden width (Qwen3-Coder-30B-A3B: 2048).
+        #[arg(long, default_value_t = 2048)]
+        d_model: usize,
+        /// Expert intermediate width (Qwen3-Coder-30B-A3B: 768).
+        #[arg(long, default_value_t = 768)]
+        d_ff: usize,
+        /// Warmup resident-hit iterations per path.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured resident-hit iterations per path.
+        #[arg(long, default_value_t = 5)]
+        measured_runs: usize,
+        /// Native backend to exercise. `auto` mirrors the conservative
+        /// production policy; `all` includes every supported native backend
+        /// plus the Candle reference.
+        #[arg(long, value_enum, default_value_t = Q8BenchKernel::Auto)]
+        kernel: Q8BenchKernel,
     },
 
     /// Count heap allocations for the old transformer wrappers vs request scratch buffers.
@@ -1835,6 +1866,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             skip_lm_head,
             json,
         }),
+        Cmd::Q8ExpertMicrobench {
+            d_model,
+            d_ff,
+            warmup_runs,
+            measured_runs,
+            kernel,
+        } => cmd_q8_expert_microbench(d_model, d_ff, warmup_runs, measured_runs, kernel),
         Cmd::ScratchAllocMicrobench {
             d_model,
             num_experts,
@@ -2304,6 +2342,321 @@ fn assert_no_softmax_fallbacks(before: u64) -> Result<(), Box<dyn std::error::Er
         .into());
     }
     Ok(())
+}
+
+fn cmd_q8_expert_microbench(
+    d_model: usize,
+    d_ff: usize,
+    warmup_runs: usize,
+    measured_runs: usize,
+    kernel: Q8BenchKernel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "q8-candle-reference"))]
+    {
+        let _ = (d_model, d_ff, warmup_runs, measured_runs, kernel);
+        return Err(
+            "q8-expert-microbench compares against Candle; on the AVX-512 baseline rebuild with \
+             `cargo run --release --features avx512,q8-candle-reference -- q8-expert-microbench`"
+                .into(),
+        );
+    }
+
+    #[cfg(feature = "q8-candle-reference")]
+    {
+        if d_model == 0
+            || d_ff == 0
+            || !d_model.is_multiple_of(crate::inference::Q8_0_BLOCK_ELEMS)
+            || !d_ff.is_multiple_of(crate::inference::Q8_0_BLOCK_ELEMS)
+        {
+            return Err("Q8 Candle comparison requires positive dimensions divisible by 32".into());
+        }
+        if measured_runs == 0 {
+            return Err("q8-expert-microbench requires --measured-runs > 0".into());
+        }
+        let weights = d_model.checked_mul(d_ff).ok_or("Q8 benchmark shape overflow")?;
+        let blocks = weights.div_ceil(crate::inference::Q8_0_BLOCK_ELEMS);
+        let logical_bytes = blocks
+            .checked_mul(crate::inference::Q8_0_BLOCK_BYTES)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or("Q8 benchmark byte size overflow")?;
+        let mut bytes = Vec::with_capacity(logical_bytes);
+        let mut state = 0x9182_7364_55aa_f00du64;
+        for _ in 0..blocks * 3 {
+            let mut values = [0.0f32; crate::inference::Q8_0_BLOCK_ELEMS];
+            for value in &mut values {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *value = (((state >> 40) as u32 as f32) / ((1u32 << 24) - 1) as f32 - 0.5)
+                    * 0.08;
+            }
+            let mut block = [0u8; crate::inference::Q8_0_BLOCK_BYTES];
+            crate::inference::quantize_q8_0_block(&values, &mut block);
+            bytes.extend_from_slice(&block);
+        }
+        let x = crate::inference::synth_hidden_state(0, d_model, 0x51);
+        let slot = logical_bytes.div_ceil(4096) * 4096;
+
+        #[derive(Clone, Copy)]
+        enum BenchPath {
+            Candle,
+            Direct(crate::inference::Q8DirectKernelChoice),
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct MemorySnapshot {
+            resident: u64,
+            pool_allocated: u64,
+            pool_primary: u64,
+            pool_shadow: u64,
+            prepared_duplicate: u64,
+        }
+
+        impl MemorySnapshot {
+            fn capture() -> Self {
+                Self {
+                    resident: crate::expert_cache::resident_expert_buffer_bytes(),
+                    pool_allocated: crate::buffer_pool::expert_buffer_pool_allocated_bytes(),
+                    pool_primary: crate::buffer_pool::expert_buffer_pool_primary_bytes(),
+                    pool_shadow: crate::buffer_pool::expert_buffer_pool_shadow_bytes(),
+                    prepared_duplicate: crate::inference::prepared_duplicate_expert_bytes(),
+                }
+            }
+
+            fn delta(self, baseline: Self) -> Self {
+                Self {
+                    resident: self.resident.saturating_sub(baseline.resident),
+                    pool_allocated: self.pool_allocated.saturating_sub(baseline.pool_allocated),
+                    pool_primary: self.pool_primary.saturating_sub(baseline.pool_primary),
+                    pool_shadow: self.pool_shadow.saturating_sub(baseline.pool_shadow),
+                    prepared_duplicate: self
+                        .prepared_duplicate
+                        .saturating_sub(baseline.prepared_duplicate),
+                }
+            }
+        }
+
+        struct LifecycleResult {
+            first_exec_ms: f64,
+            repeated_ms: f64,
+            after_construction: MemorySnapshot,
+            after_first: MemorySnapshot,
+            after_repeated: MemorySnapshot,
+            after_drop: MemorySnapshot,
+        }
+
+        fn residents(
+            count: usize,
+            slot: usize,
+            bytes: &[u8],
+        ) -> (
+            crate::buffer_pool::BufferPool,
+            Vec<crate::expert_cache::ExpertResident>,
+        ) {
+            let pool = crate::buffer_pool::BufferPool::new(count, slot, 4096);
+            let experts = (0..count)
+                .map(|id| {
+                    let mut buffer = pool.try_acquire().expect("benchmark buffer slot");
+                    buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+                    crate::expert_cache::ExpertResident::new(id as u32, buffer)
+                })
+                .collect();
+            (pool, experts)
+        }
+
+        fn execute(
+            path: BenchPath,
+            token_idx: u64,
+            resident: &crate::expert_cache::ExpertResident,
+            x: &[f32],
+            d_model: usize,
+            d_ff: usize,
+        ) -> Result<
+            (crate::inference::InferenceOutput, crate::inference::HiddenState),
+            crate::inference::ExpertWeightsError,
+        > {
+            match path {
+                BenchPath::Candle => crate::inference::run_inference_q8_0_qmm_with_timing(
+                    token_idx, resident, x, d_model, d_ff, None,
+                ),
+                BenchPath::Direct(choice) => {
+                    crate::inference::run_inference_q8_0_direct_with_timing_and_kernel(
+                        token_idx, resident, x, d_model, d_ff, None, choice,
+                    )
+                }
+            }
+        }
+
+        fn lifecycle(
+            path: BenchPath,
+            count: usize,
+            slot: usize,
+            bytes: &[u8],
+            x: &[f32],
+            d_model: usize,
+            d_ff: usize,
+            warmup: usize,
+            measured: usize,
+            logical_bytes: usize,
+        ) -> Result<LifecycleResult, Box<dyn std::error::Error>> {
+            let baseline = MemorySnapshot::capture();
+            let (pool, experts) = residents(count, slot, bytes);
+            let after_construction = MemorySnapshot::capture();
+            let started = Instant::now();
+            for resident in &experts {
+                let output = execute(path, 0, resident, x, d_model, d_ff)?;
+                std::hint::black_box(output);
+            }
+            let first_exec_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let after_first = MemorySnapshot::capture();
+            let expected_prepared = match path {
+                BenchPath::Candle => (count as u64).saturating_mul(logical_bytes as u64),
+                BenchPath::Direct(_) => 0,
+            };
+            let prepared_delta = after_first
+                .prepared_duplicate
+                .saturating_sub(baseline.prepared_duplicate);
+            if prepared_delta != expected_prepared {
+                return Err(format!(
+                    "prepared duplicate bytes after first execution: got {prepared_delta}, expected {expected_prepared}"
+                )
+                .into());
+            }
+            for iteration in 0..warmup {
+                for resident in &experts {
+                    std::hint::black_box(execute(
+                        path,
+                        iteration as u64,
+                        resident,
+                        x,
+                        d_model,
+                        d_ff,
+                    )?);
+                }
+            }
+            let started = Instant::now();
+            for iteration in 0..measured {
+                for resident in &experts {
+                    std::hint::black_box(execute(
+                        path,
+                        iteration as u64,
+                        resident,
+                        x,
+                        d_model,
+                        d_ff,
+                    )?);
+                }
+            }
+            let repeated_ms = started.elapsed().as_secs_f64() * 1000.0 / measured as f64;
+            let after_repeated = MemorySnapshot::capture();
+            drop(experts);
+            drop(pool);
+            let after_drop = MemorySnapshot::capture();
+            if after_drop != baseline {
+                return Err(format!(
+                    "Q8 benchmark memory counters did not return to baseline: baseline={baseline:?}, after_drop={after_drop:?}"
+                )
+                .into());
+            }
+            Ok(LifecycleResult {
+                first_exec_ms,
+                repeated_ms,
+                after_construction: after_construction.delta(baseline),
+                after_first: after_first.delta(baseline),
+                after_repeated: after_repeated.delta(baseline),
+                after_drop: after_drop.delta(baseline),
+            })
+        }
+
+        let selected = match kernel {
+            Q8BenchKernel::Auto => vec![crate::inference::Q8DirectKernelChoice::Auto],
+            Q8BenchKernel::Scalar => vec![crate::inference::Q8DirectKernelChoice::Scalar],
+            Q8BenchKernel::Avx2 => vec![crate::inference::Q8DirectKernelChoice::Avx2],
+            Q8BenchKernel::Avx512 => vec![crate::inference::Q8DirectKernelChoice::Avx512],
+            Q8BenchKernel::All => vec![
+                crate::inference::Q8DirectKernelChoice::Scalar,
+                crate::inference::Q8DirectKernelChoice::Avx2,
+                crate::inference::Q8DirectKernelChoice::Avx512,
+            ],
+        };
+        let mut paths = vec![("candle-qstorage", "candle-qmatmul", BenchPath::Candle)];
+        for choice in selected {
+            match crate::inference::q8_direct_kernel_backend_for(choice) {
+                Ok(backend) => paths.push(("direct-native", backend, BenchPath::Direct(choice))),
+                Err(error) if kernel == Q8BenchKernel::All => {
+                    println!("SKIPPED backend={choice:?}: {error}");
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        println!(
+            "q8-expert-microbench d_model={d_model} d_ff={d_ff} expert_bytes={logical_bytes} production_auto_backend={}",
+            crate::inference::q8_direct_kernel_backend()
+        );
+        println!(
+            "{:<18} {:<16} {:>22} {:>20} {:>28} {:>26}",
+            "path",
+            "backend",
+            "single-first-exec-ms",
+            "single-repeated-ms",
+            "top8-serial-first-exec-ms",
+            "top8-serial-repeated-ms"
+        );
+        println!(
+            "memory rows are deltas from the baseline captured before resident/pool construction"
+        );
+        for (name, backend, path) in paths {
+            let single = lifecycle(
+                path,
+                1,
+                slot,
+                &bytes,
+                &x,
+                d_model,
+                d_ff,
+                warmup_runs,
+                measured_runs,
+                logical_bytes,
+            )?;
+            let top8 = lifecycle(
+                path,
+                8,
+                slot,
+                &bytes,
+                &x,
+                d_model,
+                d_ff,
+                warmup_runs,
+                measured_runs,
+                logical_bytes,
+            )?;
+            println!(
+                "{name:<18} {backend:<16} {:>22.3} {:>20.3} {:>28.3} {:>26.3}",
+                single.first_exec_ms,
+                single.repeated_ms,
+                top8.first_exec_ms,
+                top8.repeated_ms,
+            );
+            for (count, result) in [(1, &single), (8, &top8)] {
+                for (stage, memory) in [
+                    ("after-construction", result.after_construction),
+                    ("after-first-exec", result.after_first),
+                    ("after-repeated", result.after_repeated),
+                    ("after-explicit-drop", result.after_drop),
+                ] {
+                    println!(
+                        "memory path={name} backend={backend} experts={count} stage={stage} resident_expert_buffer_bytes={} expert_buffer_pool_allocated_bytes={} expert_buffer_pool_primary_bytes={} expert_buffer_pool_shadow_bytes={} prepared_duplicate_expert_bytes={}",
+                        memory.resident,
+                        memory.pool_allocated,
+                        memory.pool_primary,
+                        memory.pool_shadow,
+                        memory.prepared_duplicate,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn cmd_matvec_microbench(args: MatvecMicrobenchArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -3885,6 +4238,9 @@ fn build_features() -> Vec<&'static str> {
     }
     if cfg!(feature = "avx512") {
         features.push("avx512");
+    }
+    if cfg!(feature = "q8-candle-reference") {
+        features.push("q8-candle-reference");
     }
     if cfg!(feature = "amx") {
         features.push("amx");

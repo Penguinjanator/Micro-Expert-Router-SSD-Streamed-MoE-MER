@@ -25,8 +25,27 @@
 
 use crate::aligned_buffer::AlignedBuffer;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+static EXPERT_BUFFER_POOL_PRIMARY_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXPERT_BUFFER_POOL_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes allocated by the primary slots of all live expert buffer pools.
+pub fn expert_buffer_pool_primary_bytes() -> u64 {
+    EXPERT_BUFFER_POOL_PRIMARY_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes allocated by the shadow slots of all live expert buffer pools.
+pub fn expert_buffer_pool_shadow_bytes() -> u64 {
+    EXPERT_BUFFER_POOL_SHADOW_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes allocated by every slot of all live expert buffer pools.
+pub fn expert_buffer_pool_allocated_bytes() -> u64 {
+    expert_buffer_pool_primary_bytes().saturating_add(expert_buffer_pool_shadow_bytes())
+}
 
 struct Inner {
     /// Primary free list — slots backing the resident LRU.
@@ -44,6 +63,15 @@ struct Inner {
     shadow_slots: usize,
     buffer_size: usize,
     align: usize,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let primary = (self.primary_slots as u64).saturating_mul(self.buffer_size as u64);
+        let shadow = (self.shadow_slots as u64).saturating_mul(self.buffer_size as u64);
+        EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_sub(primary, Ordering::Relaxed);
+        EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_sub(shadow, Ordering::Relaxed);
+    }
 }
 
 /// A bounded pool of aligned RAM buffers.
@@ -85,6 +113,10 @@ impl BufferPool {
         } else {
             None
         };
+        let primary_bytes = (primary_slots as u64).saturating_mul(buffer_size as u64);
+        let shadow_bytes = (shadow_slots as u64).saturating_mul(buffer_size as u64);
+        EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_add(primary_bytes, Ordering::Relaxed);
+        EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
         Self {
             inner: Arc::new(Inner {
                 free: Mutex::new(free),
@@ -114,6 +146,22 @@ impl BufferPool {
     /// Size of each buffer in the pool, in bytes.
     pub fn buffer_size(&self) -> usize {
         self.inner.buffer_size
+    }
+
+    /// Fixed primary allocation for this pool, independent of occupancy.
+    pub fn primary_allocated_bytes(&self) -> usize {
+        self.capacity().saturating_mul(self.buffer_size())
+    }
+
+    /// Fixed shadow allocation for this pool, independent of occupancy.
+    pub fn shadow_allocated_bytes(&self) -> usize {
+        self.shadow_capacity().saturating_mul(self.buffer_size())
+    }
+
+    /// Fixed total allocation for this pool, independent of occupancy.
+    pub fn allocated_bytes(&self) -> usize {
+        self.primary_allocated_bytes()
+            .saturating_add(self.shadow_allocated_bytes())
     }
 
     /// Snapshot the raw `(ptr, len)` of every currently-free buffer
@@ -411,5 +459,16 @@ mod tests {
         let pool = BufferPool::new_with_shadow(3, 2, 4096, 4096);
         let iovecs = pool.raw_iovecs();
         assert_eq!(iovecs.len(), 5);
+    }
+
+    #[test]
+    fn allocated_bytes_use_fixed_slot_counts_not_occupancy() {
+        let pool = BufferPool::new_with_shadow(3, 2, 8192, 4096);
+        assert_eq!(pool.primary_allocated_bytes(), 3 * 8192);
+        assert_eq!(pool.shadow_allocated_bytes(), 2 * 8192);
+        assert_eq!(pool.allocated_bytes(), 5 * 8192);
+        let _primary = pool.try_acquire().unwrap();
+        let _shadow = pool.try_acquire_shadow().unwrap();
+        assert_eq!(pool.allocated_bytes(), 5 * 8192);
     }
 }

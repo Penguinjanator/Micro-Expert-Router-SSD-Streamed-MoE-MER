@@ -23,6 +23,15 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+static RESIDENT_EXPERT_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes owned by all live CPU expert residents. This includes residents
+/// temporarily held by an in-flight activation after LRU eviction, which is
+/// the useful definition for process memory accounting.
+pub fn resident_expert_buffer_bytes() -> u64 {
+    RESIDENT_EXPERT_BUFFER_BYTES.load(Ordering::Relaxed)
+}
+
 /// Pack/unpack an `f64` heat score into the bits of an `AtomicU64` so it
 /// can be read and updated without a lock. The cost-aware eviction
 /// scorer tolerates the occasional torn update from a racing reader —
@@ -66,9 +75,9 @@ pub struct ExpertResident {
     /// on-disk bytes are slightly short (≤ one block/page) of the
     /// derived expected size.
     q4_0_padded: OnceCell<(usize, Arc<[u8]>)>,
-    /// Cached once-per-resident Q8_0 QMatMul preparation. The cell stores
-    /// the first error as well as the prepared bundle so malformed resident
-    /// payloads are not re-prepared on every activation.
+    /// Test/benchmark-only Candle Q8_0 reference preparation. The default
+    /// native path executes directly over `data()` and retains no duplicate.
+    #[cfg(feature = "q8-candle-reference")]
     q8_0_qmm: OnceCell<
         Result<crate::inference::PreparedQ8_0Expert, crate::inference::ExpertWeightsError>,
     >,
@@ -115,6 +124,7 @@ impl ExpertResident {
             debug_assert!(payload_offset <= raw.len());
             (payload_offset, mixed)
         };
+        RESIDENT_EXPERT_BUFFER_BYTES.fetch_add(buffer.as_slice().len() as u64, Ordering::Relaxed);
         Self {
             id,
             buffer,
@@ -122,6 +132,7 @@ impl ExpertResident {
             mixed_layout,
             hits: AtomicU64::new(0),
             q4_0_padded: OnceCell::new(),
+            #[cfg(feature = "q8-candle-reference")]
             q8_0_qmm: OnceCell::new(),
             heat_bits: AtomicU64::new(0.0f64.to_bits()),
             heat_last_epoch: AtomicU64::new(0),
@@ -214,6 +225,7 @@ impl ExpertResident {
         (*cached_need == need).then(|| cached.clone())
     }
 
+    #[cfg(feature = "q8-candle-reference")]
     pub(crate) fn prepared_q8_0_qmm<F>(
         &self,
         prepare: F,
@@ -237,6 +249,15 @@ impl ExpertResident {
             Err(err) => Err(err.clone()),
         };
         (result, prepared_now)
+    }
+}
+
+impl Drop for ExpertResident {
+    fn drop(&mut self) {
+        RESIDENT_EXPERT_BUFFER_BYTES.fetch_sub(
+            self.buffer.as_slice().len() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 

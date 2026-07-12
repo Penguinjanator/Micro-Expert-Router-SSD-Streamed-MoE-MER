@@ -70,6 +70,19 @@ pub mod amx;
 
 use std::sync::OnceLock;
 
+/// GGUF Q8_0 stores 32 signed weights after one little-endian f16 scale.
+pub const Q8_0_BLOCK_ELEMS: usize = 32;
+pub const Q8_0_BLOCK_BYTES: usize = 2 + Q8_0_BLOCK_ELEMS;
+
+/// Decode the scale at the start of a caller-validated Q8_0 block.
+///
+/// # Safety
+/// `block` must point to at least two readable bytes.
+#[inline]
+pub(crate) unsafe fn q8_0_scale_from_ptr(block: *const u8) -> f32 {
+    half::f16::from_bits(u16::from_le_bytes([*block, *block.add(1)])).to_f32()
+}
+
 /// Identifier for the active kernel backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelBackend {

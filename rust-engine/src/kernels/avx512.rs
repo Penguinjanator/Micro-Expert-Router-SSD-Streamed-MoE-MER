@@ -15,6 +15,7 @@
 
 #![cfg(all(feature = "avx512", target_arch = "x86_64"))]
 
+use super::{q8_0_scale_from_ptr, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
 use std::arch::x86_64::*;
 
 /// AVX-512 f32 dot product.
@@ -84,6 +85,93 @@ pub unsafe fn dot_f32_avx512(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// Row-wide GGUF Q8_0 × F32 dot product. Two vector accumulators span the
+/// complete row and are horizontally reduced once.
+///
+/// # Safety
+/// The CPU must support AVX-512F+BW. `x.len()` must be divisible by 32 and
+/// `row_blocks.len()` must equal `x.len()/32*34`.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn q8_0_row_dot_avx512(row_blocks: &[u8], x: &[f32]) -> f32 {
+    debug_assert!(x.len().is_multiple_of(Q8_0_BLOCK_ELEMS));
+    debug_assert_eq!(
+        row_blocks.len(),
+        x.len() / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES
+    );
+    let mut acc = [_mm512_setzero_ps(); 2];
+    for block_index in 0..x.len() / Q8_0_BLOCK_ELEMS {
+        let block = row_blocks.as_ptr().add(block_index * Q8_0_BLOCK_BYTES);
+        let q = block.add(2);
+        let xv = x.as_ptr().add(block_index * Q8_0_BLOCK_ELEMS);
+        let scale = _mm512_set1_ps(q8_0_scale_from_ptr(block));
+        for lane in 0..2 {
+            let offset = lane * 16;
+            let packed = _mm_loadu_si128(q.add(offset).cast::<__m128i>());
+            let weights = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(packed)), scale);
+            acc[lane] = _mm512_fmadd_ps(
+                weights,
+                _mm512_loadu_ps(xv.add(offset)),
+                acc[lane],
+            );
+        }
+    }
+    _mm512_reduce_add_ps(_mm512_add_ps(acc[0], acc[1]))
+}
+
+/// Fused gate/up row traversal. Each activation vector is loaded once into
+/// independent row-wide gate and up accumulators.
+///
+/// # Safety
+/// The CPU must support AVX-512F+BW. Gate/up ranges must have identical
+/// length; `x.len()` must be divisible by 32; each range must be
+/// `x.len()/32*34`.
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn q8_0_gate_up_row_avx512(
+    gate_blocks: &[u8],
+    up_blocks: &[u8],
+    x: &[f32],
+) -> (f32, f32) {
+    debug_assert_eq!(gate_blocks.len(), up_blocks.len());
+    debug_assert!(x.len().is_multiple_of(Q8_0_BLOCK_ELEMS));
+    debug_assert_eq!(
+        gate_blocks.len(),
+        x.len() / Q8_0_BLOCK_ELEMS * Q8_0_BLOCK_BYTES
+    );
+    let mut gate_acc = [_mm512_setzero_ps(); 2];
+    let mut up_acc = [_mm512_setzero_ps(); 2];
+    for block_index in 0..x.len() / Q8_0_BLOCK_ELEMS {
+        let gate_block = gate_blocks
+            .as_ptr()
+            .add(block_index * Q8_0_BLOCK_BYTES);
+        let up_block = up_blocks.as_ptr().add(block_index * Q8_0_BLOCK_BYTES);
+        let gate_q = gate_block.add(2);
+        let up_q = up_block.add(2);
+        let xv = x.as_ptr().add(block_index * Q8_0_BLOCK_ELEMS);
+        let gate_scale = _mm512_set1_ps(q8_0_scale_from_ptr(gate_block));
+        let up_scale = _mm512_set1_ps(q8_0_scale_from_ptr(up_block));
+        for lane in 0..2 {
+            let offset = lane * 16;
+            let activations = _mm512_loadu_ps(xv.add(offset));
+            let gate_packed = _mm_loadu_si128(gate_q.add(offset).cast::<__m128i>());
+            let up_packed = _mm_loadu_si128(up_q.add(offset).cast::<__m128i>());
+            let gate_weights = _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(gate_packed)),
+                gate_scale,
+            );
+            let up_weights = _mm512_mul_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(up_packed)),
+                up_scale,
+            );
+            gate_acc[lane] = _mm512_fmadd_ps(gate_weights, activations, gate_acc[lane]);
+            up_acc[lane] = _mm512_fmadd_ps(up_weights, activations, up_acc[lane]);
+        }
+    }
+    (
+        _mm512_reduce_add_ps(_mm512_add_ps(gate_acc[0], gate_acc[1])),
+        _mm512_reduce_add_ps(_mm512_add_ps(up_acc[0], up_acc[1])),
+    )
 }
 
 /// Fused SwiGLU FFN inner stage: `y[i] = silu(gate_w[i]·x) * (up_w[i]·x)`.
@@ -403,6 +491,61 @@ pub unsafe fn dot_int8_int8_avx512_vnni(out_scale: f32, qw: &[i8], qx: &[i8]) ->
 mod tests {
     use super::*;
 
+    fn q8_row(width: usize, case: usize, seed: u64) -> Vec<u8> {
+        let blocks = width / Q8_0_BLOCK_ELEMS;
+        let mut out = vec![0u8; blocks * Q8_0_BLOCK_BYTES];
+        let mut state = seed;
+        for block in 0..blocks {
+            let start = block * Q8_0_BLOCK_BYTES;
+            let scale_bits = match case {
+                0 => 0,
+                1 => 1,
+                2 => 0x7bff,
+                6 => 0x0400,
+                _ => half::f16::from_f32(0.003 + block as f32 * 0.00001).to_bits(),
+            };
+            out[start..start + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            for i in 0..Q8_0_BLOCK_ELEMS {
+                let q = match case {
+                    3 => 0,
+                    4 => if (i + block) % 2 == 0 { i8::MIN } else { i8::MAX },
+                    5 => if (i + block) % 2 == 0 { -1 } else { 1 },
+                    _ => {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as i8
+                    }
+                };
+                out[start + 2 + i] = q as u8;
+            }
+        }
+        out
+    }
+
+    fn assert_close(name: &str, actual: f32, expected: f32) {
+        let tolerance = 2e-4 + expected.abs() * 2e-5;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{name}: actual={actual} expected={expected} tolerance={tolerance}"
+        );
+    }
+
+    fn q8_scalar(row: &[u8], x: &[f32]) -> f32 {
+        let mut out = 0.0;
+        for (block, activations) in row
+            .chunks_exact(Q8_0_BLOCK_BYTES)
+            .zip(x.chunks_exact(Q8_0_BLOCK_ELEMS))
+        {
+            let scale =
+                half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+            for i in 0..Q8_0_BLOCK_ELEMS {
+                out += scale * (block[2 + i] as i8 as f32) * activations[i];
+            }
+        }
+        out
+    }
+
     #[test]
     fn dot_f32_avx512_matches_scalar_when_supported() {
         if !std::is_x86_feature_detected!("avx512f") {
@@ -413,6 +556,37 @@ mod tests {
         let lhs = unsafe { dot_f32_avx512(&a, &b) };
         let rhs = crate::kernels::scalar::dot_f32(&a, &b);
         assert!((lhs - rhs).abs() <= 1e-3);
+    }
+
+    #[test]
+    fn q8_row_and_fused_gate_up_avx512_match_scalar_when_supported() {
+        if !(std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw"))
+        {
+            return;
+        }
+        for width in [32usize, 64, 96, 768, 2048] {
+            for case in 0..7 {
+                for seed in [1u64, 0x1234_5678, 0xfeed_beef] {
+                    let gate = q8_row(width, case, seed);
+                    let up = q8_row(width, case, seed ^ 0xa5a5_5a5a);
+                    let x: Vec<f32> = (0..width)
+                        .map(|i| ((i as f32) * 0.013).sin() * 0.01)
+                        .collect();
+                    let gate_ref = q8_scalar(&gate, &x);
+                    let up_ref = q8_scalar(&up, &x);
+                    let gate_dot = unsafe { q8_0_row_dot_avx512(&gate, &x) };
+                    let up_dot = unsafe { q8_0_row_dot_avx512(&up, &x) };
+                    let (gate_fused, up_fused) =
+                        unsafe { q8_0_gate_up_row_avx512(&gate, &up, &x) };
+                    let label = format!("width={width} case={case} seed={seed}");
+                    assert_close(&format!("gate-dot {label}"), gate_dot, gate_ref);
+                    assert_close(&format!("up/down-dot {label}"), up_dot, up_ref);
+                    assert_close(&format!("gate-fused {label}"), gate_fused, gate_ref);
+                    assert_close(&format!("up-fused {label}"), up_fused, up_ref);
+                }
+            }
+        }
     }
 
     #[test]

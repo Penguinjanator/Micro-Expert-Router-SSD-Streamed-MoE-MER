@@ -177,6 +177,11 @@ io_uring = ["dep:io-uring"]
 # compatibility with downstream build scripts that still pass
 # `--features simd`; new builds should omit it.
 simd = []
+# Keep Candle's copying Q8_0 `QStorage` implementation available for
+# numerical comparison and microbenchmarks. Production Q8_0 dispatch uses
+# the native zero-copy block-stream kernel and does not compile the
+# per-resident prepared-copy cache unless this feature is requested.
+q8-candle-reference = []
 
 # BLAS-equivalent dense matmul. Retained as a compatibility feature and
 # as the `auto` default selector for deployments that already opted into

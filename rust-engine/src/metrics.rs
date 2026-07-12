@@ -14,9 +14,10 @@
 
 use prometheus::{
     register_counter_vec_with_registry, register_counter_with_registry,
+    register_gauge_with_registry,
     register_histogram_vec_with_registry, register_histogram_with_registry,
     register_int_gauge_vec_with_registry, register_int_gauge_with_registry, Counter, CounterVec,
-    Encoder, Histogram, HistogramVec, IntGauge, IntGaugeVec, Registry, TextEncoder,
+    Encoder, Gauge, Histogram, HistogramVec, IntGauge, IntGaugeVec, Registry, TextEncoder,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -117,6 +118,16 @@ struct MetricsInner {
     /// (checked CPU attention + GPU experts) observable instead of a
     /// single ambiguous "gpu" device string.
     pub backend_component_plane: IntGaugeVec,
+    pub resident_expert_buffer_bytes: IntGauge,
+    pub expert_buffer_pool_allocated_bytes: IntGauge,
+    pub expert_buffer_pool_primary_bytes: IntGauge,
+    pub expert_buffer_pool_shadow_bytes: IntGauge,
+    pub prepared_duplicate_expert_bytes: IntGauge,
+    pub q8_direct_kernel_dispatches: IntGauge,
+    pub q8_scalar_layout_fallbacks: IntGauge,
+    pub q8_preparation_seconds: Gauge,
+    pub q8_gate_up_kernel_seconds: Gauge,
+    pub q8_down_kernel_seconds: Gauge,
 }
 
 impl Default for Metrics {
@@ -309,6 +320,66 @@ impl Metrics {
             registry
         )
         .expect("metric registration: mer_backend_component_plane");
+        let resident_expert_buffer_bytes = register_int_gauge_with_registry!(
+            "mer_resident_expert_buffer_bytes",
+            "Bytes held by live expert residents; occupancy, not total pool allocation.",
+            registry
+        )
+        .expect("metric registration: mer_resident_expert_buffer_bytes");
+        let expert_buffer_pool_allocated_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_allocated_bytes",
+            "Bytes preallocated across all live primary and shadow expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_allocated_bytes");
+        let expert_buffer_pool_primary_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_primary_bytes",
+            "Bytes preallocated across all live primary expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_primary_bytes");
+        let expert_buffer_pool_shadow_bytes = register_int_gauge_with_registry!(
+            "mer_expert_buffer_pool_shadow_bytes",
+            "Bytes preallocated across all live speculative shadow expert-buffer slots.",
+            registry
+        )
+        .expect("metric registration: mer_expert_buffer_pool_shadow_bytes");
+        let prepared_duplicate_expert_bytes = register_int_gauge_with_registry!(
+            "mer_prepared_duplicate_expert_bytes",
+            "Bytes retained in duplicated prepared expert representations.",
+            registry
+        )
+        .expect("metric registration: mer_prepared_duplicate_expert_bytes");
+        let q8_direct_kernel_dispatches = register_int_gauge_with_registry!(
+            "mer_q8_direct_kernel_dispatches",
+            "Cumulative native direct Q8_0 expert dispatches.",
+            registry
+        )
+        .expect("metric registration: mer_q8_direct_kernel_dispatches");
+        let q8_scalar_layout_fallbacks = register_int_gauge_with_registry!(
+            "mer_q8_scalar_layout_fallbacks",
+            "Cumulative Q8_0 projection stages using the scalar layout fallback.",
+            registry
+        )
+        .expect("metric registration: mer_q8_scalar_layout_fallbacks");
+        let q8_preparation_seconds = register_gauge_with_registry!(
+            "mer_q8_preparation_seconds",
+            "Cumulative Q8_0 validation and scratch preparation time.",
+            registry
+        )
+        .expect("metric registration: mer_q8_preparation_seconds");
+        let q8_gate_up_kernel_seconds = register_gauge_with_registry!(
+            "mer_q8_gate_up_kernel_seconds",
+            "Cumulative native Q8_0 gate/up kernel time.",
+            registry
+        )
+        .expect("metric registration: mer_q8_gate_up_kernel_seconds");
+        let q8_down_kernel_seconds = register_gauge_with_registry!(
+            "mer_q8_down_kernel_seconds",
+            "Cumulative native Q8_0 down-projection kernel time.",
+            registry
+        )
+        .expect("metric registration: mer_q8_down_kernel_seconds");
         Self {
             inner: Arc::new(MetricsInner {
                 registry,
@@ -338,6 +409,16 @@ impl Metrics {
                 gpu_cpu_fallbacks_total,
                 nonfinite_softmax_fallbacks,
                 backend_component_plane,
+                resident_expert_buffer_bytes,
+                expert_buffer_pool_allocated_bytes,
+                expert_buffer_pool_primary_bytes,
+                expert_buffer_pool_shadow_bytes,
+                prepared_duplicate_expert_bytes,
+                q8_direct_kernel_dispatches,
+                q8_scalar_layout_fallbacks,
+                q8_preparation_seconds,
+                q8_gate_up_kernel_seconds,
+                q8_down_kernel_seconds,
             }),
         }
     }
@@ -515,6 +596,36 @@ impl Metrics {
         self.inner
             .nonfinite_softmax_fallbacks
             .set(crate::transformer::nonfinite_softmax_fallbacks().min(i64::MAX as u64) as i64);
+        self.inner.resident_expert_buffer_bytes.set(
+            crate::expert_cache::resident_expert_buffer_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.expert_buffer_pool_allocated_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_allocated_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.expert_buffer_pool_primary_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_primary_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.expert_buffer_pool_shadow_bytes.set(
+            crate::buffer_pool::expert_buffer_pool_shadow_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.prepared_duplicate_expert_bytes.set(
+            crate::inference::prepared_duplicate_expert_bytes().min(i64::MAX as u64) as i64,
+        );
+        self.inner.q8_direct_kernel_dispatches.set(
+            crate::inference::q8_direct_kernel_dispatches().min(i64::MAX as u64) as i64,
+        );
+        self.inner.q8_scalar_layout_fallbacks.set(
+            crate::inference::q8_scalar_layout_fallbacks().min(i64::MAX as u64) as i64,
+        );
+        self.inner
+            .q8_preparation_seconds
+            .set(crate::inference::q8_preparation_seconds());
+        self.inner
+            .q8_gate_up_kernel_seconds
+            .set(crate::inference::q8_gate_up_kernel_seconds());
+        self.inner
+            .q8_down_kernel_seconds
+            .set(crate::inference::q8_down_kernel_seconds());
         let metric_families = self.inner.registry.gather();
         let mut buf = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buf)?;
@@ -525,6 +636,25 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q8_direct_telemetry_is_exported() {
+        let body = String::from_utf8(Metrics::new().render().unwrap()).unwrap();
+        for metric in [
+            "mer_resident_expert_buffer_bytes",
+            "mer_expert_buffer_pool_allocated_bytes",
+            "mer_expert_buffer_pool_primary_bytes",
+            "mer_expert_buffer_pool_shadow_bytes",
+            "mer_prepared_duplicate_expert_bytes",
+            "mer_q8_direct_kernel_dispatches",
+            "mer_q8_scalar_layout_fallbacks",
+            "mer_q8_preparation_seconds",
+            "mer_q8_gate_up_kernel_seconds",
+            "mer_q8_down_kernel_seconds",
+        ] {
+            assert!(body.contains(metric), "missing {metric}");
+        }
+    }
 
     /// Item 5 (strict GPU / hybrid resolution): the per-component
     /// compute-plane gauge reports the actual resolved attention and
