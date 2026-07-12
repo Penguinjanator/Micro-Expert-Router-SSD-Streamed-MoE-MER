@@ -3405,7 +3405,7 @@ pub enum Q8DirectKernelChoice {
 /// Row-kernel selection is resolved once per projection traversal, never per
 /// quantization block. Every unsafe implementation is entered only after the
 /// safe layout validator has established exact row and activation lengths.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Q8RowKernel {
     Scalar,
     #[cfg(target_arch = "x86_64")]
@@ -3415,35 +3415,45 @@ enum Q8RowKernel {
 }
 
 #[inline]
-fn select_q8_0_row_kernel() -> Q8RowKernel {
-    #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
-    {
-        let features = crate::kernels::cpu_features();
-        if features.avx512f && features.avx512bw {
-            return Q8RowKernel::Avx512;
-        }
-    }
+fn select_q8_0_auto_kernel_for_capabilities(avx2: bool, fma: bool) -> Q8RowKernel {
     #[cfg(target_arch = "x86_64")]
     {
-        let features = crate::kernels::cpu_features();
-        if features.avx2 && features.fma {
+        if avx2 && fma {
             return Q8RowKernel::Avx2;
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (avx2, fma);
     Q8RowKernel::Scalar
 }
 
-fn resolve_q8_0_row_kernel(
+/// Conservative production policy: select the qualified AVX2+FMA backend
+/// when available, otherwise scalar. AVX-512 remains explicitly selectable,
+/// but ISA availability alone is not treated as performance qualification.
+#[inline]
+fn select_q8_0_row_kernel() -> Q8RowKernel {
+    let features = crate::kernels::cpu_features();
+    select_q8_0_auto_kernel_for_capabilities(features.avx2, features.fma)
+}
+
+fn resolve_q8_0_row_kernel_for_capabilities(
     choice: Q8DirectKernelChoice,
+    avx2: bool,
+    fma: bool,
+    avx512f: bool,
+    avx512bw: bool,
 ) -> Result<Q8RowKernel, ExpertWeightsError> {
+    #[cfg(not(all(feature = "avx512", target_arch = "x86_64")))]
+    let _ = (avx512f, avx512bw);
     match choice {
-        Q8DirectKernelChoice::Auto => Ok(select_q8_0_row_kernel()),
+        Q8DirectKernelChoice::Auto => {
+            Ok(select_q8_0_auto_kernel_for_capabilities(avx2, fma))
+        }
         Q8DirectKernelChoice::Scalar => Ok(Q8RowKernel::Scalar),
         Q8DirectKernelChoice::Avx2 => {
             #[cfg(target_arch = "x86_64")]
             {
-                let features = crate::kernels::cpu_features();
-                if features.avx2 && features.fma {
+                if avx2 && fma {
                     return Ok(Q8RowKernel::Avx2);
                 }
             }
@@ -3454,8 +3464,7 @@ fn resolve_q8_0_row_kernel(
         Q8DirectKernelChoice::Avx512 => {
             #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
             {
-                let features = crate::kernels::cpu_features();
-                if features.avx512f && features.avx512bw {
+                if avx512f && avx512bw {
                     return Ok(Q8RowKernel::Avx512);
                 }
             }
@@ -3464,6 +3473,19 @@ fn resolve_q8_0_row_kernel(
             ))
         }
     }
+}
+
+fn resolve_q8_0_row_kernel(
+    choice: Q8DirectKernelChoice,
+) -> Result<Q8RowKernel, ExpertWeightsError> {
+    let features = crate::kernels::cpu_features();
+    resolve_q8_0_row_kernel_for_capabilities(
+        choice,
+        features.avx2,
+        features.fma,
+        features.avx512f,
+        features.avx512bw,
+    )
 }
 
 /// Return the exact backend name for a requested benchmark choice, or a
@@ -5868,6 +5890,125 @@ mod tests {
             .unwrap();
             assert_q8_close(label, &expected, &actual);
         }
+    }
+
+    #[test]
+    fn q8_auto_dispatch_is_conservative_and_avx2_qualified() {
+        assert_eq!(
+            select_q8_0_auto_kernel_for_capabilities(false, false),
+            Q8RowKernel::Scalar
+        );
+        assert_eq!(
+            select_q8_0_auto_kernel_for_capabilities(true, false),
+            Q8RowKernel::Scalar
+        );
+        assert_eq!(
+            select_q8_0_auto_kernel_for_capabilities(false, true),
+            Q8RowKernel::Scalar
+        );
+        assert_eq!(
+            resolve_q8_0_row_kernel_for_capabilities(
+                Q8DirectKernelChoice::Auto,
+                false,
+                false,
+                true,
+                true,
+            )
+            .unwrap(),
+            Q8RowKernel::Scalar,
+            "AVX-512 availability alone must not change production auto dispatch"
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                select_q8_0_auto_kernel_for_capabilities(true, true),
+                Q8RowKernel::Avx2
+            );
+            assert_eq!(
+                resolve_q8_0_row_kernel_for_capabilities(
+                    Q8DirectKernelChoice::Auto,
+                    true,
+                    true,
+                    true,
+                    true,
+                )
+                .unwrap(),
+                Q8RowKernel::Avx2,
+                "qualified AVX2+FMA must win auto dispatch even when AVX-512 is available"
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(
+            select_q8_0_auto_kernel_for_capabilities(true, true),
+            Q8RowKernel::Scalar
+        );
+    }
+
+    #[test]
+    fn q8_explicit_simd_dispatch_requires_every_runtime_feature() {
+        for &(avx2, fma) in &[(false, false), (true, false), (false, true)] {
+            assert!(resolve_q8_0_row_kernel_for_capabilities(
+                Q8DirectKernelChoice::Avx2,
+                avx2,
+                fma,
+                true,
+                true,
+            )
+            .is_err());
+        }
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            resolve_q8_0_row_kernel_for_capabilities(
+                Q8DirectKernelChoice::Avx2,
+                true,
+                true,
+                false,
+                false,
+            )
+            .unwrap(),
+            Q8RowKernel::Avx2
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(resolve_q8_0_row_kernel_for_capabilities(
+            Q8DirectKernelChoice::Avx2,
+            true,
+            true,
+            false,
+            false,
+        )
+        .is_err());
+
+        for &(avx512f, avx512bw) in &[(false, false), (true, false), (false, true)] {
+            assert!(resolve_q8_0_row_kernel_for_capabilities(
+                Q8DirectKernelChoice::Avx512,
+                true,
+                true,
+                avx512f,
+                avx512bw,
+            )
+            .is_err());
+        }
+        #[cfg(all(feature = "avx512", target_arch = "x86_64"))]
+        assert_eq!(
+            resolve_q8_0_row_kernel_for_capabilities(
+                Q8DirectKernelChoice::Avx512,
+                true,
+                true,
+                true,
+                true,
+            )
+            .unwrap(),
+            Q8RowKernel::Avx512
+        );
+        #[cfg(not(all(feature = "avx512", target_arch = "x86_64")))]
+        assert!(resolve_q8_0_row_kernel_for_capabilities(
+            Q8DirectKernelChoice::Avx512,
+            true,
+            true,
+            true,
+            true,
+        )
+        .is_err());
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -1832,10 +1832,12 @@ progress_timeout_secs = 300
 The production Q8_0 path reads the resident GGUF blocks directly. Build the
 test/benchmark-only Candle reference feature to compare both implementations
 at the Qwen expert shape. `--kernel auto|scalar|avx2|avx512|all` controls only
-the benchmark wrapper; production remains runtime-selected `auto`. Explicit
-ISA choices are runtime-checked and fail or print `SKIPPED` rather than
-entering an unsupported kernel. The top-eight columns are a serial aggregation
-and do not represent the engine's expert-parallel scheduling policy.
+the benchmark wrapper. Production `auto` uses the conservatively qualified
+AVX2+FMA backend when available and otherwise scalar; it does not prefer
+AVX-512 from feature detection alone. Explicit ISA choices remain
+runtime-checked and fail or print `SKIPPED` rather than entering an unsupported
+kernel. The top-eight columns are a serial aggregation and do not represent
+the engine's expert-parallel scheduling policy.
 
 ```bash
 cargo run --manifest-path rust-engine/Cargo.toml --release \
@@ -1856,6 +1858,25 @@ plus shadow pool allocation, with separate primary/shadow gauges.
 should be approximately one logical expert per live Candle resident and zero
 for every direct backend. All counters must return to their pre-construction
 baseline after the residents and pool are dropped.
+
+ISA availability and measured performance are separate concerns. On the
+qualified GCP `g2-standard-32` Intel Xeon host (32 logical CPUs, 30 Rayon
+threads), five repeated-execution samples measured AVX2+FMA faster than
+AVX-512 at the Qwen expert shape:
+
+| Backend | Single repeated mean | Serial top-eight repeated mean |
+|---|---:|---:|
+| Candle | 1.611 ms | 12.604 ms |
+| Scalar | 0.877 ms | 7.103 ms |
+| AVX2+FMA | 0.657 ms | 5.422 ms |
+| AVX-512F+BW | 0.741 ms | 6.200 ms |
+
+AVX2+FMA was about 12.8% faster for one repeated expert and 14.3% faster
+for serial top-eight, so it is the current conservative production `auto`
+choice on capable x86 hosts. AVX-512 remains implemented, runtime-validated,
+and directly testable with `--kernel avx512` or `--kernel all`; a future
+persisted/profiled policy may qualify it for automatic selection on a CPU
+where it wins.
 
 The native kernels are implemented, and portable macOS compilation/tests can
 check the scalar path and layout validation. That is not x86 qualification.
@@ -1882,10 +1903,10 @@ Qualification status for this native Q8 change:
 | Gate | Status |
 |---|---|
 | Native scalar, AVX2+FMA, and optional AVX-512F+BW implementations | Implemented |
-| x86 release compile with `avx512,q8-candle-reference` | Pending target-host run |
-| AVX2 numerical tests executed | Pending target-host run |
-| AVX-512 numerical tests executed | Pending target-host run |
-| Native-vs-Candle performance qualified | Pending target-host benchmark |
+| x86 release compile with `avx512,q8-candle-reference` | Completed on target host |
+| AVX2+FMA and AVX-512 benchmark execution | Completed on target host |
+| Native-vs-Candle performance qualification | AVX2+FMA qualified as the current GCP winner |
+| Full x86 release suite after the dense-reference tolerance correction | Pending target-host rerun |
 | End-to-end strict Qwen inference with the new native path | Pending target-host run |
 
 #### Full real-transformer bench-real

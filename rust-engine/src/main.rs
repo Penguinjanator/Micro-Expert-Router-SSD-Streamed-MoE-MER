@@ -893,8 +893,9 @@ enum Cmd {
         /// Measured resident-hit iterations per path.
         #[arg(long, default_value_t = 5)]
         measured_runs: usize,
-        /// Native backend to exercise. `all` includes every supported native
-        /// backend plus the Candle reference.
+        /// Native backend to exercise. `auto` mirrors the conservative
+        /// production policy; `all` includes every supported native backend
+        /// plus the Candle reference.
         #[arg(long, value_enum, default_value_t = Q8BenchKernel::Auto)]
         kernel: Q8BenchKernel,
     },

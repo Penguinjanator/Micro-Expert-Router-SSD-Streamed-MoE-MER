@@ -4813,7 +4813,8 @@ impl Engine {
                 r.prepared_duplicate_expert_bytes,
             );
             info!(
-                "q8 kernels:   direct_dispatches={}  scalar_layout_fallbacks={}  preparation={:.6}s  gate_up={:.6}s  down={:.6}s",
+                "q8 kernels:   production_auto_backend={}  direct_dispatches={}  scalar_layout_fallbacks={}  preparation={:.6}s  gate_up={:.6}s  down={:.6}s",
+                crate::inference::q8_direct_kernel_backend(),
                 r.q8_direct_kernel_dispatches,
                 r.q8_scalar_layout_fallbacks,
                 r.q8_preparation_seconds,
