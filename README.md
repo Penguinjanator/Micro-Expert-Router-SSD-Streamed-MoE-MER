@@ -2417,6 +2417,15 @@ output directory is created. The converter writes into a sibling
 file and `metadata.json`, then atomically renames staging into place.
 Existing nonempty output directories are refused rather than destroyed.
 
+Q4_0 datasets use the standard GGML/Candle block contract: byte `j` stores
+element `j` in its low nibble and element `j + 16` in its high nibble.
+Converters and `gen-data --dtype q4_0` record
+`"q4_0_layout": "ggml-standard-v1"` in `metadata.json`. Runtime Q4_0
+loading rejects a missing, legacy, or unknown marker; there is no heuristic
+or dual-reader fallback. Reconvert the original GGUF or rerun `gen-data` for
+older MER-generated Q4_0 directories whose nibble layout was not versioned.
+Other dtypes are unaffected.
+
 Use `--experts-only` for the expert-streaming benchmark path. It writes
 expert blobs and metadata, skips dense transformer tensors, and records
 `"conversion_mode": "experts_only"` in `metadata.json`. Validate any

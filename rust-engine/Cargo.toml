@@ -153,6 +153,9 @@ prost = { version = "0.13", optional = true }
 # the strategies API in our `tests` modules stays compatible without a
 # transitive bump.
 proptest = "1"
+# Parse and validate embedded WGSL in unit tests without requiring a GPU
+# adapter. Keep this aligned with wgpu 0.20's naga dependency.
+naga = { version = "0.20", features = ["wgsl-in"] }
 
 [profile.release]
 lto = "thin"
