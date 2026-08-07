@@ -1816,6 +1816,17 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
         }
     }
 
+    // Mixed metadata is only a summary; the UTH2 projection ranges are
+    // authoritative. Reconcile the marker against the observed headers so
+    // an omitted or incomplete histogram cannot conceal Q4_0 payloads.
+    if dtype == WeightDtype::Mixed {
+        validate_q4_0_layout_marker(
+            metadata_uses_q4_0(dtype, Some(&observed_hist)),
+            meta.q4_0_layout.as_deref(),
+            &meta_path,
+        )?;
+    }
+
     if let Some(expected_hist) = meta.projection_dtype_histogram {
         if dtype == WeightDtype::Mixed && expected_hist != observed_hist {
             return Err(io::Error::new(
@@ -1845,11 +1856,85 @@ fn metadata_uses_q4_0(
         || (dtype == WeightDtype::Mixed
             && projection_dtype_histogram.is_some_and(|histogram| {
                 histogram.keys().any(|layout| {
-                    layout
-                        .split('/')
-                        .any(|projection| projection.eq_ignore_ascii_case("q4_0"))
+                    layout.split('/').any(|projection| {
+                        WeightDtype::from_str_opt(projection) == Some(WeightDtype::Q4_0)
+                    })
                 })
             }))
+}
+
+fn projection_dtype_histogram_is_complete(
+    histogram: &BTreeMap<String, usize>,
+    num_experts: usize,
+) -> bool {
+    !histogram.is_empty()
+        && histogram.iter().all(|(layout, count)| {
+            *count > 0
+                && layout.split('/').count() == 3
+                && layout.split('/').all(|projection| {
+                    WeightDtype::from_str_opt(projection)
+                        .is_some_and(|dtype| dtype != WeightDtype::Mixed)
+                })
+        })
+        && histogram
+            .values()
+            .try_fold(0usize, |total, count| total.checked_add(*count))
+            == Some(num_experts)
+}
+
+fn mixed_expert_headers_use_q4_0(data_dir: &Path, num_experts: usize) -> io::Result<bool> {
+    use std::io::Read;
+
+    for id in 0..num_experts {
+        let path = data_dir.join(format!("expert_{id}.bin"));
+        let mut head = [0u8; crate::tensor_header::UTH2_BYTES];
+        let mut file = fs::File::open(&path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: failed to open UTH2 header {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        file.read_exact(&mut head).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: failed to read UTH2 header {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let header = MixedExpertHeader::probe(&head).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: expert file {} has no valid UTH2 header; regenerate or reconvert the dataset",
+                    path.display()
+                ),
+            )
+        })?;
+        if [header.gate, header.up, header.down]
+            .into_iter()
+            .any(|projection| projection.dtype.to_weight() == WeightDtype::Q4_0)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn mixed_metadata_or_headers_use_q4_0(
+    data_dir: &Path,
+    meta: &ValidationMetadata,
+) -> io::Result<bool> {
+    if let Some(histogram) = meta.projection_dtype_histogram.as_ref() {
+        if projection_dtype_histogram_is_complete(histogram, meta.num_experts) {
+            return Ok(metadata_uses_q4_0(WeightDtype::Mixed, Some(histogram)));
+        }
+    }
+    mixed_expert_headers_use_q4_0(data_dir, meta.num_experts)
 }
 
 fn validate_q4_0_layout_marker(
@@ -1930,7 +2015,9 @@ pub fn validate_q4_0_dataset_layout(
         }
     };
     let requires_q4_0 = configured_dtype == WeightDtype::Q4_0
-        || metadata_uses_q4_0(declared_dtype, meta.projection_dtype_histogram.as_ref());
+        || metadata_uses_q4_0(declared_dtype, meta.projection_dtype_histogram.as_ref())
+        || (declared_dtype == WeightDtype::Mixed
+            && mixed_metadata_or_headers_use_q4_0(data_dir, &meta)?);
     validate_q4_0_layout_marker(requires_q4_0, meta.q4_0_layout.as_deref(), &meta_path)
 }
 
@@ -4405,6 +4492,18 @@ mod tests {
     }
 
     #[test]
+    fn mixed_histogram_q4_0_detection_uses_supported_dtype_aliases() {
+        for layout in ["q4_0/q8_0/q8_0", "Q4_0/q8_0/q8_0", "q4/q8_0/q8_0"] {
+            let histogram = BTreeMap::from([(layout.to_string(), 1usize)]);
+            assert!(metadata_uses_q4_0(
+                WeightDtype::Mixed,
+                Some(&histogram)
+            ));
+            assert!(projection_dtype_histogram_is_complete(&histogram, 1));
+        }
+    }
+
+    #[test]
     fn uniform_tail_block_layout_uses_uth2_plan() {
         let weights = Q5K_BLOCK_ELEMS + 1;
         let payload_bytes =
@@ -4998,6 +5097,59 @@ mod tests {
             meta["projection_dtype_histogram"]["q4_0/q4_0/q8_0"],
             num_experts
         );
+        validate_data_dir(&out).expect("mixed Q4_0 metadata validates");
+        validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect("runtime accepts mixed Q4_0 metadata");
+
+        let meta_path = out.join("metadata.json");
+        let mut missing_histogram = meta.clone();
+        missing_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("projection_dtype_histogram");
+        missing_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("q4_0_layout");
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&missing_histogram).unwrap(),
+        )
+        .unwrap();
+        for err in [
+            validate_data_dir(&out).expect_err("UTH2 Q4_0 requires a layout marker"),
+            validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+                .expect_err("runtime must inspect UTH2 when the histogram is missing"),
+        ] {
+            assert!(err.to_string().contains("<missing>"), "{err}");
+        }
+
+        missing_histogram["q4_0_layout"] = serde_json::json!(Q4_0_LAYOUT_STANDARD_V1);
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&missing_histogram).unwrap(),
+        )
+        .unwrap();
+        validate_data_dir(&out).expect("UTH2 inspection proves standard Q4_0 layout");
+        validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect("standard marker makes runtime mixed metadata safe");
+
+        let mut incomplete_histogram = meta.clone();
+        incomplete_histogram["projection_dtype_histogram"] =
+            serde_json::json!({"q8_0/q8_0/q8_0": num_experts - 1});
+        incomplete_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("q4_0_layout");
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&incomplete_histogram).unwrap(),
+        )
+        .unwrap();
+        let err = validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect_err("runtime must inspect UTH2 when the histogram is incomplete");
+        assert!(err.to_string().contains("<missing>"), "{err}");
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 
         let q4_payload = (d_ff * d_model / Q4_0_BLOCK_ELEMS) * Q4_0_BLOCK_BYTES;
         let q8_payload = (d_ff * d_model / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES;

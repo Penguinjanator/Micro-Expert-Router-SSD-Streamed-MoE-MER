@@ -10,9 +10,9 @@
 //
 // Block layout (must match `inference::dequantize_q4_0_block`):
 //   d  : f16 little-endian (2 bytes)   — block scale
-//   qs : 16 bytes                      — 32× 4-bit weights, low nibble
-//                                        first: elem 2j = qs[j] & 0xF,
-//                                        elem 2j+1 = qs[j] >> 4; both
+//   qs : 16 bytes                      — 32× 4-bit weights. For each j:
+//                                        elem j      = qs[j] & 0xF,
+//                                        elem j + 16 = qs[j] >> 4; both
 //                                        biased by -8.
 //
 // The expert FFN only ever needs N == 1 (a per-token GEMV), so this is a
