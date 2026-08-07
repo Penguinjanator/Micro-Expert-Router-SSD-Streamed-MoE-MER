@@ -920,7 +920,7 @@ impl BatchScheduler {
         //     real token does not pay the one-shot kernel-init
         //     cost.
         {
-            let backend = crate::backend::current();
+            let backend = engine.execution_context().routed_expert_backend();
             let gate_f16 = vec![half::f16::from_f32(0.1); 16];
             let up_f16 = vec![half::f16::from_f32(0.2); 16];
             let mut out_f16 = vec![half::f16::ZERO; 16];
