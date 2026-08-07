@@ -2984,6 +2984,7 @@ mod q4_0_shader_logic_tests {
     //! or offset mistake in the shader's math shows up in CI without
     //! needing a GPU adapter.
 
+    use super::MATMUL_Q4_0_SHADER;
     use crate::inference::{
         dequantize_q4_0_block, quantize_q4_0_block, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS,
     };
@@ -3020,7 +3021,7 @@ mod q4_0_shader_logic_tests {
                 let q = read_byte(w, byte_off + 2 + j);
                 let w0 = (q & 0xf) as f32 - 8.0;
                 let w1 = (q >> 4) as f32 - 8.0;
-                partial += w0 * x[x_base + 2 * j] + w1 * x[x_base + 2 * j + 1];
+                partial += w0 * x[x_base + j] + w1 * x[x_base + j + Q4_0_BLOCK_ELEMS / 2];
             }
             sum += d * partial;
             byte_off += Q4_0_BLOCK_BYTES;
@@ -3041,6 +3042,22 @@ mod q4_0_shader_logic_tests {
                 ((state % 2000) as f32 - 1000.0) / 250.0
             })
             .collect()
+    }
+
+    #[test]
+    fn q4_0_wgsl_parses_and_validates_without_gpu_hardware() {
+        let module =
+            naga::front::wgsl::parse_str(MATMUL_Q4_0_SHADER).expect("Q4_0 WGSL must parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("Q4_0 WGSL must validate");
+        assert!(module
+            .entry_points
+            .iter()
+            .any(|entry| entry.name == "matmul_q4_0_main"));
     }
 
     /// Quantise an `m × k` row-major matrix into a tight Q4_0 block
@@ -3084,6 +3101,25 @@ mod q4_0_shader_logic_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shader_host_mirror_obeys_independent_ggml_nibble_fixture() {
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
+        for (j, byte) in block[2..].iter_mut().enumerate() {
+            *byte = j as u8 | ((15 - j as u8) << 4);
+        }
+        let words = bytes_to_words(&block);
+        let x: Vec<f32> = (0..Q4_0_BLOCK_ELEMS)
+            .map(|i| (i as f32 - 11.0) / 7.0)
+            .collect();
+        let expected: f32 = (0..16)
+            .map(|j| 0.25 * (j as f32 - 8.0) * x[j])
+            .chain((0..16).map(|j| 0.25 * (7.0 - j as f32) * x[j + 16]))
+            .sum();
+        let got = shader_row_dot(&words, 0, 0, Q4_0_BLOCK_ELEMS, &x);
+        assert!((got - expected).abs() < 1e-6, "{got} != {expected}");
     }
 
     #[test]

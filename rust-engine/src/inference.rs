@@ -746,15 +746,18 @@ pub const MXFP4_SCALE_BLOCK: usize = 32;
 /// layout (one f16 scale, no min, no sub-blocks).
 pub const Q4_0_BLOCK_BYTES: usize = 2 + Q4_0_BLOCK_ELEMS / 2;
 
+/// On-disk Q4_0 nibble ordering used by GGML, GGUF, and Candle.
+pub const Q4_0_LAYOUT_STANDARD_V1: &str = "ggml-standard-v1";
+
 /// Dequantise one Q4_0 block into `dst` (must hold exactly
 /// [`Q4_0_BLOCK_ELEMS`] floats).
 ///
 /// Inverse of the GGUF Q4_0 quantiser:
 /// ```text
 ///   d  = f16 super-scale (first 2 bytes, little-endian)
-///   for i in 0..32:
-///       q4 = qs[i >> 1] >> ((i & 1) * 4) & 0xF      (low/high nibble)
-///       dst[i] = d * (q4 as i32 - 8) as f32
+///   for j in 0..16:
+///       dst[j]      = d * ((qs[j] & 0xF) - 8)
+///       dst[j + 16] = d * ((qs[j] >> 4) - 8)
 /// ```
 pub fn dequantize_q4_0_block(src: &[u8], dst: &mut [f32]) {
     assert_eq!(
@@ -771,11 +774,12 @@ pub fn dequantize_q4_0_block(src: &[u8], dst: &mut [f32]) {
     );
     let d = half::f16::from_bits(u16::from_le_bytes([src[0], src[1]])).to_f32();
     let qs = &src[2..2 + Q4_0_BLOCK_ELEMS / 2];
-    for i in 0..Q4_0_BLOCK_ELEMS {
-        let byte = qs[i >> 1];
-        let q4 = if i & 1 == 0 { byte & 0x0F } else { byte >> 4 };
-        // Symmetric range: q4 ∈ 0..15 dequantises to q4-8 ∈ -8..+7.
-        dst[i] = d * (q4 as i32 - 8) as f32;
+    for j in 0..Q4_0_BLOCK_ELEMS / 2 {
+        let byte = qs[j];
+        // GGML stores element j in the low nibble and element j+16 in
+        // the high nibble. Symmetric q4 values decode from 0..15 to -8..+7.
+        dst[j] = d * ((byte & 0x0F) as i32 - 8) as f32;
+        dst[j + Q4_0_BLOCK_ELEMS / 2] = d * ((byte >> 4) as i32 - 8) as f32;
     }
 }
 
@@ -822,18 +826,17 @@ pub fn quantize_q4_0_block(src: &[f32], dst: &mut [u8]) {
         return;
     }
     let inv_d = 1.0 / d;
-    let qs = &mut dst[2..2 + Q4_0_BLOCK_ELEMS / 2];
-    for i in 0..Q4_0_BLOCK_ELEMS {
+    let quantize = |i: usize| {
         let v = if i < src.len() { src[i] } else { 0.0 };
         // Round to nearest, shift +8 to map [-8,+7] → [0,15], clamp.
         let q = (v * inv_d).round() as i32 + 8;
-        let q4 = q.clamp(0, 15) as u8;
-        let byte = &mut qs[i >> 1];
-        if i & 1 == 0 {
-            *byte = (*byte & 0xF0) | (q4 & 0x0F);
-        } else {
-            *byte = (*byte & 0x0F) | ((q4 & 0x0F) << 4);
-        }
+        q.clamp(0, 15) as u8
+    };
+    let qs = &mut dst[2..2 + Q4_0_BLOCK_ELEMS / 2];
+    for j in 0..Q4_0_BLOCK_ELEMS / 2 {
+        let low = quantize(j);
+        let high = quantize(j + Q4_0_BLOCK_ELEMS / 2);
+        qs[j] = low | (high << 4);
     }
 }
 
@@ -4183,6 +4186,11 @@ fn forward_q4_0_qmm_from_exact_bytes(
     d_ff: usize,
     one_bytes: usize,
 ) -> Result<HiddenState, ExpertWeightsError> {
+    if !d_model.is_multiple_of(Q4_0_BLOCK_ELEMS) || !d_ff.is_multiple_of(Q4_0_BLOCK_ELEMS) {
+        return Err(ExpertWeightsError::InvalidLayout(format!(
+            "Q4_0 QMatMul requires d_model and d_ff to be multiples of {Q4_0_BLOCK_ELEMS}, got d_model={d_model}, d_ff={d_ff}"
+        )));
+    }
     let gate_b = &bytes[0..one_bytes];
     let up_b = &bytes[one_bytes..2 * one_bytes];
     let down_b = &bytes[2 * one_bytes..3 * one_bytes];
@@ -5576,6 +5584,58 @@ mod tests {
         // refactor can't silently change the on-disk layout.
         assert_eq!(Q4_0_BLOCK_ELEMS, 32);
         assert_eq!(Q4_0_BLOCK_BYTES, 2 + 16); // f16 + 16 nibble bytes
+        assert_eq!(Q4_0_LAYOUT_STANDARD_V1, "ggml-standard-v1");
+    }
+
+    #[test]
+    fn q4_0_non_symmetric_block_matches_ggml_and_candle() {
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        for (j, byte) in block[2..].iter_mut().enumerate() {
+            *byte = j as u8 | ((15 - j as u8) << 4);
+        }
+
+        let mut mer = [0.0f32; Q4_0_BLOCK_ELEMS];
+        dequantize_q4_0_block(&block, &mut mer);
+        let expected: Vec<f32> = (0..16)
+            .map(|j| 0.5 * (j as f32 - 8.0))
+            .chain((0..16).map(|j| 0.5 * (7.0 - j as f32)))
+            .collect();
+        assert_eq!(mer.as_slice(), expected.as_slice());
+
+        let candle = cpu_qtensor_from_blocks(&block, 1, Q4_0_BLOCK_ELEMS, GgmlDType::Q4_0)
+            .expect("Candle Q4_0 tensor")
+            .dequantize(&Device::Cpu)
+            .expect("Candle dequantize")
+            .flatten_all()
+            .expect("flatten Candle tensor")
+            .to_vec1::<f32>()
+            .expect("Candle values");
+        assert_eq!(candle, expected);
+    }
+
+    #[test]
+    fn q4_0_writer_emits_exact_ggml_nibble_bytes() {
+        let low_q: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 8];
+        let high_q: [u8; 16] = [9, 10, 11, 12, 13, 14, 15, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let src: Vec<f32> = low_q
+            .iter()
+            .chain(high_q.iter())
+            .map(|q| *q as f32 - 8.0)
+            .collect();
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        quantize_q4_0_block(&src, &mut block);
+
+        assert_eq!(
+            &block[..2],
+            &half::f16::from_f32(1.0).to_bits().to_le_bytes()
+        );
+        let expected: Vec<u8> = low_q
+            .iter()
+            .zip(high_q.iter())
+            .map(|(&low, &high)| low | (high << 4))
+            .collect();
+        assert_eq!(&block[2..], expected.as_slice());
     }
 
     #[test]
@@ -5606,6 +5666,46 @@ mod tests {
         for (a, b) in src.iter().zip(decoded.iter()) {
             let err = (a - b).abs();
             assert!(err <= d * 1.01, "err {err} exceeds bound {d}");
+        }
+    }
+
+    #[test]
+    fn q4_0_round_trip_covers_diverse_block_shapes() {
+        let mut pseudo_random = [0.0f32; Q4_0_BLOCK_ELEMS];
+        let mut state = 0xD1CE_BA5E_1234_5678u64;
+        for value in &mut pseudo_random {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *value = ((state % 20_001) as f32 - 10_000.0) / 37.0;
+        }
+        let cases: Vec<[f32; Q4_0_BLOCK_ELEMS]> = vec![
+            [0.0; Q4_0_BLOCK_ELEMS],
+            std::array::from_fn(|i| (i as f32 - 15.5) / 3.0),
+            std::array::from_fn(|i| if i & 1 == 0 { -7.0 } else { 7.0 }),
+            std::array::from_fn(|i| {
+                if i < 16 {
+                    i as f32 / 5.0
+                } else {
+                    -50.0 + i as f32
+                }
+            }),
+            std::array::from_fn(|i| if i == 0 { -1.0e4 } else { i as f32 * 1.0e-3 }),
+            pseudo_random,
+        ];
+
+        for (case_idx, src) in cases.iter().enumerate() {
+            let mut block = [0u8; Q4_0_BLOCK_BYTES];
+            quantize_q4_0_block(src, &mut block);
+            let mut decoded = [0.0f32; Q4_0_BLOCK_ELEMS];
+            dequantize_q4_0_block(&block, &mut decoded);
+            let d = src.iter().fold(0.0f32, |max, value| max.max(value.abs())) / 7.0;
+            for (element, (&actual, &wanted)) in decoded.iter().zip(src.iter()).enumerate() {
+                assert!(
+                    (actual - wanted).abs() <= d * 1.01 + f32::EPSILON,
+                    "case {case_idx} element {element}: {actual} vs {wanted}, d={d}"
+                );
+            }
         }
     }
 
@@ -6426,22 +6526,21 @@ mod tests {
         let d_model = Q4_0_BLOCK_ELEMS; // 32 — block-aligned cols.
         let d_ff = 64usize;
         let blocks_per_matrix = (d_model * d_ff).div_ceil(Q4_0_BLOCK_ELEMS);
-        // Build one synthetic Q4_0 block with structured nibble
-        // contents: scale = 0.05, every nibble = 9 (signed-4 →
-        // (9 - 8) = 1 → weight = 0.05). Replicating it across all
-        // tensors gives a constant-weight expert whose output is
-        // analytically tractable and finite.
-        let mut blk = [0u8; Q4_0_BLOCK_BYTES];
-        let scale: f32 = 0.05;
-        let scale16 = half::f16::from_f32(scale).to_bits().to_le_bytes();
-        blk[0..2].copy_from_slice(&scale16);
-        let q = 9u8; // signed offset 9-8=+1
-        for i in 2..Q4_0_BLOCK_BYTES {
-            blk[i] = q | (q << 4);
-        }
         let mut bytes = Vec::new();
-        for _ in 0..(3 * blocks_per_matrix) {
-            bytes.extend_from_slice(&blk);
+        for projection in 0..3 {
+            for block_idx in 0..blocks_per_matrix {
+                let weights: [f32; Q4_0_BLOCK_ELEMS] = std::array::from_fn(|i| {
+                    let sign = if (i + block_idx + projection) & 1 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    sign * ((i * 11 + block_idx * 7 + projection * 5) % 17) as f32 / 20.0
+                });
+                let mut block = [0u8; Q4_0_BLOCK_BYTES];
+                quantize_q4_0_block(&weights, &mut block);
+                bytes.extend_from_slice(&block);
+            }
         }
 
         // Hidden state: deterministic synth.
@@ -6459,14 +6558,29 @@ mod tests {
                 a.is_finite() && b.is_finite(),
                 "non-finite at idx {i}: baseline={a} qmm={b}"
             );
-            // Baseline & qmm differ only in matmul accumulation
-            // order + f16 dequant rounding; bound generously.
-            let tol = 1e-3 * a.abs().max(1.0) + 1e-5;
+            // Candle's quantized QMatMul converts each activation operand
+            // to Q8_0 before the Q4_0 dot product. The baseline keeps F32
+            // activations, so full-expert SwiGLU compounds two bounded
+            // activation-quantization errors even though the weight bytes
+            // (covered independently above) are identical.
+            let tol = 5e-2 * a.abs().max(1.0) + 1e-5;
             assert!(
                 (a - b).abs() <= tol,
                 "QMatMul Q4_0 path diverged at {i}: baseline={a} qmm={b} (tol={tol})"
             );
         }
+    }
+
+    #[test]
+    fn q4_0_qmm_rejects_unaligned_dimensions() {
+        let d_model = Q4_0_BLOCK_ELEMS - 1;
+        let d_ff = Q4_0_BLOCK_ELEMS;
+        let bytes = synth_q4_0_blob(d_model, d_ff);
+        let x = vec![0.0; d_model];
+        assert!(matches!(
+            forward_q4_0_qmm_from_bytes(&bytes, &x, d_model, d_ff, 0),
+            Err(ExpertWeightsError::InvalidLayout(_))
+        ));
     }
 
     /// Build a synthetic Q4_0 `gate||up||down` blob for the given dims

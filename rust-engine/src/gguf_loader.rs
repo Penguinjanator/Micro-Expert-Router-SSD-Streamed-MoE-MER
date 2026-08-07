@@ -18,11 +18,10 @@
 //! already consumes: `gate_proj || up_proj || down_proj` row-major, with
 //! gate / up shape `[d_ff, d_model]` and down shape `[d_model, d_ff]`.
 //! For F32, F16 and BF16 source dtypes the bytes are repacked into that
-//! layout directly (BF16 and F16 are decoded to F32); for Q4_0 / Q4_K we
-//! currently dequantise to F32 because the
-//! GGUF stores each (gate, up, down) tensor as a single block stream
-//! that doesn't slice cleanly along the expert axis at the byte level.
-//! This preserves the **engine's** on-disk format invariants
+//! layout directly (BF16 and F16 are decoded to F32). Supported native
+//! quantised tensors whose expert slices are block-aligned are copied
+//! byte-for-byte; other layouts use the F32 conversion path. This
+//! preserves the **engine's** on-disk format invariants
 //! (`expert_size` is the same for every expert, the file is page-padded,
 //! and `metadata.json::dtype` correctly describes the contents).
 
@@ -32,9 +31,9 @@ use crate::dense_tensor::{
 use crate::gguf::{ggml_dtype, GgufFile, GgufSource, GgufTensorInfo, GgufValue};
 use crate::inference::{
     dequantize_bf16_to_f32, dequantize_f16_to_f32, expert_weight_bytes_for,
-    projection_weight_bytes_for, WeightDtype,
-    Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q5K_BLOCK_BYTES,
-    Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES, Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
+    projection_weight_bytes_for, WeightDtype, Q4K_BLOCK_BYTES, Q4K_BLOCK_ELEMS, Q4_0_BLOCK_BYTES,
+    Q4_0_BLOCK_ELEMS, Q4_0_LAYOUT_STANDARD_V1, Q5K_BLOCK_BYTES, Q5K_BLOCK_ELEMS, Q6K_BLOCK_BYTES,
+    Q6K_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS,
 };
 use crate::tensor_header::{MixedExpertHeader, ProjectionRange, TensorHeader, UthDtypeId};
 use serde::{Deserialize, Serialize};
@@ -101,6 +100,8 @@ struct ExtractedMetadata<'a> {
     expert_layout_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_dtype_histogram: Option<BTreeMap<String, usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    q4_0_layout: Option<&'a str>,
     experts_written: usize,
     dense_tensors_written: usize,
 }
@@ -1236,6 +1237,10 @@ fn extract_experts_from_source_inner(
         projection_dtype_histogram: native_plan
             .as_ref()
             .and_then(NativeQuantPlan::metadata_histogram),
+        q4_0_layout: native_plan
+            .as_ref()
+            .filter(|plan| plan.contains_q4_0())
+            .map(|_| Q4_0_LAYOUT_STANDARD_V1),
         experts_written: report.experts_written,
         dense_tensors_written: report.dense_written,
     };
@@ -1598,6 +1603,8 @@ struct ValidationMetadata {
     #[serde(default)]
     projection_dtype_histogram: Option<BTreeMap<String, usize>>,
     #[serde(default)]
+    q4_0_layout: Option<String>,
+    #[serde(default)]
     experts_written: Option<usize>,
 }
 
@@ -1654,6 +1661,11 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
             format!("metadata dtype {:?} is not supported", meta.dtype),
         )
     })?;
+    validate_q4_0_layout_marker(
+        metadata_uses_q4_0(dtype, meta.projection_dtype_histogram.as_ref()),
+        meta.q4_0_layout.as_deref(),
+        &meta_path,
+    )?;
     if meta.block_align == 0 || !meta.block_align.is_power_of_two() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1804,6 +1816,17 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
         }
     }
 
+    // Mixed metadata is only a summary; the UTH2 projection ranges are
+    // authoritative. Reconcile the marker against the observed headers so
+    // an omitted or incomplete histogram cannot conceal Q4_0 payloads.
+    if dtype == WeightDtype::Mixed {
+        validate_q4_0_layout_marker(
+            metadata_uses_q4_0(dtype, Some(&observed_hist)),
+            meta.q4_0_layout.as_deref(),
+            &meta_path,
+        )?;
+    }
+
     if let Some(expected_hist) = meta.projection_dtype_histogram {
         if dtype == WeightDtype::Mixed && expected_hist != observed_hist {
             return Err(io::Error::new(
@@ -1823,6 +1846,179 @@ pub fn validate_data_dir(data_dir: &Path) -> io::Result<DataValidationReport> {
         dtype,
         mixed_experts: observed_mixed,
     })
+}
+
+fn metadata_uses_q4_0(
+    dtype: WeightDtype,
+    projection_dtype_histogram: Option<&BTreeMap<String, usize>>,
+) -> bool {
+    dtype == WeightDtype::Q4_0
+        || (dtype == WeightDtype::Mixed
+            && projection_dtype_histogram.is_some_and(|histogram| {
+                histogram.keys().any(|layout| {
+                    layout.split('/').any(|projection| {
+                        WeightDtype::from_str_opt(projection) == Some(WeightDtype::Q4_0)
+                    })
+                })
+            }))
+}
+
+fn projection_dtype_histogram_is_complete(
+    histogram: &BTreeMap<String, usize>,
+    num_experts: usize,
+) -> bool {
+    !histogram.is_empty()
+        && histogram.iter().all(|(layout, count)| {
+            *count > 0
+                && layout.split('/').count() == 3
+                && layout.split('/').all(|projection| {
+                    WeightDtype::from_str_opt(projection)
+                        .is_some_and(|dtype| dtype != WeightDtype::Mixed)
+                })
+        })
+        && histogram
+            .values()
+            .try_fold(0usize, |total, count| total.checked_add(*count))
+            == Some(num_experts)
+}
+
+fn mixed_expert_headers_use_q4_0(data_dir: &Path, num_experts: usize) -> io::Result<bool> {
+    use std::io::Read;
+
+    for id in 0..num_experts {
+        let path = data_dir.join(format!("expert_{id}.bin"));
+        let mut head = [0u8; crate::tensor_header::UTH2_BYTES];
+        let mut file = fs::File::open(&path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: failed to open UTH2 header {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        file.read_exact(&mut head).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: failed to read UTH2 header {}: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        let header = MixedExpertHeader::probe(&head).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "mixed metadata cannot prove Q4_0 is absent: expert file {} has no valid UTH2 header; regenerate or reconvert the dataset",
+                    path.display()
+                ),
+            )
+        })?;
+        if [header.gate, header.up, header.down]
+            .into_iter()
+            .any(|projection| projection.dtype.to_weight() == WeightDtype::Q4_0)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn mixed_metadata_or_headers_use_q4_0(
+    data_dir: &Path,
+    meta: &ValidationMetadata,
+) -> io::Result<bool> {
+    if let Some(histogram) = meta.projection_dtype_histogram.as_ref() {
+        if projection_dtype_histogram_is_complete(histogram, meta.num_experts) {
+            return Ok(metadata_uses_q4_0(WeightDtype::Mixed, Some(histogram)));
+        }
+    }
+    mixed_expert_headers_use_q4_0(data_dir, meta.num_experts)
+}
+
+fn validate_q4_0_layout_marker(
+    requires_q4_0: bool,
+    marker: Option<&str>,
+    meta_path: &Path,
+) -> io::Result<()> {
+    if !requires_q4_0 {
+        return Ok(());
+    }
+    if marker == Some(Q4_0_LAYOUT_STANDARD_V1) {
+        return Ok(());
+    }
+    let found = marker.unwrap_or("<missing>");
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "metadata {} has missing, legacy, or unsupported Q4_0 layout marker {found:?}; expected q4_0_layout={Q4_0_LAYOUT_STANDARD_V1:?}. Reconvert the original GGUF or regenerate this dataset before loading it",
+            meta_path.display()
+        ),
+    ))
+}
+
+/// Fail closed before opening a runtime dataset that is known to use Q4_0.
+///
+/// Q4_0 datasets created before the standard GGML nibble contract were
+/// versioned may contain the legacy adjacent-nibble layout. They must be
+/// reconverted or regenerated; production does not guess or dual-decode.
+pub fn validate_q4_0_dataset_layout(
+    data_dir: &Path,
+    configured_dtype: WeightDtype,
+) -> io::Result<()> {
+    let configured_may_use_q4_0 =
+        configured_dtype == WeightDtype::Q4_0 || configured_dtype == WeightDtype::Mixed;
+    let meta_path = data_dir.join("metadata.json");
+    let body = match fs::read_to_string(&meta_path) {
+        Ok(body) => body,
+        Err(err)
+            if configured_dtype == WeightDtype::Mixed && err.kind() == io::ErrorKind::NotFound =>
+        {
+            // Preserve pre-existing non-Q4 mixed-dataset behavior when no
+            // metadata exists. A metadata-declared mixed Q4_0 dataset is
+            // still checked below.
+            return Ok(());
+        }
+        Err(_) if !configured_may_use_q4_0 => return Ok(()),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!(
+                    "Q4_0 dataset metadata {} is required to prove q4_0_layout={Q4_0_LAYOUT_STANDARD_V1:?}; reconvert the original GGUF or regenerate this dataset: {err}",
+                    meta_path.display()
+                ),
+            ));
+        }
+    };
+    let meta: ValidationMetadata = match serde_json::from_str(&body) {
+        Ok(meta) => meta,
+        Err(_) if !configured_may_use_q4_0 => return Ok(()),
+        Err(err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Q4_0 dataset metadata {} is invalid; reconvert the original GGUF or regenerate this dataset: {err}",
+                    meta_path.display()
+                ),
+            ));
+        }
+    };
+    let declared_dtype = match WeightDtype::from_str_opt(&meta.dtype) {
+        Some(dtype) => dtype,
+        None if !configured_may_use_q4_0 => return Ok(()),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("metadata dtype {:?} is not supported", meta.dtype),
+            ));
+        }
+    };
+    let requires_q4_0 = configured_dtype == WeightDtype::Q4_0
+        || metadata_uses_q4_0(declared_dtype, meta.projection_dtype_histogram.as_ref())
+        || (declared_dtype == WeightDtype::Mixed
+            && mixed_metadata_or_headers_use_q4_0(data_dir, &meta)?);
+    validate_q4_0_layout_marker(requires_q4_0, meta.q4_0_layout.as_deref(), &meta_path)
 }
 
 fn f32_vec_to_le_bytes(v: &[f32]) -> Vec<u8> {
@@ -2439,6 +2635,17 @@ impl NativeQuantPlan {
         match self {
             NativeQuantPlan::Homogeneous { .. } => None,
             NativeQuantPlan::Mixed { histogram, .. } => Some(histogram.clone()),
+        }
+    }
+
+    fn contains_q4_0(&self) -> bool {
+        match self {
+            NativeQuantPlan::Homogeneous { dtype } => *dtype == WeightDtype::Q4_0,
+            NativeQuantPlan::Mixed { layouts, .. } => layouts.iter().any(|layout| {
+                [layout.gate, layout.up, layout.down]
+                    .into_iter()
+                    .any(|projection| projection.dtype == WeightDtype::Q4_0)
+            }),
         }
     }
 }
@@ -4172,6 +4379,131 @@ mod tests {
     }
 
     #[test]
+    fn native_q4_0_interleaved_extraction_preserves_exact_bytes() {
+        struct FakeSource {
+            tensors: std::collections::HashMap<String, GgufTensorInfo>,
+            data: std::collections::HashMap<String, Vec<u8>>,
+            metadata: std::collections::HashMap<String, GgufValue>,
+        }
+        impl GgufSource for FakeSource {
+            fn metadata(&self) -> &std::collections::HashMap<String, GgufValue> {
+                &self.metadata
+            }
+            fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
+                self.tensors.get(name)
+            }
+            fn read_tensor_owned(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+                Ok(self.data.get(name).cloned())
+            }
+        }
+
+        let d_model = 4usize;
+        let d_ff = 16usize;
+        let num_experts = 3usize;
+        let blocks = d_model * d_ff / Q4_0_BLOCK_ELEMS;
+        let mut tensors = std::collections::HashMap::new();
+        let mut data = std::collections::HashMap::new();
+        for (projection, name) in [
+            "blk.0.ffn_gate_exps.weight",
+            "blk.0.ffn_up_exps.weight",
+            "blk.0.ffn_down_exps.weight",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let blob: Vec<u8> = (0..num_experts)
+                .flat_map(|expert| q4_0_fixture_blob(blocks, expert, projection))
+                .collect();
+            tensors.insert(
+                name.to_string(),
+                GgufTensorInfo {
+                    name: name.to_string(),
+                    shape: vec![d_model as u64, d_ff as u64, num_experts as u64],
+                    ggml_dtype: ggml_dtype::Q4_0,
+                    offset: 0,
+                    byte_len: blob.len() as u64,
+                },
+            );
+            data.insert(name.to_string(), blob);
+        }
+        let source = FakeSource {
+            tensors,
+            data,
+            metadata: std::collections::HashMap::new(),
+        };
+        let extracted = load_layer_expert_native_quant(
+            &source,
+            0,
+            num_experts,
+            d_model,
+            d_ff,
+            WeightDtype::Q4_0,
+        )
+        .expect("interleaved extraction");
+        for (expert, (gate, up, down)) in extracted.iter().enumerate() {
+            assert_eq!(gate, &q4_0_fixture_blob(blocks, expert, 0));
+            assert_eq!(up, &q4_0_fixture_blob(blocks, expert, 1));
+            assert_eq!(down, &q4_0_fixture_blob(blocks, expert, 2));
+        }
+    }
+
+    #[test]
+    fn runtime_q4_0_layout_check_is_explicit_and_fail_closed() {
+        let tmp = tempfile_dir();
+        assert!(validate_q4_0_dataset_layout(&tmp, WeightDtype::F32).is_ok());
+
+        let missing = validate_q4_0_dataset_layout(&tmp, WeightDtype::Q4_0)
+            .expect_err("Q4_0 metadata is mandatory");
+        assert!(missing.to_string().contains("regenerate"));
+
+        fs::write(tmp.join("metadata.json"), b"{not-json").unwrap();
+        assert!(validate_q4_0_dataset_layout(&tmp, WeightDtype::F32).is_ok());
+        let corrupt = validate_q4_0_dataset_layout(&tmp, WeightDtype::Q4_0)
+            .expect_err("corrupt metadata must fail");
+        assert!(corrupt.to_string().contains("invalid"));
+
+        let mut metadata = serde_json::json!({
+            "num_experts": 1,
+            "d_model": 32,
+            "d_ff": 32,
+            "expert_size": DEFAULT_BLOCK_ALIGN,
+            "block_align": DEFAULT_BLOCK_ALIGN,
+            "dtype": "q4_0",
+            "experts_written": 1,
+        });
+        fs::write(
+            tmp.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+        let unversioned = validate_q4_0_dataset_layout(&tmp, WeightDtype::Q4_0)
+            .expect_err("unversioned Q4_0 must fail");
+        assert!(unversioned.to_string().contains("<missing>"));
+        assert!(validate_q4_0_dataset_layout(&tmp, WeightDtype::F32).is_err());
+
+        metadata["q4_0_layout"] = serde_json::json!(Q4_0_LAYOUT_STANDARD_V1);
+        fs::write(
+            tmp.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+        validate_q4_0_dataset_layout(&tmp, WeightDtype::Q4_0).expect("standard marker accepted");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn mixed_histogram_q4_0_detection_uses_supported_dtype_aliases() {
+        for layout in ["q4_0/q8_0/q8_0", "Q4_0/q8_0/q8_0", "q4/q8_0/q8_0"] {
+            let histogram = BTreeMap::from([(layout.to_string(), 1usize)]);
+            assert!(metadata_uses_q4_0(
+                WeightDtype::Mixed,
+                Some(&histogram)
+            ));
+            assert!(projection_dtype_histogram_is_complete(&histogram, 1));
+        }
+    }
+
+    #[test]
     fn uniform_tail_block_layout_uses_uth2_plan() {
         let weights = Q5K_BLOCK_ELEMS + 1;
         let payload_bytes =
@@ -4230,6 +4562,20 @@ mod tests {
         out
     }
 
+    fn q4_0_fixture_blob(blocks: usize, expert: usize, projection: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(blocks * Q4_0_BLOCK_BYTES);
+        for block in 0..blocks {
+            let scale = 0.0625 * (1 + expert * 3 + projection * 5 + block) as f32;
+            out.extend_from_slice(&half::f16::from_f32(scale).to_bits().to_le_bytes());
+            for j in 0..16 {
+                let low = (j + expert + projection * 3 + block * 5) as u8 & 0x0f;
+                let high = (15usize + expert * 7 + projection * 5 + block * 3 - j) as u8 & 0x0f;
+                out.push(low | (high << 4));
+            }
+        }
+        out
+    }
+
     /// Leak an owned `String` into a `'static str`. Test-only helper for
     /// building metadata key tables whose names are computed at runtime
     /// (e.g. `<arch>.block_count`); the small leak is bounded by the
@@ -4251,14 +4597,6 @@ mod tests {
         use crate::gguf::GGUF_MAGIC;
         assert_eq!((d_ff * d_model) % Q4_0_BLOCK_ELEMS, 0);
         let blocks = (d_ff * d_model) / Q4_0_BLOCK_ELEMS;
-        // One Q4_0 block: f16 scale 0.1 (0x2e66) + 16 nibble-pair bytes.
-        let q4_0_block: Vec<u8> = {
-            let mut b = vec![0x66u8, 0x2e];
-            b.extend_from_slice(&[0x77u8; 16]);
-            b
-        };
-        let expert_blob: Vec<u8> = q4_0_block.repeat(blocks);
-
         let mut out = Vec::new();
         out.extend_from_slice(GGUF_MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes());
@@ -4402,21 +4740,21 @@ mod tests {
                 &format!("blk.0.ffn_gate.{e}.weight"),
                 &[d_model as u64, d_ff as u64],
                 ggml_dtype::Q4_0,
-                expert_blob.clone(),
+                q4_0_fixture_blob(blocks, e, 0),
             );
             push_raw(
                 &mut out,
                 &format!("blk.0.ffn_up.{e}.weight"),
                 &[d_model as u64, d_ff as u64],
                 ggml_dtype::Q4_0,
-                expert_blob.clone(),
+                q4_0_fixture_blob(blocks, e, 1),
             );
             push_raw(
                 &mut out,
                 &format!("blk.0.ffn_down.{e}.weight"),
                 &[d_ff as u64, d_model as u64],
                 ggml_dtype::Q4_0,
-                expert_blob.clone(),
+                q4_0_fixture_blob(blocks, e, 2),
             );
         }
         while out.len() % 32 != 0 {
@@ -4438,17 +4776,11 @@ mod tests {
         assert_eq!((d_ff * d_model) % Q8_0_BLOCK_ELEMS, 0);
         let q4_blocks = (d_ff * d_model) / Q4_0_BLOCK_ELEMS;
         let q8_blocks = (d_ff * d_model) / Q8_0_BLOCK_ELEMS;
-        let q4_block: Vec<u8> = {
-            let mut b = half::f16::from_f32(0.1).to_bits().to_le_bytes().to_vec();
-            b.extend_from_slice(&[0x88u8; 16]);
-            b
-        };
         let q8_block: Vec<u8> = {
             let mut b = half::f16::from_f32(0.1).to_bits().to_le_bytes().to_vec();
             b.extend_from_slice(&[1u8; 32]);
             b
         };
-        let q4_blob = q4_block.repeat(q4_blocks);
         let q8_blob = q8_block.repeat(q8_blocks);
 
         let mut out = Vec::new();
@@ -4593,14 +4925,14 @@ mod tests {
                 &format!("blk.0.ffn_gate.{e}.weight"),
                 &[d_model as u64, d_ff as u64],
                 ggml_dtype::Q4_0,
-                q4_blob.clone(),
+                q4_0_fixture_blob(q4_blocks, e, 0),
             );
             push_raw(
                 &mut out,
                 &format!("blk.0.ffn_up.{e}.weight"),
                 &[d_model as u64, d_ff as u64],
                 ggml_dtype::Q4_0,
-                q4_blob.clone(),
+                q4_0_fixture_blob(q4_blocks, e, 1),
             );
             push_raw(
                 &mut out,
@@ -4665,6 +4997,34 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(meta["dtype"], "q4_0");
+        assert_eq!(meta["q4_0_layout"], Q4_0_LAYOUT_STANDARD_V1);
+        validate_data_dir(&out).expect("converted GGUF Q4_0 validates");
+
+        let meta_path = out.join("metadata.json");
+        for (marker, expected_fragment) in [
+            (None, "<missing>"),
+            (Some("mer-adjacent-v0"), "mer-adjacent-v0"),
+            (Some("ggml-standard-v999"), "ggml-standard-v999"),
+        ] {
+            let mut incompatible = meta.clone();
+            match marker {
+                Some(value) => incompatible["q4_0_layout"] = serde_json::json!(value),
+                None => {
+                    incompatible.as_object_mut().unwrap().remove("q4_0_layout");
+                }
+            }
+            fs::write(
+                &meta_path,
+                serde_json::to_vec_pretty(&incompatible).unwrap(),
+            )
+            .unwrap();
+            let err = validate_data_dir(&out).expect_err("incompatible Q4_0 marker must fail");
+            let message = err.to_string();
+            assert!(message.contains(expected_fragment), "{message}");
+            assert!(message.contains("Reconvert") && message.contains("regenerate"));
+        }
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+        validate_data_dir(&out).expect("restored standard marker validates");
 
         // Raw quantised payload size, much smaller than the F32 dequant
         // (which would be 3 * d_ff * d_model * 4 bytes).
@@ -4677,6 +5037,19 @@ mod tests {
                 payload.len() >= q4_payload && payload.len() < f32_payload,
                 "expert {e} payload {} should be raw Q4_0 ({q4_payload}), not F32 ({f32_payload})",
                 payload.len()
+            );
+            let one_projection = q4_payload / 3;
+            assert_eq!(
+                &payload[..one_projection],
+                q4_0_fixture_blob((d_model * d_ff) / Q4_0_BLOCK_ELEMS, e, 0).as_slice()
+            );
+            assert_eq!(
+                &payload[one_projection..2 * one_projection],
+                q4_0_fixture_blob((d_model * d_ff) / Q4_0_BLOCK_ELEMS, e, 1).as_slice()
+            );
+            assert_eq!(
+                &payload[2 * one_projection..3 * one_projection],
+                q4_0_fixture_blob((d_model * d_ff) / Q4_0_BLOCK_ELEMS, e, 2).as_slice()
             );
         }
         let _ = fs::remove_dir_all(&tmp);
@@ -4719,10 +5092,64 @@ mod tests {
             serde_json::from_slice(&fs::read(out.join("metadata.json")).unwrap()).unwrap();
         assert_eq!(meta["dtype"], "mixed");
         assert_eq!(meta["expert_layout_version"], 2);
+        assert_eq!(meta["q4_0_layout"], Q4_0_LAYOUT_STANDARD_V1);
         assert_eq!(
             meta["projection_dtype_histogram"]["q4_0/q4_0/q8_0"],
             num_experts
         );
+        validate_data_dir(&out).expect("mixed Q4_0 metadata validates");
+        validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect("runtime accepts mixed Q4_0 metadata");
+
+        let meta_path = out.join("metadata.json");
+        let mut missing_histogram = meta.clone();
+        missing_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("projection_dtype_histogram");
+        missing_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("q4_0_layout");
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&missing_histogram).unwrap(),
+        )
+        .unwrap();
+        for err in [
+            validate_data_dir(&out).expect_err("UTH2 Q4_0 requires a layout marker"),
+            validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+                .expect_err("runtime must inspect UTH2 when the histogram is missing"),
+        ] {
+            assert!(err.to_string().contains("<missing>"), "{err}");
+        }
+
+        missing_histogram["q4_0_layout"] = serde_json::json!(Q4_0_LAYOUT_STANDARD_V1);
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&missing_histogram).unwrap(),
+        )
+        .unwrap();
+        validate_data_dir(&out).expect("UTH2 inspection proves standard Q4_0 layout");
+        validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect("standard marker makes runtime mixed metadata safe");
+
+        let mut incomplete_histogram = meta.clone();
+        incomplete_histogram["projection_dtype_histogram"] =
+            serde_json::json!({"q8_0/q8_0/q8_0": num_experts - 1});
+        incomplete_histogram
+            .as_object_mut()
+            .unwrap()
+            .remove("q4_0_layout");
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&incomplete_histogram).unwrap(),
+        )
+        .unwrap();
+        let err = validate_q4_0_dataset_layout(&out, WeightDtype::Mixed)
+            .expect_err("runtime must inspect UTH2 when the histogram is incomplete");
+        assert!(err.to_string().contains("<missing>"), "{err}");
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
 
         let q4_payload = (d_ff * d_model / Q4_0_BLOCK_ELEMS) * Q4_0_BLOCK_BYTES;
         let q8_payload = (d_ff * d_model / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES;
@@ -4767,9 +5194,10 @@ mod tests {
         );
         assert_eq!(actual.len(), expected.len());
         for (idx, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            let tolerance = 3e-3 * b.abs().max(1.0) + 3e-5;
             assert!(
-                (a - b).abs() <= 1e-5,
-                "mixed direct output mismatch at {idx}: actual={a}, expected={b}"
+                (a - b).abs() <= tolerance,
+                "mixed direct output mismatch at {idx}: actual={a}, expected={b}, tolerance={tolerance}"
             );
         }
         let _ = fs::remove_dir_all(&tmp);

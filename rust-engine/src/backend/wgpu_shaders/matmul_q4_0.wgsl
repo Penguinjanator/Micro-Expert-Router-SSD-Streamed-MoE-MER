@@ -10,9 +10,9 @@
 //
 // Block layout (must match `inference::dequantize_q4_0_block`):
 //   d  : f16 little-endian (2 bytes)   — block scale
-//   qs : 16 bytes                      — 32× 4-bit weights, low nibble
-//                                        first: elem 2j = qs[j] & 0xF,
-//                                        elem 2j+1 = qs[j] >> 4; both
+//   qs : 16 bytes                      — 32× 4-bit weights. For each j:
+//                                        elem j      = qs[j] & 0xF,
+//                                        elem j + 16 = qs[j] >> 4; both
 //                                        biased by -8.
 //
 // The expert FFN only ever needs N == 1 (a per-token GEMV), so this is a
@@ -68,14 +68,15 @@ fn matmul_q4_0_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s_hi = read_byte(byte_off + 1u);
         let d = unpack2x16float(s_lo | (s_hi << 8u)).x;
 
-        // 16 nibble bytes → 32 weights. Accumulate the un-scaled dot
-        // product per block and apply the scale once at the end.
+        // GGML Q4_0 stores element j in the low nibble and element j+16
+        // in the high nibble. Accumulate the un-scaled dot product per
+        // block and apply the scale once at the end.
         var partial = 0.0;
         for (var j = 0u; j < 16u; j = j + 1u) {
             let q = read_byte(byte_off + 2u + j);
             let w0 = f32(q & 0xfu) - 8.0;
             let w1 = f32(q >> 4u) - 8.0;
-            partial = partial + w0 * X[x_base + 2u * j] + w1 * X[x_base + 2u * j + 1u];
+            partial = partial + w0 * X[x_base + j] + w1 * X[x_base + j + 16u];
         }
         sum = sum + d * partial;
 

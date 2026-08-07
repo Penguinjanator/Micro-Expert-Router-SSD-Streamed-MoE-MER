@@ -3343,6 +3343,7 @@ async fn build_bench_real_runtime(
         )
         .into());
     }
+    crate::gguf_loader::validate_q4_0_dataset_layout(&cfg.model.data_dir, cfg.model.dtype)?;
 
     let storage = NvmeStorage::new(StorageConfig {
         base_path: cfg.model.data_dir.clone(),
@@ -4622,6 +4623,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         )
         .into());
     }
+    crate::gguf_loader::validate_q4_0_dataset_layout(&cfg.model.data_dir, cfg.model.dtype)?;
 
     // Wire the multi-layer extractor naming when num_layers > 1, so
     // either `expert_<id>.bin` or `expert_<layer>_<local>.bin` works.
@@ -5444,6 +5446,25 @@ fn cmd_gen_data(
         d_ff,
         dtype,
     )?;
+    if dtype == WeightDtype::Q4_0 {
+        let metadata = serde_json::json!({
+            "format_version": 2,
+            "conversion_mode": "synthetic",
+            "num_experts": num_experts,
+            "d_model": d_model,
+            "d_ff": d_ff,
+            "expert_size": expert_size,
+            "maximum_payload_bytes": weight_bytes,
+            "block_align": block_align,
+            "dtype": dtype.as_str(),
+            "weight_layout": "gate_proj || up_proj || down_proj (row-major)",
+            "q4_0_layout": crate::inference::Q4_0_LAYOUT_STANDARD_V1,
+            "experts_written": num_experts,
+        });
+        let mut body = serde_json::to_vec_pretty(&metadata)?;
+        body.push(b'\n');
+        std::fs::write(data_dir.join("metadata.json"), body)?;
+    }
     let total_bytes = num_experts as u64 * expert_size as u64;
     info!(
         elapsed_s = started.elapsed().as_secs_f64(),
@@ -5806,6 +5827,7 @@ async fn cmd_run(
     // `metadata.json` / `alias-map` lookups downstream. The other
     // directories only need to contain `expert_<id>.bin`.
     args.data_dir = primary_dir.clone();
+    crate::gguf_loader::validate_q4_0_dataset_layout(&args.data_dir, args.dtype)?;
 
     if args.io_uring {
         // CPU placement is a startup-level decision now. If the operator
@@ -7071,6 +7093,25 @@ fn json_get_u32_array(line: &str, key: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gen_data_q4_0_records_standard_layout_metadata() {
+        let dir = tempdir_unique("q4-standard-metadata");
+        cmd_gen_data(&dir, 2, 4096, 32, 32, 4096, "q4_0").expect("generate Q4_0");
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("metadata.json")).expect("metadata.json"),
+        )
+        .expect("metadata JSON");
+        assert_eq!(metadata["dtype"], "q4_0");
+        assert_eq!(
+            metadata["q4_0_layout"],
+            crate::inference::Q4_0_LAYOUT_STANDARD_V1
+        );
+        crate::gguf_loader::validate_data_dir(&dir).expect("generated dataset validates");
+        crate::gguf_loader::validate_q4_0_dataset_layout(&dir, crate::inference::WeightDtype::Q4_0)
+            .expect("runtime accepts generated dataset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cli_parses_rayon_threads_after_run_subcommand() {
