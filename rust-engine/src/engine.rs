@@ -1786,14 +1786,12 @@ impl Engine {
         self.core.execution_context.routed_expert_backend()
     }
 
-    /// Whether the configured expert dtype is eligible for the GPU
-    /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
-    /// qualifies only when both `d_model` and `d_ff` are
-    /// Q4_0-block-aligned: the raw block stream then has every matrix
-    /// row starting on a 32-element block boundary, which is what the
-    /// inline-dequant GEMV shader (`matmul_q4_0.wgsl`) assumes when it
-    /// walks `k / 32` blocks per row. All other dtypes stay on the
-    /// CPU path.
+    /// Whether the configured expert dtype and shape are eligible for the GPU
+    /// `Backend::expert_matmul` fast path. F32 and Q4_0 must fit the fixed GPU
+    /// expert workspace. Q4_0 additionally requires both `d_model` and `d_ff`
+    /// to be block-aligned so every matrix row starts on a 32-element block
+    /// boundary, as assumed by `matmul_q4_0.wgsl`. All other dtypes stay on
+    /// the CPU path.
     fn gpu_eligible_dtype(&self) -> bool {
         crate::backend::routed_expert_gpu_compatibility(
             crate::backend::RoutedExpertGpuSpec {
@@ -2548,11 +2546,6 @@ impl Engine {
                         is_gpu = self.routed_expert_backend().is_gpu(),
                         gpu_eligible_dtype = self.gpu_eligible_dtype(),
                         "generate GPU fast-path guard"
-                    );
-                    info!(
-                        is_gpu = self.routed_expert_backend().is_gpu(),
-                        gpu_eligible = self.gpu_eligible_dtype(),
-                        "generate GPU fast-path guard check"
                     );
                     let use_gpu =
                         self.routed_expert_backend().is_gpu() && self.gpu_eligible_dtype();

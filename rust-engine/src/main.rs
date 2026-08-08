@@ -1981,6 +1981,15 @@ fn install_run_gpu_backend(
     let compute_plane = backend.compute_plane().to_string();
     crate::backend::set_execution_context(execution_context.clone())
         .map_err(|e| format!("explicit --gpu request failed: context installation failed ({e})"))?;
+    if execution_context.plan().routed_experts() != crate::backend::ExecutionPlane::Gpu {
+        warn!(
+            dtype = routed_expert_gpu_spec.dtype.as_str(),
+            d_model = routed_expert_gpu_spec.d_model,
+            d_ff = routed_expert_gpu_spec.d_ff,
+            routed_expert_plane = execution_context.plan().routed_experts().as_str(),
+            "run --gpu resolved routed experts to CPU; expert compute is not GPU-offloaded"
+        );
+    }
     info!(
         device = device_name,
         compute_plane,

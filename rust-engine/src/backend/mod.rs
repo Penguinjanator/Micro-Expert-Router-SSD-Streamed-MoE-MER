@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-/// Maximum FFN intermediate dimension supported. Sized for Mixtral-8x7B (d_ff=14336).
-/// Increase if using models with larger d_ff.
+/// Maximum routed-expert workspace dimension supported for both `d_model` and
+/// `d_ff`. Sized for Mixtral-8x7B (`d_ff = 14336`).
 const MAX_EXPERT_D_FF: usize = 16_384;
 
 // Embed WGSL shaders using include_str
@@ -570,6 +570,14 @@ pub struct GpuBackend {
 }
 
 impl GpuBackend {
+    fn min_storage_buffer_offset_alignment(&self) -> u64 {
+        (self
+            .device
+            .limits()
+            .min_storage_buffer_offset_alignment as u64)
+            .max(1)
+    }
+
     pub async fn try_new(
         num_layers: usize,
         max_seq_len: usize,
@@ -1124,33 +1132,29 @@ impl GpuBackend {
         d_model:      usize,
         d_ff:         usize,
     ) -> anyhow::Result<VramExpertEntry> {
-
-        let proj_bytes = d_ff * d_model * 4;  // bytes per projection matrix
         anyhow::ensure!(
-            proj_bytes > 0,
+            d_model > 0 && d_ff > 0,
             "invalid expert shape: d_ff={} d_model={} produces zero-byte projections",
             d_ff,
             d_model
         );
+        let spec = RoutedExpertGpuSpec {
+            dtype: crate::inference::WeightDtype::F32,
+            d_model,
+            d_ff,
+        };
+        // Re-run startup compatibility at upload as a defensive check. Both
+        // paths share the checked projection-layout formula below.
+        routed_expert_gpu_compatibility(spec).map_err(|e| anyhow!(e))?;
+        let layout = f32_expert_projection_layout(
+            spec,
+            self.min_storage_buffer_offset_alignment(),
+        )
+        .map_err(|e| anyhow!(e))?;
         anyhow::ensure!(
-            weight_bytes.len() >= 3 * proj_bytes,
+            weight_bytes.len() >= layout.required_bytes,
             "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
-            weight_bytes.len(), 3 * proj_bytes, d_ff, d_model
-        );
-        anyhow::ensure!(
-            d_ff <= MAX_EXPERT_D_FF,
-            "d_ff={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
-            d_ff, MAX_EXPERT_D_FF
-        );
-        // `d_model` flows through the same `MAX_EXPERT_D_FF`-sized workspace
-        // buffers (`x_buf`, and `mid_1` reused for the [d_model] down output)
-        // and host scratch, so bound it here too — otherwise an oversized
-        // `d_model` only trips a late `assert!` mid-dispatch instead of
-        // failing cleanly at load time.
-        anyhow::ensure!(
-            d_model <= MAX_EXPERT_D_FF,
-            "d_model={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
-            d_model, MAX_EXPERT_D_FF
+            weight_bytes.len(), layout.required_bytes, d_ff, d_model
         );
 
         // ── Upload weights to VRAM ────────────────────────────────────────────
@@ -1162,33 +1166,12 @@ impl GpuBackend {
         });
         self.queue.write_buffer(&weight_buf, 0, weight_bytes);
 
-        // ── Sub-range offsets ─────────────────────────────────────────────────
-        // The per-dispatch bind groups (built in `expert_matmul_from_vram`
-        // against the checked-out workspace) bind gate/up/down as offset
-        // sub-ranges of this buffer, so the offsets must honour the
-        // device's storage-offset alignment.
-        let up_offset    = proj_bytes as u64;
-        let down_offset  = 2 * proj_bytes as u64;
-        let min_align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
-        anyhow::ensure!(
-            up_offset % min_align == 0,
-            "expert projection slice offset {} is not aligned to min_storage_buffer_offset_alignment={}",
-            up_offset,
-            min_align
-        );
-        anyhow::ensure!(
-            down_offset % min_align == 0,
-            "expert projection slice offset {} is not aligned to min_storage_buffer_offset_alignment={}",
-            down_offset,
-            min_align
-        );
-
         Ok(VramExpertEntry {
             weight_buf,
             d_model,
             d_ff,
             layout: VramWeightLayout::F32,
-            proj_bytes: proj_bytes as u64,
+            proj_bytes: layout.projection_offset,
             up_block_off: 0,
             down_block_off: 0,
         })
@@ -1221,23 +1204,14 @@ impl GpuBackend {
             "invalid expert shape: d_ff={} d_model={}",
             d_ff, d_model
         );
-        anyhow::ensure!(
-            d_model % Q4_0_BLOCK_ELEMS == 0 && d_ff % Q4_0_BLOCK_ELEMS == 0,
-            "Q4_0 GPU path requires block-aligned dims: d_model={} d_ff={} (block={})",
-            d_model, d_ff, Q4_0_BLOCK_ELEMS
-        );
-        anyhow::ensure!(
-            d_ff <= MAX_EXPERT_D_FF,
-            "d_ff={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
-            d_ff, MAX_EXPERT_D_FF
-        );
-        // Same `MAX_EXPERT_D_FF` workspace bound applies to `d_model`
-        // (the down projection writes [d_model] into a workspace buffer).
-        anyhow::ensure!(
-            d_model <= MAX_EXPERT_D_FF,
-            "d_model={} exceeds MAX_EXPERT_D_FF={}; increase the constant",
-            d_model, MAX_EXPERT_D_FF
-        );
+        // Re-run the shared block-alignment and workspace checks at upload so
+        // startup validation never replaces this defensive boundary.
+        routed_expert_gpu_compatibility(RoutedExpertGpuSpec {
+            dtype: crate::inference::WeightDtype::Q4_0,
+            d_model,
+            d_ff,
+        })
+        .map_err(|e| anyhow!(e))?;
 
         // `checked_mul` guards against `usize` overflow on user-configurable
         // dims; the division is exact (block alignment is enforced above and
@@ -2344,10 +2318,23 @@ pub enum RoutedExpertGpuIncompatibility {
     UnsupportedDtype {
         dtype: crate::inference::WeightDtype,
     },
+    ShapeExceedsWorkspace {
+        d_model: usize,
+        d_ff: usize,
+        max: usize,
+    },
     MisalignedQ4_0 {
         d_model: usize,
         d_ff: usize,
         block_elems: usize,
+    },
+    F32ProjectionSizeOverflow {
+        d_model: usize,
+        d_ff: usize,
+    },
+    F32StorageOffsetMisaligned {
+        projection_bytes: usize,
+        required_alignment: u64,
     },
 }
 
@@ -2360,6 +2347,11 @@ impl fmt::Display for RoutedExpertGpuIncompatibility {
                  are f32 and block-aligned q4_0",
                 dtype.as_str()
             ),
+            Self::ShapeExceedsWorkspace { d_model, d_ff, max } => write!(
+                f,
+                "routed-expert GPU workspace supports d_model and d_ff up to {max}; got \
+                 d_model={d_model}, d_ff={d_ff}"
+            ),
             Self::MisalignedQ4_0 {
                 d_model,
                 d_ff,
@@ -2369,17 +2361,41 @@ impl fmt::Display for RoutedExpertGpuIncompatibility {
                 "routed-expert q4_0 geometry requires d_model and d_ff to be multiples of \
                  {block_elems}; got d_model={d_model}, d_ff={d_ff}"
             ),
+            Self::F32ProjectionSizeOverflow { d_model, d_ff } => write!(
+                f,
+                "routed-expert f32 projection size overflows addressable storage for \
+                 d_model={d_model}, d_ff={d_ff}"
+            ),
+            Self::F32StorageOffsetMisaligned {
+                projection_bytes,
+                required_alignment,
+            } => write!(
+                f,
+                "routed-expert f32 projection size {projection_bytes} bytes does not satisfy \
+                 the selected GPU's min_storage_buffer_offset_alignment={required_alignment}"
+            ),
         }
     }
 }
 
-/// Authoritative routed-expert GPU compatibility rule shared by resolution
-/// and execution. This must stay aligned with the formats implemented by
-/// `GpuBackend::expert_matmul`.
+impl std::error::Error for RoutedExpertGpuIncompatibility {}
+
+/// Authoritative device-independent routed-expert GPU compatibility rule
+/// shared by resolution and execution. Device-specific limits are validated
+/// separately during backend construction. Both checks must stay aligned with
+/// the formats implemented by `GpuBackend::expert_matmul`.
 pub fn routed_expert_gpu_compatibility(
     spec: RoutedExpertGpuSpec,
 ) -> std::result::Result<(), RoutedExpertGpuIncompatibility> {
     use crate::inference::{WeightDtype, Q4_0_BLOCK_ELEMS};
+
+    if spec.d_model > MAX_EXPERT_D_FF || spec.d_ff > MAX_EXPERT_D_FF {
+        return Err(RoutedExpertGpuIncompatibility::ShapeExceedsWorkspace {
+            d_model: spec.d_model,
+            d_ff: spec.d_ff,
+            max: MAX_EXPERT_D_FF,
+        });
+    }
 
     match spec.dtype {
         WeightDtype::F32 => Ok(()),
@@ -2396,6 +2412,60 @@ pub fn routed_expert_gpu_compatibility(
         }),
         dtype => Err(RoutedExpertGpuIncompatibility::UnsupportedDtype { dtype }),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct F32ExpertProjectionLayout {
+    projection_bytes: usize,
+    projection_offset: u64,
+    required_bytes: usize,
+}
+
+/// Checked F32 projection layout shared by startup compatibility validation
+/// and the defensive upload path.
+fn f32_expert_projection_layout(
+    spec: RoutedExpertGpuSpec,
+    required_alignment: u64,
+) -> std::result::Result<F32ExpertProjectionLayout, RoutedExpertGpuIncompatibility> {
+    let overflow = || RoutedExpertGpuIncompatibility::F32ProjectionSizeOverflow {
+        d_model: spec.d_model,
+        d_ff: spec.d_ff,
+    };
+    let projection_bytes = spec
+        .d_ff
+        .checked_mul(spec.d_model)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(overflow)?;
+    let down_offset_bytes = projection_bytes.checked_mul(2).ok_or_else(overflow)?;
+    let required_bytes = projection_bytes.checked_mul(3).ok_or_else(overflow)?;
+    let projection_offset = u64::try_from(projection_bytes).map_err(|_| overflow())?;
+    let down_offset = u64::try_from(down_offset_bytes).map_err(|_| overflow())?;
+    let required_alignment = required_alignment.max(1);
+    if !projection_offset.is_multiple_of(required_alignment)
+        || !down_offset.is_multiple_of(required_alignment)
+    {
+        return Err(
+            RoutedExpertGpuIncompatibility::F32StorageOffsetMisaligned {
+                projection_bytes,
+                required_alignment,
+            },
+        );
+    }
+    Ok(F32ExpertProjectionLayout {
+        projection_bytes,
+        projection_offset,
+        required_bytes,
+    })
+}
+
+fn routed_expert_gpu_device_compatibility(
+    spec: RoutedExpertGpuSpec,
+    min_storage_buffer_offset_alignment: u64,
+) -> std::result::Result<(), RoutedExpertGpuIncompatibility> {
+    if spec.dtype == crate::inference::WeightDtype::F32 {
+        f32_expert_projection_layout(spec, min_storage_buffer_offset_alignment)?;
+    }
+    Ok(())
 }
 
 /// Stable, process-local identity for one resolved execution context.
@@ -2448,10 +2518,9 @@ impl ResolvedExecutionPlan {
         context_id: ExecutionContextId,
         gpu_expert_cache_available: bool,
         routed_expert_gpu_spec: RoutedExpertGpuSpec,
+        routed_expert_gpu_compatible: bool,
     ) -> Self {
         let cpu = ExecutionPlane::Cpu;
-        let routed_expert_gpu_compatible =
-            routed_expert_gpu_compatibility(routed_expert_gpu_spec).is_ok();
         let (attention, kv, routed_experts) = match resolution.resolved {
             ResolvedBackend::Cpu => (cpu, cpu, cpu),
             ResolvedBackend::Gpu => (
@@ -2578,14 +2647,16 @@ impl ExecutionContext {
         gpu_backend: Option<Arc<BackendBox>>,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     ) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             plan.component_planes()
                 .iter()
                 .any(|(_, plane)| *plane == ExecutionPlane::Gpu),
-            gpu_backend.is_some()
+            gpu_backend.is_some(),
+            "resolved component planes and GPU backend ownership disagree: {plan:?}"
         );
-        debug_assert!(
-            plan.routed_experts() != ExecutionPlane::Gpu || gpu_expert_cache.capacity_bytes() > 0
+        assert!(
+            plan.routed_experts() != ExecutionPlane::Gpu || gpu_expert_cache.capacity_bytes() > 0,
+            "GPU routed-expert plane requires a non-zero VRAM expert cache"
         );
         Self {
             plan,
@@ -2931,7 +3002,7 @@ pub fn resolve_execution_context(
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
 ) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError> {
     let context_gpu_expert_cache = gpu_expert_cache.clone();
-    resolve_execution_context_with(
+    resolve_execution_context_with_device_limits(
         requested,
         strict_attention,
         geometry,
@@ -2948,7 +3019,14 @@ pub fn resolve_execution_context(
                 gpu_expert_cache,
                 geometry.q4_truncation_tolerance,
             ))
-            .map(|gpu| Arc::new(BackendBox::Gpu(gpu)))
+            .map(|gpu| {
+                let min_storage_buffer_offset_alignment =
+                    gpu.min_storage_buffer_offset_alignment();
+                (
+                    Arc::new(BackendBox::Gpu(gpu)),
+                    min_storage_buffer_offset_alignment,
+                )
+            })
             .map_err(|e| e.to_string())
         },
     )
@@ -2957,6 +3035,7 @@ pub fn resolve_execution_context(
 /// Injectable resolution boundary used by hardware-independent tests.
 /// Production callers use [`resolve_execution_context`]. The factory is
 /// consulted at most once and never for a CPU-only resolution.
+#[cfg(test)]
 pub(crate) fn resolve_execution_context_with<F>(
     requested: ComputeOffload,
     strict_attention: bool,
@@ -2967,6 +3046,29 @@ pub(crate) fn resolve_execution_context_with<F>(
 ) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError>
 where
     F: FnOnce(&GpuBackendGeometry) -> std::result::Result<Arc<BackendBox>, String>,
+{
+    resolve_execution_context_with_device_limits(
+        requested,
+        strict_attention,
+        geometry,
+        routed_expert_gpu_spec,
+        gpu_expert_cache,
+        move |geometry| gpu_init(geometry).map(|backend| (backend, 1)),
+    )
+}
+
+fn resolve_execution_context_with_device_limits<F>(
+    requested: ComputeOffload,
+    strict_attention: bool,
+    geometry: GpuBackendGeometry,
+    routed_expert_gpu_spec: RoutedExpertGpuSpec,
+    gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+    gpu_init: F,
+) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError>
+where
+    F: FnOnce(
+        &GpuBackendGeometry,
+    ) -> std::result::Result<(Arc<BackendBox>, u64), String>,
 {
     let gpu_expert_cache_available = gpu_expert_cache.capacity_bytes() > 0;
     let expert_compatibility = routed_expert_gpu_compatibility(routed_expert_gpu_spec);
@@ -2986,16 +3088,37 @@ where
     }
 
     let mut gpu_backend = None;
+    let mut min_storage_buffer_offset_alignment = None;
     let resolution = resolve_backend_selection_with_numerics(requested, strict_attention, || {
         match gpu_init(&geometry) {
-            Ok(backend) if backend.is_gpu() => {
+            Ok((backend, required_alignment)) if backend.is_gpu() => {
                 gpu_backend = Some(backend);
+                min_storage_buffer_offset_alignment = Some(required_alignment);
                 Ok(())
             }
-            Ok(_) => Err("GPU backend factory returned a CPU backend".to_string()),
+            Ok((_, _)) => Err("GPU backend factory returned a CPU backend".to_string()),
             Err(detail) => Err(detail),
         }
     })?;
+
+    let device_compatibility = min_storage_buffer_offset_alignment
+        .map(|required_alignment| {
+            routed_expert_gpu_device_compatibility(
+                routed_expert_gpu_spec,
+                required_alignment,
+            )
+        })
+        .unwrap_or(Ok(()));
+    if requested == ComputeOffload::Hybrid {
+        device_compatibility.map_err(|incompatibility| {
+            BackendResolutionError::RoutedExpertGpuIncompatible {
+                requested,
+                incompatibility,
+            }
+        })?;
+    }
+    let routed_expert_gpu_compatible =
+        expert_compatibility.is_ok() && device_compatibility.is_ok();
 
     let context_id = next_execution_context_id();
     let plan = ResolvedExecutionPlan::from_resolution(
@@ -3003,6 +3126,7 @@ where
         context_id,
         gpu_expert_cache_available,
         routed_expert_gpu_spec,
+        routed_expert_gpu_compatible,
     );
     Ok(Arc::new(ExecutionContext::new(
         plan,
@@ -3030,6 +3154,7 @@ pub fn cpu_execution_context() -> Arc<ExecutionContext> {
             d_model: 0,
             d_ff: 0,
         },
+        true,
     );
     Arc::new(ExecutionContext::new(
         plan,
@@ -3170,10 +3295,18 @@ mod tests {
     }
 
     fn test_routed_expert_gpu_spec(dtype: crate::inference::WeightDtype) -> RoutedExpertGpuSpec {
+        test_routed_expert_gpu_spec_with_shape(dtype, 32, 64)
+    }
+
+    fn test_routed_expert_gpu_spec_with_shape(
+        dtype: crate::inference::WeightDtype,
+        d_model: usize,
+        d_ff: usize,
+    ) -> RoutedExpertGpuSpec {
         RoutedExpertGpuSpec {
             dtype,
-            d_model: 32,
-            d_ff: 64,
+            d_model,
+            d_ff,
         }
     }
 
@@ -3206,6 +3339,147 @@ mod tests {
                 crate::inference::WeightDtype::Q4_0,
             )),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn routed_expert_gpu_compatibility_accepts_workspace_limit() {
+        for dtype in [
+            crate::inference::WeightDtype::F32,
+            crate::inference::WeightDtype::Q4_0,
+        ] {
+            assert_eq!(
+                routed_expert_gpu_compatibility(test_routed_expert_gpu_spec_with_shape(
+                    dtype,
+                    MAX_EXPERT_D_FF,
+                    MAX_EXPERT_D_FF,
+                )),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn routed_expert_gpu_compatibility_rejects_d_model_above_workspace() {
+        let err = routed_expert_gpu_compatibility(test_routed_expert_gpu_spec_with_shape(
+            crate::inference::WeightDtype::F32,
+            MAX_EXPERT_D_FF + 1,
+            64,
+        ));
+        assert_eq!(
+            err,
+            Err(RoutedExpertGpuIncompatibility::ShapeExceedsWorkspace {
+                d_model: MAX_EXPERT_D_FF + 1,
+                d_ff: 64,
+                max: MAX_EXPERT_D_FF,
+            })
+        );
+    }
+
+    #[test]
+    fn routed_expert_gpu_compatibility_rejects_d_ff_above_workspace() {
+        let err = routed_expert_gpu_compatibility(test_routed_expert_gpu_spec_with_shape(
+            crate::inference::WeightDtype::Q4_0,
+            64,
+            MAX_EXPERT_D_FF + 32,
+        ));
+        assert_eq!(
+            err,
+            Err(RoutedExpertGpuIncompatibility::ShapeExceedsWorkspace {
+                d_model: 64,
+                d_ff: MAX_EXPERT_D_FF + 32,
+                max: MAX_EXPERT_D_FF,
+            })
+        );
+    }
+
+    #[test]
+    fn hybrid_workspace_rejection_skips_gpu_factory() {
+        for spec in [
+            test_routed_expert_gpu_spec_with_shape(
+                crate::inference::WeightDtype::F32,
+                MAX_EXPERT_D_FF + 1,
+                64,
+            ),
+            test_routed_expert_gpu_spec_with_shape(
+                crate::inference::WeightDtype::Q4_0,
+                64,
+                MAX_EXPERT_D_FF + 32,
+            ),
+        ] {
+            let mut attempts = 0;
+            let err = resolve_execution_context_with(
+                ComputeOffload::Hybrid,
+                true,
+                test_gpu_geometry(),
+                spec,
+                test_gpu_expert_cache(1024),
+                |_| {
+                    attempts += 1;
+                    Ok(test_gpu_backend())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 0);
+            assert!(matches!(
+                err,
+                BackendResolutionError::RoutedExpertGpuIncompatible {
+                    requested: ComputeOffload::Hybrid,
+                    incompatibility: RoutedExpertGpuIncompatibility::ShapeExceedsWorkspace { .. },
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn f32_projection_layout_accepts_device_alignment() {
+        let layout = f32_expert_projection_layout(
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            256,
+        )
+        .unwrap();
+        assert_eq!(layout.projection_bytes, 32 * 64 * 4);
+        assert_eq!(layout.projection_offset, (32 * 64 * 4) as u64);
+        assert_eq!(layout.required_bytes, 3 * 32 * 64 * 4);
+    }
+
+    #[test]
+    fn f32_projection_layout_rejects_device_misalignment() {
+        let err = f32_expert_projection_layout(
+            test_routed_expert_gpu_spec_with_shape(
+                crate::inference::WeightDtype::F32,
+                32,
+                65,
+            ),
+            256,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoutedExpertGpuIncompatibility::F32StorageOffsetMisaligned {
+                projection_bytes: 32 * 65 * 4,
+                required_alignment: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn f32_projection_layout_rejects_checked_overflow() {
+        let err = f32_expert_projection_layout(
+            test_routed_expert_gpu_spec_with_shape(
+                crate::inference::WeightDtype::F32,
+                usize::MAX,
+                2,
+            ),
+            256,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RoutedExpertGpuIncompatibility::F32ProjectionSizeOverflow {
+                d_model: usize::MAX,
+                d_ff: 2,
+            }
         );
     }
 
@@ -3301,6 +3575,62 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_device_misalignment_is_typed_after_one_gpu_initialization() {
+        let mut attempts = 0;
+        let err = resolve_execution_context_with_device_limits(
+            ComputeOffload::Hybrid,
+            true,
+            test_gpu_geometry(),
+            test_routed_expert_gpu_spec_with_shape(
+                crate::inference::WeightDtype::F32,
+                32,
+                65,
+            ),
+            test_gpu_expert_cache(1024),
+            |_| {
+                attempts += 1;
+                Ok((test_gpu_backend(), 256))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            err,
+            BackendResolutionError::RoutedExpertGpuIncompatible {
+                requested: ComputeOffload::Hybrid,
+                incompatibility:
+                    RoutedExpertGpuIncompatibility::F32StorageOffsetMisaligned {
+                        projection_bytes: 32 * 65 * 4,
+                        required_alignment: 256,
+                    },
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_gpu_and_auto_device_misalignment_keeps_experts_on_cpu() {
+        for requested in [ComputeOffload::Gpu, ComputeOffload::Auto] {
+            let context = resolve_execution_context_with_device_limits(
+                requested,
+                false,
+                test_gpu_geometry(),
+                test_routed_expert_gpu_spec_with_shape(
+                    crate::inference::WeightDtype::F32,
+                    32,
+                    65,
+                ),
+                test_gpu_expert_cache(1024),
+                |_| Ok((test_gpu_backend(), 256)),
+            )
+            .unwrap();
+            assert_eq!(context.plan().resolved(), ResolvedBackend::Gpu);
+            assert_eq!(context.plan().attention(), ExecutionPlane::Gpu);
+            assert_eq!(context.plan().routed_experts(), ExecutionPlane::Cpu);
+            assert!(!context.routed_expert_backend().is_gpu());
+        }
+    }
+
+    #[test]
     fn cpu_execution_plan_is_all_cpu_and_skips_gpu_factory() {
         let mut attempts = 0;
         let context = resolve_execution_context_with(
@@ -3334,7 +3664,7 @@ mod tests {
         let expected_backend = test_gpu_backend();
         let factory_backend = expected_backend.clone();
         let expected_cache = test_gpu_expert_cache(1024);
-        let context = resolve_execution_context_with(
+        let context = resolve_execution_context_with_device_limits(
             ComputeOffload::Hybrid,
             true,
             test_gpu_geometry(),
@@ -3342,7 +3672,7 @@ mod tests {
             expected_cache.clone(),
             |_| {
                 attempts += 1;
-                Ok(factory_backend)
+                Ok((factory_backend, 256))
             },
         )
         .unwrap();
@@ -3367,6 +3697,42 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(context.gpu_expert_cache(), &expected_cache));
         assert!(!context.attention_backend().is_gpu());
+    }
+
+    #[test]
+    #[should_panic(expected = "resolved component planes and GPU backend ownership disagree")]
+    fn execution_context_rejects_gpu_plane_without_gpu_backend() {
+        let plan = ResolvedExecutionPlan::from_resolution(
+            BackendResolution {
+                requested: ComputeOffload::Gpu,
+                resolved: ResolvedBackend::Gpu,
+                fallback_occurred: false,
+                reason: None,
+            },
+            next_execution_context_id(),
+            true,
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            true,
+        );
+        let _ = ExecutionContext::new(plan, None, test_gpu_expert_cache(1024));
+    }
+
+    #[test]
+    #[should_panic(expected = "GPU routed-expert plane requires a non-zero VRAM expert cache")]
+    fn execution_context_rejects_gpu_experts_without_cache() {
+        let plan = ResolvedExecutionPlan::from_resolution(
+            BackendResolution {
+                requested: ComputeOffload::Hybrid,
+                resolved: ResolvedBackend::HybridCpuAttentionGpuExperts,
+                fallback_occurred: false,
+                reason: None,
+            },
+            next_execution_context_id(),
+            true,
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            true,
+        );
+        let _ = ExecutionContext::new(plan, Some(test_gpu_backend()), test_gpu_expert_cache(0));
     }
 
     #[test]
@@ -3567,7 +3933,6 @@ mod tests {
         assert!(!out.fallback_occurred, "strict auto->cpu is a resolution, not a fallback");
         assert!(out.reason.is_some(), "the auto->cpu reason must be recorded");
         assert!(!attempted, "strict auto must not attempt GPU initialization");
-        assert_eq!(out.resolved, ResolvedBackend::Cpu);
     }
 
     #[test]
@@ -3603,7 +3968,7 @@ mod tests {
     }
 
     #[test]
-    fn non_strict_gpu_resolution_reports_gpu_planes() {
+    fn non_strict_gpu_resolution_resolves_to_gpu() {
         let out = resolve_backend_selection_with_numerics(ComputeOffload::Gpu, false, || Ok(()))
             .unwrap();
         assert_eq!(out.resolved, ResolvedBackend::Gpu);
