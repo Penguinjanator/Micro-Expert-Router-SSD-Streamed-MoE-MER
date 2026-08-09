@@ -1107,13 +1107,10 @@ pub(crate) struct EngineCore {
     /// failure to acquire drops the prefetch and increments
     /// `EngineMetrics::counters::prefetch_dropped_concurrency`.
     pub(super) prefetch_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Math backend used for the Phase 3 GPU expert FFN fast-path. When
-    /// the expert is VRAM-resident, [`Engine::moe_step`] / [`Engine::generate`]
-    /// route the per-expert SwiGLU forward through this backend instead
-    /// of `dispatch_expert_forward`. `BackendBox::init_blocking` returns
-    /// `BackendBox::Cpu` automatically if no GPU is available, so this
-    /// field is always installed (see gist Phase 3, CHANGE 3).
-    pub(super) backend: Arc<crate::backend::BackendBox>,
+    /// Immutable execution plan plus the sole backend context used by this
+    /// engine and its associated real model. Routed-expert dispatch reads the
+    /// backend selected by this context; it never reconstructs one privately.
+    pub(super) execution_context: Arc<crate::backend::ExecutionContext>,
     /// **Tier 4 — adaptive prefetch admission controller.** Always
     /// present; constructed in the transparent pass-through state unless
     /// [`EngineOptions::prefetch_governor`] is set, in which case it
@@ -1329,6 +1326,7 @@ impl EngineCore {
         predictor: Arc<PredictiveLoader>,
         shape: ModelShape,
         options: EngineOptions,
+        execution_context: Arc<crate::backend::ExecutionContext>,
     ) -> Self {
         // Bound the speculative-prefetch semaphore by the buffer
         // pool's *actual* headroom (`pool_slots − cache_slots`), not
@@ -1403,12 +1401,7 @@ impl EngineCore {
             gpu_promotion_tx: None,
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
-            // Default to the CPU backend; `install_gpu_cache` swaps in a
-            // real `GpuBackend` (or leaves CPU when no adapter is available)
-            // once a `GpuExpertCache` is wired up.
-            backend: Arc::new(crate::backend::BackendBox::Cpu(
-                crate::backend::CandleBackend::new(),
-            )),
+            execution_context,
             governor,
         }
     }
@@ -1725,31 +1718,89 @@ impl Engine {
         shape: ModelShape,
         options: EngineOptions,
     ) -> Self {
+        Self::with_options_and_execution_context(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            shape,
+            options,
+            crate::backend::cpu_execution_context(),
+        )
+    }
+
+    /// Construct an engine that consumes an already-resolved authoritative
+    /// execution context. Production startup uses this path so planning,
+    /// reporting, real-model attention, and routed-expert dispatch all share
+    /// the same context identity and backend instances.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options_and_execution_context(
+        cache: Arc<MultiLayerExpertCache>,
+        pool: BufferPool,
+        storage: Arc<NvmeStorage>,
+        router: Router,
+        predictor: Arc<PredictiveLoader>,
+        shape: ModelShape,
+        options: EngineOptions,
+        execution_context: Arc<crate::backend::ExecutionContext>,
+    ) -> Self {
+        let engine_expert_spec = crate::backend::RoutedExpertGpuSpec {
+            dtype: options.dtype,
+            d_model: shape.d_model,
+            d_ff: shape.d_ff,
+        };
+        if execution_context.plan().routed_experts() == crate::backend::ExecutionPlane::Gpu {
+            assert_eq!(
+                execution_context.plan().routed_expert_gpu_spec(),
+                engine_expert_spec,
+                "resolved GPU routed-expert plan does not match Engine dtype/geometry"
+            );
+            assert!(
+                crate::backend::routed_expert_gpu_compatibility(engine_expert_spec).is_ok(),
+                "resolved GPU routed-expert plan is incompatible with Engine dtype/geometry"
+            );
+        }
         let speculator_topk_default = router.top_k();
         Self {
-            core: EngineCore::new(cache, pool, storage, router, predictor, shape, options),
+            core: EngineCore::new(
+                cache,
+                pool,
+                storage,
+                router,
+                predictor,
+                shape,
+                options,
+                execution_context,
+            ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
         }
     }
 
-    /// Whether the configured expert dtype is eligible for the GPU
-    /// `Backend::expert_matmul` fast path. F32 always qualifies. Q4_0
-    /// qualifies only when both `d_model` and `d_ff` are
-    /// Q4_0-block-aligned: the raw block stream then has every matrix
-    /// row starting on a 32-element block boundary, which is what the
-    /// inline-dequant GEMV shader (`matmul_q4_0.wgsl`) assumes when it
-    /// walks `k / 32` blocks per row. All other dtypes stay on the
-    /// CPU path.
+    pub fn execution_context(&self) -> &Arc<crate::backend::ExecutionContext> {
+        &self.core.execution_context
+    }
+
+    fn routed_expert_backend(&self) -> &Arc<crate::backend::BackendBox> {
+        self.core.execution_context.routed_expert_backend()
+    }
+
+    /// Whether the configured expert dtype and shape are eligible for the GPU
+    /// `Backend::expert_matmul` fast path. F32 and Q4_0 must fit the fixed GPU
+    /// expert workspace. Q4_0 additionally requires both `d_model` and `d_ff`
+    /// to be block-aligned so every matrix row starts on a 32-element block
+    /// boundary, as assumed by `matmul_q4_0.wgsl`. All other dtypes stay on
+    /// the CPU path.
     fn gpu_eligible_dtype(&self) -> bool {
-        match self.core.options.dtype {
-            WeightDtype::F32 => true,
-            WeightDtype::Q4_0 => {
-                self.core.shape.d_model % Q4_0_BLOCK_ELEMS == 0
-                    && self.core.shape.d_ff % Q4_0_BLOCK_ELEMS == 0
-            }
-            _ => false,
-        }
+        crate::backend::routed_expert_gpu_compatibility(
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: self.core.options.dtype,
+                d_model: self.core.shape.d_model,
+                d_ff: self.core.shape.d_ff,
+            },
+        )
+        .is_ok()
     }
 
     /// Synchronously promote a freshly-loaded RAM resident into the
@@ -1784,7 +1835,7 @@ impl Engine {
         // one the GPU kernels can actually consume; otherwise the
         // promotion would just waste a VRAM slot on bytes the fast
         // path can never use.
-        if !self.core.backend.is_gpu() || !self.gpu_eligible_dtype() {
+        if !self.routed_expert_backend().is_gpu() || !self.gpu_eligible_dtype() {
             return;
         }
         let Some(gpu) = self.core.gpu_cache.as_ref() else {
@@ -1824,7 +1875,8 @@ impl Engine {
     ///
     /// Updates the `mer_vram_used_bytes` Prometheus gauge after every
     /// successful promotion.
-    pub fn install_gpu_cache(&mut self, gpu: Arc<GpuExpertCache>) {
+    pub fn install_gpu_cache(&mut self) {
+        let gpu = self.core.execution_context.gpu_expert_cache().clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
@@ -1866,20 +1918,6 @@ impl Engine {
         });
         self.core.gpu_cache = Some(gpu.clone());
         self.core.gpu_promotion_tx = Some(tx);
-
-        // Phase 3: try to bring up a real `GpuBackend` now that a
-        // `GpuExpertCache` is available. The `num_layers`/`max_seq_len`/
-        // `num_heads`/`head_dim` parameters drive `GpuKvCache` sizing,
-        // which is **not** on the expert-FFN dispatch path.
-        // `BackendBox::init_blocking` returns `BackendBox::Cpu`
-        // automatically when no adapter is present, so this never
-        // panics.
-        let backend = crate::backend::BackendBox::init_blocking(
-            /* num_layers   = */ 1, /* max_seq_len  = */ 1, /* num_heads    = */ 1,
-            /* num_kv_heads = */ 1, /* head_dim     = */ 1, /* v_head_dim   = */ 1, gpu,
-            self.core.options.policy.expert_size_tolerance(),
-        );
-        self.core.backend = Arc::new(backend);
     }
 
     /// **Test-only** wiring of the GPU promotion channel without
@@ -2505,16 +2543,13 @@ impl Engine {
                     // `Engine::gpu_eligible_dtype`.
                     debug!(
                         expert = r.id,
-                        is_gpu = self.core.backend.is_gpu(),
+                        is_gpu = self.routed_expert_backend().is_gpu(),
                         gpu_eligible_dtype = self.gpu_eligible_dtype(),
                         "generate GPU fast-path guard"
                     );
-                    info!(
-                        is_gpu = self.core.backend.is_gpu(),
-                        gpu_eligible = self.gpu_eligible_dtype(),
-                        "generate GPU fast-path guard check"
-                    );
-                    let gpu_result = if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
+                    let use_gpu =
+                        self.routed_expert_backend().is_gpu() && self.gpu_eligible_dtype();
+                    let gpu_result = if use_gpu {
                         let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
                         let x_f16: Vec<half::f16> =
                             x.iter().map(|&f| half::f16::from_f32(f)).collect();
@@ -2534,11 +2569,11 @@ impl Engine {
                         // (the trait API takes it only for future logging).
                         debug!(
                             expert = r.id,
-                            is_gpu = self.core.backend.is_gpu(),
+                            is_gpu = self.routed_expert_backend().is_gpu(),
                             dtype = ?self.core.options.dtype,
                             "calling backend.expert_matmul"
                         );
-                        let matmul_res = self.core.backend.expert_matmul(
+                        let matmul_res = self.routed_expert_backend().expert_matmul(
                             0,
                             r.id,
                             x_view,
@@ -2548,7 +2583,7 @@ impl Engine {
                         );
                         debug!(
                             expert = r.id,
-                            is_gpu = self.core.backend.is_gpu(),
+                            is_gpu = self.routed_expert_backend().is_gpu(),
                             dtype = ?self.core.options.dtype,
                             ok = matmul_res.is_ok(),
                             "returned from backend.expert_matmul"
@@ -3892,7 +3927,7 @@ impl Engine {
         // miss returns Err and we fall through to the CPU path below.
         // Both F32 and (block-aligned) Q4_0 experts are eligible —
         // see `Engine::gpu_eligible_dtype`.
-        if self.core.backend.is_gpu() && self.gpu_eligible_dtype() {
+        if self.routed_expert_backend().is_gpu() && self.gpu_eligible_dtype() {
             let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
             let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
             let x_view = crate::backend::TensorView {
@@ -3905,7 +3940,7 @@ impl Engine {
                 rows: 1,
                 cols: self.core.shape.d_model,
             };
-            let matmul_res = self.core.backend.expert_matmul(
+            let matmul_res = self.routed_expert_backend().expert_matmul(
                 layer as usize,
                 r.id,
                 x_view,
@@ -5244,6 +5279,69 @@ mod tests {
             )
             .with_speculator(spec, top_k),
         )
+    }
+
+    #[tokio::test]
+    async fn engine_consumes_the_exact_resolved_hybrid_context() {
+        let dir = TempDir::new("execution-context-identity");
+        let base = build_engine(&dir.path, 4, 8, 16, 2, 2, 0, 7);
+        let gpu_backend = Arc::new(crate::backend::BackendBox::TestGpu(
+            crate::backend::CandleBackend::new(),
+        ));
+        let expected_backend = gpu_backend.clone();
+        let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16));
+        let expected_gpu_expert_cache = gpu_expert_cache.clone();
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Hybrid,
+            true,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 16,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 8,
+                v_head_dim: 8,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: 8,
+                d_ff: 16,
+            },
+            gpu_expert_cache,
+            |_| Ok(gpu_backend),
+        )
+        .unwrap();
+
+        let mut engine = Engine::with_options_and_execution_context(
+            base.core.cache.clone(),
+            base.core.pool.clone(),
+            base.core.storage.clone(),
+            base.core.router.clone(),
+            base.core.predictor.clone(),
+            base.core.shape,
+            base.core.options.clone(),
+            context.clone(),
+        );
+
+        assert!(Arc::ptr_eq(engine.execution_context(), &context));
+        assert_eq!(engine.execution_context().id(), context.plan().context_id());
+        assert!(Arc::ptr_eq(
+            engine.routed_expert_backend(),
+            &expected_backend
+        ));
+        assert!(Arc::ptr_eq(
+            engine.execution_context().gpu_expert_cache(),
+            &expected_gpu_expert_cache
+        ));
+        engine.install_gpu_cache();
+        assert!(Arc::ptr_eq(
+            engine.core.gpu_cache.as_ref().unwrap(),
+            &expected_gpu_expert_cache
+        ));
+
+        let other = crate::backend::cpu_execution_context();
+        assert_ne!(engine.execution_context().id(), other.id());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

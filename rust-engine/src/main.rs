@@ -1595,31 +1595,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before they go looking for missing AVX-512 perf.
     crate::kernels::log_backend();
 
-    // Install the default plugin-system math backend (gist Task 2).
+    // Install the default plugin-system execution context (gist Task 2).
     // Logged on the same boot line so ops can see both the low-level
-    // CPU-feature dispatch and the high-level Backend in one place.
+    // CPU-feature dispatch and the high-level backend in one place.
     //
     // For the `serve` subcommand we **defer** the default install
     // until `cmd_serve` has loaded the TOML config — the hybrid
     // compute offload (`[real_transformer].compute_offload`, gist
-    // Part 2 fix #5) is selected from there, and it must run
+    // Part 2 fix #5) is resolved there, and it must run
     // *before* `install_default` claims the OnceLock. Other
     // subcommands keep the immediate install so their math path is
     // ready as soon as `main` returns into them.
     //
     // The `run` subcommand grows one extra wrinkle: when invoked with
-    // `--gpu` it must initialise the GPU compute backend *before* the
-    // default CPU backend claims the `OnceLock` (gist Fix 2), mirroring
-    // `cmd_serve`. `--gpu` is an explicit request, so a failed GPU init is
-    // fatal (fail closed) — it never silently falls back to CPU.
-    let run_gpu_cache = if let Cmd::Run {
-        gpu: true,
-        gpu_cache_mb,
-        ..
-    } = &cli.cmd
-    {
-        install_run_gpu_backend(*gpu_cache_mb)?
-    } else if !matches!(cli.cmd, Cmd::Serve { .. }) {
+    // `--gpu` it must leave the execution-context `OnceLock` free until
+    // `cmd_run` has applied any dataset metadata and can resolve against
+    // the effective expert dtype/geometry. GPU initialization failure is
+    // fatal; legacy deterministic dtype/geometry bypass remains visible in
+    // the resolved component plan.
+    let run_gpu_requested = matches!(cli.cmd, Cmd::Run { gpu: true, .. });
+    if !matches!(cli.cmd, Cmd::Serve { .. }) && !run_gpu_requested {
         crate::backend::install_default();
         let b = crate::backend::current();
         info!(
@@ -1627,10 +1622,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             compute_plane = b.compute_plane(),
             "math backend installed"
         );
-        None
-    } else {
-        None
-    };
+    }
 
     match cli.cmd {
         Cmd::GenData {
@@ -1715,7 +1707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     gate_weights,
                     trace_out,
                     gpu,
-                    gpu_cache_mb: _,
+                    gpu_cache_mb,
                     pipeline_depth,
                     speculator,
                     speculator_hidden_dim,
@@ -1782,7 +1774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             router_matrix,
                             gate_weights,
                             trace_out,
-                            gpu_expert_cache: if gpu { run_gpu_cache.clone() } else { None },
+                            gpu_cache_mb: gpu.then_some(gpu_cache_mb),
                             pipeline_depth,
                             speculator,
                             speculator_hidden_dim,
@@ -1936,23 +1928,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Install the GPU compute backend for the `run` subcommand (gist
 /// Fix 2).
 ///
-/// Mirrors the GPU init path in [`cmd_serve`]: it builds a
-/// bounded [`GpuExpertCache`] and initialises a
-/// [`BackendBox`](crate::backend::BackendBox) before the default CPU
-/// backend claims the `OnceLock`. On any failure — no GPU device or a
-/// `set_backend` race — it falls back to
-/// [`install_default`](crate::backend::install_default) with a
-/// warning so the benchmark still runs on CPU.
-/// Install the GPU compute backend for an explicit `run --gpu` request.
+/// Builds a bounded [`GpuExpertCache`], resolves one execution context, and
+/// installs that same context for the engine to consume. `run --gpu` is an
+/// explicit request, so initialization or installation failure is fatal.
 ///
-/// Finding 5 (fail-closed GPU): `--gpu` is an explicit request, so both GPU
-/// initialisation failure and backend-installation failure are fatal. We never
-/// silently continue on CPU — that would produce a "GPU" benchmark measuring
-/// the CPU path. Operators who want best-effort GPU with CPU fallback use the
-/// serving `compute_offload = "auto"` path instead.
+/// Finding 5 (fail-closed GPU initialization): `--gpu` is an explicit request,
+/// so both GPU initialisation failure and backend-installation failure are
+/// fatal. Legacy deterministic expert compatibility bypass remains represented
+/// by the resolved component plan. Operators who want best-effort GPU
+/// initialization with CPU fallback use serving `compute_offload = "auto"`.
 fn install_run_gpu_backend(
     gpu_cache_mb: usize,
-) -> Result<Option<Arc<crate::expert_cache::GpuExpertCache>>, Box<dyn std::error::Error>> {
+    routed_expert_gpu_spec: crate::backend::RoutedExpertGpuSpec,
+) -> Result<Arc<crate::backend::ExecutionContext>, Box<dyn std::error::Error>> {
+    if gpu_cache_mb == 0 {
+        return Err(
+            "explicit run --gpu requires --gpu-cache-mb > 0 so routed experts can execute on GPU"
+                .into(),
+        );
+    }
     // The KV-cache geometry below only sizes the dense-backbone cache,
     // which the synthetic `run` benchmark does not exercise — it routes
     // everything through `expert_matmul`.
@@ -1966,43 +1960,45 @@ fn install_run_gpu_backend(
         0.5,
         16,
     ));
-    let backend_box = crate::backend::BackendBox::init_blocking(
-        1, // num_layers
-        1, // max_seq_len
-        1, // num_heads
-        1, // num_kv_heads
-        1, // head_dim
-        1, // v_head_dim
+    let execution_context = crate::backend::resolve_execution_context(
+        crate::backend::ComputeOffload::Gpu,
+        false,
+        crate::backend::GpuBackendGeometry {
+            num_layers: 1,
+            max_seq_len: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            v_head_dim: 1,
+            q4_truncation_tolerance: 0,
+        },
+        routed_expert_gpu_spec,
         gpu_expert_cache.clone(),
-        // The synthetic GPU tool path never serves real checkpoints;
-        // strict payload sizing (tolerance 0) always applies here.
-        0,
-    );
-    if !backend_box.is_gpu() {
-        return Err(
-            "explicit --gpu request failed: GPU backend initialization did not \
-                    produce a GPU device; refusing to run on CPU (use serving \
-                    compute_offload = \"auto\" for best-effort GPU with CPU fallback)"
-                .into(),
+    )
+    .map_err(|e| format!("explicit --gpu request failed: {e}"))?;
+    let backend = execution_context.primary_backend();
+    let device_name = backend.device_name().to_string();
+    let compute_plane = backend.compute_plane().to_string();
+    crate::backend::set_execution_context(execution_context.clone())
+        .map_err(|e| format!("explicit --gpu request failed: context installation failed ({e})"))?;
+    if execution_context.plan().routed_experts() != crate::backend::ExecutionPlane::Gpu {
+        warn!(
+            dtype = routed_expert_gpu_spec.dtype.as_str(),
+            d_model = routed_expert_gpu_spec.d_model,
+            d_ff = routed_expert_gpu_spec.d_ff,
+            routed_expert_plane = execution_context.plan().routed_experts().as_str(),
+            "run --gpu resolved routed experts to CPU; expert compute is not GPU-offloaded"
         );
-    }
-    let device_name = backend_box.device_name().to_string();
-    let compute_plane = backend_box.compute_plane().to_string();
-    let gpu = std::sync::Arc::new(backend_box);
-    if let Err(e) = crate::backend::set_backend(gpu) {
-        return Err(format!(
-            "explicit --gpu request failed: GPU backend installation failed ({e}); \
-             refusing to run on CPU"
-        )
-        .into());
     }
     info!(
         device = device_name,
         compute_plane,
+        routed_expert_plane = execution_context.plan().routed_experts().as_str(),
+        context_id = %execution_context.id(),
         vram_capacity_mb = gpu_cache_mb,
-        "GpuBackend installed for run benchmark"
+        "GPU execution context installed for run benchmark"
     );
-    Ok(Some(gpu_expert_cache))
+    Ok(execution_context)
 }
 
 /// **Tier 2.** Attach a packed expert blob to `storage` when both the blob
@@ -3481,7 +3477,7 @@ async fn build_bench_real_runtime(
     );
     let router = crate::gating::Router::Linear(Arc::new(model.layers[0].gate.clone()));
     let metrics = Metrics::new();
-    let mut engine_builder = Engine::with_options(
+    let mut engine_builder = Engine::with_options_and_execution_context(
         cache,
         pool,
         storage,
@@ -3509,6 +3505,7 @@ async fn build_bench_real_runtime(
             collect_route_profile: false,
             policy: cfg.real_transformer.inference_policy(),
         },
+        crate::backend::current_execution_context(),
     );
     engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
     if cfg.predictive.locality_enabled {
@@ -4430,20 +4427,14 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         "loaded server config"
     );
 
-    // Hybrid compute offload (gist Part 2, fix #6). Selects which
-    // `Backend` instance owns the dense transformer body; runs
-    // *before* `install_default` so the OnceLock keeps our pointer.
-    // The startup log below reports the actual device runtime
-    // (`cpu-fallback` / `cuda-0` / `wgpu-vulkan`) as `GpuBackend::name`
-    // surfaces it — no more stale hardcoded `"gpu-fallback"` strings.
+    // Resolve requested mode once into the authoritative component plan and
+    // backend context before constructing the model or engine.
     //
     // The GPU expert cache is constructed up-front so the same `Arc`
     // can be threaded into both `GpuBackend` (which checks VRAM
     // residency before falling back to NVMe streaming) and
-    // `Engine::install_gpu_cache` further below. When
-    // `[gpu_cache].enabled = false` we still allocate a zero-capacity
-    // cache to satisfy the `BackendBox::init_blocking` signature —
-    // the cache simply never promotes anything in that mode.
+    // `Engine::install_gpu_cache` further below. When `[gpu_cache].enabled =
+    // false` the zero-capacity cache never promotes anything.
     let gpu_expert_cache = {
         let capacity_bytes = if cfg.gpu_cache.enabled {
             (cfg.gpu_cache.vram_capacity_mb as usize) * 1024 * 1024
@@ -4456,7 +4447,6 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             cfg.gpu_cache.promote_after_hits,
         ))
     };
-    let mut backend_fallback_occurred = false;
     // Strict attention numerics (the production default) can only be
     // validated on the checked CPU softmax path, so backend resolution is
     // strictness-aware (hardening pass, strict GPU behaviour): an explicit
@@ -4468,151 +4458,72 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             .real_transformer
             .inference_policy()
             .allow_nonfinite_attention_fallback;
-    let mut backend_attention_plane: &'static str = "cpu";
-    let mut backend_expert_plane: &'static str = "cpu";
-    if matches!(
-        cfg.real_transformer.compute_offload,
-        crate::backend::ComputeOffload::Gpu
-            | crate::backend::ComputeOffload::Auto
-            | crate::backend::ComputeOffload::Hybrid
-    ) {
-        // Resolve the request *before* touching the device so unsupported
-        // combinations (explicit gpu + strict numerics, hybrid + legacy
-        // attention fallback) fail startup without a partial init, and
-        // `auto` under strict numerics skips GPU init entirely.
-        let precheck = crate::backend::resolve_backend_selection_with_numerics(
-            cfg.real_transformer.compute_offload,
-            strict_attention,
-            || Ok(()),
-        )?;
-        if !precheck.install_gpu_backend() {
-            // `auto` resolved to CPU under strict numerics: record why and
-            // keep the CPU backend (never report GPU while strict
-            // attention runs on CPU).
-            if let Some(reason) = precheck.reason.as_deref() {
-                info!(
-                    requested = ?precheck.requested,
-                    resolved = ?precheck.resolved,
-                    reason,
-                    "compute backend resolved to CPU"
-                );
-            }
+    let num_heads = cfg.real_transformer.num_heads;
+    let head_dim = if cfg.real_transformer.head_dim == 0 {
+        if num_heads > 0 {
+            cfg.model.d_model / num_heads
         } else {
-            let num_layers = cfg.model.num_layers;
-            let max_seq_len = if cfg.real_transformer.window_size == 0 {
+            64
+        }
+    } else {
+        cfg.real_transformer.head_dim
+    };
+    let execution_context = crate::backend::resolve_execution_context(
+        cfg.real_transformer.compute_offload,
+        strict_attention,
+        crate::backend::GpuBackendGeometry {
+            num_layers: cfg.model.num_layers,
+            max_seq_len: if cfg.real_transformer.window_size == 0 {
                 4096
             } else {
                 cfg.real_transformer.window_size
-            };
-            let num_heads = cfg.real_transformer.num_heads;
-            let num_kv_heads = if cfg.real_transformer.num_kv_heads == 0 {
-                num_heads
-            } else {
-                cfg.real_transformer.num_kv_heads
-            };
-            let head_dim = if cfg.real_transformer.head_dim == 0 {
-                if num_heads > 0 {
-                    cfg.model.d_model / num_heads
-                } else {
-                    64
-                }
-            } else {
-                cfg.real_transformer.head_dim
-            };
-            let backend_box = crate::backend::BackendBox::init_blocking(
-                num_layers,
-                max_seq_len,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                // Finding 12: the run path does not surface an asymmetric
-                // `v_head_dim` here; pass 0 (auto → head_dim). Asymmetric-V
-                // models force the CPU attention path via the eligibility guard
-                // in transformer.rs, so the symmetric GPU sizing is never used
-                // for them.
-                0,
-                gpu_expert_cache.clone(),
-                cfg.real_transformer
-                    .inference_policy()
-                    .expert_size_tolerance(),
-            );
-            let has_device = backend_box.is_gpu();
-            // Reconcile the operator's request with the observed init result
-            // (Finding 5). An explicit `gpu`/`hybrid` request fails closed;
-            // `auto` demotes to CPU and records a fallback. `is_gpu()` is the
-            // signal because `init_blocking` internally swallows GPU errors
-            // and returns a CPU backend.
-            let resolution = crate::backend::resolve_backend_selection_with_numerics(
-                cfg.real_transformer.compute_offload,
-                strict_attention,
-                || {
-                    if has_device {
-                        Ok(())
-                    } else {
-                        Err("GPU backend initialization did not produce a GPU device".to_string())
-                    }
-                },
-            )?;
-            backend_fallback_occurred = resolution.fallback_occurred;
-            let device_name = backend_box.device_name().to_string();
-            let compute_plane = backend_box.compute_plane().to_string();
-            if resolution.fallback_occurred {
-                warn!(
-                    requested = ?resolution.requested,
-                    resolved = ?resolution.resolved,
-                    reason = resolution.reason.as_deref().unwrap_or(""),
-                    "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
-                );
-            }
-            if resolution.install_gpu_backend() {
-                let gpu = std::sync::Arc::new(backend_box);
-                if let Err(e) = crate::backend::set_backend(gpu) {
-                    // Finding 5 (fail-closed GPU): installation failure is fatal for an
-                    // explicit `gpu`/`hybrid` request — we must never silently continue
-                    // on CPU. Under `auto` it is a recorded fallback instead.
-                    if matches!(
-                        resolution.requested,
-                        crate::backend::ComputeOffload::Gpu
-                            | crate::backend::ComputeOffload::Hybrid
-                    ) {
-                        return Err(format!(
-                            "explicit compute_offload = {:?}: GpuBackend installation failed \
-                             ({e}); refusing to fall back to CPU",
-                            resolution.requested
-                        )
-                        .into());
-                    }
-                    backend_fallback_occurred = true;
-                    warn!(
-                        error = e,
-                        "compute_offload = \"auto\": GpuBackend installation failed; falling back to CPU"
-                    );
-                } else {
-                    backend_attention_plane = resolution.attention_plane();
-                    backend_expert_plane = resolution.expert_plane();
-                    info!(
-                        device = device_name,
-                        compute_plane,
-                        has_device,
-                        requested = ?resolution.requested,
-                        resolved = ?resolution.resolved,
-                        attention_plane = backend_attention_plane,
-                        expert_plane = backend_expert_plane,
-                        reason = resolution.reason.as_deref().unwrap_or(""),
-                        "math backend installed for dense backbone"
-                    );
-                }
-            }
-        }
-    }
-    crate::backend::install_default();
+            },
+            num_heads,
+            num_kv_heads: cfg.real_transformer.num_kv_heads,
+            head_dim,
+            // Finding 12: asymmetric-V models keep the CPU attention path;
+            // zero retains the existing symmetric GPU sizing contract.
+            v_head_dim: 0,
+            q4_truncation_tolerance: cfg
+                .real_transformer
+                .inference_policy()
+                .expert_size_tolerance(),
+        },
+        crate::backend::RoutedExpertGpuSpec {
+            dtype: cfg.model.dtype,
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+        },
+        gpu_expert_cache.clone(),
+    )?;
+    crate::backend::set_execution_context(execution_context.clone())
+        .map_err(|e| format!("failed to install resolved execution context: {e}"))?;
     {
-        let b = crate::backend::current();
+        let plan = execution_context.plan();
+        let backend = execution_context.primary_backend();
+        if plan.fallback_occurred() {
+            warn!(
+                requested = ?plan.requested(),
+                resolved = ?plan.resolved(),
+                reason = plan.reason().unwrap_or(""),
+                "compute_offload = \"auto\": GPU initialization failed; resolved to CPU"
+            );
+        }
         info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            compute_offload = ?cfg.real_transformer.compute_offload,
-            "math backend installed"
+            context_id = %execution_context.id(),
+            backend = backend.device_name(),
+            compute_plane = backend.compute_plane(),
+            requested = ?plan.requested(),
+            resolved = ?plan.resolved(),
+            embeddings_plane = plan.embeddings().as_str(),
+            lm_head_plane = plan.lm_head().as_str(),
+            dense_projections_plane = plan.dense_projections().as_str(),
+            attention_plane = plan.attention().as_str(),
+            kv_plane = plan.kv().as_str(),
+            router_plane = plan.router().as_str(),
+            expert_plane = plan.routed_experts().as_str(),
+            reason = plan.reason().unwrap_or(""),
+            "resolved execution context installed"
         );
     }
 
@@ -4927,16 +4838,8 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     };
 
     let metrics = Metrics::new();
-    // Surface any auto GPU->CPU demotion decided above now that metrics
-    // exist (Finding 5).
-    if backend_fallback_occurred {
-        metrics.record_gpu_cpu_fallback(1);
-    }
-    // Per-component compute planes (hardening pass, strict GPU
-    // behaviour): make an intentional hybrid split (checked CPU
-    // attention + GPU experts) observable in /metrics.
-    metrics.set_backend_component_planes(backend_attention_plane, backend_expert_plane);
-    let mut engine_builder = Engine::with_options(
+    metrics.set_backend_component_planes(execution_context.plan());
+    let mut engine_builder = Engine::with_options_and_execution_context(
         cache,
         pool,
         storage,
@@ -4964,6 +4867,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             collect_route_profile: false,
             policy: cfg.real_transformer.inference_policy(),
         },
+        execution_context.clone(),
     );
     // Apply the configured look-ahead pipeline depth (`[storage]
     // pipeline_depth`). Controls how many layers ahead
@@ -5076,7 +4980,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             dtype_advisory = %dtype_for_logging.as_str(),
             "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active (dtype is advisory; bytes copied as-is)"
         );
-        engine_builder.install_gpu_cache(gpu_expert_cache.clone());
+        engine_builder.install_gpu_cache();
     }
     let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
 
@@ -5657,7 +5561,7 @@ struct RunArgs {
     router_matrix: Option<PathBuf>,
     gate_weights: Option<PathBuf>,
     trace_out: Option<PathBuf>,
-    gpu_expert_cache: Option<Arc<crate::expert_cache::GpuExpertCache>>,
+    gpu_cache_mb: Option<usize>,
     pipeline_depth: u32,
     speculator: bool,
     speculator_hidden_dim: usize,
@@ -5698,6 +5602,19 @@ async fn cmd_run(
     //    detect "user didn't override" by comparing against clap defaults
     //    — anyone who actually passes a flag overrides the metadata.
     apply_metadata_if_present(&mut args);
+
+    let execution_context = if let Some(gpu_cache_mb) = args.gpu_cache_mb {
+        install_run_gpu_backend(
+            gpu_cache_mb,
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: args.dtype,
+                d_model: args.d_model,
+                d_ff: args.d_ff,
+            },
+        )?
+    } else {
+        crate::backend::current_execution_context()
+    };
 
     let weight_bytes = expert_weight_bytes_for(args.d_model, args.d_ff, args.dtype);
     let reported_weight_bytes = if args.dtype == crate::inference::WeightDtype::Mixed {
@@ -6033,7 +5950,7 @@ async fn cmd_run(
     ));
 
     let engine = Arc::new({
-        let mut base = Engine::with_options(
+        let mut base = Engine::with_options_and_execution_context(
             cache.clone(),
             pool.clone(),
             storage.clone(),
@@ -6067,9 +5984,10 @@ async fn cmd_run(
                     ..crate::inference::RealInferencePolicy::STRICT
                 },
             },
+            execution_context.clone(),
         );
-        if let Some(gpu_cache) = args.gpu_expert_cache.clone() {
-            base.install_gpu_cache(gpu_cache);
+        if execution_context.plan().routed_experts() == crate::backend::ExecutionPlane::Gpu {
+            base.install_gpu_cache();
         }
         // Apply the configured look-ahead pipeline depth (sized in tandem
         // with the shadow buffer-pool budget above). No-op for the legacy

@@ -2104,7 +2104,7 @@ pub async fn run_engine_warmup(state: &AppState) {
             }
         }
         // JIT-warm the math backend kernels regardless.
-        let backend = crate::backend::current();
+        let backend = state.engine.execution_context().routed_expert_backend();
         let gate_f16 = vec![half::f16::from_f32(0.1); 16];
         let up_f16 = vec![half::f16::from_f32(0.2); 16];
         let mut out_f16 = vec![half::f16::ZERO; 16];

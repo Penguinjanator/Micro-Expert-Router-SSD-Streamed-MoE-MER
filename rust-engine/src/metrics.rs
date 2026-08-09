@@ -113,10 +113,11 @@ struct MetricsInner {
     pub nonfinite_softmax_fallbacks: IntGauge,
     /// **Gauge** of the resolved per-component compute plane
     /// (hardening pass, strict GPU behaviour). Labels: `component`
-    /// (`attention` / `experts`) and `plane` (`cpu` / `gpu`); the active
+    /// (`embeddings`, `lm_head`, `dense_projections`, `attention`, `kv`,
+    /// `router`, or `experts`) and `plane` (`cpu` / `gpu`); the active
     /// combination is set to `1`. Makes an intentional hybrid split
-    /// (checked CPU attention + GPU experts) observable instead of a
-    /// single ambiguous "gpu" device string.
+    /// observable instead of collapsing execution into one ambiguous device
+    /// string.
     pub backend_component_plane: IntGaugeVec,
     pub resident_expert_buffer_bytes: IntGauge,
     pub expert_buffer_pool_allocated_bytes: IntGauge,
@@ -315,7 +316,7 @@ impl Metrics {
         .expect("metric registration: mer_nonfinite_softmax_fallbacks");
         let backend_component_plane = register_int_gauge_vec_with_registry!(
             "mer_backend_component_plane",
-            "Resolved compute plane per model component (1 = active). Components: attention, experts; planes: cpu, gpu.",
+            "Resolved compute plane per model component (1 = active). Components: embeddings, lm_head, dense_projections, attention, kv, router, experts; planes: cpu, gpu.",
             &["component", "plane"],
             registry
         )
@@ -548,13 +549,13 @@ impl Metrics {
     /// startup after backend resolution). Sets the active
     /// `{component, plane}` combinations to `1` and the inactive plane
     /// of each component to `0`.
-    pub fn set_backend_component_planes(&self, attention_plane: &str, expert_plane: &str) {
-        for (component, plane) in [("attention", attention_plane), ("experts", expert_plane)] {
+    pub fn set_backend_component_planes(&self, plan: &crate::backend::ResolvedExecutionPlan) {
+        for (component, plane) in plan.component_planes() {
             for candidate in ["cpu", "gpu"] {
                 self.inner
                     .backend_component_plane
                     .with_label_values(&[component, candidate])
-                    .set(i64::from(candidate == plane));
+                    .set(i64::from(candidate == plane.as_str()));
             }
         }
     }
@@ -663,8 +664,34 @@ mod tests {
     #[test]
     fn backend_component_plane_gauge_reports_resolved_planes() {
         let m = Metrics::new();
-        // Hybrid: checked CPU attention + GPU experts.
-        m.set_backend_component_planes("cpu", "gpu");
+        let geometry = crate::backend::GpuBackendGeometry {
+            num_layers: 1,
+            max_seq_len: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            v_head_dim: 1,
+            q4_truncation_tolerance: 0,
+        };
+        // Hybrid: all named components stay on CPU except routed experts.
+        let hybrid = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Hybrid,
+            true,
+            geometry,
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: crate::inference::WeightDtype::F32,
+                d_model: 32,
+                d_ff: 64,
+            },
+            std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16)),
+            |_| {
+                Ok(std::sync::Arc::new(crate::backend::BackendBox::TestGpu(
+                    crate::backend::CandleBackend::new(),
+                )))
+            },
+        )
+        .unwrap();
+        m.set_backend_component_planes(hybrid.plan());
         let body = String::from_utf8(m.render().unwrap()).unwrap();
         let want_one = [
             r#"mer_backend_component_plane{component="attention",plane="cpu"} 1"#,
@@ -675,17 +702,56 @@ mod tests {
             r#"mer_backend_component_plane{component="experts",plane="cpu"} 0"#,
         ];
         for needle in want_one.iter().chain(&want_zero) {
-            assert!(body.contains(needle), "missing {needle} in:
-{body}");
+            assert!(
+                body.contains(needle),
+                "missing {needle} in:
+{body}"
+            );
         }
-        // Re-resolution to full CPU flips both components.
-        m.set_backend_component_planes("cpu", "cpu");
+        for component in ["embeddings", "lm_head", "dense_projections", "kv", "router"] {
+            assert!(body.contains(&format!(
+                "mer_backend_component_plane{{component=\"{component}\",plane=\"cpu\"}} 1"
+            )));
+        }
+        // A CPU plan flips expert reporting without re-reading config flags.
+        let cpu = crate::backend::cpu_execution_context();
+        m.set_backend_component_planes(cpu.plan());
         let body = String::from_utf8(m.render().unwrap()).unwrap();
+        assert!(body.contains(r#"mer_backend_component_plane{component="experts",plane="cpu"} 1"#));
+        assert!(body.contains(r#"mer_backend_component_plane{component="experts",plane="gpu"} 0"#));
+    }
+
+    #[test]
+    fn startup_auto_fallback_does_not_increment_runtime_expert_fallback_counter() {
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Auto,
+            false,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 1,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 1,
+                v_head_dim: 1,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: crate::inference::WeightDtype::F32,
+                d_model: 32,
+                d_ff: 64,
+            },
+            std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16)),
+            |_| Err("no compatible adapter".to_string()),
+        )
+        .unwrap();
+        assert!(context.plan().fallback_occurred());
+
+        let metrics = Metrics::new();
+        metrics.set_backend_component_planes(context.plan());
+        let body = String::from_utf8(metrics.render().unwrap()).unwrap();
+        assert!(body.contains("mer_gpu_cpu_fallbacks_total 0"));
         assert!(body.contains(
             r#"mer_backend_component_plane{component="experts",plane="cpu"} 1"#
-        ));
-        assert!(body.contains(
-            r#"mer_backend_component_plane{component="experts",plane="gpu"} 0"#
         ));
     }
 

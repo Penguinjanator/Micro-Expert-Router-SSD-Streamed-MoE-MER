@@ -470,18 +470,18 @@ pub struct RealTransformerConfig {
     #[serde(default = "default_pressure_critical_threshold")]
     pub pressure_critical_threshold: f32,
 
-    /// **Hybrid compute offload** (gist Part 2, fix #5). Picks which
-    /// [`crate::backend::Backend`] implementation handles the dense
-    /// transformer body's matmul / attention / LM-head. `"cpu"`
-    /// (default) routes through [`crate::backend::CandleBackend`] /
-    /// the auto-escalating SIMD dispatcher in [`crate::kernels`].
-    /// `"gpu"` selects the [`crate::backend::GpuBackend`] integration
-    /// seam. At present this is a compatibility/configuration switch
-    /// for the GPU backend path rather than a guaranteed operational
-    /// GPU offload mode, so execution still falls back to the CPU
-    /// dense path when GPU acceleration is not active. The
-    /// SSD-streamed expert pipeline stays CPU-side either way,
-    /// matching the gist's "budget GPU augments CPU" posture.
+    /// Requested compute mode. Startup resolves this once into an immutable
+    /// [`crate::backend::ResolvedExecutionPlan`]; runtime and reporting consume
+    /// that plan rather than interpreting this request independently. `"cpu"`
+    /// is the compatibility default, `"gpu"` is explicit and fail-closed,
+    /// `"auto"` retains its documented CPU fallback, and `"hybrid"` keeps
+    /// embeddings, LM head, dense projections, attention, KV, and routing on
+    /// CPU while selecting the GPU plane only for routed experts. `"hybrid"`
+    /// requires strict attention semantics
+    /// (`allow_nonfinite_attention_fallback = false`), an enabled GPU expert
+    /// cache with a non-zero VRAM budget, and a routed-expert dtype/geometry
+    /// supported by the current GPU expert implementation. Invalid Hybrid
+    /// combinations are hard startup errors.
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
 

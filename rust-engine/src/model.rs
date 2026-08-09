@@ -2616,7 +2616,7 @@ impl RealModel {
             crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
                 self.try_embed(token_id)
             })?;
-        let backend = crate::backend::current();
+        let backend = engine.execution_context().attention_backend();
         let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
         let mut next_x = Vec::with_capacity(self.config.d_model);
         // Fail-closed numerical propagation (hardening pass, A3
@@ -2644,7 +2644,7 @@ impl RealModel {
                         pos,
                         layer_idx,
                         &mut kv[layer_idx],
-                        &*backend,
+                        &**backend,
                         &mut layer_scratch,
                         &mut next_x,
                         timings,
@@ -2662,7 +2662,7 @@ impl RealModel {
                     pos,
                     layer_idx,
                     &mut kv[layer_idx],
-                    &*backend,
+                    &**backend,
                     &mut layer_scratch,
                     &mut next_x,
                     timings,
