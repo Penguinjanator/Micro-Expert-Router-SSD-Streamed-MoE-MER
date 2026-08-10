@@ -34,6 +34,7 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -843,10 +844,38 @@ pub(crate) struct Counters {
     /// mixed GPU/CPU execution is a major source of
     /// inconsistent token latency, so make it countable.
     gpu_cpu_fallbacks: AtomicU64,
+    /// Routed expert activations selected by the real MoE routing path.
+    selected_routed_experts: AtomicU64,
+    /// Physical GPU routed-expert dispatch attempts.
+    gpu_dispatch_attempts: AtomicU64,
+    /// Physical GPU routed-expert dispatches that returned output.
+    gpu_dispatch_successes: AtomicU64,
+    /// Physical GPU routed-expert dispatches that returned a typed failure.
+    gpu_dispatch_failures: AtomicU64,
+    /// Routed expert activations executed by the CPU backend. This includes
+    /// CPU plans and explicit serving-mode fallbacks, but never strict GPU
+    /// failures.
+    cpu_routed_expert_dispatches: AtomicU64,
     /// Hardware-independent CPU routed-expert forward spy. Test-only so the
     /// public fallback metric keeps its production schema and meaning.
     #[cfg(test)]
     cpu_expert_forward_calls: AtomicU64,
+}
+
+/// Monotonic execution counters for real routed-expert activations.
+///
+/// These counters deliberately exclude the synthetic [`Engine::generate`]
+/// path. They are a qualification seam rather than a second Prometheus
+/// telemetry surface.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RoutedExpertExecutionSnapshot {
+    pub selected_routed_experts: u64,
+    pub gpu_dispatch_attempts: u64,
+    pub gpu_dispatch_successes: u64,
+    pub gpu_dispatch_failures: u64,
+    pub cpu_routed_expert_dispatches: u64,
+    pub gpu_cpu_fallbacks: u64,
+    pub degraded_expert_substitutions: u64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -1847,6 +1876,58 @@ impl Engine {
         &self,
     ) -> Option<crate::backend::GpuExpertMemorySnapshot> {
         self.core.execution_context.gpu_expert_memory_snapshot()
+    }
+
+    /// Identity of the adapter already selected by the authoritative
+    /// execution context. This never performs adapter rediscovery.
+    pub fn gpu_device_identity(&self) -> Option<crate::backend::GpuDeviceIdentity> {
+        self.core.execution_context.gpu_device_identity()
+    }
+
+    /// Monotonic routed-expert GPU transfer/submission counters.
+    pub fn gpu_expert_io_snapshot(&self) -> Option<crate::backend::GpuExpertIoSnapshot> {
+        self.core.execution_context.gpu_expert_io_snapshot()
+    }
+
+    /// Snapshot the qualification-only real routed-expert execution counters.
+    pub fn routed_expert_execution_snapshot(&self) -> RoutedExpertExecutionSnapshot {
+        RoutedExpertExecutionSnapshot {
+            selected_routed_experts: self
+                .metrics
+                .counters
+                .selected_routed_experts
+                .load(Ordering::Relaxed),
+            gpu_dispatch_attempts: self
+                .metrics
+                .counters
+                .gpu_dispatch_attempts
+                .load(Ordering::Relaxed),
+            gpu_dispatch_successes: self
+                .metrics
+                .counters
+                .gpu_dispatch_successes
+                .load(Ordering::Relaxed),
+            gpu_dispatch_failures: self
+                .metrics
+                .counters
+                .gpu_dispatch_failures
+                .load(Ordering::Relaxed),
+            cpu_routed_expert_dispatches: self
+                .metrics
+                .counters
+                .cpu_routed_expert_dispatches
+                .load(Ordering::Relaxed),
+            gpu_cpu_fallbacks: self
+                .metrics
+                .counters
+                .gpu_cpu_fallbacks
+                .load(Ordering::Relaxed),
+            degraded_expert_substitutions: self
+                .metrics
+                .counters
+                .degraded_expert_substitutions
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Synchronously copy a freshly-loaded RAM resident into the logical GPU
@@ -3963,6 +4044,10 @@ impl Engine {
         if self.execution_context().plan().routed_experts()
             == crate::backend::ExecutionPlane::Gpu
         {
+            self.metrics
+                .counters
+                .gpu_dispatch_attempts
+                .fetch_add(1, Ordering::Relaxed);
             let backend = self.routed_expert_backend();
             let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
             let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
@@ -4005,15 +4090,27 @@ impl Engine {
             };
             match matmul_res {
                 Ok(()) => {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_successes
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>());
                 }
                 Err(source)
                     if self.core.routed_expert_gpu_failure_policy
                         == RoutedExpertGpuFailurePolicy::StrictFailClosed =>
                 {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(MoeStepError::GpuExpertDispatch { source });
                 }
                 Err(source) => {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     // Only an actual serving-mode CPU recovery increments the
                     // fallback counter.
                     let prev = self
@@ -4035,6 +4132,11 @@ impl Engine {
                 }
             }
         }
+
+        self.metrics
+            .counters
+            .cpu_routed_expert_dispatches
+            .fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
         self.metrics
@@ -4134,6 +4236,10 @@ impl Engine {
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
+        self.metrics
+            .counters
+            .selected_routed_experts
+            .fetch_add(target.len() as u64, Ordering::Relaxed);
 
         // Locality monitor: observe and reconcile pinning. Same
         // semantics as in `generate`.
@@ -5500,6 +5606,18 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 1);
         assert_eq!(cpu_expert_forward_calls(&engine), 0);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 1,
+                gpu_dispatch_failures: 0,
+                cpu_routed_expert_dispatches: 0,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5536,6 +5654,19 @@ mod tests {
             let report = engine.report();
             assert_eq!(report.gpu_cpu_fallbacks, 0, "{label}");
             assert_eq!(report.degraded_expert_substitutions, 0, "{label}");
+            assert_eq!(
+                engine.routed_expert_execution_snapshot(),
+                RoutedExpertExecutionSnapshot {
+                    selected_routed_experts: 1,
+                    gpu_dispatch_attempts: 1,
+                    gpu_dispatch_successes: 0,
+                    gpu_dispatch_failures: 1,
+                    cpu_routed_expert_dispatches: 0,
+                    gpu_cpu_fallbacks: 0,
+                    degraded_expert_substitutions: 0,
+                },
+                "{label}"
+            );
         }
     }
 
@@ -5580,6 +5711,18 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 1);
         assert_eq!(cpu_expert_forward_calls(&engine), 1);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 1);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 1,
+                cpu_routed_expert_dispatches: 1,
+                gpu_cpu_fallbacks: 1,
+                degraded_expert_substitutions: 0,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5634,6 +5777,18 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 0);
         assert_eq!(cpu_expert_forward_calls(&engine), 1);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 0,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 0,
+                cpu_routed_expert_dispatches: 1,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
         assert!(
             engine.gpu_expert_memory_snapshot().is_none(),
             "CPU plans must not depend on a physical GPU expert registry"
@@ -5858,6 +6013,11 @@ mod tests {
         assert!(
             r.predictor_observations > 0,
             "predictor should have logged at least one transition"
+        );
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot::default(),
+            "synthetic Engine::generate traffic must not qualify as real routed execution"
         );
     }
 

@@ -2022,6 +2022,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "sha2",
  "tokenizers 0.20.4",
  "tokio",
  "toml",

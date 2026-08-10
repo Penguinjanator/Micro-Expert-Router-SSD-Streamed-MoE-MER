@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as ParkingMutex;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +34,38 @@ struct AdapterMetadata {
     driver: String,
     driver_info: String,
     backend: wgpu::Backend,
+}
+
+/// Immutable identity of the adapter selected by the authoritative GPU
+/// backend. This is evidence about the backend that executes work; it does not
+/// enumerate or rediscover a second adapter for reporting.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GpuDeviceIdentity {
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: String,
+    pub wgpu_backend: String,
+    pub driver: String,
+    pub driver_info: String,
+    pub compute_plane: String,
+    pub software_adapter: bool,
+}
+
+impl AdapterMetadata {
+    fn identity(&self, compute_plane: &str) -> GpuDeviceIdentity {
+        GpuDeviceIdentity {
+            name: self.name.clone(),
+            vendor_id: self.vendor,
+            device_id: self.device,
+            device_type: format!("{:?}", self.device_type),
+            wgpu_backend: self.backend.to_str().to_string(),
+            driver: self.driver.clone(),
+            driver_info: self.driver_info.clone(),
+            compute_plane: compute_plane.to_string(),
+            software_adapter: self.is_software(),
+        }
+    }
 }
 
 impl AdapterMetadata {
@@ -278,7 +311,7 @@ impl std::error::Error for GpuExpertDispatchError {}
 /// deliberately narrower than process/device memory: physical expert weight
 /// buffers plus the fixed routed-expert workspace buffers. Dense, attention,
 /// KV, driver, and allocator overhead remain outside this internal ledger.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[allow(dead_code)] // Public PR5 seam; PR4 validates it through backend-local tests.
 pub struct GpuExpertMemorySnapshot {
     /// Host payload bytes admitted by [`crate::expert_cache::GpuExpertCache`].
@@ -298,6 +331,58 @@ pub struct GpuExpertMemorySnapshot {
     pub physical_installs: u64,
     pub physical_evictions: u64,
     pub stale_retirements: u64,
+}
+
+/// Monotonic counters for only the routed-expert GPU path. Dense and
+/// attention operations are deliberately excluded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct GpuExpertIoSnapshot {
+    /// Actual physical expert-buffer writes; registry hits do not increment it.
+    pub expert_weight_uploads: u64,
+    /// Exact bytes passed to successful expert-buffer write calls.
+    pub expert_weight_upload_bytes: u64,
+    /// Actual routed hidden-state workspace writes.
+    pub hidden_state_uploads: u64,
+    /// Exact bytes passed to routed hidden-state workspace writes.
+    pub hidden_state_upload_bytes: u64,
+    /// Routed command-buffer submissions. A returned `SubmissionIndex` is not
+    /// represented as synchronous wgpu validation success.
+    pub queue_submissions: u64,
+    /// Routed staging-buffer `map_async` requests.
+    pub map_requests: u64,
+    /// Successfully mapped and copied routed readbacks.
+    pub readback_completions: u64,
+    /// Exact output bytes copied by completed routed readbacks.
+    pub readback_bytes: u64,
+}
+
+#[derive(Default)]
+struct GpuExpertIoCounters {
+    expert_weight_uploads: AtomicU64,
+    expert_weight_upload_bytes: AtomicU64,
+    hidden_state_uploads: AtomicU64,
+    hidden_state_upload_bytes: AtomicU64,
+    queue_submissions: AtomicU64,
+    map_requests: AtomicU64,
+    readback_completions: AtomicU64,
+    readback_bytes: AtomicU64,
+}
+
+impl GpuExpertIoCounters {
+    fn snapshot(&self) -> GpuExpertIoSnapshot {
+        GpuExpertIoSnapshot {
+            expert_weight_uploads: self.expert_weight_uploads.load(Ordering::Relaxed),
+            expert_weight_upload_bytes: self
+                .expert_weight_upload_bytes
+                .load(Ordering::Relaxed),
+            hidden_state_uploads: self.hidden_state_uploads.load(Ordering::Relaxed),
+            hidden_state_upload_bytes: self.hidden_state_upload_bytes.load(Ordering::Relaxed),
+            queue_submissions: self.queue_submissions.load(Ordering::Relaxed),
+            map_requests: self.map_requests.load(Ordering::Relaxed),
+            readback_completions: self.readback_completions.load(Ordering::Relaxed),
+            readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1140,6 +1225,8 @@ pub struct GpuBackend {
     device_loss: Arc<DeviceLossState>,
     device_name: String,
     compute_plane: String,
+    adapter_metadata: AdapterMetadata,
+    expert_io: GpuExpertIoCounters,
 
     matmul_pipeline: wgpu::ComputePipeline,
     /// Q4_0 inline-dequant GEMV pipeline (`matmul_q4_0.wgsl`) for expert
@@ -1758,6 +1845,8 @@ impl GpuBackend {
             device_loss,
             device_name,
             compute_plane,
+            adapter_metadata: info,
+            expert_io: GpuExpertIoCounters::default(),
             matmul_pipeline,
             matmul_q4_0_pipeline,
             swiglu_pipeline,
@@ -1928,6 +2017,12 @@ impl GpuBackend {
             .map_err(|_| anyhow!("F32 device buffer size does not fit usize"))?;
         self.queue
             .write_buffer(&weight_buf, 0, &weight_bytes[..upload_bytes]);
+        self.expert_io
+            .expert_weight_uploads
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .expert_weight_upload_bytes
+            .fetch_add(plan.device_bytes, Ordering::Relaxed);
         let allocation = permit.charge_allocation().map_err(|e| anyhow!(e))?;
 
         Ok(VramExpertEntry {
@@ -1994,6 +2089,12 @@ impl GpuBackend {
             padded.resize(padded_len, 0);
             self.queue.write_buffer(&weight_buf, 0, &padded);
         }
+        self.expert_io
+            .expert_weight_uploads
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .expert_weight_upload_bytes
+            .fetch_add(plan.device_bytes, Ordering::Relaxed);
         let allocation = permit.charge_allocation().map_err(|e| anyhow!(e))?;
 
         // The projection base is selected via the `w_block_off` push
@@ -2117,6 +2218,14 @@ impl GpuBackend {
             ws.scratch[i] = x.data[i].to_f32();
         }
         self.queue.write_buffer(&ws.x_buf, 0, bytemuck::cast_slice(&ws.scratch[..d_model]));
+        let hidden_bytes = u64::try_from(d_model * std::mem::size_of::<f32>())
+            .expect("routed-expert hidden upload length fits u64");
+        self.expert_io
+            .hidden_state_uploads
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .hidden_state_upload_bytes
+            .fetch_add(hidden_bytes, Ordering::Relaxed);
 
         // ── Per-dispatch bind groups against the workspace buffers ────────────
         // Bind group creation is microseconds against a millisecond-scale
@@ -2281,9 +2390,13 @@ impl GpuBackend {
         // Wait only for *this* submission — other in-flight expert
         // dispatches (and dense ops) keep making progress on the queue.
         let submission = self.queue.submit(Some(encoder.finish()));
+        self.expert_io
+            .queue_submissions
+            .fetch_add(1, Ordering::Relaxed);
 
         let slice = ws.staging.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
+        self.expert_io.map_requests.fetch_add(1, Ordering::Relaxed);
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
         self.device.poll(wgpu::Maintain::wait_for(submission));
 
@@ -2318,6 +2431,12 @@ impl GpuBackend {
             out.data[..d_model].convert_from_f32_slice(&floats[..d_model]);
         }
         ws.staging.unmap();
+        self.expert_io
+            .readback_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .readback_bytes
+            .fetch_add(out_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -2857,6 +2976,14 @@ impl GpuBackend {
     fn compute_plane(&self) -> &str {
         &self.compute_plane
     }
+
+    fn gpu_device_identity(&self) -> GpuDeviceIdentity {
+        self.adapter_metadata.identity(&self.compute_plane)
+    }
+
+    fn gpu_expert_io_snapshot(&self) -> GpuExpertIoSnapshot {
+        self.expert_io.snapshot()
+    }
 }
 
 // =====================================================================
@@ -3095,6 +3222,24 @@ impl BackendBox {
     pub fn gpu_expert_memory_snapshot(&self) -> Option<GpuExpertMemorySnapshot> {
         match self {
             Self::Gpu(gpu) => Some(gpu.gpu_expert_memory_snapshot()),
+            Self::Cpu(_) => None,
+            #[cfg(test)]
+            Self::TestGpu(_) => None,
+        }
+    }
+
+    pub fn gpu_device_identity(&self) -> Option<GpuDeviceIdentity> {
+        match self {
+            Self::Gpu(gpu) => Some(gpu.gpu_device_identity()),
+            Self::Cpu(_) => None,
+            #[cfg(test)]
+            Self::TestGpu(_) => None,
+        }
+    }
+
+    pub fn gpu_expert_io_snapshot(&self) -> Option<GpuExpertIoSnapshot> {
+        match self {
+            Self::Gpu(gpu) => Some(gpu.gpu_expert_io_snapshot()),
             Self::Cpu(_) => None,
             #[cfg(test)]
             Self::TestGpu(_) => None,
@@ -3721,6 +3866,18 @@ impl ExecutionContext {
             .and_then(|backend| backend.gpu_expert_memory_snapshot())
     }
 
+    pub fn gpu_device_identity(&self) -> Option<GpuDeviceIdentity> {
+        self.gpu_backend
+            .as_ref()
+            .and_then(|backend| backend.gpu_device_identity())
+    }
+
+    pub fn gpu_expert_io_snapshot(&self) -> Option<GpuExpertIoSnapshot> {
+        self.gpu_backend
+            .as_ref()
+            .and_then(|backend| backend.gpu_expert_io_snapshot())
+    }
+
     pub fn primary_backend(&self) -> &Arc<BackendBox> {
         self.gpu_backend.as_ref().unwrap_or(&self.cpu_backend)
     }
@@ -4254,6 +4411,39 @@ pub fn current() -> Arc<BackendBox> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_expert_io_snapshot_reads_each_monotonic_counter() {
+        let counters = GpuExpertIoCounters::default();
+        counters.expert_weight_uploads.fetch_add(1, Ordering::Relaxed);
+        counters
+            .expert_weight_upload_bytes
+            .fetch_add(11, Ordering::Relaxed);
+        counters.hidden_state_uploads.fetch_add(2, Ordering::Relaxed);
+        counters
+            .hidden_state_upload_bytes
+            .fetch_add(22, Ordering::Relaxed);
+        counters.queue_submissions.fetch_add(3, Ordering::Relaxed);
+        counters.map_requests.fetch_add(4, Ordering::Relaxed);
+        counters
+            .readback_completions
+            .fetch_add(5, Ordering::Relaxed);
+        counters.readback_bytes.fetch_add(55, Ordering::Relaxed);
+
+        assert_eq!(
+            counters.snapshot(),
+            GpuExpertIoSnapshot {
+                expert_weight_uploads: 1,
+                expert_weight_upload_bytes: 11,
+                hidden_state_uploads: 2,
+                hidden_state_upload_bytes: 22,
+                queue_submissions: 3,
+                map_requests: 4,
+                readback_completions: 5,
+                readback_bytes: 55,
+            }
+        );
+    }
 
     struct TestPhysicalEntry {
         key: PhysicalExpertKey,

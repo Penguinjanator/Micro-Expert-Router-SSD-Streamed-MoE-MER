@@ -159,6 +159,7 @@ mod packed_storage;
 mod parallel;
 mod prefetch_governor;
 mod pregate;
+mod qualification;
 mod rayon_autotune;
 mod residency;
 mod router;
@@ -850,6 +851,32 @@ enum Cmd {
         format: BenchRealOutputFormat,
     },
 
+    /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
+    /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
+    QualifyHybridQ4 {
+        /// Path to the TOML config file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Prompt text to encode and qualify.
+        #[arg(long, conflicts_with = "request_json")]
+        prompt: Option<String>,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`.
+        #[arg(long, conflicts_with = "prompt")]
+        request_json: Option<PathBuf>,
+        /// Completion-token count; overrides request JSON `max_tokens`.
+        #[arg(long)]
+        output_tokens: Option<usize>,
+        /// Strict greedy warmups before the single measured request.
+        #[arg(long, default_value_t = 0)]
+        warmup_runs: usize,
+        /// Write the typed JSON report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+        /// Opaque reference to separately collected external GPU-memory evidence.
+        #[arg(long)]
+        external_gpu_memory_artifact: Option<String>,
+    },
+
     /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
     ///
     /// This is intentionally separate from `bench-real`: it isolates Q/K/V/O,
@@ -1493,9 +1520,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // handlers still own their normal config reconciliation and runtime
     // construction below.
     let startup_config = match &cli.cmd {
-        Cmd::Serve { config } | Cmd::BenchReal { config, .. } => {
-            Some(crate::config::Config::from_file(config)?)
-        }
+        Cmd::Serve { config }
+        | Cmd::BenchReal { config, .. }
+        | Cmd::QualifyHybridQ4 { config, .. } => Some(crate::config::Config::from_file(config)?),
         _ => None,
     };
 
@@ -1596,9 +1623,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logged on the same boot line so ops can see both the low-level
     // CPU-feature dispatch and the high-level backend in one place.
     //
-    // For the `serve` subcommand we **defer** the default install
-    // until `cmd_serve` has loaded the TOML config — the hybrid
-    // compute offload (`[real_transformer].compute_offload`, gist
+    // For the `serve` and `qualify-hybrid-q4` subcommands we **defer** the
+    // default install until their handlers have loaded the TOML config — the
+    // hybrid compute offload (`[real_transformer].compute_offload`, gist
     // Part 2 fix #5) is resolved there, and it must run
     // *before* `install_default` claims the OnceLock. Other
     // subcommands keep the immediate install so their math path is
@@ -1611,7 +1638,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fatal; legacy deterministic dtype/geometry bypass remains visible in
     // the resolved component plan.
     let run_gpu_requested = matches!(cli.cmd, Cmd::Run { gpu: true, .. });
-    if !matches!(cli.cmd, Cmd::Serve { .. }) && !run_gpu_requested {
+    if !matches!(cli.cmd, Cmd::Serve { .. } | Cmd::QualifyHybridQ4 { .. }) && !run_gpu_requested {
         crate::backend::install_default();
         let b = crate::backend::current();
         info!(
@@ -1842,6 +1869,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress_watchdog,
             }))
         }
+        Cmd::QualifyHybridQ4 {
+            config,
+            prompt,
+            request_json,
+            output_tokens,
+            warmup_runs,
+            report_out,
+            external_gpu_memory_artifact,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_qualify_hybrid_q4(QualifyHybridQ4Args {
+                config,
+                prompt,
+                request_json,
+                output_tokens,
+                warmup_runs,
+                report_out,
+                external_gpu_memory_artifact,
+                progress_watchdog,
+            }))
+        }
         Cmd::MatvecMicrobench {
             backend,
             warmup_runs,
@@ -2049,6 +2099,17 @@ struct BenchRealArgs {
     cache_reset: BenchRealCacheReset,
     greedy: bool,
     format: BenchRealOutputFormat,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct QualifyHybridQ4Args {
+    config: PathBuf,
+    prompt: Option<String>,
+    request_json: Option<PathBuf>,
+    output_tokens: Option<usize>,
+    warmup_runs: usize,
+    report_out: Option<PathBuf>,
+    external_gpu_memory_artifact: Option<String>,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
@@ -2297,6 +2358,483 @@ async fn cmd_bench_real(args: BenchRealArgs) -> Result<(), Box<dyn std::error::E
         emit_bench_real_report(&args, input, runs)?;
     }
     Ok(())
+}
+
+struct RealCliRequestInput {
+    prompt: String,
+    output_tokens: usize,
+    input_kind: &'static str,
+}
+
+fn load_real_cli_request_input(
+    command: &'static str,
+    prompt_arg: Option<&String>,
+    request_json: Option<&Path>,
+    output_tokens_arg: Option<usize>,
+) -> Result<RealCliRequestInput, Box<dyn std::error::Error>> {
+    let mut json_max_tokens = None;
+    let (prompt, input_kind) = if let Some(prompt) = prompt_arg {
+        (prompt.clone(), "prompt")
+    } else if let Some(path) = request_json {
+        let body = std::fs::read_to_string(path)?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        json_max_tokens = value
+            .get("max_tokens")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
+        let prompt = if let Some(prompt) = value.get("prompt").and_then(|value| value.as_str()) {
+            prompt.to_string()
+        } else if let Some(messages) = value.get("messages").and_then(|value| value.as_array()) {
+            flatten_bench_messages(messages)
+        } else {
+            return Err(
+                "--request-json must contain a string `prompt` or chat `messages` array".into(),
+            );
+        };
+        (prompt, "request-json")
+    } else {
+        return Err(format!("{command} requires either --prompt or --request-json").into());
+    };
+    if prompt.is_empty() {
+        return Err(format!("{command} prompt must be non-empty").into());
+    }
+    let output_tokens = output_tokens_arg.or(json_max_tokens).unwrap_or(16);
+    if output_tokens == 0 {
+        return Err(format!("{command} requires output token count > 0").into());
+    }
+    Ok(RealCliRequestInput {
+        prompt,
+        output_tokens,
+        input_kind,
+    })
+}
+
+fn load_qualification_input(
+    args: &QualifyHybridQ4Args,
+) -> Result<RealCliRequestInput, Box<dyn std::error::Error>> {
+    load_real_cli_request_input(
+        "qualify-hybrid-q4",
+        args.prompt.as_ref(),
+        args.request_json.as_deref(),
+        args.output_tokens,
+    )
+}
+
+fn qualification_artifacts(
+    config_path: &Path,
+    cfg: &crate::config::Config,
+) -> (crate::qualification::QualificationArtifacts, Vec<String>) {
+    use crate::qualification::{hash_optional_small_file, hash_small_file};
+
+    let mut errors = Vec::new();
+    let config_digest = match hash_small_file(config_path) {
+        Ok(digest) => Some(digest),
+        Err(error) => {
+            errors.push(format!(
+                "failed to hash qualification config {}: {error}",
+                config_path.display()
+            ));
+            None
+        }
+    };
+    let mut hash_optional = |path: Option<&Path>, label: &str| match hash_optional_small_file(path)
+    {
+        Ok(digest) => digest,
+        Err(error) => {
+            let display = path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            errors.push(format!(
+                "failed to hash optional {label} {display}: {error}"
+            ));
+            None
+        }
+    };
+
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let weights_config = cfg
+        .real_transformer
+        .weights_dir
+        .as_ref()
+        .map(|dir| dir.join("config.json"));
+    let artifacts = crate::qualification::QualificationArtifacts {
+        config: config_digest,
+        tokenizer: hash_optional(cfg.tokenizer.path.as_deref(), "tokenizer"),
+        expert_metadata: hash_optional(Some(&metadata_path), "expert metadata"),
+        packed_manifest: hash_optional(
+            cfg.storage.packed_manifest.as_deref(),
+            "packed expert manifest",
+        ),
+        weights_config: hash_optional(weights_config.as_deref(), "weights config"),
+        dense_weights_directory: cfg
+            .real_transformer
+            .weights_dir
+            .as_deref()
+            .map(crate::qualification::canonical_or_configured),
+        expert_data_directory: crate::qualification::canonical_or_configured(&cfg.model.data_dir),
+        packed_expert_blob: cfg
+            .storage
+            .packed_blob
+            .as_deref()
+            .map(crate::qualification::canonical_or_configured),
+        large_artifacts_recursively_hashed: false,
+    };
+    (artifacts, errors)
+}
+
+fn emit_qualification_report(
+    report: &crate::qualification::QualificationReport,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = serde_json::to_vec_pretty(report)?;
+    json.push(b'\n');
+    if let Some(path) = report_out {
+        std::fs::write(path, json)?;
+        eprintln!("qualification report written to {}", path.display());
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&json)?;
+    }
+    Ok(())
+}
+
+fn fail_qualification(
+    mut report: crate::qualification::QualificationReport,
+    failure: crate::qualification::QualificationFailure,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = format!("{}: {}", failure.code, failure.detail);
+    report.fail(failure);
+    emit_qualification_report(&report, report_out)?;
+    Err(summary.into())
+}
+
+fn qualification_inference_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> crate::qualification::QualificationFailure {
+    use crate::engine::MoeStepError;
+    use crate::model::RealInferenceError;
+    use crate::qualification::{FailureStage, GpuFailureEvidence, QualificationFailure};
+
+    if let Some(RealInferenceError::MoeStep(MoeStepError::GpuExpertDispatch { source })) =
+        error.downcast_ref::<RealInferenceError>()
+    {
+        let mut failure = QualificationFailure::new(
+            FailureStage::Inference,
+            "routed-gpu-dispatch-failed",
+            source.to_string(),
+        );
+        failure.gpu_dispatch = Some(GpuFailureEvidence {
+            layer: source.layer,
+            expert_id: source.expert_id,
+            kind: source.kind.to_string(),
+        });
+        failure
+    } else {
+        QualificationFailure::new(
+            FailureStage::Inference,
+            "inference-failed",
+            error.to_string(),
+        )
+    }
+}
+
+async fn cmd_qualify_hybrid_q4(
+    args: QualifyHybridQ4Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{
+        gpu_io_delta, request_evidence, routed_execution_delta, validate_device,
+        validate_execution_plan, validate_gpu_failure_policy, validate_memory,
+        validate_postconditions, validate_preflight, BuildProvenance, FailureStage,
+        PreflightEvidence, QualificationFailure, QualificationReport, QualificationTiming,
+    };
+
+    // Config/request parse errors retain normal CLI error behavior. Once both
+    // are parsed, every expected qualification failure below emits the typed
+    // report before returning a non-zero status.
+    let cfg = crate::config::Config::from_file(&args.config)?;
+    let input = load_qualification_input(&args)?;
+    let provenance = BuildProvenance::embedded();
+    let (artifacts, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let metadata_result = crate::qualification::read_expert_metadata(&metadata_path);
+    let metadata = metadata_result.clone().ok();
+    let request = request_evidence(
+        input.input_kind,
+        &input.prompt,
+        input.output_tokens,
+        args.warmup_runs,
+    );
+    let mut report = QualificationReport::new(
+        provenance.clone(),
+        artifacts,
+        metadata.clone(),
+        request,
+        args.external_gpu_memory_artifact.clone(),
+    );
+
+    if !artifact_errors.is_empty() {
+        return fail_qualification(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "artifact-identity-unavailable",
+                artifact_errors.join("; "),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let metadata = match metadata_result {
+        Ok(metadata) => metadata,
+        Err(detail) => {
+            return fail_qualification(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "q4-layout-not-standard",
+                    detail,
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let weight_policy = cfg.real_transformer.resolve_weight_policy();
+    if !matches!(
+        weight_policy,
+        Ok(crate::config::RealWeightPolicy::StrictReal)
+    ) {
+        return fail_qualification(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "non-strict-weight-policy",
+                weight_policy
+                    .err()
+                    .unwrap_or_else(|| "resolved weight policy is SeededDev".to_string()),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let preflight = PreflightEvidence {
+        provenance,
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        requested_mode: cfg.real_transformer.compute_offload,
+        routed_expert_dtype: cfg.model.dtype,
+        metadata,
+    };
+    if let Err(failure) = validate_preflight(&preflight, &mut report.qualification_checks) {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+
+    let runtime =
+        match build_real_cli_runtime(&args.config, RealCliRuntimeMode::StrictHybridQualification)
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return fail_qualification(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Startup,
+                        "startup-failed",
+                        error.to_string(),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+    if !runtime.model.load_status.strict
+        || runtime.model.load_status.seeded_fallback_remained
+        || runtime.model.load_status.loaded_tensors != runtime.model.load_status.required_tensors
+    {
+        return fail_qualification(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "seeded-model-loaded",
+                format!(
+                    "strict={} loaded={}/{} seeded_fallback_remained={}",
+                    runtime.model.load_status.strict,
+                    runtime.model.load_status.loaded_tensors,
+                    runtime.model.load_status.required_tensors,
+                    runtime.model.load_status.seeded_fallback_remained
+                ),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+
+    let context = runtime.engine.execution_context();
+    report.execution_plan = Some(context.plan().into());
+    report.device = runtime.engine.gpu_device_identity();
+    if let Err(failure) = validate_execution_plan(context.plan(), &mut report.qualification_checks)
+    {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+    if let Err(failure) = validate_device(report.device.as_ref(), &mut report.qualification_checks)
+    {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+    if let Err(failure) = validate_gpu_failure_policy(
+        runtime.engine.routed_expert_gpu_failure_policy(),
+        &mut report.qualification_checks,
+    ) {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+
+    let greedy = crate::sampling::SamplingParams::greedy();
+    for index in 0..args.warmup_runs {
+        if let Err(error) = with_progress_timeout(
+            format!("qualify-hybrid-q4 warmup run {index}"),
+            args.progress_watchdog,
+            run_bench_real_once(&runtime, &input.prompt, input.output_tokens, greedy, index),
+        )
+        .await
+        {
+            return fail_qualification(
+                report,
+                qualification_inference_failure(error.as_ref()),
+                args.report_out.as_deref(),
+            );
+        }
+    }
+
+    let routed_before = runtime.engine.routed_expert_execution_snapshot();
+    let io_before = match runtime.engine.gpu_expert_io_snapshot() {
+        Some(snapshot) => snapshot,
+        None => {
+            return fail_qualification(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "gpu-device-unavailable",
+                    "authoritative GPU backend has no routed-expert I/O snapshot",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let memory_before = match runtime.engine.gpu_expert_memory_snapshot() {
+        Some(snapshot) => snapshot,
+        None => {
+            return fail_qualification(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "gpu-device-unavailable",
+                    "authoritative GPU backend has no PR4 memory snapshot",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.gpu_memory_before = Some(memory_before);
+
+    let measured = with_progress_timeout(
+        "qualify-hybrid-q4 measured request".to_string(),
+        args.progress_watchdog,
+        run_bench_real_once(&runtime, &input.prompt, input.output_tokens, greedy, 0),
+    )
+    .await;
+
+    let routed_after = runtime.engine.routed_expert_execution_snapshot();
+    let io_after = runtime.engine.gpu_expert_io_snapshot();
+    let memory_after = runtime.engine.gpu_expert_memory_snapshot();
+    report.gpu_memory_after = memory_after;
+    report.routed_experts = routed_execution_delta(routed_before, routed_after).ok();
+    report.gpu_io = io_after.and_then(|after| gpu_io_delta(io_before, after).ok());
+
+    let measured = match measured {
+        Ok(measured) => measured,
+        Err(error) => {
+            return fail_qualification(
+                report,
+                qualification_inference_failure(error.as_ref()),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let routed_delta = match routed_execution_delta(routed_before, routed_after) {
+        Ok(delta) => delta,
+        Err(failure) => {
+            return fail_qualification(report, failure, args.report_out.as_deref());
+        }
+    };
+    let io_after = match io_after {
+        Some(snapshot) => snapshot,
+        None => {
+            return fail_qualification(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "gpu-device-unavailable",
+                    "authoritative GPU I/O snapshot disappeared during measurement",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let memory_after = match memory_after {
+        Some(snapshot) => snapshot,
+        None => {
+            return fail_qualification(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "gpu-device-unavailable",
+                    "authoritative PR4 memory snapshot disappeared during measurement",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let io_delta = match gpu_io_delta(io_before, io_after) {
+        Ok(delta) => delta,
+        Err(failure) => {
+            return fail_qualification(report, failure, args.report_out.as_deref());
+        }
+    };
+    report.routed_experts = Some(routed_delta);
+    report.gpu_io = Some(io_delta);
+    for snapshot in [memory_before, memory_after] {
+        if let Err(failure) = validate_memory(snapshot) {
+            return fail_qualification(report, failure, args.report_out.as_deref());
+        }
+    }
+    report.timing = Some(QualificationTiming::from_measurement(
+        measured.prompt_tokens,
+        input.output_tokens,
+        measured.completion_tokens,
+        measured.prompt_seconds,
+        measured.decode_seconds,
+        measured.total_seconds,
+    ));
+    if let Err(failure) = validate_postconditions(
+        measured.completion_tokens,
+        routed_delta,
+        &mut report.qualification_checks,
+    ) {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+    if let Err(failure) = report.finish() {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
+    emit_qualification_report(&report, args.report_out.as_deref())
 }
 
 async fn with_progress_timeout<T, F>(
@@ -3165,38 +3703,15 @@ fn print_matvec_microbench_human(report: &MatvecMicrobenchReport) {
 fn load_bench_real_input(
     args: &BenchRealArgs,
 ) -> Result<BenchRealInput, Box<dyn std::error::Error>> {
-    let mut json_max_tokens = None;
-    let prompt = if let Some(prompt) = args.prompt.as_ref() {
-        prompt.clone()
-    } else if let Some(path) = args.request_json.as_ref() {
-        let body = std::fs::read_to_string(path)?;
-        let value: serde_json::Value = serde_json::from_str(&body)?;
-        json_max_tokens = value
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        if let Some(prompt) = value.get("prompt").and_then(|v| v.as_str()) {
-            prompt.to_string()
-        } else if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
-            flatten_bench_messages(messages)
-        } else {
-            return Err(
-                "--request-json must contain a string `prompt` or chat `messages` array".into(),
-            );
-        }
-    } else {
-        return Err("bench-real requires either --prompt or --request-json".into());
-    };
-    if prompt.is_empty() {
-        return Err("bench-real prompt must be non-empty".into());
-    }
-    let output_tokens = args.output_tokens.or(json_max_tokens).unwrap_or(16);
-    if output_tokens == 0 {
-        return Err("bench-real requires output token count > 0".into());
-    }
+    let input = load_real_cli_request_input(
+        "bench-real",
+        args.prompt.as_ref(),
+        args.request_json.as_deref(),
+        args.output_tokens,
+    )?;
     Ok(BenchRealInput {
-        prompt,
-        output_tokens,
+        prompt: input.prompt,
+        output_tokens: input.output_tokens,
     })
 }
 
@@ -3298,8 +3813,21 @@ fn validate_bench_real_policies(cfg: &crate::config::Config) -> Result<(), Strin
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RealCliRuntimeMode {
+    BenchReal,
+    StrictHybridQualification,
+}
+
 async fn build_bench_real_runtime(
     config_path: &Path,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    build_real_cli_runtime(config_path, RealCliRuntimeMode::BenchReal).await
+}
+
+async fn build_real_cli_runtime(
+    config_path: &Path,
+    mode: RealCliRuntimeMode,
 ) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
     use crate::config::Config;
     use crate::metrics::Metrics;
@@ -3307,7 +3835,9 @@ async fn build_bench_real_runtime(
 
     let mut cfg = Config::from_file(config_path)?;
     crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
-    validate_bench_real_policies(&cfg)?;
+    if mode == RealCliRuntimeMode::BenchReal {
+        validate_bench_real_policies(&cfg)?;
+    }
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
         reconcile_real_model_config(&mut cfg)?;
@@ -3320,15 +3850,63 @@ async fn build_bench_real_runtime(
         &resolved_advanced,
     )?;
 
-    crate::backend::install_default();
-    {
-        let b = crate::backend::current();
-        info!(
-            backend = b.device_name(),
-            compute_plane = b.compute_plane(),
-            "bench-real math backend installed"
-        );
-    }
+    let execution_context = match mode {
+        RealCliRuntimeMode::BenchReal => {
+            crate::backend::install_default();
+            let context = crate::backend::current_execution_context();
+            let b = crate::backend::current();
+            info!(
+                backend = b.device_name(),
+                compute_plane = b.compute_plane(),
+                "bench-real math backend installed"
+            );
+            context
+        }
+        RealCliRuntimeMode::StrictHybridQualification => {
+            let capacity_bytes = cfg
+                .gpu_cache
+                .vram_capacity_mb
+                .checked_mul(1024 * 1024)
+                .ok_or("gpu_cache.vram_capacity_mb overflows usize")?;
+            let gpu_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+                capacity_bytes,
+                cfg.gpu_cache.vram_anchor_ratio,
+                cfg.gpu_cache.promote_after_hits,
+            ));
+            let rt = &cfg.real_transformer;
+            let head_dim = if rt.head_dim == 0 {
+                cfg.model.d_model / rt.num_heads
+            } else {
+                rt.head_dim
+            };
+            let context = crate::backend::resolve_execution_context(
+                cfg.real_transformer.compute_offload,
+                true,
+                crate::backend::GpuBackendGeometry {
+                    num_layers: cfg.model.num_layers,
+                    max_seq_len: if rt.window_size == 0 {
+                        4096
+                    } else {
+                        rt.window_size
+                    },
+                    num_heads: rt.num_heads,
+                    num_kv_heads: rt.num_kv_heads,
+                    head_dim,
+                    v_head_dim: 0,
+                    q4_truncation_tolerance: 0,
+                },
+                crate::backend::RoutedExpertGpuSpec {
+                    dtype: cfg.model.dtype,
+                    d_model: cfg.model.d_model,
+                    d_ff: cfg.model.d_ff,
+                },
+                gpu_cache,
+            )?;
+            crate::backend::set_execution_context(context.clone())
+                .map_err(|e| format!("failed to install qualification execution context: {e}"))?;
+            context
+        }
+    };
 
     if !cfg.model.data_dir.is_dir() {
         return Err(format!(
@@ -3503,7 +4081,7 @@ async fn build_bench_real_runtime(
             collect_route_profile: false,
             policy: cfg.real_transformer.inference_policy(),
         },
-        crate::backend::current_execution_context(),
+        execution_context,
     );
     engine_builder = engine_builder.with_pipeline_depth(cfg.storage.pipeline_depth);
     if cfg.predictive.locality_enabled {
@@ -3560,22 +4138,36 @@ async fn build_bench_real_runtime(
         ));
         engine_builder = engine_builder.with_pregate(pregate);
     }
+    if mode == RealCliRuntimeMode::StrictHybridQualification {
+        engine_builder.install_gpu_cache();
+        engine_builder = engine_builder.with_routed_expert_gpu_failure_policy(
+            crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed,
+        );
+    }
     let engine = Arc::new(engine_builder.with_metrics(metrics));
 
     let tokenizer = match cfg.tokenizer.path.as_ref() {
         Some(p) => match Tokenizer::from_file(p) {
             Ok(t) => Arc::new(t),
             Err(e) => {
-                return Err(
-                    format!("bench-real failed to load tokenizer {}: {e}", p.display()).into(),
-                );
+                let detail = match mode {
+                    RealCliRuntimeMode::BenchReal => {
+                        format!("bench-real failed to load tokenizer {}: {e}", p.display())
+                    }
+                    RealCliRuntimeMode::StrictHybridQualification => format!(
+                        "qualify-hybrid-q4 failed to load tokenizer {}: {e}",
+                        p.display()
+                    ),
+                };
+                return Err(detail.into());
             }
         },
         None => {
-            return Err(
-                "bench-real requires tokenizer.path; byte tokenizer fallback is not a production benchmark"
-                    .into(),
-            );
+            let detail = match mode {
+                RealCliRuntimeMode::BenchReal => "bench-real requires tokenizer.path; byte tokenizer fallback is not a production benchmark",
+                RealCliRuntimeMode::StrictHybridQualification => "qualify-hybrid-q4 requires tokenizer.path; byte tokenizer fallback is not permitted",
+            };
+            return Err(detail.into());
         }
     };
     // The tokenizer must be addressable by the reconciled model vocabulary
@@ -3583,7 +4175,15 @@ async fn build_bench_real_runtime(
     tokenizer
         .validate_vocab_compat(model.config.vocab_size)
         .map_err(|e| -> Box<dyn std::error::Error> {
-            format!("bench-real tokenizer is incompatible with the model: {e}").into()
+            match mode {
+                RealCliRuntimeMode::BenchReal => {
+                    format!("bench-real tokenizer is incompatible with the model: {e}").into()
+                }
+                RealCliRuntimeMode::StrictHybridQualification => {
+                    format!("qualify-hybrid-q4 tokenizer is incompatible with the model: {e}")
+                        .into()
+                }
+            }
         })?;
 
     Ok(BenchRealRuntime {
@@ -7616,6 +8216,115 @@ mod tests {
         let input = load_bench_real_input(&args).unwrap();
         assert_eq!(input.prompt, "hello");
         assert_eq!(input.output_tokens, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bench_real_cli_defaults_remain_unchanged() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "bench-real",
+            "--config",
+            "config.toml",
+            "--prompt",
+            "hello",
+        ])
+        .unwrap();
+        let Cmd::BenchReal {
+            warmup_runs,
+            measured_runs,
+            cache_reset,
+            greedy,
+            format,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected bench-real command");
+        };
+        assert_eq!(warmup_runs, 1);
+        assert_eq!(measured_runs, 1);
+        assert_eq!(cache_reset, BenchRealCacheReset::Keep);
+        assert!(!greedy);
+        assert_eq!(format, BenchRealOutputFormat::Human);
+    }
+
+    #[test]
+    fn qualification_cli_has_strict_defaults_and_external_evidence_slot() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-hybrid-q4",
+            "--config",
+            "config.toml",
+            "--prompt",
+            "hello",
+            "--external-gpu-memory-artifact",
+            "pr6://sample",
+        ])
+        .unwrap();
+        let Cmd::QualifyHybridQ4 {
+            warmup_runs,
+            output_tokens,
+            report_out,
+            external_gpu_memory_artifact,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected qualify-hybrid-q4 command");
+        };
+        assert_eq!(warmup_runs, 0);
+        assert_eq!(output_tokens, None);
+        assert_eq!(report_out, None);
+        assert_eq!(
+            external_gpu_memory_artifact.as_deref(),
+            Some("pr6://sample")
+        );
+    }
+
+    #[test]
+    fn qualification_cli_rejects_both_request_inputs() {
+        let error = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-hybrid-q4",
+            "--config",
+            "config.toml",
+            "--prompt",
+            "hello",
+            "--request-json",
+            "request.json",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn qualification_request_json_uses_bench_semantics_and_cli_override() {
+        let path = tempdir_unique("qualification-request.json");
+        std::fs::write(
+            &path,
+            r#"{ "prompt": "hello", "max_tokens": 7, "temperature": 0.9 }"#,
+        )
+        .unwrap();
+        let args = QualifyHybridQ4Args {
+            config: PathBuf::from("config.toml"),
+            prompt: None,
+            request_json: Some(path.clone()),
+            output_tokens: Some(3),
+            warmup_runs: 0,
+            report_out: None,
+            external_gpu_memory_artifact: None,
+            progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig::disabled(),
+        };
+        let input = load_qualification_input(&args).unwrap();
+        assert_eq!(input.prompt, "hello");
+        assert_eq!(input.output_tokens, 3);
+        assert_eq!(input.input_kind, "request-json");
+        assert!(crate::qualification::request_evidence(
+            input.input_kind,
+            &input.prompt,
+            input.output_tokens,
+            0
+        )
+        .greedy);
         let _ = std::fs::remove_file(path);
     }
 
