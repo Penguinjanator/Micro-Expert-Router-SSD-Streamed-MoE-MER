@@ -1,5 +1,5 @@
 //! Native terminal dashboard for `mer-cli monitor` — Phase 4 of the
-//! three-tier (SSD → RAM → VRAM) memory hierarchy.
+//! SSD/RAM plus logical GPU-admission hierarchy.
 //!
 //! This module is compiled only when the `tui` cargo feature is on
 //! (the default), in which case it pulls in `ratatui` + `crossterm`
@@ -16,11 +16,10 @@
 //! * Header strip with status pill, uptime, and per-second throughput
 //!   (with restart-recovery: TPS resets to zero on a backwards jump
 //!   of `tokens_generated`);
-//! * 3-tier hit-grid (VRAM / RAM / SSD) rendered as three side-by-side
+//! * hit-grid (GPU admission / RAM / SSD) rendered as three side-by-side
 //!   sparklines plotting the **delta** of each tier's hit counter
 //!   per refresh tick — i.e. pulse/load, not a cumulative staircase;
-//! * VRAM and RAM utilisation bars (anchor + LRU regions for the
-//!   VRAM tier; logical occupancy for the RAM tier);
+//! * logical GPU-admission and RAM utilisation bars;
 //! * I/O reactor pulse — a sparkline of the per-tick miss delta
 //!   (i.e. SSD reads required this tick), surfacing backpressure
 //!   and stall on the inference critical path.
@@ -365,7 +364,7 @@ fn draw_tiers(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     draw_tier_sparkline(
         f,
         columns[0],
-        "VRAM",
+        "GPU ADM",
         vram_hits,
         &app.vram_hits_history,
         ACCENT,
@@ -388,7 +387,7 @@ fn draw_tiers(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     );
 }
 
-/// Render one tier column: a label line ("VRAM 12345 Δ7") above a
+/// Render one tier column: a label line ("GPU ADM 12345 Δ7") above a
 /// sparkline drawn from the supplied delta history. Each panel owns
 /// its own border so the three tiers visually segment cleanly even
 /// in narrow terminals.
@@ -423,7 +422,7 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " VRAM UTILISATION ",
+            " GPU ADMISSION UTILISATION ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(block, area);
@@ -449,7 +448,7 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
         .split(inner);
 
     let vram_label = format!(
-        "VRAM  {} / {} MiB   anchor={}  lru={}  promotions={}",
+        "logical  {} / {} MiB   anchor={}  lru={}  promotions={}",
         app.last.vram_used_bytes / (1024 * 1024),
         app.last.vram_capacity_bytes / (1024 * 1024),
         app.last.gpu_anchor_count,
@@ -472,7 +471,7 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     f.render_widget(vram, rows[0]);
     f.render_widget(ram, rows[1]);
     let footer = if app.last.gpu_cache_enabled {
-        "[gpu_cache] ACTIVE — RAM→VRAM promotions on hit threshold"
+        "[gpu_cache] ACTIVE — RAM→logical-GPU admission on hit threshold"
     } else {
         "[gpu_cache] DISABLED — running 2-tier SSD→RAM"
     };
@@ -485,7 +484,7 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
 fn draw_pulse(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     // Reactor pulse — per-tick SSD-miss delta sourced from
     // `ssd_hits_history` (a RAM miss == an SSD read). A flat-zero
-    // line means every routed expert was served out of RAM/VRAM
+    // line means every routed expert was served from RAM/logical admission
     // (no I/O stall); tall bars are direct evidence of backpressure
     // on the inference critical path.
     let last_delta = app.ssd_hits_history.back().copied().unwrap_or(0);

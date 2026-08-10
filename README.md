@@ -612,8 +612,9 @@ when the GPU cache is enabled:
   logs, metrics, and runtime metadata; under `compute_offload = "gpu"`
   the same failure is **fatal and never continues on CPU** (explicit GPU
   does not transparently fall back). SSD-streamed MoE experts use the CPU
-  path unless they are promoted into the VRAM tier and dispatched through
-  the wgpu expert path; `--features cuda` is a separate candle CUDA path,
+  path unless they are logically admitted, materialized in the bounded
+  physical registry, and dispatched through the wgpu expert path;
+  `--features cuda` is a separate candle CUDA path,
   see [Building with CUDA](#building-with-cuda). The
   backend logs the **actual device runtime** (`cpu-fallback`,
   `cuda-0`, `wgpu-vulkan` …) at startup, gist Part 2 retired the
@@ -675,7 +676,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 |---|---|
 | `aligned_buffer` | Heap-allocated, page-aligned buffer (`std::alloc::alloc` with a `Layout`). The defining requirement of `O_DIRECT`: kernel rejects unaligned buffers with `EINVAL`. Reused by [`AlignedKvCache`](#page-aligned-kv-cache-buffer) so the session-scoped K/V state can be snapshotted to NVMe with no extra copy. |
 | `buffer_pool` | Fixed-capacity slab of `AlignedBuffer`s, optionally split into **primary** + **shadow** halves sharing one `Notify`. Hands out `PooledBuffer` RAII guards; `try_acquire`/`try_acquire_shadow` route to the corresponding free list; dropping a guard returns the buffer to its originating list and wakes waiters. `promote_shadow` does the zero-copy slot-tag swap when a speculative prefetch is confirmed. The literal "pre-allocated RAM buffer" the spec asks for. |
-| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Also owns the optional `GpuExpertCache` VRAM tier: hot RAM residents can promote into Anchor Core + LRU Edge regions, wgpu can materialize promoted experts as device buffers, and the CPU path remains the fallback when GPU execution is unavailable. |
+| `expert_cache` | LRU map `expert_id → Arc<ExpertResident>`, with a separate **pin set** so frequency-pinned and locality-hot experts skip eviction. Also owns the optional host-side `GpuExpertCache` logical admission policy (Anchor Core + LRU Edge). `GpuBackend` separately owns the generation-validated, capacity-bounded physical wgpu expert registry. |
 | `multi_layer_cache` | Per-layer `ExpertCache` wrapper keyed on `(layer, expert)`. Lets multi-layer Mixtral / DeepSeek configurations give each layer its own LRU budget instead of sharing one global cache. **Now wired into the engine hot path** (gist Part 1 fix #2): `EngineCore::cache` is an `Arc<MultiLayerExpertCache>` and `run`/`serve` distribute `--cache-slots` across `num_layers` (uniform per-layer caps via `MultiLayerExpertCache::with_capacities`, with any remainder going to the lowest-indexed layers). Single-layer / `--io-only` mode collapses to `MultiLayerExpertCache::single_layer(cap)` so existing benchmark paths are byte-identical. |
 | `block_pool` | Server-wide physical block pool for the **paged KV cache**. A pre-allocated slab plus a heap-backed overflow slab that grows on demand, with O(1) free-list alloc/release. The `BlockManager` is a per-request handle that auto-returns all of its blocks on `Drop`. Exposes `utilization()` and a three-level `PressureLevel { Normal, High, Critical }` whose soft-cap / critical ratios default to `SOFT_CAP_RATIO = 0.90` / `CRITICAL_PRESSURE_RATIO = 0.98` but are **operator-configurable** via `[real_transformer].pressure_high_threshold` / `pressure_critical_threshold` in `config.toml` (gist Part 1 fix #4), the [batch scheduler](#continuous-batching) reads the current level every batch to drive **preemptive idle-block eviction** and **speculation-depth clamping**. The overflow slab is **bounded** by `[real_transformer].max_overflow_capacity` (`PressureThresholds::with_max_overflow_capacity`, gist Part 1 fix #5): once the pool grows past the cap, `allocate` returns `None` so `BlockManager` surfaces `BlockAllocError::Exhausted` to the admission path instead of letting overflow grow unboundedly. |
 | `io_provider` | NVMe storage layer. Opens each expert as its own file (`O_DIRECT` on Linux), keeps fds resident, and reads via `tokio::task::block_in_place` + `pread(2)` (`FileExt::read_at`) routed through the **fault-tolerant `read_at_with_retries` path**: three-tier exponential backoff on transient errors (EIO / EINTR / `WouldBlock` / `TimedOut` / `EAGAIN`; short reads / `UnexpectedEof` fail fast) plus a per-expert **circuit breaker** that trips after `STORAGE_BREAKER_THRESHOLD = 3` consecutive failures and short-circuits to a structured `HardwareFailure::ExpertUnavailable`. A **per-drive** breaker (`STORAGE_DRIVE_BREAKER_THRESHOLD = 3`, sticky `DriveBreakerState`) sums failures across all experts sharded onto the same shard and short-circuits to `HardwareFailure::DriveUnavailable` so the engine stops routing to a known-bad drive without ever issuing the syscall, gist Phase 3. Both breakers transition to **half-open** after `STORAGE_BREAKER_PROBE_INTERVAL = 500 ms`, admitting exactly one probe read per interval via a `compare_exchange` on `tripped_at_ms` so a recovered drive can actually reach the `note_read_success` path and clear the breaker. Supports **multi-drive striping** (`NvmeStorage::striped`), experts are sharded across `N` mountpoints by `id % N`. A startup [`Manifest::scan`](#cold-start-manifest) walks every `expert_<id>.bin` once, reads each header into RAM, and lets `NvmeStorage::with_manifest` short-circuit per-fetch path resolution and dtype lookup. Includes synthetic test generators (for every dtype) and a portable Unix fallback for development on macOS. |
@@ -701,7 +702,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `numa` | Startup CPU placement helpers. By default MER applies no artificial CPU mask. Operators can opt in with global `--cpu-mask <CPULIST>` or `[performance].cpu_mask`; legacy `MER_PIN_CORES=N` remains a lower-precedence fallback. On Linux this uses `sched_setaffinity(2)` best-effort; elsewhere MER logs and continues. |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
-| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a 3-tier hit grid with one **delta-calculated** sparkline per tier (VRAM / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a VRAM/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
+| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a hit grid with one **delta-calculated** sparkline per tier (logical GPU admission / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a logical-admission/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
 | `rpc` | Sharded `RouteExperts` RPC frames (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` f16 wire frames documented in `docs/distributed.md`. Dependency-free so the default build stays slim; the real `tonic`/`prost` gRPC transport in `grpc` (behind `--features grpc`) reuses these frames and their f16 pack/unpack helpers as the single source of truth for the on-wire layout. |
@@ -1146,7 +1147,7 @@ Endpoints:
 | -------- | -------------------------- | -------------------------------------------------- |
 | `GET`    | `/health`                  | liveness probe (`{"status":"ok"...}`)             |
 | `GET`    | `/metrics`                 | Prometheus text format: cache hit rate, request latency histograms, tokens generated, per-token I/O wait, and, when the predictive arms are enabled, `mer_locality_hits_total`, `mer_locality_misses_total`, `mer_speculator_hits_total`, `mer_speculator_misses_total`, `mer_speculator_accuracy_total`, `mer_speculator_evaluations_total`, and the `mer_ssd_stall_seconds` histogram. When `[gpu_cache] enabled = true`, also exports `mer_vram_used_bytes`, `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total`, `mer_gpu_cache_misses_total`, and `mer_promotions_total` |
-| `GET`    | `/v1/admin/health/experts` | JSON snapshot of the 3-tier hierarchy: per-tier hit/miss counters (SSD, RAM, VRAM), VRAM used / capacity bytes, total RAM→VRAM promotions, and engine status fields. Consumed by `micro-expert-router monitor`. |
+| `GET`    | `/v1/admin/health/experts` | JSON snapshot with SSD/RAM/logical-GPU-admission counters and compatibility `vram_*` logical admission bytes. Consumed by `micro-expert-router monitor`; exact physical bytes use the Rust snapshot API. |
 | `POST`   | `/v1/admin/evict`          | One-shot reclaim pass on the paged-KV pool's overflow slab. Returns `{"reclaimed_overflow_blocks": N}`. Useful after a transient burst inflated the heap-backed fallback, returns memory to the allocator immediately rather than waiting for the periodic background sweep. |
 | `POST`   | `/v1/completions`          | OpenAI text-completion shape (`prompt`, `max_tokens`...) |
 | `POST`   | `/v1/chat/completions`     | OpenAI chat-completion shape (`messages`...)       |
@@ -2158,9 +2159,9 @@ micro-expert-router run
   --io-only                  Skip the SwiGLU FFN; XOR every byte to isolate I/O cost
   --gpu                      Initialise the GPU compute backend before the
                               benchmark so the FFN forward uses GPU matmul
-                              where available, and install a bounded VRAM
-                              `GpuExpertCache` so hot experts can promote and
-                              be served from device memory. This is an
+                              where available, and install bounded logical GPU
+                              admission plus physical expert-weight residency.
+                              This is an
                               explicit fail-closed request: GPU init or
                               backend installation failure aborts the run
                               rather than silently measuring the CPU path.
@@ -2336,7 +2337,7 @@ micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance
                               (default `http://127.0.0.1:8080`). Polls
                               `/v1/admin/health/experts` and renders the
-                              live SSD → RAM → VRAM dashboard described in
+                              live SSD/RAM/GPU-admission dashboard described in
                               the `monitor` subcommand section below.
   --refresh-ms <MS>          Dashboard refresh interval (default 500).
 ```
@@ -2864,12 +2865,14 @@ get wrong with a handful of hand-picked unit tests:
 `(expert_id, ExpertResident)` message on the
 `gpu_promotion_tx` mpsc channel after `promote_after_hits` RAM hits
 on the same expert, the crossing is edge-triggered so subsequent
-hits must NOT re-fire the promotion. A dedicated unit test
-(`moe_step_emits_exactly_one_gpu_promotion_after_threshold_hits`)
-installs the channel via a test-only helper that skips spawning the
-background consumer task, then drives `moe_step` past the threshold
-and asserts on the raw mpsc traffic. This guards against silent
-regressions in the three-tier SSD → RAM → VRAM promotion logic.
+hits must not flood duplicate promotion requests. After logical eviction,
+the already-hot expert can claim one new request without requiring its
+monotonic RAM hit count to cross the threshold again. The
+`moe_step_emits_exactly_one_gpu_promotion_after_threshold_hits` test installs
+the channel via a test-only helper, drives `moe_step` past the threshold, and
+asserts on raw mpsc traffic. The
+`promotion_claim_rearms_after_logical_eviction_above_hit_threshold` test covers
+the re-admission edge.
 
 
 ---
@@ -3221,10 +3224,10 @@ counters / a histogram on `/metrics`:
 | `mer_locality_hits_total` | Routed experts that were already in the locality monitor's hot set at routing time (would-be cache miss avoided by pinning). |
 | `mer_locality_misses_total` | Routed experts that were not. |
 | `mer_ssd_stall_seconds` | Histogram of cumulative SSD critical-path stall time per token, the wall-clock window the engine spent blocked waiting for cache-miss reads to land. The headline number the L / M arms aim to drive down. |
-| `mer_vram_used_bytes` | Bytes currently resident in the optional GPU/VRAM tier of the 3-tier hierarchy (`[gpu_cache] enabled = true`). Updated by the background promotion task installed via `Engine::install_gpu_cache`. |
-| `mer_vram_capacity_bytes` | VRAM budget the `GpuExpertCache` was sized with (`[gpu_cache] vram_capacity_mb * 1 MiB`). Constant for the lifetime of the process. |
-| `mer_gpu_cache_hits_total` / `mer_gpu_cache_misses_total` | Counters incremented on every probe of the VRAM tier during routing. A non-zero hit count is the proof point that hot experts have actually been promoted off RAM. |
-| `mer_promotions_total` | Total number of RAM → VRAM promotions completed by the background promotion task since startup. |
+| `mer_vram_used_bytes` | Compatibility metric: logical host payload bytes admitted by `GpuExpertCache` (`[gpu_cache] enabled = true`), not physical wgpu allocation bytes. |
+| `mer_vram_capacity_bytes` | Compatibility metric: logical admission budget (`vram_capacity_mb * 1 MiB`), also used as the physical expert-weight cap; fixed workspaces are separate. |
+| `mer_gpu_cache_hits_total` / `mer_gpu_cache_misses_total` | Counters incremented on every logical `GpuExpertCache` admission probe during routing; they do not prove physical device residency. |
+| `mer_promotions_total` | Total RAM → logical-GPU-admission promotions completed by the background task. |
 
 The CLI run summary (`print_summary`) appends an extra line when
 either arm is enabled, e.g.:
@@ -3481,39 +3484,42 @@ cost_aware_eviction            = true
 
 The legacy 2-tier `SSD → RAM` substrate is bit-for-bit unchanged when
 `[gpu_cache] enabled = false` (the default). With `enabled = true`,
-the engine layers an Anchor + LRU-Edge **VRAM tier** on top of it:
+the engine layers host-side logical GPU admission over RAM, while the GPU
+backend separately materializes generation-matched physical weights:
 
 ```
-   ┌──────────┐         ┌──────────────┐          ┌──────────────────────┐
-   │   SSD    │ ──read─▶│  ExpertCache │ ─promote▶│   GpuExpertCache     │
-   │ (NVMe)   │  pread  │   (RAM, LRU) │  hot     │ Anchor Core + LRU Edge│
-   └──────────┘         └──────────────┘          └──────────────────────┘
+   SSD ──read──▶ ExpertCache (RAM) ──promote──▶ GpuExpertCache (host admission)
+                                                  │ current generation
+                                                  ▼
+                                  PhysicalGpuExpertRegistry (wgpu weights)
 ```
 
-* **RAM hits are still authoritative.** On a VRAM hit we still resolve
-  from RAM; VRAM shadows the bytes so the inference contract is
-  identical to the 2-tier path. With the wgpu backend active, promoted
-  experts can be materialized as device buffers for GPU expert matmul;
-  otherwise the cache remains a RAM-side promotion/observability tier
+* **Logical and physical ownership are separate.** `GpuExpertCache` retains
+  host payloads and assigns admission generations. The wgpu backend validates
+  that generation before every physical hit, lazily uploads exact device
+  buffers, and evicts them under the configured expert-weight cap. Otherwise
+  the admission cache remains a RAM-side promotion/observability tier
   and execution falls back to CPU. The optional `cuda` cargo feature is
   a separate candle CUDA path via
   [`run_inference_gpu`](rust-engine/src/inference.rs).
 * **Anchor Core.** A HashMap pinning the experts whose RAM hit count
   has crossed `[gpu_cache] promote_after_hits`. Sized to
   `vram_anchor_ratio * vram_capacity_mb`.
-* **LRU Edge.** Tracks topical experts that haven't pinned yet, evicted
-  by an `lru::LruCache` driven by the remaining VRAM budget.
+* **LRU Edge.** Tracks topical logical admissions that have not pinned yet,
+  evicted by an `lru::LruCache` under the remaining admission budget.
 * **Async promotion.** `Engine::install_gpu_cache` spawns a background
   tokio task that drains an unbounded `mpsc` of promotion intents off
-  the hot path, copies the RAM bytes into the VRAM tier, and bumps
+  the hot path, copies RAM bytes into logical admission, and bumps
   `mer_vram_used_bytes` + `mer_promotions_total`.
 * **Configured via [`[gpu_cache]`](config.toml)**, see the annotated
   TOML for every field.
-* **Observability.** Four new Prometheus metrics (`mer_vram_used_bytes`,
+* **Observability.** Compatibility Prometheus metrics (`mer_vram_used_bytes`,
   `mer_vram_capacity_bytes`, `mer_gpu_cache_hits_total` /
   `_misses_total`, `mer_promotions_total`) and the extended
-  `/v1/admin/health/experts` JSON. The latter is what the
-  [`monitor` subcommand](#monitor-subcommand) consumes.
+  `/v1/admin/health/experts` JSON explicitly describe logical admission. The
+  exact physical expert/live/workspace ledger is exposed through the Rust
+  `gpu_expert_memory_snapshot` API for qualification work. The health JSON is
+  what the [`monitor` subcommand](#monitor-subcommand) consumes.
 
 ### `monitor` subcommand
 
@@ -3530,11 +3536,11 @@ the Amalgafy-style monochromatic tech-noir layout:
 * a header with status / uptime / TPS, the TPS counter resets to
   zero when `tokens_generated` jumps backwards (server restart) so
   the rate stays meaningful across engine restarts;
-* a 3-tier hit grid with one sparkline per tier (VRAM / RAM / SSD).
+* a hit grid with one sparkline per tier (logical GPU admission / RAM / SSD).
   Each sparkline plots the **delta** of the tier's cumulative
   counter per refresh tick, so the trace shows real load pulse, not
   a cumulative staircase;
-* a VRAM utilisation gauge (anchor + LRU regions) and a RAM
+* a logical GPU-admission gauge (anchor + LRU regions) and a RAM
   occupancy gauge driven by the `/metrics` companion gauges; and
 * an I/O reactor stall pulse, a sparkline of the per-tick SSD-miss
   delta, surfacing backpressure on the inference critical path.

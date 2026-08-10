@@ -67,19 +67,20 @@ struct MetricsInner {
     /// path that was actually waiting on the storage device, as
     /// distinct from the total I/O time which can overlap compute).
     pub ssd_stall_seconds: Histogram,
-    /// VRAM tier probe hits — lookups for which the requested expert
+    /// Logical GPU-admission probe hits — lookups for which the requested expert
     /// was already present in
     /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
     /// at probe time (Phase 1).
     pub gpu_cache_hits_total: Counter,
-    /// VRAM tier probe misses — lookups for which the requested expert
-    /// was not present in VRAM at probe time and therefore required
+    /// Logical GPU-admission probe misses — lookups for which the requested
+    /// expert was not admitted at probe time and therefore required
     /// lower-tier resolution/promotion logic (Phase 1).
     pub gpu_cache_misses_total: Counter,
-    /// **Gauge** of currently-resident VRAM bytes across the Anchor +
-    /// LRU regions. Phase 1.
+    /// Compatibility gauge of logical host payload bytes admitted across the
+    /// Anchor + LRU regions. It is not physical wgpu memory; PR4 physical
+    /// accounting is exposed by `GpuExpertMemorySnapshot`.
     pub vram_used_bytes: IntGauge,
-    /// **Gauge** of the total VRAM byte budget for the
+    /// Compatibility gauge of the logical admission byte budget for the
     /// [`GpuExpertCache`](crate::expert_cache::GpuExpertCache)
     /// (Anchor + LRU capacity). Set once when the GPU cache is
     /// installed so dashboards can compute utilisation as
@@ -87,7 +88,7 @@ struct MetricsInner {
     /// relying on the `/v1/admin/health/experts` admin endpoint.
     /// Stays at `0` when the GPU cache is disabled. Phase 1.
     pub vram_capacity_bytes: IntGauge,
-    /// Total RAM → VRAM promotions performed since startup. Each
+    /// Total RAM → logical GPU-admission promotions performed since startup. Each
     /// promotion is the result of an `ExpertResident` crossing
     /// `gpu_cache.promote_after_hits` and being copied into the
     /// Anchor Core (or the LRU Edge as a fallback). Phase 1.
@@ -101,7 +102,7 @@ struct MetricsInner {
     /// a hidden-state / `d_model` mismatch.
     pub speculator_disabled_total: Counter,
     /// Expert activations that fell back from the GPU fast path to the
-    /// CPU path because the VRAM dispatch errored.
+    /// CPU path because physical GPU routed-expert dispatch errored.
     pub gpu_cpu_fallbacks_total: Counter,
     /// **Gauge** mirroring the process-wide cumulative count of
     /// attention-softmax non-finite fallbacks
@@ -262,31 +263,31 @@ impl Metrics {
         .expect("metric registration: mer_ssd_stall_seconds");
         let gpu_cache_hits_total = register_counter_with_registry!(
             "mer_gpu_cache_hits_total",
-            "VRAM-tier expert cache hits (lookups served out of GpuExpertCache).",
+            "Logical GPU-admission hits served by GpuExpertCache.",
             registry
         )
         .expect("metric registration: mer_gpu_cache_hits_total");
         let gpu_cache_misses_total = register_counter_with_registry!(
             "mer_gpu_cache_misses_total",
-            "VRAM-tier expert cache misses (lookups that fell through to RAM/NVMe).",
+            "Logical GPU-admission misses that fell through to RAM/NVMe.",
             registry
         )
         .expect("metric registration: mer_gpu_cache_misses_total");
         let vram_used_bytes = register_int_gauge_with_registry!(
             "mer_vram_used_bytes",
-            "Currently-resident VRAM bytes across the Anchor Core + LRU Edge regions.",
+            "Compatibility metric: logical host payload bytes admitted across GpuExpertCache Anchor + LRU; not physical wgpu allocation bytes.",
             registry
         )
         .expect("metric registration: mer_vram_used_bytes");
         let vram_capacity_bytes = register_int_gauge_with_registry!(
             "mer_vram_capacity_bytes",
-            "Total VRAM byte budget configured for the GpuExpertCache (Anchor + LRU). 0 when the GPU cache is disabled.",
+            "Compatibility metric: logical GpuExpertCache admission budget (also the physical expert-weight cap); excludes fixed workspaces. 0 when disabled.",
             registry
         )
         .expect("metric registration: mer_vram_capacity_bytes");
         let promotions_total = register_counter_with_registry!(
             "mer_promotions_total",
-            "Total RAM-to-VRAM promotions performed since startup.",
+            "Total RAM-to-logical-GPU-admission promotions performed since startup.",
             registry
         )
         .expect("metric registration: mer_promotions_total");
@@ -520,7 +521,7 @@ impl Metrics {
         self.inner.ssd_stall_seconds.observe(seconds);
     }
 
-    /// Record one VRAM (GPU) tier cache lookup outcome. Mirrors
+    /// Record one logical GPU-admission lookup outcome. Mirrors
     /// `record_cache` for the new top-tier in the 3-tier hierarchy.
     pub fn record_gpu_cache(&self, hits: u64, misses: u64) {
         if hits > 0 {
@@ -531,16 +532,15 @@ impl Metrics {
         }
     }
 
-    /// Set the currently-resident VRAM bytes gauge. Called by the
-    /// `GpuExpertCache` whenever the resident set changes (insert /
-    /// promote / evict).
+    /// Set the compatibility logical-admission byte gauge. Physical wgpu
+    /// expert/workspace bytes are available from `GpuExpertMemorySnapshot`.
     pub fn set_vram_used_bytes(&self, bytes: u64) {
         self.inner.vram_used_bytes.set(bytes as i64);
     }
 
-    /// Set the total VRAM byte budget gauge. Called once when the
-    /// `GpuExpertCache` is installed (constant for the lifetime of
-    /// the process); stays at `0` when the GPU cache is disabled.
+    /// Set the compatibility logical-admission budget gauge. The same
+    /// configured value caps physical expert weights, while fixed workspaces
+    /// are reported separately by the PR4 ledger.
     pub fn set_vram_capacity_bytes(&self, bytes: u64) {
         self.inner.vram_capacity_bytes.set(bytes as i64);
     }
@@ -560,7 +560,7 @@ impl Metrics {
         }
     }
 
-    /// Record `n` RAM → VRAM promotions.
+    /// Record `n` RAM → logical GPU-admission promotions.
     pub fn record_promotions(&self, n: u64) {
         if n > 0 {
             self.inner.promotions_total.inc_by(n as f64);
@@ -693,6 +693,12 @@ mod tests {
         .unwrap();
         m.set_backend_component_planes(hybrid.plan());
         let body = String::from_utf8(m.render().unwrap()).unwrap();
+        assert!(body.contains(
+            "# HELP mer_vram_used_bytes Compatibility metric: logical host payload bytes"
+        ));
+        assert!(body.contains(
+            "# HELP mer_vram_capacity_bytes Compatibility metric: logical GpuExpertCache admission budget"
+        ));
         let want_one = [
             r#"mer_backend_component_plane{component="attention",plane="cpu"} 1"#,
             r#"mer_backend_component_plane{component="experts",plane="gpu"} 1"#,

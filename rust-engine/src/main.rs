@@ -576,15 +576,13 @@ enum Cmd {
         trace_out: Option<PathBuf>,
         /// Initialise the GPU compute backend before running the
         /// benchmark so the FFN forward pass uses GPU matmul where
-        /// available. The run path also installs a bounded VRAM
-        /// `GpuExpertCache` so hot experts can promote and be served
-        /// from device memory. Falls back to the default CPU backend
+        /// available. The run path also installs bounded logical admission
+        /// plus physical expert-weight residency. Falls back to the default CPU backend
         /// with a warning if GPU init fails.
         #[arg(long)]
         gpu: bool,
-        /// VRAM budget, in MiB, for the run-mode GPU expert cache
-        /// (only with `--gpu`). Hot experts promote into this cache and
-        /// are served from device memory. The 4 GiB default fits ~40
+        /// Physical expert-weight cap and logical admission budget, in MiB
+        /// (only with `--gpu`). The 4 GiB default fits ~40
         /// Mixtral-8x7B Q4 experts (~99 MiB each — 512 MiB would hold
         /// barely 5); lower it on cards with less free VRAM.
         #[arg(long, default_value_t = 4096)]
@@ -926,10 +924,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Native terminal dashboard — Phase 4 of the three-tier memory
-    /// hierarchy. Polls a running `serve` instance and renders a live
-    /// ratatui view of the SSD → RAM → VRAM hit grid, current cache
-    /// state, VRAM utilisation, and I/O reactor activity. Pure
+    /// Native terminal dashboard. Polls a running `serve` instance and renders
+    /// SSD/RAM/logical-GPU-admission hits, cache state, admission utilisation,
+    /// and I/O reactor activity. Pure
     /// observability; the dashboard does not mutate engine state.
     ///
     /// Requires the binary to be built with the `tui` cargo feature
@@ -1952,7 +1949,8 @@ fn install_run_gpu_backend(
     // everything through `expert_matmul`.
     //
     // Give run-mode GPU promotion a bounded (but non-zero) budget so
-    // repeated experts can become true GPU hits. Sized by
+    // repeated experts can become logically admitted and then physically
+    // uploaded by the backend on demand. Sized by
     // `--gpu-cache-mb` (default 4 GiB — a single Mixtral-8x7B Q4
     // expert is ~99 MiB, so anything much smaller thrashes).
     let gpu_expert_cache = std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(
@@ -4430,9 +4428,9 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // Resolve requested mode once into the authoritative component plan and
     // backend context before constructing the model or engine.
     //
-    // The GPU expert cache is constructed up-front so the same `Arc`
-    // can be threaded into both `GpuBackend` (which checks VRAM
-    // residency before falling back to NVMe streaming) and
+    // The logical GPU-admission cache is constructed up-front so the same
+    // `Arc` can be threaded into both `GpuBackend` (which validates admission
+    // generations before physical lookup/upload) and
     // `Engine::install_gpu_cache` further below. When `[gpu_cache].enabled =
     // false` the zero-capacity cache never promotes anything.
     let gpu_expert_cache = {
@@ -4961,14 +4959,14 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         ));
         engine_builder = engine_builder.with_pregate(pregate);
     }
-    // Phase 2: optional VRAM (GPU) expert cache (3-tier hierarchy
-    // SSD → RAM → VRAM). When `[gpu_cache].enabled = false` (default)
+    // Phase 2: optional logical GPU-admission cache. Physical wgpu expert
+    // residency is owned separately by the backend registry. When disabled,
     // the engine retains its historical 2-tier posture.
     if cfg.gpu_cache.enabled {
         // `gpu_cache.dtype` is currently advisory — it is validated by
         // `AppConfig::validate` (so typos fail fast) and surfaced here
         // for observability, but the promotion path copies on-disk
-        // bytes into VRAM without conversion or repacking. Parse it
+        // bytes into logical host admission without conversion or repacking. Parse it
         // here purely so the startup log records the operator's
         // declared intent.
         let dtype_for_logging = crate::inference::WeightDtype::from_str_opt(&cfg.gpu_cache.dtype)
@@ -4978,7 +4976,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             anchor_ratio = cfg.gpu_cache.vram_anchor_ratio,
             promote_after_hits = cfg.gpu_cache.promote_after_hits,
             dtype_advisory = %dtype_for_logging.as_str(),
-            "VRAM (GPU) expert cache enabled — 3-tier SSD→RAM→VRAM hierarchy active (dtype is advisory; bytes copied as-is)"
+            "logical GPU expert admission enabled (dtype is advisory; physical upload is lazy and backend-owned)"
         );
         engine_builder.install_gpu_cache();
     }
