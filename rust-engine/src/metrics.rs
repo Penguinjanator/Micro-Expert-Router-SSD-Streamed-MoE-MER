@@ -88,10 +88,10 @@ struct MetricsInner {
     /// relying on the `/v1/admin/health/experts` admin endpoint.
     /// Stays at `0` when the GPU cache is disabled. Phase 1.
     pub vram_capacity_bytes: IntGauge,
-    /// Total RAM → logical GPU-admission promotions performed since startup. Each
-    /// promotion is the result of an `ExpertResident` crossing
-    /// `gpu_cache.promote_after_hits` and being copied into the
-    /// Anchor Core (or the LRU Edge as a fallback). Phase 1.
+    /// Total successful logical GPU-promotion transitions since startup: a new
+    /// Anchor/LRU admission or an existing LRU admission graduating to Anchor.
+    /// No-op/already-resident outcomes are excluded. Mirrors
+    /// [`GpuExpertCache::promotions`](crate::expert_cache::GpuExpertCache::promotions).
     pub promotions_total: Counter,
     /// Speculative prefetches dropped because no pool buffer could be
     /// acquired (shadow half starved even after recycling, or legacy
@@ -287,7 +287,7 @@ impl Metrics {
         .expect("metric registration: mer_vram_capacity_bytes");
         let promotions_total = register_counter_with_registry!(
             "mer_promotions_total",
-            "Total RAM-to-logical-GPU-admission promotions performed since startup.",
+            "Total successful logical GPU promotion transitions (new admission or LRU-to-Anchor graduation) since startup.",
             registry
         )
         .expect("metric registration: mer_promotions_total");
@@ -560,7 +560,7 @@ impl Metrics {
         }
     }
 
-    /// Record `n` RAM → logical GPU-admission promotions.
+    /// Record `n` successful logical GPU-promotion transitions.
     pub fn record_promotions(&self, n: u64) {
         if n > 0 {
             self.inner.promotions_total.inc_by(n as f64);

@@ -4512,6 +4512,39 @@ mod tests {
     }
 
     #[test]
+    fn logical_lru_to_anchor_move_reuses_matching_physical_generation() {
+        let cache = crate::expert_cache::GpuExpertCache::new(128, 0.5, 3);
+        let resident = Arc::new(crate::expert_cache::GpuResident::new(7, vec![0u8; 32]));
+        assert_eq!(cache.demand_admit_lru(resident.clone()), Ok(true));
+        let generation = cache.current_generation(7).expect("LRU generation");
+        let key = physical_key(7, generation);
+        let registry = test_physical_registry(128, 0);
+        let physical = install_test_physical_entry(&registry, key, 32).unwrap();
+
+        assert!(cache.claim_promotion(7, 3));
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            crate::expert_cache::GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        assert_eq!(cache.current_generation(7), Some(generation));
+        assert!(Arc::ptr_eq(
+            cache.current_admission(7).unwrap().resident(),
+            &resident
+        ));
+
+        let reused = match registry.lookup_current(key) {
+            PhysicalRegistryLookup::Hit(entry) => entry,
+            _ => panic!("matching physical generation must remain reusable"),
+        };
+        assert!(Arc::ptr_eq(&physical, &reused));
+        let snapshot = registry.snapshot(cache.used_bytes());
+        assert_eq!(snapshot.physical_installs, 1);
+        assert_eq!(snapshot.physical_entries, 1);
+        assert_eq!(snapshot.expert_registry_bytes, 32);
+        assert_eq!(snapshot.stale_retirements, 0);
+    }
+
+    #[test]
     fn physical_registry_retires_stale_generation_before_reinstall() {
         let registry = test_physical_registry(128, 0);
         let g1 = physical_key(7, 1);

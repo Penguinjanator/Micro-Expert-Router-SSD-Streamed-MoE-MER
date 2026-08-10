@@ -16,7 +16,9 @@
 use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
-use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
+use crate::expert_cache::{
+    ExpertResident, GpuExpertCache, GpuHotPromotionOutcome, GpuResident,
+};
 use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
@@ -2042,6 +2044,43 @@ impl Engine {
         }
     }
 
+    /// Process one threshold-driven promotion request. Existing logical
+    /// admissions are resolved first so an LRU entry can move to Anchor Core
+    /// without copying its multi-megabyte RAM payload. Only an absent id
+    /// requires a payload copy, followed by a locked recheck that preserves a
+    /// foreground demand admission if it won the race.
+    fn complete_background_gpu_promotion(
+        gpu: &GpuExpertCache,
+        prom: Option<&Metrics>,
+        id: u32,
+        resident: &ExpertResident,
+        dtype: WeightDtype,
+    ) -> GpuHotPromotionOutcome {
+        let initial = gpu.promote_hot_existing(id);
+        let outcome = if initial == GpuHotPromotionOutcome::PayloadRequired {
+            // The cache lock was released by `promote_hot_existing` before
+            // this copy. `promote_hot_sync` rechecks under its own lock, so a
+            // concurrent demand admission is moved intact rather than
+            // replaced by this redundant payload.
+            let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+                id,
+                resident.data().to_vec(),
+                dtype,
+            ));
+            gpu.promote_hot_sync(gpu_resident)
+        } else {
+            initial
+        };
+
+        if outcome.is_transition() {
+            if let Some(prom) = prom {
+                prom.record_promotions(1);
+                prom.set_vram_used_bytes(gpu.used_bytes());
+            }
+        }
+        outcome
+    }
+
     /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.
     ///
     /// Spawns a background Tokio task that drains an MPSC channel of
@@ -2072,24 +2111,16 @@ impl Engine {
         }
         tokio::spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
-                // `promote_sync` copies resident bytes into the host logical
-                // admission Anchor/LRU under the parking_lot mutex; safe to
-                // call from a Tokio worker because it never .awaits.
-                // Bytes are promoted verbatim; the dtype tag tells the
-                // GPU backend which matmul pipeline to dispatch (shared
-                // with the synchronous warm-up promotion path).
-                let gpu_res = Arc::new(GpuResident::new_with_dtype(
+                // Existing LRU admissions graduate atomically without a host
+                // payload copy. Absent ids copy outside the cache mutex and
+                // are rechecked under lock before final hot admission.
+                Self::complete_background_gpu_promotion(
+                    gpu_for_task.as_ref(),
+                    prom_for_task.as_ref(),
                     id,
-                    resident.data().to_vec(),
+                    resident.as_ref(),
                     promote_dtype,
-                ));
-                let promoted = gpu_for_task.promote_sync(gpu_res);
-                if promoted {
-                    if let Some(p) = prom_for_task.as_ref() {
-                        p.record_promotions(1);
-                        p.set_vram_used_bytes(gpu_for_task.used_bytes() as u64);
-                    }
-                }
+                );
             }
         });
         self.core.gpu_cache = Some(gpu.clone());
@@ -5311,9 +5342,9 @@ pub struct EngineReport {
     /// Compatibility field: logical admission budget. The same configured
     /// value caps physical expert weights; fixed workspaces are separate.
     pub vram_capacity_bytes: u64,
-    /// Cumulative RAM → logical-admission promotions performed by the background
-    /// promotion task. Promotions are gated by the per-expert
-    /// `promote_after_hits` threshold.
+    /// Cumulative successful logical GPU-promotion transitions: new
+    /// Anchor/LRU admissions plus LRU-to-Anchor graduation. No-op outcomes are
+    /// excluded; this mirrors `mer_promotions_total` when metrics are enabled.
     pub gpu_promotions: u64,
     /// Logical GPU-admission hit count (anchor + LRU).
     pub gpu_cache_hits: u64,
@@ -5580,6 +5611,18 @@ mod tests {
             .load(Ordering::Relaxed)
     }
 
+    fn rendered_counter(metrics: &Metrics, name: &str) -> u64 {
+        let body = String::from_utf8(metrics.render().expect("render Prometheus metrics"))
+            .expect("metrics are UTF-8");
+        body.lines()
+            .find_map(|line| {
+                let (metric, value) = line.split_once(' ')?;
+                (metric == name)
+                    .then(|| value.parse::<f64>().expect("Prometheus counter value") as u64)
+            })
+            .unwrap_or_else(|| panic!("missing Prometheus counter {name} in:\n{body}"))
+    }
+
     fn assert_gpu_dispatch_error(
         error: MoeStepError,
         expected_kind: crate::backend::GpuExpertDispatchErrorKind,
@@ -5699,6 +5742,184 @@ mod tests {
                 degraded_expert_substitutions: 0,
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_wins_hot_promotion_race_keeps_internal_and_prometheus_equal() {
+        let dir = TempDir::new("hot-promotion-demand-wins");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30A);
+        let id = 2;
+        base.warm_with(&[id]).await.expect("warm RAM resident");
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let rebuilt = rebuild_with_test_gpu(
+            &base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        let metrics = Metrics::new();
+        let engine = match Arc::try_unwrap(rebuilt) {
+            Ok(engine) => engine.with_metrics(metrics.clone()),
+            Err(_) => panic!("test owns the sole rebuilt engine Arc"),
+        };
+        let resident = engine.core.cache.get(id).expect("RAM resident");
+        let gpu = engine.execution_context().gpu_expert_cache();
+
+        assert!(gpu.claim_promotion(id, 16));
+        engine
+            .demand_admit_resident_to_gpu(0, resident.as_ref())
+            .expect("foreground demand admission");
+        let demand_admission = gpu.current_admission(id).expect("demand LRU admission");
+        let generation = demand_admission.generation();
+
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu,
+                Some(&metrics),
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        let current = gpu.current_admission(id).expect("graduated admission");
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), demand_admission.resident()));
+        assert_eq!(gpu.promotions(), 2, "demand install + Anchor graduation");
+        assert_eq!(rendered_counter(&metrics, "mer_promotions_total"), 2);
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_wins_hot_promotion_race_keeps_demand_recheck_noop() {
+        let dir = TempDir::new("hot-promotion-background-wins");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30B);
+        let id = 2;
+        base.warm_with(&[id]).await.expect("warm RAM resident");
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let rebuilt = rebuild_with_test_gpu(
+            &base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        let metrics = Metrics::new();
+        let engine = match Arc::try_unwrap(rebuilt) {
+            Ok(engine) => engine.with_metrics(metrics.clone()),
+            Err(_) => panic!("test owns the sole rebuilt engine Arc"),
+        };
+        let resident = engine.core.cache.get(id).expect("RAM resident");
+        let gpu = engine.execution_context().gpu_expert_cache();
+
+        assert_eq!(
+            gpu.demand_admission_preflight(id, resident.data().len()),
+            Ok(crate::expert_cache::GpuDemandAdmissionPreflight::NeedsPayload)
+        );
+        assert!(gpu.claim_promotion(id, 16));
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu,
+                Some(&metrics),
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::InstalledAnchor
+        );
+        let background_admission = gpu.current_admission(id).expect("Anchor admission");
+        let generation = background_admission.generation();
+
+        engine
+            .demand_admit_resident_to_gpu(0, resident.as_ref())
+            .expect("demand recheck must observe background admission");
+        let current = gpu.current_admission(id).expect("current admission");
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), background_admission.resident()));
+        assert_eq!(gpu.promotions(), 1);
+        assert_eq!(rendered_counter(&metrics, "mer_promotions_total"), 1);
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_demand_admitted_hot_expert_graduates_to_anchor() {
+        let dir = TempDir::new("serving-demand-hot-graduation");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30C);
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let gpu = Arc::new(crate::expert_cache::GpuExpertCache::new(64 * 1024, 0.5, 3));
+        let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu.clone()));
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Hybrid,
+            true,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 16,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: base.core.shape.d_model,
+                v_head_dim: base.core.shape.d_model,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: base.core.options.dtype,
+                d_model: base.core.shape.d_model,
+                d_ff: base.core.shape.d_ff,
+            },
+            gpu.clone(),
+            |_| Ok(backend),
+        )
+        .expect("test Hybrid context");
+        let mut engine = Engine::with_options_and_execution_context(
+            base.core.cache.clone(),
+            base.core.pool.clone(),
+            base.core.storage.clone(),
+            base.core.router.clone(),
+            base.core.predictor.clone(),
+            base.core.shape,
+            base.core.options,
+            context,
+        );
+        assert_eq!(
+            engine.routed_expert_gpu_failure_policy(),
+            RoutedExpertGpuFailurePolicy::ServingCpuFallback
+        );
+        let mut rx = engine.install_gpu_cache_for_test(gpu.clone());
+        let engine = Arc::new(engine);
+        let id = 2;
+        let hidden = crate::inference::synth_hidden_state(0, 8, 0x30C);
+
+        for token in 0..3 {
+            engine
+                .moe_step(token, 0, &hidden, &[id])
+                .await
+                .expect("serving demand GPU execution");
+        }
+        let (queued_id, resident) = rx.try_recv().expect("threshold promotion request");
+        assert_eq!(queued_id, id);
+        assert!(rx.try_recv().is_err(), "only one threshold request is queued");
+        let generation = gpu.current_generation(id).expect("demand LRU generation");
+        assert_eq!(gpu.anchor_len(), 0);
+        assert_eq!(gpu.lru_len(), 1);
+
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu.as_ref(),
+                None,
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        assert_eq!(gpu.current_generation(id), Some(generation));
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+        assert_eq!(test_gpu.expert_calls(), 3);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
