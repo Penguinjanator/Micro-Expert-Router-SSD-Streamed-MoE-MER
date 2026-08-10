@@ -66,7 +66,7 @@ pub struct ExpertResident {
     /// Bumped by [`GpuExpertCache::observe_ram_hit`] / engine routing
     /// every time a RAM lookup resolves to this resident. Read by the
     /// promotion controller — once `hits >= promote_after_hits`, the
-    /// expert becomes a candidate for the **Anchor Core** in VRAM.
+    /// expert becomes a candidate for logical GPU admission.
     ///
     /// Stored as an `AtomicU64` so the engine's lock-free routing hot
     /// path can update it with a single relaxed atomic increment.
@@ -535,29 +535,15 @@ impl ExpertCache {
 }
 
 // =====================================================================
-// Phase 2 — GPU (VRAM) expert cache: Segmented Hybrid Policy.
+// Phase 2 — logical GPU expert admission: Segmented Hybrid Policy.
 // =====================================================================
 
-/// One VRAM-resident expert. Bytes are owned by the cache and
-/// (conceptually) live in device memory; on the default build —
-/// where the `gpu` cargo feature is **not** compiled in — VRAM is
-/// emulated with a host-side `Vec<u8>` so the rest of the engine
-/// (engine.rs, server.rs, batch_scheduler.rs) sees the same
-/// `Arc<GpuResident>` shape regardless of whether real CUDA is
-/// available.
-///
-/// The cache surface is identical to [`ExpertResident::data`]: callers
-/// get a `&[u8]` weight payload that can be fed directly into the
-/// existing `run_inference_*` family. When a real CUDA device is
-/// active, [`GpuResident::data`] performs the device-to-host copy
-/// lazily (see Phase 3's `run_inference_gpu`), so the inference loop
-/// never blocks on the cache itself.
+/// One host-side logical GPU admission. The payload remains a `Vec<u8>` in
+/// process memory; physical routed-expert device buffers are owned and
+/// accounted by `GpuBackend`'s physical registry.
 pub struct GpuResident {
     pub id: u32,
-    /// Device-resident bytes. On builds without a real GPU runtime
-    /// this is just a host `Vec<u8>`; on `gpu`-feature builds the
-    /// init path replaces it with a `candle_core::Tensor` reference
-    /// (see Phase 3 / `inference::run_inference_gpu`).
+    /// Host payload retained by the logical admission policy.
     bytes: Vec<u8>,
     /// On-disk encoding of `bytes`. `F32` residents feed the dense
     /// matmul pipeline; `Q4_0` residents stay in native GGUF blocks
@@ -595,8 +581,7 @@ impl GpuResident {
         self.dtype
     }
 
-    /// Size in bytes of the VRAM footprint owned by this resident.
-    /// Aggregated by the cache to track `mer_vram_used_bytes`.
+    /// Size of the logical host payload admitted for future GPU upload.
     #[inline]
     pub fn byte_len(&self) -> usize {
         self.bytes.len()
@@ -612,15 +597,41 @@ impl crate::backend::GpuStorage for GpuResident {
     }
 }
 
-/// Outcome of a VRAM-tier lookup. The variants double as the
+/// One installed logical GPU admission. Generations are allocated by
+/// [`GpuExpertCache`] and change only when an id is evicted and admitted
+/// again; ordinary hits preserve the generation.
+#[derive(Clone)]
+pub struct GpuAdmission {
+    resident: Arc<GpuResident>,
+    generation: u64,
+}
+
+impl GpuAdmission {
+    #[inline]
+    pub fn resident(&self) -> &Arc<GpuResident> {
+        &self.resident
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.resident.byte_len()
+    }
+}
+
+/// Outcome of a logical GPU-admission lookup. The variants double as the
 /// instrumentation discriminator for `mer_gpu_cache_hits_total` and
 /// the engine's three-tier reporting in `/v1/admin/health/experts`.
 pub enum GpuLookup {
     /// Hit on the **Anchor Core** — high-frequency, permanently
     /// pinned expert. No LRU recency update.
-    AnchorHit(Arc<GpuResident>),
+    AnchorHit(GpuAdmission),
     /// Hit on the **LRU Edge** — temporal locality. Recency updated.
-    LruHit(Arc<GpuResident>),
+    LruHit(GpuAdmission),
     /// Miss. Caller falls through to the RAM tier.
     Miss,
 }
@@ -631,13 +642,13 @@ impl GpuLookup {
     }
 }
 
-/// Thread-safe VRAM expert cache implementing the **Segmented Hybrid
-/// Policy** from the Phase 2 spec:
+/// Thread-safe logical GPU-admission cache implementing the **Segmented
+/// Hybrid Policy** from the Phase 2 spec:
 ///
-/// * **Anchor Core** — `HashMap<u32, Arc<GpuResident>>` for experts
+/// * **Anchor Core** — `HashMap<u32, GpuAdmission>` for experts
 ///   that have crossed `promote_after_hits`. Pinned, never evicted.
 ///   Sized by `anchor_ratio * capacity_bytes`.
-/// * **LRU Edge** — `LruCache<u32, Arc<GpuResident>>` for temporal
+/// * **LRU Edge** — `LruCache<u32, GpuAdmission>` for temporal
 ///   topic shifts. O(1) recency tracking, byte-budgeted evictions.
 ///
 /// Concurrency contract (gist "Zero-Contention" critical constraint):
@@ -648,13 +659,11 @@ impl GpuLookup {
 /// * Hit counters on individual `ExpertResident`s are
 ///   [`AtomicU64`](std::sync::atomic::AtomicU64); the inference hot
 ///   path bumps them lock-free.
-/// * `mer_vram_used_bytes` is an atomic `IntGauge` updated inside the
-///   same critical section so external scrapes never observe a
-///   torn value.
+/// * The compatibility `mer_vram_used_bytes` gauge is logical admitted host
+///   payload bytes, not physical wgpu allocation bytes.
 pub struct GpuExpertCache {
     inner: Mutex<GpuExpertCacheInner>,
-    /// Capacity of the **Anchor Core**, in bytes. The total VRAM
-    /// budget is `anchor_capacity_bytes + lru_capacity_bytes`.
+    /// Logical host-payload capacity of the **Anchor Core**, in bytes.
     anchor_capacity_bytes: usize,
     /// Capacity of the **LRU Edge**, in bytes.
     lru_capacity_bytes: usize,
@@ -667,34 +676,53 @@ pub struct GpuExpertCache {
     /// the admin health endpoint can render the value without going
     /// through the Prometheus registry.
     promotions: AtomicU64,
-    /// VRAM bytes resident across Anchor + LRU. Read by the admin
-    /// health endpoint and the TUI dashboard.
-    vram_used: AtomicU64,
-    /// Cumulative VRAM (GPU) cache hits — mirrors the
+    /// Logical host payload bytes admitted across Anchor + LRU.
+    logical_admitted_bytes: AtomicU64,
+    /// Cumulative logical GPU-admission hits — mirrors the
     /// `mer_gpu_cache_hits_total` Prometheus counter.
     hits: AtomicU64,
-    /// Cumulative VRAM (GPU) cache misses — mirrors
+    /// Cumulative logical GPU-admission misses — mirrors
     /// `mer_gpu_cache_misses_total`.
     misses: AtomicU64,
 }
 
 struct GpuExpertCacheInner {
     /// **Anchor Core** — permanently pinned high-frequency experts.
-    anchor: HashMap<u32, Arc<GpuResident>>,
+    anchor: HashMap<u32, GpuAdmission>,
     anchor_used_bytes: usize,
     /// **LRU Edge** — temporal locality region.
-    lru: LruCache<u32, Arc<GpuResident>>,
+    lru: LruCache<u32, GpuAdmission>,
     lru_used_bytes: usize,
+    /// Next logical admission generation. Exhaustion cleanly refuses a new
+    /// admission rather than reusing an identity.
+    next_generation: u64,
+    /// Ids with one threshold-triggered promotion request in flight. This is
+    /// cleared when promotion completes or enqueueing fails, so eviction can
+    /// retrigger exactly one request even when the RAM hit count is already
+    /// above the threshold.
+    promotion_pending: HashSet<u32>,
+    /// Logically evicted ids that may claim one new promotion attempt without
+    /// a fresh hit-count edge. Consuming this marker prevents a failed or
+    /// oversized promotion from retrying on every later RAM hit.
+    promotion_rearm: HashSet<u32>,
+}
+
+impl GpuExpertCacheInner {
+    fn allocate_generation(&mut self) -> Option<u64> {
+        let generation = self.next_generation;
+        self.next_generation = generation.checked_add(1)?;
+        Some(generation)
+    }
 }
 
 impl GpuExpertCache {
-    /// Construct a new VRAM expert cache.
+    /// Construct a new logical GPU-admission cache.
     ///
-    /// * `capacity_bytes` — total VRAM budget for the cache
-    ///   (anchor + LRU regions combined).
+    /// * `capacity_bytes` — logical host-admission budget (anchor + LRU),
+    ///   also passed to the backend as its physical expert-weight cap.
     /// * `anchor_ratio` — fraction of `capacity_bytes` reserved for
     ///   the Anchor Core. Clamped to `[0.0, 1.0]`.
-    /// * `promote_after_hits` — threshold for RAM → VRAM promotion.
+    /// * `promote_after_hits` — threshold for RAM → GPU admission.
     ///   `0` disables Anchor Core promotion.
     pub fn new(capacity_bytes: usize, anchor_ratio: f32, promote_after_hits: u64) -> Self {
         let ratio = anchor_ratio.clamp(0.0, 1.0);
@@ -711,48 +739,53 @@ impl GpuExpertCache {
                 anchor_used_bytes: 0,
                 lru: LruCache::unbounded(),
                 lru_used_bytes: 0,
+                next_generation: 1,
+                promotion_pending: HashSet::new(),
+                promotion_rearm: HashSet::new(),
             }),
             anchor_capacity_bytes,
             lru_capacity_bytes,
             promote_after_hits,
             promotions: AtomicU64::new(0),
-            vram_used: AtomicU64::new(0),
+            logical_admitted_bytes: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
-    /// Total VRAM budget (anchor + LRU), in bytes.
+    /// Logical admission budget (anchor + LRU host payloads), in bytes. The
+    /// same configured value is also the physical expert-weight capacity.
     #[inline]
     pub fn capacity_bytes(&self) -> usize {
         self.anchor_capacity_bytes + self.lru_capacity_bytes
     }
 
-    /// Currently-resident VRAM bytes (anchor + LRU).
+    /// Logical admitted host payload bytes (anchor + LRU). Retained for API
+    /// compatibility; physical wgpu bytes come from the backend ledger.
     #[inline]
     pub fn used_bytes(&self) -> u64 {
-        self.vram_used.load(Ordering::Relaxed)
+        self.logical_admitted_bytes.load(Ordering::Relaxed)
     }
 
-    /// Cumulative RAM → VRAM promotions.
+    /// Cumulative RAM → logical GPU-admission promotions.
     #[inline]
     pub fn promotions(&self) -> u64 {
         self.promotions.load(Ordering::Relaxed)
     }
 
-    /// Cumulative VRAM cache hits.
+    /// Cumulative logical GPU-admission hits.
     #[inline]
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
 
-    /// Cumulative VRAM cache misses.
+    /// Cumulative logical GPU-admission misses.
     #[inline]
     pub fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Look up an expert in VRAM. Returns the [`GpuLookup`] discriminator
+    /// Look up a logical GPU admission. Returns the [`GpuLookup`] discriminator
     /// (anchor / LRU / miss) plus the resident handle on hit.
     ///
     /// **LRU Edge** hits update recency; **Anchor Core** hits do not
@@ -773,11 +806,37 @@ impl GpuExpertCache {
         GpuLookup::Miss
     }
 
+    /// Clone the current logical admission without recording a routing probe
+    /// or changing logical LRU recency. Physical backends use this to validate
+    /// identity after routing has already performed the authoritative
+    /// telemetry/recency lookup.
+    pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
+        let g = self.inner.lock();
+        g.anchor
+            .get(&id)
+            .or_else(|| g.lru.peek(&id))
+            .cloned()
+    }
+
     /// Check whether an expert is currently resident in either the
     /// anchor or LRU regions, without mutating recency or counters.
     pub fn contains(&self, id: u32) -> bool {
         let g = self.inner.lock();
         g.anchor.contains_key(&id) || g.lru.peek(&id).is_some()
+    }
+
+    /// Current admission generation without changing recency or counters.
+    pub fn current_generation(&self, id: u32) -> Option<u64> {
+        let g = self.inner.lock();
+        g.anchor
+            .get(&id)
+            .or_else(|| g.lru.peek(&id))
+            .map(GpuAdmission::generation)
+    }
+
+    /// O(1) identity validation used by the physical registry after upload.
+    pub fn contains_generation(&self, id: u32, generation: u64) -> bool {
+        self.current_generation(id) == Some(generation)
     }
 
     /// Should the resident's current hit count promote it to the
@@ -789,9 +848,41 @@ impl GpuExpertCache {
         self.promote_after_hits > 0 && ram_hits >= self.promote_after_hits
     }
 
-    /// Synchronous promotion entry point — copy a RAM resident's
-    /// bytes into VRAM and place it in the Anchor Core if budget
-    /// allows, otherwise in the LRU Edge.
+    /// Claim the single outstanding promotion request for an id. Unlike a
+    /// hit-count edge alone, this becomes claimable again after logical
+    /// eviction, even when the RAM resident's monotonic hit count is already
+    /// above the threshold.
+    pub fn claim_promotion(&self, id: u32, ram_hits: u64) -> bool {
+        if !self.should_promote(ram_hits) {
+            return false;
+        }
+        let mut g = self.inner.lock();
+        if g.anchor.contains_key(&id)
+            || g.lru.peek(&id).is_some()
+            || g.promotion_pending.contains(&id)
+        {
+            return false;
+        }
+        let threshold_crossed = ram_hits == self.promote_after_hits;
+        let rearmed_after_eviction = g.promotion_rearm.remove(&id);
+        if !threshold_crossed && !rearmed_after_eviction {
+            return false;
+        }
+        g.promotion_pending.insert(id)
+    }
+
+    /// Release a promotion claim when channel enqueueing fails.
+    pub fn cancel_promotion(&self, id: u32) {
+        let mut g = self.inner.lock();
+        if g.promotion_pending.remove(&id) {
+            g.promotion_rearm.insert(id);
+        }
+    }
+
+    /// Synchronous promotion entry point — copy a RAM resident's bytes into
+    /// the host-side logical admission cache and place it in the Anchor Core
+    /// if budget allows, otherwise in the LRU Edge. Physical upload remains
+    /// lazy and is owned by `GpuBackend`.
     ///
     /// **Hot-path callers must not invoke this directly** — instead
     /// hand the resident off to the engine's background promotion
@@ -799,15 +890,17 @@ impl GpuExpertCache {
     /// exists for the warm-up sequence (where blocking is the
     /// expected behaviour) and for tests.
     ///
-    /// Returns `true` when the expert landed in VRAM, `false` if it
+    /// Returns `true` when the expert was admitted, `false` if it
     /// could not fit even after eviction (e.g. payload exceeds the
     /// LRU budget entirely).
     pub fn promote_sync(&self, resident: Arc<GpuResident>) -> bool {
         let bytes = resident.byte_len();
+        let mut g = self.inner.lock();
+        g.promotion_pending.remove(&resident.id);
+        g.promotion_rearm.remove(&resident.id);
         if bytes == 0 {
             return false;
         }
-        let mut g = self.inner.lock();
         // Already resident: nothing to promote. Touch the LRU entry so
         // it becomes MRU, but don't count this as a new promotion nor
         // re-account bytes (the existing entry already owns them).
@@ -822,37 +915,52 @@ impl GpuExpertCache {
         // any explicit promote_sync as "hot" (the engine only calls
         // this after threshold), but still prefer Anchor only when
         // there's room without evicting another anchor entry.
-        if bytes <= self.anchor_capacity_bytes
-            && g.anchor_used_bytes + bytes <= self.anchor_capacity_bytes
-        {
-            g.anchor.insert(resident.id, resident.clone());
-            g.anchor_used_bytes += bytes;
+        let use_anchor = bytes <= self.anchor_capacity_bytes
+            && g.anchor_used_bytes
+                .checked_add(bytes)
+                .is_some_and(|used| used <= self.anchor_capacity_bytes);
+        if !use_anchor && bytes > self.lru_capacity_bytes {
+            return false;
+        }
+        let Some(generation) = g.allocate_generation() else {
+            return false;
+        };
+        let admission = GpuAdmission { resident, generation };
+        if use_anchor {
+            g.anchor.insert(admission.resident.id, admission);
+            g.anchor_used_bytes = g
+                .anchor_used_bytes
+                .checked_add(bytes)
+                .expect("logical GPU anchor byte overflow after capacity check");
             drop(g);
             self.promotions.fetch_add(1, Ordering::Relaxed);
             self.refresh_used_bytes();
             return true;
         }
-        if bytes > self.lru_capacity_bytes {
-            // Won't fit even after evicting everything in the LRU
-            // region. Don't try.
-            return false;
-        }
         // Evict LRU entries until there is room. `LruCache::pop_lru`
         // returns the least-recently-used (k, v).
-        while g.lru_used_bytes + bytes > self.lru_capacity_bytes {
+        while g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .is_none_or(|used| used > self.lru_capacity_bytes)
+        {
             match g.lru.pop_lru() {
-                Some((_, victim)) => {
+                Some((evicted_id, victim)) => {
                     g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
+                    g.promotion_rearm.insert(evicted_id);
                 }
                 None => break,
             }
         }
-        let already = g.lru.put(resident.id, resident.clone());
+        let already = g.lru.put(admission.resident.id, admission);
         if let Some(prev) = already {
             // Replacing an existing entry — subtract the old footprint.
             g.lru_used_bytes = g.lru_used_bytes.saturating_sub(prev.byte_len());
         }
-        g.lru_used_bytes += bytes;
+        g.lru_used_bytes = g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .expect("logical GPU LRU byte overflow after capacity check");
         drop(g);
         self.promotions.fetch_add(1, Ordering::Relaxed);
         self.refresh_used_bytes();
@@ -866,7 +974,7 @@ impl GpuExpertCache {
     ///
     /// This is the warm-up counterpart to [`Self::promote_sync`]: the
     /// synchronous NVMe-miss path in the engine uses it to pin a freshly
-    /// loaded expert in VRAM without (a) evicting threshold-promoted
+    /// loaded expert in the logical admission LRU without (a) evicting threshold-promoted
     /// hot experts already resident in the LRU Edge, or (b) consuming
     /// Anchor Core slots that the hit-threshold policy reserves for
     /// genuinely hot experts. Anchor Core promotion remains the
@@ -879,22 +987,38 @@ impl GpuExpertCache {
     /// eviction.
     pub fn try_promote_lru_no_evict(&self, resident: Arc<GpuResident>) -> bool {
         let bytes = resident.byte_len();
+        let mut g = self.inner.lock();
         if bytes == 0 {
             return false;
         }
-        let mut g = self.inner.lock();
         // Already resident anywhere: nothing to do. Don't touch LRU
-        // recency — the caller is a warm-up path, not a real access.
+        // recency — the caller is a warm-up path, not a real access. Any
+        // promotion markers for this already-satisfied id are stale.
         if g.anchor.contains_key(&resident.id) || g.lru.peek(&resident.id).is_some() {
+            g.promotion_pending.remove(&resident.id);
+            g.promotion_rearm.remove(&resident.id);
             return false;
         }
         // Strictly non-evicting: must fit in whatever LRU budget is
         // currently free.
-        if g.lru_used_bytes + bytes > self.lru_capacity_bytes {
+        if g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .is_none_or(|used| used > self.lru_capacity_bytes)
+        {
             return false;
         }
-        g.lru.put(resident.id, resident.clone());
-        g.lru_used_bytes += bytes;
+        let Some(generation) = g.allocate_generation() else {
+            return false;
+        };
+        let admission = GpuAdmission { resident, generation };
+        g.promotion_pending.remove(&admission.resident.id);
+        g.promotion_rearm.remove(&admission.resident.id);
+        g.lru.put(admission.resident.id, admission);
+        g.lru_used_bytes = g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .expect("logical GPU LRU byte overflow after capacity check");
         drop(g);
         self.promotions.fetch_add(1, Ordering::Relaxed);
         self.refresh_used_bytes();
@@ -913,9 +1037,13 @@ impl GpuExpertCache {
 
     fn refresh_used_bytes(&self) {
         let g = self.inner.lock();
-        let total = (g.anchor_used_bytes + g.lru_used_bytes) as u64;
+        let total = g
+            .anchor_used_bytes
+            .checked_add(g.lru_used_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .expect("logical GPU admitted-byte total overflow");
         drop(g);
-        self.vram_used.store(total, Ordering::Relaxed);
+        self.logical_admitted_bytes.store(total, Ordering::Relaxed);
     }
 }
 
@@ -1243,5 +1371,136 @@ mod tests {
         assert!(!cache.try_promote_lru_no_evict(gpu_res(9, 32)));
         assert_eq!(cache.promotions(), 1);
         assert_eq!(cache.used_bytes(), 32);
+    }
+
+    #[test]
+    fn failed_no_evict_promotion_preserves_eviction_rearm() {
+        let cache = GpuExpertCache::new(20, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(1, 8)));
+        assert!(cache.promote_sync(gpu_res(2, 20)));
+        assert!(!cache.contains(1), "id 1 must be rearmed by logical eviction");
+
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
+        assert!(
+            cache.claim_promotion(1, 99),
+            "failed opportunistic admission must leave one rearm claim"
+        );
+        assert!(!cache.claim_promotion(1, 100), "rearm remains one-shot");
+    }
+
+    #[test]
+    fn failed_no_evict_promotion_preserves_pending_claim() {
+        let cache = GpuExpertCache::new(20, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(1, 8)));
+        assert!(cache.promote_sync(gpu_res(2, 20)));
+        assert!(!cache.contains(1));
+        assert!(cache.claim_promotion(1, 3));
+
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
+        assert!(
+            !cache.claim_promotion(1, 3),
+            "failed opportunistic admission must keep the existing claim pending"
+        );
+    }
+
+    #[test]
+    fn current_admission_anchor_does_not_change_counters() {
+        let cache = GpuExpertCache::new(100, 1.0, 0);
+        let resident = gpu_res(1, 32);
+        assert!(cache.promote_sync(resident.clone()));
+        assert_eq!(cache.anchor_len(), 1);
+
+        let admission = cache.current_admission(1).expect("anchor admission");
+        assert!(Arc::ptr_eq(admission.resident(), &resident));
+        assert_eq!(admission.generation(), cache.current_generation(1).unwrap());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn current_admission_lru_does_not_change_counters() {
+        let cache = GpuExpertCache::new(100, 0.0, 0);
+        let resident = gpu_res(2, 32);
+        assert!(cache.promote_sync(resident.clone()));
+        assert_eq!(cache.lru_len(), 1);
+
+        let admission = cache.current_admission(2).expect("LRU admission");
+        assert!(Arc::ptr_eq(admission.resident(), &resident));
+        assert_eq!(admission.generation(), cache.current_generation(2).unwrap());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn current_admission_lru_does_not_update_recency() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.promote_sync(gpu_res(1, 10)));
+        assert!(cache.promote_sync(gpu_res(2, 10)));
+
+        assert!(cache.current_admission(1).is_some());
+        assert!(cache.promote_sync(gpu_res(3, 10)));
+        assert!(!cache.contains(1), "non-mutating lookup must leave id 1 LRU");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn current_admission_miss_does_not_increment_misses() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.current_admission(99).is_none());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn get_retains_counter_and_lru_recency_behavior() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.promote_sync(gpu_res(1, 10)));
+        assert!(cache.promote_sync(gpu_res(2, 10)));
+
+        assert!(matches!(cache.get(1), GpuLookup::LruHit(_)));
+        assert!(matches!(cache.get(99), GpuLookup::Miss));
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+
+        assert!(cache.promote_sync(gpu_res(3, 10)));
+        assert!(cache.contains(1), "mutating get must make id 1 MRU");
+        assert!(!cache.contains(2), "id 2 must remain the LRU victim");
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn logical_admission_generation_changes_only_after_eviction_and_readmission() {
+        let cache = GpuExpertCache::new(16, 0.0, 0);
+        assert!(cache.promote_sync(gpu_res(7, 8)));
+        let g1 = cache.current_generation(7).expect("first admission generation");
+        let hit_generation = match cache.get(7) {
+            GpuLookup::LruHit(admission) => admission.generation(),
+            _ => panic!("expected logical LRU hit"),
+        };
+        assert_eq!(hit_generation, g1, "ordinary hits preserve generation");
+
+        assert!(cache.promote_sync(gpu_res(8, 16)));
+        assert!(!cache.contains(7), "larger admission evicts old generation");
+        assert!(cache.promote_sync(gpu_res(7, 8)));
+        let g2 = cache.current_generation(7).expect("readmission generation");
+        assert_ne!(g2, g1, "readmission must never reuse physical identity");
+    }
+
+    #[test]
+    fn promotion_claim_rearms_after_logical_eviction_above_hit_threshold() {
+        let cache = GpuExpertCache::new(16, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(7, 8)));
+        assert!(!cache.claim_promotion(7, 99), "admitted id needs no request");
+        assert!(cache.promote_sync(gpu_res(8, 16)));
+        assert!(!cache.contains(7));
+
+        assert!(
+            cache.claim_promotion(7, 99),
+            "evicted id can claim again without a fresh RAM-hit edge"
+        );
+        assert!(!cache.claim_promotion(7, 100), "only one request may be pending");
+        assert!(cache.promote_sync(gpu_res(7, 8)));
+        assert!(cache.contains(7));
     }
 }

@@ -479,9 +479,9 @@ pub struct RealTransformerConfig {
     /// CPU while selecting the GPU plane only for routed experts. `"hybrid"`
     /// requires strict attention semantics
     /// (`allow_nonfinite_attention_fallback = false`), an enabled GPU expert
-    /// cache with a non-zero VRAM budget, and a routed-expert dtype/geometry
-    /// supported by the current GPU expert implementation. Invalid Hybrid
-    /// combinations are hard startup errors.
+    /// cache with non-zero expert-weight capacity, and a routed-expert
+    /// dtype/geometry supported by the current GPU expert implementation.
+    /// Invalid Hybrid combinations are hard startup errors.
     #[serde(default)]
     pub compute_offload: crate::backend::ComputeOffload,
 
@@ -821,13 +821,12 @@ impl Default for PredictiveConfig {
     }
 }
 
-/// `[gpu_cache]` — Phase 1/2 of the 3-Tier Heterogeneous Memory
-/// Orchestrator (SSD → RAM → VRAM).
+/// `[gpu_cache]` — logical GPU admission plus bounded physical expert weights.
 ///
 /// Off by default. When `enabled = true`, the server is configured to
 /// layer a [`GpuExpertCache`](crate::expert_cache::GpuExpertCache) on
-/// top of the existing RAM `ExpertCache`. The VRAM cache is split into
-/// an **Anchor Core** (high-frequency experts permanently pinned once
+/// top of the existing RAM `ExpertCache`. This host admission cache is split
+/// into an **Anchor Core** (high-frequency experts permanently pinned once
 /// they cross `promote_after_hits`) and an **LRU Edge** (O(1) LRU
 /// queue handling temporal topic shifts). The `vram_anchor_ratio`
 /// controls the split between the two regions.
@@ -843,12 +842,10 @@ pub struct GpuCacheConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// VRAM budget, in mebibytes (1 MiB = 1024 × 1024 bytes), available
-    /// to the expert cache. Defaults to 0 — i.e. the cache is created
-    /// with zero capacity and every lookup misses straight through to
-    /// the RAM tier. Operators sizing the cache should leave headroom
-    /// for the dense transformer body and the KV cache; a typical
-    /// 16 GiB consumer card might allocate 4096–8192 here.
+    /// Logical admission budget and physical routed-expert weight cap, in
+    /// mebibytes (1 MiB = 1024 × 1024 bytes). Fixed routed-expert workspaces
+    /// are accounted separately. Defaults to 0, so every admission lookup
+    /// misses through to RAM. Leave headroom for dense and KV allocations.
     #[serde(default)]
     pub vram_capacity_mb: usize,
 
@@ -859,27 +856,24 @@ pub struct GpuCacheConfig {
     #[serde(default = "default_promote_after_hits")]
     pub promote_after_hits: u64,
 
-    /// Fraction of `vram_capacity_mb` reserved for the Anchor Core
+    /// Fraction of `vram_capacity_mb` reserved for the logical Anchor Core
     /// (the rest is the LRU Edge). Range `0.0..=1.0`. Defaults to
-    /// `0.5` — half the VRAM is pinned to the hottest experts, half
+    /// `0.5` — half the admission budget is pinned to hottest experts, half
     /// floats with topical shifts.
     #[serde(default = "default_vram_anchor_ratio")]
     pub vram_anchor_ratio: f32,
 
-    /// Advisory on-device dtype label for the resident expert bytes.
+    /// Advisory dtype label for logically admitted expert bytes.
     /// Accepts the same spellings as [`WeightDtype::as_str`]: `"f32"`,
     /// `"f16"`, `"int8"`, `"q4k"`, `"q4_0"`, `"q8_0"`; defaults to
     /// `"f16"`.
     ///
     /// **Currently advisory only.** The promotion path copies the
-    /// on-disk expert bytes into VRAM as-is — it does not yet convert
-    /// or repack between dtypes, and VRAM accounting is driven by the
-    /// raw byte length of each [`ExpertResident`] rather than by this
-    /// field. The value is validated at startup (so typos fail fast)
-    /// and logged for observability, and is reserved for a future
-    /// promotion-time conversion/sizing path. Operators should size
-    /// `vram_capacity_mb` against the on-disk footprint, not against
-    /// the dtype label here.
+    /// on-disk payload into host logical admission as-is; the backend later
+    /// uploads supported formats without conversion. Compatibility `vram_*`
+    /// telemetry uses logical payload length, while the PR4 physical ledger
+    /// uses exact wgpu descriptor bytes. The value is validated and logged,
+    /// but does not drive promotion-time conversion or sizing.
     #[serde(default = "default_gpu_dtype")]
     pub dtype: String,
 }
@@ -981,8 +975,8 @@ pub struct Config {
     /// HTTP) to preserve the legacy behaviour bit-for-bit.
     #[serde(default)]
     pub security: SecurityConfig,
-    /// Optional `[gpu_cache]` section — Phase 1/2 of the 3-tier
-    /// heterogeneous memory orchestrator (SSD → RAM → VRAM). Off by
+    /// Optional `[gpu_cache]` section — logical GPU admission and physical
+    /// routed-expert weight capacity. Off by
     /// default; the binary behaves identically to the 2-tier engine
     /// when this section is absent.
     #[serde(default)]
@@ -1127,7 +1121,7 @@ impl Config {
                 )));
             }
             // Parse the dtype string against the WeightDtype contract so
-            // we fail fast on a typo rather than at first VRAM
+            // we fail fast on a typo rather than at first logical
             // promotion.
             if WeightDtype::from_str_opt(&self.gpu_cache.dtype).is_none() {
                 return Err(ConfigError::Invalid(format!(

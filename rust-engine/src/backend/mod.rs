@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as ParkingMutex;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -211,6 +212,7 @@ pub struct TensorViewMut<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuExpertDispatchErrorKind {
     ResidencyMiss,
+    PhysicalCapacity,
     Upload,
     #[allow(dead_code)] // wgpu 0.20 has no per-dispatch synchronous validation result.
     ValidationDispatch,
@@ -226,6 +228,7 @@ impl fmt::Display for GpuExpertDispatchErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::ResidencyMiss => "residency-miss",
+            Self::PhysicalCapacity => "physical-capacity",
             Self::Upload => "upload",
             Self::ValidationDispatch => "validation-dispatch",
             Self::Submission => "submission",
@@ -270,6 +273,488 @@ impl fmt::Display for GpuExpertDispatchError {
 }
 
 impl std::error::Error for GpuExpertDispatchError {}
+
+/// PR4's exact MER-owned routed-expert GPU memory snapshot. Its scope is
+/// deliberately narrower than process/device memory: physical expert weight
+/// buffers plus the fixed routed-expert workspace buffers. Dense, attention,
+/// KV, driver, and allocator overhead remain outside this internal ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)] // Public PR5 seam; PR4 validates it through backend-local tests.
+pub struct GpuExpertMemorySnapshot {
+    /// Host payload bytes admitted by [`crate::expert_cache::GpuExpertCache`].
+    pub logical_admitted_bytes: u64,
+    /// All live physical expert weight buffers, including evicted entries
+    /// retained by an in-flight `Arc`.
+    pub expert_live_bytes: u64,
+    /// Physical expert bytes still addressable through the registry.
+    pub expert_registry_bytes: u64,
+    /// Fixed device buffers owned by the routed-expert workspace pool.
+    pub workspace_bytes: u64,
+    /// `expert_live_bytes + workspace_bytes`.
+    pub total_tracked_bytes: u64,
+    /// Configured capacity for physical expert weight buffers only.
+    pub expert_capacity_bytes: u64,
+    pub physical_entries: usize,
+    pub physical_installs: u64,
+    pub physical_evictions: u64,
+    pub stale_retirements: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PhysicalExpertKey {
+    expert_id: u32,
+    generation: u64,
+}
+
+trait PhysicalRegistryEntry: Send + Sync + 'static {
+    fn physical_key(&self) -> PhysicalExpertKey;
+    fn device_bytes(&self) -> u64;
+}
+
+#[allow(dead_code)] // `workspace_bytes` is consumed through the PR5 snapshot seam.
+struct GpuMemoryLedger {
+    expert_live_bytes: AtomicU64,
+    workspace_bytes: u64,
+    expert_capacity_bytes: u64,
+}
+
+impl GpuMemoryLedger {
+    fn new(workspace_bytes: u64, expert_capacity_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            expert_live_bytes: AtomicU64::new(0),
+            workspace_bytes,
+            expert_capacity_bytes,
+        })
+    }
+
+    fn expert_live_bytes(&self) -> u64 {
+        self.expert_live_bytes.load(Ordering::Acquire)
+    }
+
+    fn acquire(self: &Arc<Self>, bytes: u64) -> std::result::Result<ExpertAllocationLease, String> {
+        if bytes == 0 {
+            return Err("physical expert allocation must be non-zero".to_string());
+        }
+        self.expert_live_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_add(bytes)
+                    .filter(|next| *next <= self.expert_capacity_bytes)
+            })
+            .map_err(|live| {
+                format!(
+                    "physical expert live-byte ledger capacity/overflow: capacity={} live={live} add={bytes}",
+                    self.expert_capacity_bytes
+                )
+            })?;
+        Ok(ExpertAllocationLease {
+            ledger: self.clone(),
+            bytes,
+        })
+    }
+}
+
+/// Non-cloneable charge owned by one physical allocation. An entry may be
+/// removed from the registry while in flight; only the final entry `Arc` drop
+/// releases this lease and decrements live bytes.
+struct ExpertAllocationLease {
+    ledger: Arc<GpuMemoryLedger>,
+    bytes: u64,
+}
+
+impl Drop for ExpertAllocationLease {
+    fn drop(&mut self) {
+        self.ledger
+            .expert_live_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_sub(self.bytes)
+            })
+            .expect("physical expert live-byte ledger underflow");
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InstallReservation {
+    bytes: u64,
+    charged: bool,
+}
+
+struct PhysicalRegistryInner<T: PhysicalRegistryEntry> {
+    entries: lru::LruCache<u32, Arc<T>>,
+    registry_bytes: u64,
+    reserved_bytes: u64,
+    installing: HashMap<PhysicalExpertKey, InstallReservation>,
+    installs: u64,
+    evictions: u64,
+    stale_retirements: u64,
+}
+
+struct PhysicalGpuExpertRegistry<T: PhysicalRegistryEntry> {
+    inner: ParkingMutex<PhysicalRegistryInner<T>>,
+    install_cv: parking_lot::Condvar,
+    ledger: Arc<GpuMemoryLedger>,
+}
+
+#[derive(Debug)]
+struct PhysicalCapacityError {
+    requested_bytes: u64,
+    expert_capacity_bytes: u64,
+    expert_live_bytes: u64,
+    expert_registry_bytes: u64,
+    reserved_bytes: u64,
+}
+
+impl fmt::Display for PhysicalCapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "physical expert allocation of {} bytes exceeds available capacity: capacity={} live={} registry={} reserved={}",
+            self.requested_bytes,
+            self.expert_capacity_bytes,
+            self.expert_live_bytes,
+            self.expert_registry_bytes,
+            self.reserved_bytes
+        )
+    }
+}
+
+enum PhysicalRegistryAcquire<T: PhysicalRegistryEntry> {
+    Hit(Arc<T>),
+    Install(PhysicalInstallPermit<T>),
+    StaleRequester,
+}
+
+/// Directional generation result for one expert-id lookup. A newer request
+/// may retire an older stored generation; an older request must never disturb
+/// a newer stored generation.
+enum PhysicalRegistryLookup<T: PhysicalRegistryEntry> {
+    Hit(Arc<T>),
+    Miss,
+    StaleRequester,
+}
+
+struct PhysicalInstallPermit<T: PhysicalRegistryEntry> {
+    registry: Arc<PhysicalGpuExpertRegistry<T>>,
+    key: PhysicalExpertKey,
+    bytes: u64,
+    active: bool,
+    charged: bool,
+}
+
+impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
+    fn new(ledger: Arc<GpuMemoryLedger>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: ParkingMutex::new(PhysicalRegistryInner {
+                entries: lru::LruCache::unbounded(),
+                registry_bytes: 0,
+                reserved_bytes: 0,
+                installing: HashMap::new(),
+                installs: 0,
+                evictions: 0,
+                stale_retirements: 0,
+            }),
+            install_cv: parking_lot::Condvar::new(),
+            ledger,
+        })
+    }
+
+    fn capacity_bytes(&self) -> u64 {
+        self.ledger.expert_capacity_bytes
+    }
+
+    /// Return an addressable physical entry only when its logical generation
+    /// still matches. This is the routed-expert fast path: it performs one
+    /// registry lock and no upload planning or host-weight copy.
+    fn lookup_current(&self, key: PhysicalExpertKey) -> PhysicalRegistryLookup<T> {
+        let mut inner = self.inner.lock();
+        Self::lookup_current_locked(&mut inner, key)
+    }
+
+    fn lookup_current_locked(
+        inner: &mut PhysicalRegistryInner<T>,
+        key: PhysicalExpertKey,
+    ) -> PhysicalRegistryLookup<T> {
+        let Some(existing) = inner.entries.peek(&key.expert_id).cloned() else {
+            return PhysicalRegistryLookup::Miss;
+        };
+        let stored_key = existing.physical_key();
+        debug_assert_eq!(stored_key.expert_id, key.expert_id);
+        if stored_key.generation == key.generation {
+            return PhysicalRegistryLookup::Hit(
+                inner
+                    .entries
+                    .get(&key.expert_id)
+                    .cloned()
+                    .expect("validated physical entry must remain present under lock"),
+            );
+        }
+        if stored_key.generation > key.generation {
+            return PhysicalRegistryLookup::StaleRequester;
+        }
+
+        Self::retire_entry_locked(inner, key.expert_id);
+        PhysicalRegistryLookup::Miss
+    }
+
+    fn retire_entry_locked(inner: &mut PhysicalRegistryInner<T>, expert_id: u32) {
+        let stale = inner
+            .entries
+            .pop(&expert_id)
+            .expect("validated physical entry must remain present under lock");
+        inner.registry_bytes = inner
+            .registry_bytes
+            .checked_sub(stale.device_bytes())
+            .expect("physical registry byte underflow retiring stale entry");
+        inner.stale_retirements = inner.stale_retirements.saturating_add(1);
+        drop(stale);
+    }
+
+    /// Validate `(id, generation)` and either return the current physical
+    /// entry or reserve exact capacity for one keyed install. Concurrent
+    /// demand for the same id waits on the keyed in-progress state and then
+    /// reuses the winner; the registry lock is never held during upload.
+    fn acquire_or_reserve(
+        self: &Arc<Self>,
+        key: PhysicalExpertKey,
+        bytes: u64,
+    ) -> std::result::Result<PhysicalRegistryAcquire<T>, PhysicalCapacityError> {
+        let capacity = self.capacity_bytes();
+        if bytes == 0 || bytes > capacity {
+            return Err(self.capacity_error(bytes, 0, 0));
+        }
+
+        let mut inner = self.inner.lock();
+        loop {
+            match Self::lookup_current_locked(&mut inner, key) {
+                PhysicalRegistryLookup::Hit(hit) => {
+                    return Ok(PhysicalRegistryAcquire::Hit(hit));
+                }
+                PhysicalRegistryLookup::Miss => {}
+                PhysicalRegistryLookup::StaleRequester => {
+                    return Ok(PhysicalRegistryAcquire::StaleRequester);
+                }
+            }
+
+            if inner
+                .installing
+                .keys()
+                .any(|installing| installing.expert_id == key.expert_id)
+            {
+                self.install_cv.wait(&mut inner);
+                continue;
+            }
+
+            while !self.install_fits(&inner, bytes) {
+                let Some((_, victim)) = inner.entries.pop_lru() else {
+                    return Err(self.capacity_error(
+                        bytes,
+                        inner.registry_bytes,
+                        inner.reserved_bytes,
+                    ));
+                };
+                inner.registry_bytes = inner
+                    .registry_bytes
+                    .checked_sub(victim.device_bytes())
+                    .expect("physical registry byte underflow during eviction");
+                inner.evictions = inner.evictions.saturating_add(1);
+                // Release registry ownership before re-reading live bytes. If
+                // an activation still owns the Arc, the RAII lease remains.
+                drop(victim);
+            }
+
+            inner.reserved_bytes = inner
+                .reserved_bytes
+                .checked_add(bytes)
+                .expect("physical install reservation byte overflow");
+            let previous = inner.installing.insert(
+                key,
+                InstallReservation {
+                    bytes,
+                    charged: false,
+                },
+            );
+            debug_assert!(previous.is_none());
+            return Ok(PhysicalRegistryAcquire::Install(PhysicalInstallPermit {
+                registry: self.clone(),
+                key,
+                bytes,
+                active: true,
+                charged: false,
+            }));
+        }
+    }
+
+    fn install_fits(&self, inner: &PhysicalRegistryInner<T>, bytes: u64) -> bool {
+        inner
+            .registry_bytes
+            .checked_add(inner.reserved_bytes)
+            .and_then(|used| used.checked_add(bytes))
+            .is_some_and(|used| used <= self.capacity_bytes())
+            && self
+                .ledger
+                .expert_live_bytes()
+                .checked_add(inner.reserved_bytes)
+                .and_then(|used| used.checked_add(bytes))
+                .is_some_and(|used| used <= self.capacity_bytes())
+    }
+
+    fn capacity_error(
+        &self,
+        requested_bytes: u64,
+        expert_registry_bytes: u64,
+        reserved_bytes: u64,
+    ) -> PhysicalCapacityError {
+        PhysicalCapacityError {
+            requested_bytes,
+            expert_capacity_bytes: self.capacity_bytes(),
+            expert_live_bytes: self.ledger.expert_live_bytes(),
+            expert_registry_bytes,
+            reserved_bytes,
+        }
+    }
+
+    /// Logical miss retirement is O(1): remove only this id. Unrelated stale
+    /// entries remain accounted and capacity-evictable, but cannot execute
+    /// because every routed lookup starts with logical admission validation.
+    fn retire_logical_miss(&self, expert_id: u32) {
+        let mut inner = self.inner.lock();
+        if inner.entries.peek(&expert_id).is_some() {
+            Self::retire_entry_locked(&mut inner, expert_id);
+        }
+    }
+
+    /// Retire only the stale allocation this dispatch observed. If another
+    /// thread has already installed a newer generation, leave it addressable.
+    fn retire_key_if_present(&self, key: PhysicalExpertKey) {
+        let mut inner = self.inner.lock();
+        if inner
+            .entries
+            .peek(&key.expert_id)
+            .is_some_and(|entry| entry.physical_key() == key)
+        {
+            Self::retire_entry_locked(&mut inner, key.expert_id);
+        }
+    }
+
+    #[allow(dead_code)] // Public snapshot callers arrive in PR5; PR4 tests invariants here.
+    fn snapshot(&self, logical_admitted_bytes: u64) -> GpuExpertMemorySnapshot {
+        let inner = self.inner.lock();
+        let expert_live_bytes = self.ledger.expert_live_bytes();
+        let workspace_bytes = self.ledger.workspace_bytes;
+        GpuExpertMemorySnapshot {
+            logical_admitted_bytes,
+            expert_live_bytes,
+            expert_registry_bytes: inner.registry_bytes,
+            workspace_bytes,
+            total_tracked_bytes: expert_live_bytes
+                .checked_add(workspace_bytes)
+                .expect("tracked GPU byte total overflow"),
+            expert_capacity_bytes: self.capacity_bytes(),
+            physical_entries: inner.entries.len(),
+            physical_installs: inner.installs,
+            physical_evictions: inner.evictions,
+            stale_retirements: inner.stale_retirements,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: PhysicalExpertKey) -> bool {
+        self.inner
+            .lock()
+            .entries
+            .peek(&key.expert_id)
+            .is_some_and(|entry| entry.physical_key() == key)
+    }
+}
+
+impl<T: PhysicalRegistryEntry> PhysicalInstallPermit<T> {
+    /// Transfer this permit's capacity reservation into an exact live-byte
+    /// lease immediately after the device allocation is successfully created.
+    fn charge_allocation(
+        &mut self,
+    ) -> std::result::Result<ExpertAllocationLease, String> {
+        if !self.active || self.charged {
+            return Err("physical install permit is not chargeable".to_string());
+        }
+        let mut inner = self.registry.inner.lock();
+        let reservation = *inner
+            .installing
+            .get(&self.key)
+            .ok_or_else(|| "physical install reservation disappeared".to_string())?;
+        if reservation.charged || reservation.bytes != self.bytes {
+            return Err("physical install reservation state mismatch".to_string());
+        }
+        let lease = self.registry.ledger.acquire(self.bytes)?;
+        inner.reserved_bytes = inner
+            .reserved_bytes
+            .checked_sub(self.bytes)
+            .ok_or_else(|| "physical install reserved-byte underflow".to_string())?;
+        inner
+            .installing
+            .get_mut(&self.key)
+            .expect("validated physical install reservation disappeared under lock")
+            .charged = true;
+        self.charged = true;
+        Ok(lease)
+    }
+
+    fn install(mut self, entry: Arc<T>) -> std::result::Result<Arc<T>, String> {
+        if !self.active || !self.charged {
+            return Err("physical install permit was not charged".to_string());
+        }
+        if entry.physical_key() != self.key || entry.device_bytes() != self.bytes {
+            return Err("physical install entry does not match its reservation".to_string());
+        }
+        let mut inner = self.registry.inner.lock();
+        // On every error below, this local guard must drop before the by-value
+        // permit argument runs `Drop` and re-locks the same registry.
+        let reservation = *inner
+            .installing
+            .get(&self.key)
+            .ok_or_else(|| "physical install reservation disappeared".to_string())?;
+        if !reservation.charged || reservation.bytes != self.bytes {
+            return Err("physical install reservation state mismatch".to_string());
+        }
+        if inner.entries.peek(&self.key.expert_id).is_some() {
+            return Err("physical entry appeared while its keyed install was reserved".to_string());
+        }
+        let new_registry_bytes = inner
+            .registry_bytes
+            .checked_add(self.bytes)
+            .ok_or_else(|| "physical registry byte overflow".to_string())?;
+        if new_registry_bytes > self.registry.capacity_bytes() {
+            return Err("physical registry exceeded configured capacity".to_string());
+        }
+        inner.installing.remove(&self.key);
+        let previous = inner.entries.put(self.key.expert_id, entry.clone());
+        debug_assert!(previous.is_none());
+        inner.registry_bytes = new_registry_bytes;
+        inner.installs = inner.installs.saturating_add(1);
+        self.active = false;
+        drop(inner);
+        self.registry.install_cv.notify_all();
+        Ok(entry)
+    }
+}
+
+impl<T: PhysicalRegistryEntry> Drop for PhysicalInstallPermit<T> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut inner = self.registry.inner.lock();
+        if let Some(reservation) = inner.installing.remove(&self.key) {
+            if !reservation.charged {
+                inner.reserved_bytes = inner
+                    .reserved_bytes
+                    .checked_sub(reservation.bytes)
+                    .expect("physical install reserved-byte underflow on cancellation");
+            }
+        }
+        self.active = false;
+        drop(inner);
+        self.registry.install_cv.notify_all();
+    }
+}
 
 /// Abstraction over GPU-resident storage for expert weight buffers.
 ///
@@ -481,12 +966,42 @@ enum VramWeightLayout {
     Q4_0,
 }
 
+#[derive(Clone, Copy)]
+struct F32ExpertUploadPlan {
+    device_bytes: u64,
+    projection_offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Q4ExpertUploadPlan {
+    device_bytes: u64,
+    required_bytes: usize,
+    up_block_offset: u32,
+    down_block_offset: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ExpertUploadPlan {
+    F32(F32ExpertUploadPlan),
+    Q4_0(Q4ExpertUploadPlan),
+}
+
+impl ExpertUploadPlan {
+    fn device_bytes(self) -> u64 {
+        match self {
+            Self::F32(plan) => plan.device_bytes,
+            Self::Q4_0(plan) => plan.device_bytes,
+        }
+    }
+}
+
 /// A fully-initialized VRAM expert: weight buffer + shape/layout
 /// metadata for the four FFN dispatch passes (the dispatch-time bind
 /// groups are built per call against the checked-out
 /// [`ExpertWorkspace`]). Created once per expert on first promotion;
 /// reused on every subsequent token.
 struct VramExpertEntry {
+    key: PhysicalExpertKey,
     /// Raw weight buffer in VRAM. Layout: [gate_proj | up_proj | down_proj],
     /// either dense f32 LE or packed Q4_0 blocks — see [`VramWeightLayout`].
     /// gate_proj: [d_ff, d_model], up_proj: [d_ff, d_model], down_proj: [d_model, d_ff].
@@ -506,11 +1021,25 @@ struct VramExpertEntry {
     up_block_off:   u32,
     /// First-block index of the down projection (Q4_0 layout only; 0 for F32).
     down_block_off: u32,
+    /// Exact descriptor size of `weight_buf`.
+    device_bytes: u64,
+    /// Final-Arc live-byte accounting charge for `weight_buf`.
+    _allocation: ExpertAllocationLease,
+}
+
+impl PhysicalRegistryEntry for VramExpertEntry {
+    fn physical_key(&self) -> PhysicalExpertKey {
+        self.key
+    }
+
+    fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
 }
 
 impl GpuStorage for VramExpertEntry {
     fn byte_len(&self) -> usize {
-        self.weight_buf.size() as usize
+        self.device_bytes as usize
     }
     fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
         Some(&self.weight_buf)
@@ -522,9 +1051,17 @@ impl GpuStorage for VramExpertEntry {
 /// lifetime, so up to this many expert FFNs can be in flight on the
 /// queue **concurrently** — the per-dispatch wait below only blocks
 /// on its own submission index, never on the whole queue. Sized at
-/// 5 × ~64 KiB buffers per workspace (≈ 1.3 MiB total for the pool):
-/// negligible VRAM for a 4-way overlap window.
+/// five device buffers per workspace. PR4 derives their exact descriptor
+/// bytes and excludes the host scratch vector from the GPU ledger.
 const EXPERT_WORKSPACE_POOL: usize = 4;
+const EXPERT_WORKSPACE_DEVICE_BUFFERS: u64 = 5;
+
+fn expert_workspace_device_bytes(buffer_bytes: u64, workspace_count: usize) -> u64 {
+    buffer_bytes
+        .checked_mul(EXPERT_WORKSPACE_DEVICE_BUFFERS)
+        .and_then(|per_workspace| per_workspace.checked_mul(workspace_count as u64))
+        .expect("routed-expert workspace byte calculation overflow")
+}
 
 /// Private buffer set for one in-flight expert FFN dispatch.
 ///
@@ -555,6 +1092,18 @@ struct ExpertWorkspace {
     /// per-workspace, so expert dispatches never contend on the
     /// backend-global `conversion_scratch` either.
     scratch: Vec<f32>,
+}
+
+impl ExpertWorkspace {
+    fn device_bytes(&self) -> u64 {
+        self.x_buf
+            .size()
+            .checked_add(self.mid_1.size())
+            .and_then(|bytes| bytes.checked_add(self.mid_2.size()))
+            .and_then(|bytes| bytes.checked_add(self.ffn_out.size()))
+            .and_then(|bytes| bytes.checked_add(self.staging.size()))
+            .expect("routed-expert workspace device-byte total overflow")
+    }
 }
 
 #[derive(Default)]
@@ -642,16 +1191,13 @@ pub struct GpuBackend {
     /// architectures; drives the V slice / attention-output geometry.
     v_head_dim: usize,
 
-    /// VRAM buffers for hot experts. Keyed by expert_id. Populated lazily
-    /// on first access after GpuExpertCache promotes an expert. Entries
-    /// are `Arc`-wrapped so the fast path can clone a handle and release
-    /// this lock *before* the (blocking) GPU dispatch — holding the map
-    /// lock across `expert_matmul_from_vram` would serialize all expert
-    /// lookups behind a multi-millisecond submit + readback.
-    vram_expert_bufs: ParkingMutex<std::collections::HashMap<u32, Arc<VramExpertEntry>>>,
+    /// Sole authoritative owner/index for physical routed-expert weight
+    /// buffers. Identity is `(expert_id, logical_generation)`; bounded LRU
+    /// lookup/install locks are released before GPU dispatch.
+    physical_expert_registry: Arc<PhysicalGpuExpertRegistry<VramExpertEntry>>,
 
-    /// Reference to the VRAM expert cache. Used to check whether an expert
-    /// is GPU-resident before falling back to the NVMe → CPU path.
+    /// Host-side logical admission policy. Every physical lookup is validated
+    /// against its current admission generation before GPU execution.
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
     /// Checked-out-on-dispatch workspaces for the expert FFN path —
     /// see [`ExpertWorkspace`]. Replaces the `expert_execution_lock`
@@ -1111,6 +1657,23 @@ impl GpuBackend {
                 scratch: vec![0.0f32; MAX_EXPERT_D_FF],
             })
             .collect();
+        let actual_expert_workspace_bytes = expert_workspaces
+            .iter()
+            .map(ExpertWorkspace::device_bytes)
+            .try_fold(0u64, u64::checked_add)
+            .expect("routed-expert workspace byte total overflow");
+        debug_assert_eq!(
+            actual_expert_workspace_bytes,
+            expert_workspace_device_bytes(workspace_bytes, EXPERT_WORKSPACE_POOL)
+        );
+        let expert_capacity_bytes = u64::try_from(gpu_expert_cache.capacity_bytes())
+            .map_err(|_| anyhow!("GPU expert capacity does not fit u64"))?;
+        let expert_memory_ledger = GpuMemoryLedger::new(
+            actual_expert_workspace_bytes,
+            expert_capacity_bytes,
+        );
+        let physical_expert_registry =
+            PhysicalGpuExpertRegistry::new(expert_memory_ledger);
 
         let staging_up = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_up"),
@@ -1216,7 +1779,7 @@ impl GpuBackend {
             num_kv_heads,
             head_dim,
             v_head_dim,
-            vram_expert_bufs: ParkingMutex::new(std::collections::HashMap::new()),
+            physical_expert_registry,
             gpu_expert_cache,
             expert_workspaces: ParkingMutex::new(expert_workspaces),
             expert_workspace_cv: parking_lot::Condvar::new(),
@@ -1224,20 +1787,31 @@ impl GpuBackend {
         })
     }
 
-    /// Upload expert weight bytes to VRAM and validate the projection
-    /// sub-range offsets for the per-dispatch bind groups.
-    ///
-    /// Weight layout (verify against `dispatch_expert_forward` before shipping):
-    ///   gate_proj bytes: [0,                   d_ff * d_model * 4)
-    ///   up_proj bytes:   [d_ff * d_model * 4,  2 * d_ff * d_model * 4)
-    ///   down_proj bytes: [2 * d_ff * d_model * 4, 3 * d_ff * d_model * 4)
-    /// All weights are f32 little-endian.
-    fn build_expert_entry(
+    /// Validate every PR1/PR2 upload invariant and compute the exact wgpu
+    /// buffer descriptor bytes before the physical registry reserves space.
+    fn plan_expert_upload(
+        &self,
+        dtype: crate::inference::WeightDtype,
+        weight_bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> anyhow::Result<ExpertUploadPlan> {
+        match dtype {
+            crate::inference::WeightDtype::Q4_0 => self
+                .plan_expert_upload_q4_0(weight_bytes, d_model, d_ff)
+                .map(ExpertUploadPlan::Q4_0),
+            _ => self
+                .plan_expert_upload_f32(weight_bytes, d_model, d_ff)
+                .map(ExpertUploadPlan::F32),
+        }
+    }
+
+    fn plan_expert_upload_f32(
         &self,
         weight_bytes: &[u8],
-        d_model:      usize,
-        d_ff:         usize,
-    ) -> anyhow::Result<VramExpertEntry> {
+        d_model: usize,
+        d_ff: usize,
+    ) -> anyhow::Result<F32ExpertUploadPlan> {
         anyhow::ensure!(
             d_model > 0 && d_ff > 0,
             "invalid expert shape: d_ff={} d_model={} produces zero-byte projections",
@@ -1257,29 +1831,116 @@ impl GpuBackend {
             self.min_storage_buffer_offset_alignment(),
         )
         .map_err(|e| anyhow!(e))?;
+        f32_expert_upload_plan(layout, weight_bytes.len(), d_model, d_ff)
+    }
+
+    fn plan_expert_upload_q4_0(
+        &self,
+        weight_bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+    ) -> anyhow::Result<Q4ExpertUploadPlan> {
+        use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
+
         anyhow::ensure!(
-            weight_bytes.len() >= layout.required_bytes,
-            "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
-            weight_bytes.len(), layout.required_bytes, d_ff, d_model
+            d_model > 0 && d_ff > 0,
+            "invalid expert shape: d_ff={} d_model={}",
+            d_ff, d_model
         );
+        routed_expert_gpu_compatibility(RoutedExpertGpuSpec {
+            dtype: crate::inference::WeightDtype::Q4_0,
+            d_model,
+            d_ff,
+        })
+        .map_err(|e| anyhow!(e))?;
+        let proj_elems = d_ff
+            .checked_mul(d_model)
+            .ok_or_else(|| anyhow!("Q4_0 expert shape overflow: d_ff={d_ff} d_model={d_model}"))?;
+        let blocks_per_projection = proj_elems / Q4_0_BLOCK_ELEMS;
+        let projection_bytes = blocks_per_projection
+            .checked_mul(Q4_0_BLOCK_BYTES)
+            .ok_or_else(|| anyhow!(
+                "Q4_0 expert projection byte size overflow: {blocks_per_projection} blocks × {Q4_0_BLOCK_BYTES}B"
+            ))?;
+        let required_bytes = projection_bytes
+            .checked_mul(3)
+            .ok_or_else(|| anyhow!(
+                "Q4_0 expert total byte size overflow: 3 × {projection_bytes}B"
+            ))?;
+        let tolerance = self.q4_truncation_tolerance;
+        anyhow::ensure!(
+            weight_bytes.len() >= required_bytes
+                || (required_bytes > tolerance
+                    && tolerance > 0
+                    && required_bytes - weight_bytes.len() <= tolerance),
+            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B); \
+             missing logical bytes are never zero-filled in strict mode \
+             (allow_truncated_expert_payloads = false)",
+            weight_bytes.len(),
+            required_bytes,
+            blocks_per_projection,
+            Q4_0_BLOCK_BYTES
+        );
+        let down_block_offset = blocks_per_projection
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("Q4_0 expert block offset overflow"))?;
+        anyhow::ensure!(
+            down_block_offset <= u32::MAX as usize,
+            "Q4_0 expert block count {} exceeds u32 push-constant range",
+            down_block_offset
+        );
+        let padded_bytes = required_bytes
+            .checked_add(3)
+            .ok_or_else(|| anyhow!("Q4_0 padded device byte size overflow"))?
+            / 4
+            * 4;
+        Ok(Q4ExpertUploadPlan {
+            device_bytes: u64::try_from(padded_bytes)
+                .map_err(|_| anyhow!("Q4_0 padded buffer length does not fit u64"))?,
+            required_bytes,
+            up_block_offset: blocks_per_projection as u32,
+            down_block_offset: down_block_offset as u32,
+        })
+    }
+
+    /// Upload validated F32 bytes after capacity has been reserved. Weight
+    /// layout is `[gate | up | down]`; `projection_offset` was checked against
+    /// the selected device's storage-offset alignment by the upload plan.
+    fn build_expert_entry(
+        &self,
+        key: PhysicalExpertKey,
+        weight_bytes: &[u8],
+        d_model: usize,
+        d_ff: usize,
+        plan: F32ExpertUploadPlan,
+        permit: &mut PhysicalInstallPermit<VramExpertEntry>,
+    ) -> anyhow::Result<VramExpertEntry> {
 
         // ── Upload weights to VRAM ────────────────────────────────────────────
         let weight_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("vram_expert_weights"),
-            size:               weight_bytes.len() as u64,
+            size:               plan.device_bytes,
             usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&weight_buf, 0, weight_bytes);
+        debug_assert_eq!(weight_buf.size(), plan.device_bytes);
+        let upload_bytes = usize::try_from(plan.device_bytes)
+            .map_err(|_| anyhow!("F32 device buffer size does not fit usize"))?;
+        self.queue
+            .write_buffer(&weight_buf, 0, &weight_bytes[..upload_bytes]);
+        let allocation = permit.charge_allocation().map_err(|e| anyhow!(e))?;
 
         Ok(VramExpertEntry {
+            key,
             weight_buf,
             d_model,
             d_ff,
             layout: VramWeightLayout::F32,
-            proj_bytes: layout.projection_offset,
+            proj_bytes: plan.projection_offset,
             up_block_off: 0,
             down_block_off: 0,
+            device_bytes: plan.device_bytes,
+            _allocation: allocation,
         })
     }
 
@@ -1299,78 +1960,27 @@ impl GpuBackend {
     /// mirroring the CPU loader's `q4_expert_bytes_with_tolerance`.
     fn build_expert_entry_q4_0(
         &self,
+        key: PhysicalExpertKey,
         weight_bytes: &[u8],
-        d_model:      usize,
-        d_ff:         usize,
+        d_model: usize,
+        d_ff: usize,
+        plan: Q4ExpertUploadPlan,
+        permit: &mut PhysicalInstallPermit<VramExpertEntry>,
     ) -> anyhow::Result<VramExpertEntry> {
-        use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
-
-        anyhow::ensure!(
-            d_model > 0 && d_ff > 0,
-            "invalid expert shape: d_ff={} d_model={}",
-            d_ff, d_model
-        );
-        // Re-run the shared block-alignment and workspace checks at upload so
-        // startup validation never replaces this defensive boundary.
-        routed_expert_gpu_compatibility(RoutedExpertGpuSpec {
-            dtype: crate::inference::WeightDtype::Q4_0,
-            d_model,
-            d_ff,
-        })
-        .map_err(|e| anyhow!(e))?;
-
-        // `checked_mul` guards against `usize` overflow on user-configurable
-        // dims; the division is exact (block alignment is enforced above and
-        // `Q4_0_BLOCK_ELEMS` is a nonzero constant).
-        let proj_elems = d_ff
-            .checked_mul(d_model)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Q4_0 expert shape overflow: d_ff={} d_model={}",
-                d_ff, d_model
-            ))?;
-        let blocks_per_proj = proj_elems / Q4_0_BLOCK_ELEMS;
-        let proj_bytes = blocks_per_proj
-            .checked_mul(Q4_0_BLOCK_BYTES)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Q4_0 expert proj byte size overflow: {} blocks × {}B",
-                blocks_per_proj, Q4_0_BLOCK_BYTES
-            ))?;
-        let need = proj_bytes
-            .checked_mul(3)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Q4_0 expert total byte size overflow: 3 × {}B",
-                proj_bytes
-            ))?;
-        // Strict mode requires the exact logical payload; the ≤ one-page
-        // zero-fill shortfall survives only behind the explicitly named
-        // `allow_truncated_expert_payloads` development flag.
-        let tol = self.q4_truncation_tolerance;
-        anyhow::ensure!(
-            weight_bytes.len() >= need
-                || (need > tol && tol > 0 && need - weight_bytes.len() <= tol),
-            "Q4_0 expert weight buffer too small: got {} bytes, need {} (3 × {} blocks × {}B); \
-             missing logical bytes are never zero-filled in strict mode \
-             (allow_truncated_expert_payloads = false)",
-            weight_bytes.len(), need, blocks_per_proj, Q4_0_BLOCK_BYTES
-        );
-        anyhow::ensure!(
-            2 * blocks_per_proj <= u32::MAX as usize,
-            "Q4_0 expert block count {} exceeds u32 push-constant range",
-            2 * blocks_per_proj
-        );
-
         // wgpu requires buffer sizes / write lengths to be 4-byte
-        // multiples; `need` is only guaranteed even (18-byte blocks), so
+        // multiples; the logical payload is only guaranteed even, so
         // round up and zero-fill the tail (also covers the ≤ one-page
         // shortfall tolerance above).
-        let padded_len = need.div_ceil(4) * 4;
+        let padded_len = usize::try_from(plan.device_bytes)
+            .map_err(|_| anyhow!("Q4_0 device buffer size does not fit usize"))?;
         let weight_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("vram_expert_weights_q4_0"),
-            size:               padded_len as u64,
+            size:               plan.device_bytes,
             usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let avail = weight_bytes.len().min(need);
+        debug_assert_eq!(weight_buf.size(), plan.device_bytes);
+        let avail = weight_bytes.len().min(plan.required_bytes);
         if avail == padded_len {
             // Fast path: the source covers the full (already 4-byte-
             // aligned) buffer, so write it directly without a copy.
@@ -1384,19 +1994,23 @@ impl GpuBackend {
             padded.resize(padded_len, 0);
             self.queue.write_buffer(&weight_buf, 0, &padded);
         }
+        let allocation = permit.charge_allocation().map_err(|e| anyhow!(e))?;
 
         // The projection base is selected via the `w_block_off` push
         // constant (Q4_0 blocks are 18 bytes and cannot honour
         // min_storage_buffer_offset_alignment), so the per-dispatch
         // matmul bind groups bind the entire weight buffer.
         Ok(VramExpertEntry {
+            key,
             weight_buf,
             d_model,
             d_ff,
             layout: VramWeightLayout::Q4_0,
             proj_bytes: 0,
-            up_block_off: blocks_per_proj as u32,
-            down_block_off: (2 * blocks_per_proj) as u32,
+            up_block_off: plan.up_block_offset,
+            down_block_off: plan.down_block_offset,
+            device_bytes: plan.device_bytes,
+            _allocation: allocation,
         })
     }
 
@@ -2079,47 +2693,165 @@ impl GpuBackend {
         d_ff: usize,
         out: &mut TensorViewMut<'_>,
     ) -> std::result::Result<(), GpuExpertDispatchError> {
-        use crate::expert_cache::GpuLookup;
-
         if let Some(detail) = self.device_loss.detail() {
             return Err(GpuExpertDispatchError::new(
                 layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
             ));
         }
 
-        let cached_entry = self.vram_expert_bufs.lock().get(&expert_id).cloned();
-        if let Some(entry) = cached_entry {
-            return self.expert_matmul_from_vram(layer, expert_id, &entry, x, out);
+        let admission = match self.gpu_expert_cache.current_admission(expert_id) {
+            Some(admission) => admission,
+            None => {
+                self.physical_expert_registry
+                    .retire_logical_miss(expert_id);
+                return Err(GpuExpertDispatchError::new(
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::ResidencyMiss,
+                    "expert has no current logical GPU admission",
+                ));
+            }
+        };
+        let key = PhysicalExpertKey {
+            expert_id,
+            generation: admission.generation(),
+        };
+        match self.physical_expert_registry.lookup_current(key) {
+            PhysicalRegistryLookup::Hit(entry) => {
+                if !self
+                    .gpu_expert_cache
+                    .contains_generation(expert_id, key.generation)
+                {
+                    self.physical_expert_registry.retire_key_if_present(key);
+                    return Err(GpuExpertDispatchError::new(
+                        layer,
+                        expert_id,
+                        GpuExpertDispatchErrorKind::ResidencyMiss,
+                        "logical GPU admission changed before physical dispatch",
+                    ));
+                }
+                return self.expert_matmul_from_vram(layer, expert_id, &entry, x, out);
+            }
+            PhysicalRegistryLookup::Miss => {}
+            PhysicalRegistryLookup::StaleRequester => {
+                return Err(GpuExpertDispatchError::new(
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::ResidencyMiss,
+                    "physical GPU residency has a newer logical generation",
+                ));
+            }
         }
 
-        self.vram_expert_bufs
-            .lock()
-            .retain(|id, _| self.gpu_expert_cache.contains(*id));
-
-        match self.gpu_expert_cache.get(expert_id) {
-            GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => {
-                // Re-run every PR2 compatibility check at the actual
-                // on-demand allocation/upload boundary.
-                let entry = match r.dtype() {
-                    crate::inference::WeightDtype::Q4_0 => {
-                        self.build_expert_entry_q4_0(r.data(), d_model, d_ff)
-                    }
-                    _ => self.build_expert_entry(r.data(), d_model, d_ff),
+        let resident = admission.resident();
+        let plan = self
+            .plan_expert_upload(resident.dtype(), resident.data(), d_model, d_ff)
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::Upload,
+                e.to_string(),
+            ))?;
+        let acquisition = self
+            .physical_expert_registry
+            .acquire_or_reserve(key, plan.device_bytes())
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::PhysicalCapacity,
+                e.to_string(),
+            ))?;
+        let entry = match acquisition {
+            PhysicalRegistryAcquire::Hit(entry) => entry,
+            PhysicalRegistryAcquire::StaleRequester => {
+                return Err(GpuExpertDispatchError::new(
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::ResidencyMiss,
+                    "physical GPU residency advanced before acquisition",
+                ));
+            }
+            PhysicalRegistryAcquire::Install(mut permit) => {
+                if !self
+                    .gpu_expert_cache
+                    .contains_generation(expert_id, key.generation)
+                {
+                    return Err(GpuExpertDispatchError::new(
+                        layer,
+                        expert_id,
+                        GpuExpertDispatchErrorKind::ResidencyMiss,
+                        "logical GPU admission changed before physical upload",
+                    ));
+                }
+                let entry = match plan {
+                    ExpertUploadPlan::F32(plan) => self.build_expert_entry(
+                        key,
+                        resident.data(),
+                        d_model,
+                        d_ff,
+                        plan,
+                        &mut permit,
+                    ),
+                    ExpertUploadPlan::Q4_0(plan) => self.build_expert_entry_q4_0(
+                        key,
+                        resident.data(),
+                        d_model,
+                        d_ff,
+                        plan,
+                        &mut permit,
+                    ),
                 }
                 .map_err(|e| GpuExpertDispatchError::new(
-                    layer, expert_id, GpuExpertDispatchErrorKind::Upload, e.to_string(),
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::Upload,
+                    e.to_string(),
                 ))?;
-                let entry = Arc::new(entry);
-                self.vram_expert_bufs.lock().insert(expert_id, entry.clone());
-                self.expert_matmul_from_vram(layer, expert_id, &entry, x, out)
+                if !self
+                    .gpu_expert_cache
+                    .contains_generation(expert_id, key.generation)
+                {
+                    drop(entry);
+                    return Err(GpuExpertDispatchError::new(
+                        layer,
+                        expert_id,
+                        GpuExpertDispatchErrorKind::ResidencyMiss,
+                        "logical GPU admission changed during physical upload",
+                    ));
+                }
+                permit.install(Arc::new(entry)).map_err(|detail| {
+                    GpuExpertDispatchError::new(
+                        layer,
+                        expert_id,
+                        GpuExpertDispatchErrorKind::RuntimeInvariant,
+                        detail,
+                    )
+                })?
             }
-            GpuLookup::Miss => Err(GpuExpertDispatchError::new(
+        };
+        // The generation may change between the post-upload check and the
+        // registry install. Retire any just-installed stale entry before it
+        // can become a dispatch result; an eviction after this point treats
+        // this Arc as the already-in-flight activation it represents.
+        if !self
+            .gpu_expert_cache
+            .contains_generation(expert_id, key.generation)
+        {
+            self.physical_expert_registry.retire_key_if_present(key);
+            return Err(GpuExpertDispatchError::new(
                 layer,
                 expert_id,
                 GpuExpertDispatchErrorKind::ResidencyMiss,
-                "expert is not present in the GPU expert cache",
-            )),
+                "logical GPU admission changed before physical dispatch",
+            ));
         }
+        self.expert_matmul_from_vram(layer, expert_id, &entry, x, out)
+    }
+
+    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
+    fn gpu_expert_memory_snapshot(&self) -> GpuExpertMemorySnapshot {
+        self.physical_expert_registry
+            .snapshot(self.gpu_expert_cache.used_bytes())
     }
 
     fn compute_plane(&self) -> &str {
@@ -2353,6 +3085,19 @@ impl BackendBox {
             BackendBox::Cpu(_) => "cpu-fallback",
             #[cfg(test)]
             BackendBox::TestGpu(_) => "test-gpu",
+        }
+    }
+
+    /// Exact PR4 routed-expert physical-memory ledger when this is a
+    /// production GPU backend. CPU and hardware-independent test backends do
+    /// not own physical wgpu expert allocations.
+    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
+    pub fn gpu_expert_memory_snapshot(&self) -> Option<GpuExpertMemorySnapshot> {
+        match self {
+            Self::Gpu(gpu) => Some(gpu.gpu_expert_memory_snapshot()),
+            Self::Cpu(_) => None,
+            #[cfg(test)]
+            Self::TestGpu(_) => None,
         }
     }
 
@@ -2703,6 +3448,31 @@ fn f32_expert_projection_layout(
     })
 }
 
+/// Convert a validated F32 projection layout into the exact device upload
+/// plan. Host payloads may include storage padding beyond the three logical
+/// projections; that padding is neither allocated nor copied to the GPU.
+fn f32_expert_upload_plan(
+    layout: F32ExpertProjectionLayout,
+    host_bytes: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> anyhow::Result<F32ExpertUploadPlan> {
+    anyhow::ensure!(
+        host_bytes >= layout.required_bytes,
+        "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
+        host_bytes,
+        layout.required_bytes,
+        d_ff,
+        d_model
+    );
+    let device_bytes = u64::try_from(layout.required_bytes)
+        .map_err(|_| anyhow!("F32 expert buffer length does not fit u64"))?;
+    Ok(F32ExpertUploadPlan {
+        device_bytes,
+        projection_offset: layout.projection_offset,
+    })
+}
+
 fn routed_expert_gpu_device_compatibility(
     spec: RoutedExpertGpuSpec,
     min_storage_buffer_offset_alignment: u64,
@@ -2901,7 +3671,7 @@ impl ExecutionContext {
         );
         assert!(
             plan.routed_experts() != ExecutionPlane::Gpu || gpu_expert_cache.capacity_bytes() > 0,
-            "GPU routed-expert plane requires a non-zero VRAM expert cache"
+            "GPU routed-expert plane requires non-zero expert-weight capacity"
         );
         Self {
             plan,
@@ -2939,6 +3709,16 @@ impl ExecutionContext {
 
     pub fn gpu_expert_cache(&self) -> &Arc<crate::expert_cache::GpuExpertCache> {
         &self.gpu_expert_cache
+    }
+
+    /// Narrow snapshot seam for PR5. Existing compatibility telemetry remains
+    /// logical-admission based; this API exposes exact MER-owned physical
+    /// expert and workspace bytes without log parsing.
+    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
+    pub fn gpu_expert_memory_snapshot(&self) -> Option<GpuExpertMemorySnapshot> {
+        self.gpu_backend
+            .as_ref()
+            .and_then(|backend| backend.gpu_expert_memory_snapshot())
     }
 
     pub fn primary_backend(&self) -> &Arc<BackendBox> {
@@ -3022,7 +3802,7 @@ pub enum BackendResolutionError {
     /// Invalid GPU sizing or attention geometry detected before adapter or
     /// device initialization.
     InvalidGeometry { detail: String },
-    /// Hybrid selects GPU routed experts, but no non-zero VRAM expert cache
+    /// Hybrid selects GPU routed experts, but no non-zero expert-weight capacity
     /// was configured to make that plane executable.
     RoutedExpertGpuCacheRequired,
     /// Explicit Hybrid requested GPU routed experts, but the current expert
@@ -3475,6 +4255,321 @@ pub fn current() -> Arc<BackendBox> {
 mod tests {
     use super::*;
 
+    struct TestPhysicalEntry {
+        key: PhysicalExpertKey,
+        bytes: u64,
+        _allocation: ExpertAllocationLease,
+    }
+
+    impl PhysicalRegistryEntry for TestPhysicalEntry {
+        fn physical_key(&self) -> PhysicalExpertKey {
+            self.key
+        }
+
+        fn device_bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    fn test_physical_registry(
+        capacity_bytes: u64,
+        workspace_bytes: u64,
+    ) -> Arc<PhysicalGpuExpertRegistry<TestPhysicalEntry>> {
+        PhysicalGpuExpertRegistry::new(GpuMemoryLedger::new(
+            workspace_bytes,
+            capacity_bytes,
+        ))
+    }
+
+    fn install_test_physical_entry(
+        registry: &Arc<PhysicalGpuExpertRegistry<TestPhysicalEntry>>,
+        key: PhysicalExpertKey,
+        bytes: u64,
+    ) -> std::result::Result<Arc<TestPhysicalEntry>, String> {
+        match registry
+            .acquire_or_reserve(key, bytes)
+            .map_err(|e| e.to_string())?
+        {
+            PhysicalRegistryAcquire::Hit(entry) => Ok(entry),
+            PhysicalRegistryAcquire::Install(mut permit) => {
+                let allocation = permit.charge_allocation()?;
+                permit.install(Arc::new(TestPhysicalEntry {
+                    key,
+                    bytes,
+                    _allocation: allocation,
+                }))
+            }
+            PhysicalRegistryAcquire::StaleRequester => {
+                Err("physical install requester generation is stale".to_string())
+            }
+        }
+    }
+
+    fn physical_key(expert_id: u32, generation: u64) -> PhysicalExpertKey {
+        PhysicalExpertKey {
+            expert_id,
+            generation,
+        }
+    }
+
+    #[test]
+    fn physical_registry_matching_generation_hits_without_reinstall() {
+        let registry = test_physical_registry(128, 0);
+        let key = physical_key(7, 1);
+        let first = install_test_physical_entry(&registry, key, 32).unwrap();
+        let second = install_test_physical_entry(&registry, key, 32).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let snapshot = registry.snapshot(32);
+        assert_eq!(snapshot.physical_installs, 1);
+        assert_eq!(snapshot.physical_entries, 1);
+        assert_eq!(snapshot.expert_registry_bytes, 32);
+    }
+
+    #[test]
+    fn physical_registry_retires_stale_generation_before_reinstall() {
+        let registry = test_physical_registry(128, 0);
+        let g1 = physical_key(7, 1);
+        let old = install_test_physical_entry(&registry, g1, 32).unwrap();
+        let g2 = physical_key(7, 2);
+        let current = install_test_physical_entry(&registry, g2, 32).unwrap();
+        assert!(!registry.contains_key(g1));
+        assert!(registry.contains_key(g2));
+        let after_reinstall = registry.snapshot(32);
+        assert_eq!(after_reinstall.physical_installs, 2);
+        assert_eq!(after_reinstall.stale_retirements, 1);
+        assert_eq!(after_reinstall.expert_registry_bytes, 32);
+        assert_eq!(after_reinstall.expert_live_bytes, 64);
+
+        registry.retire_key_if_present(g1);
+        assert_eq!(
+            registry.snapshot(32),
+            after_reinstall,
+            "retiring the old key must be a no-op against stored G2"
+        );
+        assert!(registry.contains_key(g2));
+        drop(old);
+        assert_eq!(registry.snapshot(32).expert_live_bytes, 32);
+        drop(current);
+    }
+
+    #[test]
+    fn physical_registry_stale_requester_cannot_retire_newer_generation() {
+        let registry = test_physical_registry(128, 0);
+        let g1 = physical_key(7, 1);
+        let g2 = physical_key(7, 2);
+        let current = install_test_physical_entry(&registry, g2, 32).unwrap();
+        let before = registry.snapshot(32);
+
+        assert!(matches!(
+            registry.lookup_current(g1),
+            PhysicalRegistryLookup::StaleRequester
+        ));
+        assert_eq!(registry.snapshot(32), before);
+        assert!(registry.contains_key(g2));
+        assert!(!registry.contains_key(g1));
+        assert_eq!(current.physical_key(), g2);
+    }
+
+    #[test]
+    fn physical_registry_acquire_rejects_request_staled_after_fast_miss() {
+        let registry = test_physical_registry(128, 0);
+        let g1 = physical_key(7, 1);
+        let g2 = physical_key(7, 2);
+        assert!(matches!(
+            registry.lookup_current(g1),
+            PhysicalRegistryLookup::Miss
+        ));
+
+        let current = install_test_physical_entry(&registry, g2, 32).unwrap();
+        let before = registry.snapshot(32);
+        assert!(matches!(
+            registry.acquire_or_reserve(g1, 32).unwrap(),
+            PhysicalRegistryAcquire::StaleRequester
+        ));
+        assert_eq!(registry.snapshot(32), before);
+        assert!(registry.contains_key(g2));
+        assert!(!registry.contains_key(g1));
+        assert_eq!(current.physical_key(), g2);
+    }
+
+    #[test]
+    fn logical_miss_removes_physical_addressability_but_not_inflight_charge() {
+        let registry = test_physical_registry(64, 0);
+        let key = physical_key(9, 1);
+        let in_flight = install_test_physical_entry(&registry, key, 40).unwrap();
+        registry.retire_logical_miss(9);
+        let snapshot = registry.snapshot(0);
+        assert!(!registry.contains_key(key));
+        assert_eq!(snapshot.physical_entries, 0);
+        assert_eq!(snapshot.expert_registry_bytes, 0);
+        assert_eq!(snapshot.expert_live_bytes, 40);
+        drop(in_flight);
+        assert_eq!(registry.snapshot(0).expert_live_bytes, 0);
+    }
+
+    #[test]
+    fn physical_capacity_evicts_lru_and_never_exceeds_cap() {
+        let registry = test_physical_registry(60, 0);
+        drop(install_test_physical_entry(&registry, physical_key(1, 1), 30).unwrap());
+        drop(install_test_physical_entry(&registry, physical_key(2, 1), 30).unwrap());
+        let exact = registry.snapshot(60);
+        assert_eq!(exact.expert_registry_bytes, 60);
+        assert_eq!(exact.physical_entries, 2);
+
+        drop(install_test_physical_entry(&registry, physical_key(3, 1), 30).unwrap());
+        let snapshot = registry.snapshot(60);
+        assert!(!registry.contains_key(physical_key(1, 1)));
+        assert!(registry.contains_key(physical_key(2, 1)));
+        assert!(registry.contains_key(physical_key(3, 1)));
+        assert_eq!(snapshot.expert_registry_bytes, 60);
+        assert!(snapshot.expert_registry_bytes <= snapshot.expert_capacity_bytes);
+        assert_eq!(snapshot.physical_evictions, 1);
+    }
+
+    #[test]
+    fn matching_physical_lookup_updates_registry_lru_recency() {
+        let registry = test_physical_registry(60, 0);
+        let g1 = physical_key(1, 1);
+        let g2 = physical_key(2, 1);
+        let g3 = physical_key(3, 1);
+        drop(install_test_physical_entry(&registry, g1, 30).unwrap());
+        drop(install_test_physical_entry(&registry, g2, 30).unwrap());
+
+        let hit = match registry.lookup_current(g1) {
+            PhysicalRegistryLookup::Hit(hit) => hit,
+            PhysicalRegistryLookup::Miss => panic!("expected physical hit"),
+            PhysicalRegistryLookup::StaleRequester => panic!("unexpected stale requester"),
+        };
+        drop(hit);
+        drop(install_test_physical_entry(&registry, g3, 30).unwrap());
+
+        assert!(registry.contains_key(g1), "matched lookup must make G1 MRU");
+        assert!(!registry.contains_key(g2), "G2 must remain the LRU victim");
+        assert!(registry.contains_key(g3));
+    }
+
+    #[test]
+    fn oversized_physical_expert_fails_without_any_charge() {
+        let registry = test_physical_registry(50, 0);
+        let err = registry
+            .acquire_or_reserve(physical_key(1, 1), 51)
+            .err()
+            .expect("oversized expert must fail");
+        assert_eq!(err.requested_bytes, 51);
+        assert_eq!(err.expert_capacity_bytes, 50);
+        let snapshot = registry.snapshot(51);
+        assert_eq!(snapshot.physical_entries, 0);
+        assert_eq!(snapshot.expert_registry_bytes, 0);
+        assert_eq!(snapshot.expert_live_bytes, 0);
+    }
+
+    #[test]
+    fn inflight_eviction_keeps_live_charge_and_blocks_overcommit() {
+        let registry = test_physical_registry(60, 0);
+        let in_flight =
+            install_test_physical_entry(&registry, physical_key(1, 1), 40).unwrap();
+        let err = registry
+            .acquire_or_reserve(physical_key(2, 1), 40)
+            .err()
+            .expect("in-flight live bytes must prevent overcommit");
+        assert_eq!(err.expert_live_bytes, 40);
+        let evicted = registry.snapshot(40);
+        assert_eq!(evicted.physical_entries, 0);
+        assert_eq!(evicted.expert_registry_bytes, 0);
+        assert_eq!(evicted.expert_live_bytes, 40);
+        drop(in_flight);
+        assert_eq!(registry.snapshot(0).expert_live_bytes, 0);
+        drop(install_test_physical_entry(&registry, physical_key(2, 1), 40).unwrap());
+    }
+
+    #[test]
+    fn eviction_and_new_generation_perform_real_second_install() {
+        let registry = test_physical_registry(64, 0);
+        let first = install_test_physical_entry(&registry, physical_key(4, 1), 32).unwrap();
+        registry.retire_logical_miss(4);
+        drop(first);
+        drop(install_test_physical_entry(&registry, physical_key(4, 2), 32).unwrap());
+        let snapshot = registry.snapshot(32);
+        assert_eq!(snapshot.physical_installs, 2);
+        assert_eq!(snapshot.physical_entries, 1);
+        assert!(registry.contains_key(physical_key(4, 2)));
+    }
+
+    #[test]
+    fn failed_construction_or_charged_loser_cannot_leak_bytes() {
+        let registry = test_physical_registry(64, 0);
+        let key = physical_key(5, 1);
+        let permit = match registry.acquire_or_reserve(key, 32).unwrap() {
+            PhysicalRegistryAcquire::Install(permit) => permit,
+            PhysicalRegistryAcquire::Hit(_) => panic!("unexpected physical hit"),
+            PhysicalRegistryAcquire::StaleRequester => panic!("unexpected stale requester"),
+        };
+        drop(permit);
+        assert_eq!(registry.snapshot(0).expert_live_bytes, 0);
+
+        let mut permit = match registry.acquire_or_reserve(key, 32).unwrap() {
+            PhysicalRegistryAcquire::Install(permit) => permit,
+            PhysicalRegistryAcquire::Hit(_) => panic!("unexpected physical hit"),
+            PhysicalRegistryAcquire::StaleRequester => panic!("unexpected stale requester"),
+        };
+        let allocation = permit.charge_allocation().unwrap();
+        drop(permit);
+        assert_eq!(registry.snapshot(0).expert_live_bytes, 32);
+        drop(allocation);
+        let snapshot = registry.snapshot(0);
+        assert_eq!(snapshot.expert_live_bytes, 0);
+        assert_eq!(snapshot.expert_registry_bytes, 0);
+        assert_eq!(snapshot.physical_installs, 0);
+    }
+
+    #[test]
+    fn concurrent_same_expert_demand_installs_once_and_accounts_once() {
+        let registry = test_physical_registry(64, 0);
+        let key = physical_key(6, 1);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                install_test_physical_entry(&registry, key, 32).unwrap()
+            }));
+        }
+        barrier.wait();
+        let a = handles.remove(0).join().unwrap();
+        let b = handles.remove(0).join().unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        let snapshot = registry.snapshot(32);
+        assert_eq!(snapshot.physical_installs, 1);
+        assert_eq!(snapshot.physical_entries, 1);
+        assert_eq!(snapshot.expert_registry_bytes, 32);
+        assert_eq!(snapshot.expert_live_bytes, 32);
+    }
+
+    #[test]
+    fn workspace_and_snapshot_accounting_are_exact_and_exclude_host_scratch() {
+        let buffer_bytes = (MAX_EXPERT_D_FF * std::mem::size_of::<f32>()) as u64;
+        let workspace_bytes = expert_workspace_device_bytes(buffer_bytes, EXPERT_WORKSPACE_POOL);
+        assert_eq!(
+            workspace_bytes,
+            buffer_bytes * EXPERT_WORKSPACE_DEVICE_BUFFERS * EXPERT_WORKSPACE_POOL as u64
+        );
+        // `Vec<f32>` scratch has the same logical length as one device buffer,
+        // but is intentionally absent from the five-buffer formula above.
+        let host_scratch_bytes = buffer_bytes * EXPERT_WORKSPACE_POOL as u64;
+        assert_ne!(workspace_bytes, workspace_bytes + host_scratch_bytes);
+
+        let registry = test_physical_registry(64, workspace_bytes);
+        drop(install_test_physical_entry(&registry, physical_key(1, 1), 32).unwrap());
+        let snapshot = registry.snapshot(32);
+        assert_eq!(snapshot.workspace_bytes, workspace_bytes);
+        assert_eq!(snapshot.total_tracked_bytes, 32 + workspace_bytes);
+        assert_eq!(snapshot.total_tracked_bytes, snapshot.expert_live_bytes + snapshot.workspace_bytes);
+        assert!(snapshot.expert_registry_bytes <= snapshot.expert_live_bytes);
+        assert!(snapshot.expert_registry_bytes <= snapshot.expert_capacity_bytes);
+    }
+
     #[test]
     fn kv_offset_symmetric_matches_shared_stride() {
         // Symmetric case: k_dim == v_dim. Layout is a single contiguous
@@ -3713,6 +4808,21 @@ mod tests {
         assert_eq!(layout.projection_bytes, 32 * 64 * 4);
         assert_eq!(layout.projection_offset, (32 * 64 * 4) as u64);
         assert_eq!(layout.required_bytes, 3 * 32 * 64 * 4);
+    }
+
+    #[test]
+    fn f32_upload_plan_excludes_trailing_host_padding() {
+        let layout = f32_expert_projection_layout(
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            256,
+        )
+        .unwrap();
+        let host_bytes = layout.required_bytes + 4096;
+        let plan = f32_expert_upload_plan(layout, host_bytes, 32, 64).unwrap();
+
+        assert_eq!(plan.device_bytes, layout.required_bytes as u64);
+        assert_eq!(plan.projection_offset, layout.projection_offset);
+        assert!(plan.device_bytes < host_bytes as u64);
     }
 
     #[test]
@@ -3990,7 +5100,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "GPU routed-expert plane requires a non-zero VRAM expert cache")]
+    #[should_panic(expected = "GPU routed-expert plane requires non-zero expert-weight capacity")]
     fn execution_context_rejects_gpu_experts_without_cache() {
         let plan = ResolvedExecutionPlan::from_resolution(
             BackendResolution {

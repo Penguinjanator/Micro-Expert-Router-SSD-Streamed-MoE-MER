@@ -1205,14 +1205,16 @@ struct ExpertHealth {
     block_pool_capacity: Option<usize>,
     block_pool_overflow_in_use: Option<usize>,
     tokens_generated: u64,
-    /// Phase 1 / 3-tier hierarchy: whether the VRAM (GPU) expert
-    /// cache is configured. When `false` the remaining `vram_*` and
-    /// `gpu_*` fields are still present (0) for stable schema.
+    /// Whether the logical GPU-admission cache is configured. Compatibility
+    /// `vram_*` fields remain present for stable schema but describe logical
+    /// host admission bytes; exact physical bytes use the PR4 Rust snapshot.
     gpu_cache_enabled: bool,
     gpu_cache_hits: u64,
     gpu_cache_misses: u64,
     gpu_promotions_total: u64,
+    /// Logical admitted host payload bytes (compatibility field name).
     vram_used_bytes: u64,
+    /// Logical admission budget, also used as the physical expert-weight cap.
     vram_capacity_bytes: u64,
     gpu_anchor_count: usize,
     gpu_lru_count: usize,

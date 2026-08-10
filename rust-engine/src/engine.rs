@@ -839,8 +839,8 @@ pub(crate) struct Counters {
     /// predictive arm is misconfigured and contributing nothing.
     speculator_dmodel_mismatch: AtomicU64,
     /// Expert activations that fell back from the GPU fast path to the
-    /// CPU path because the VRAM dispatch errored (typically a VRAM
-    /// miss). Invisible mixed GPU/CPU execution is a major source of
+    /// CPU path because physical routed-expert dispatch errored. Invisible
+    /// mixed GPU/CPU execution is a major source of
     /// inconsistent token latency, so make it countable.
     gpu_cpu_fallbacks: AtomicU64,
     /// Hardware-independent CPU routed-expert forward spy. Test-only so the
@@ -1087,14 +1087,13 @@ pub(crate) struct EngineCore {
     pub(super) predictor: Arc<PredictiveLoader>,
     pub(super) shape: ModelShape,
     pub(super) options: EngineOptions,
-    /// Optional VRAM (GPU) expert cache — Phase 2 of the three-tier
-    /// memory hierarchy (SSD → RAM → VRAM). `None` (default) leaves
+    /// Optional logical GPU-admission cache. `None` (default) leaves
     /// the engine in its legacy 2-tier posture. When `Some`, every
     /// cache lookup in [`Engine::generate`] / [`Engine::moe_step`]
-    /// first probes the VRAM tier; misses fall through to the RAM
+    /// first probes logical admission; misses fall through to the RAM
     /// `MultiLayerExpertCache` and then to NVMe.
     pub(super) gpu_cache: Option<Arc<GpuExpertCache>>,
-    /// One-shot sender that feeds the background RAM → VRAM
+    /// One-shot sender that feeds background RAM → logical-GPU-admission
     /// promotion task. The receiver lives on a dedicated Tokio task
     /// spawned by [`Engine::install_gpu_cache`]; the inference hot
     /// path never blocks on this channel — promotions are pure
@@ -1841,19 +1840,24 @@ impl Engine {
         self.core.routed_expert_gpu_failure_policy
     }
 
-    /// Synchronously promote a freshly-loaded RAM resident into the
-    /// VRAM (GPU) expert cache, if one is installed and the expert's
-    /// dtype is GPU-eligible.
+    /// Exact MER-owned routed-expert GPU weight/workspace ledger for PR5.
+    /// Returns `None` when the resolved execution context has no GPU backend.
+    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
+    pub fn gpu_expert_memory_snapshot(
+        &self,
+    ) -> Option<crate::backend::GpuExpertMemorySnapshot> {
+        self.core.execution_context.gpu_expert_memory_snapshot()
+    }
+
+    /// Synchronously copy a freshly-loaded RAM resident into the logical GPU
+    /// admission cache, if installed and GPU-compatible. Device upload remains
+    /// lazy and authoritative in `GpuBackend`'s physical registry.
     ///
     /// This is the warm-up counterpart to the background promotion
     /// task wired up in [`Engine::install_gpu_cache`]: the background
     /// task only fires after an expert crosses the RAM-hit promotion
-    /// threshold, which means the *first* loads of an expert always
-    /// miss VRAM and `GpuBackend::expert_matmul` returns `Err(Miss)`,
-    /// forcing the CPU fallback for the entire warm-up window. Calling
-    /// this immediately after an NVMe load pins the expert in VRAM so
-    /// the *next* dispatch of the same expert hits the GPU fast path
-    /// instead.
+    /// threshold. Calling this after an NVMe load makes the payload eligible
+    /// for a lazy physical upload on the next routed GPU dispatch.
     ///
     /// The byte handling mirrors the background task exactly: both
     /// F32 and Q4_0 experts are promoted byte-for-byte — Q4_0 bytes
@@ -1871,7 +1875,7 @@ impl Engine {
     fn try_promote_resident_to_gpu(&self, resident: &Arc<ExpertResident>) {
         // Only meaningful when a GPU backend is live and the dtype is
         // one the GPU kernels can actually consume; otherwise the
-        // promotion would just waste a VRAM slot on bytes the fast
+        // promotion would waste logical admission budget on bytes the fast
         // path can never use.
         if !self.routed_expert_backend().is_gpu() || !self.gpu_eligible_dtype() {
             return;
@@ -1880,14 +1884,14 @@ impl Engine {
             return;
         };
         let id = resident.id;
-        // Already VRAM-resident: nothing to do (and the LRU helper
+        // Already logically admitted: nothing to do (and the LRU helper
         // would short-circuit anyway). Skip the byte copy entirely.
         if gpu.contains(id) {
             return;
         }
         // Bytes are promoted verbatim and dtype-tagged: Q4_0 experts
         // stay in native GGUF blocks (~8× fewer bytes across PCIe and
-        // in VRAM than a dequantised F32 stream) and are unpacked
+        // as a physical buffer than a dequantised F32 stream) and are unpacked
         // inline by the GPU's `matmul_q4_0.wgsl` pipeline.
         let gpu_res = Arc::new(GpuResident::new_with_dtype(
             id,
@@ -1902,7 +1906,7 @@ impl Engine {
         }
     }
 
-    /// Attach a VRAM (GPU) expert cache — Phase 2 three-tier hierarchy.
+    /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.
     ///
     /// Spawns a background Tokio task that drains an MPSC channel of
     /// `(expert_id, ram_resident)` promotion requests fed by the
@@ -1911,19 +1915,17 @@ impl Engine {
     /// has no impact on per-token latency. When the channel is
     /// disconnected (engine drop) the background task exits.
     ///
-    /// Updates the `mer_vram_used_bytes` Prometheus gauge after every
-    /// successful promotion.
+    /// Updates the compatibility `mer_vram_used_bytes` gauge with logical
+    /// admitted host payload bytes after every successful promotion.
     pub fn install_gpu_cache(&mut self) {
         let gpu = self.core.execution_context.gpu_expert_cache().clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, Arc<ExpertResident>)>();
         let gpu_for_task = gpu.clone();
         let prom_for_task = self.metrics.prom.clone();
         // Snapshot the (immutable) expert dtype so each promoted
-        // resident is dtype-tagged. Q4_0 experts land in VRAM as raw
-        // GGUF blocks (~8× fewer bytes than a dequantised F32 stream)
-        // and are unpacked inline by the GPU's `matmul_q4_0.wgsl`
-        // pipeline (see `backend::build_expert_entry_q4_0`); the F32
-        // path is byte-for-byte unchanged.
+        // resident is dtype-tagged. Q4_0 logical admissions retain raw GGUF
+        // blocks; the backend later uploads and unpacks them inline via
+        // `matmul_q4_0.wgsl`. The F32 path remains byte-for-byte unchanged.
         let promote_dtype = self.core.options.dtype;
         // Capacity is constant for the lifetime of the cache; publish
         // it once so `mer_vram_capacity_bytes` is available on the
@@ -1934,8 +1936,8 @@ impl Engine {
         }
         tokio::spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
-                // `promote_sync` copies the resident bytes into the
-                // anchor/LRU edge under the parking_lot mutex; safe to
+                // `promote_sync` copies resident bytes into the host logical
+                // admission Anchor/LRU under the parking_lot mutex; safe to
                 // call from a Tokio worker because it never .awaits.
                 // Bytes are promoted verbatim; the dtype tag tells the
                 // GPU backend which matmul pipeline to dispatch (shared
@@ -2326,13 +2328,13 @@ impl Engine {
             usize,
             tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
         )> = Vec::new();
-        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // Logical GPU-admission tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
         // counters per activation on the hot path.
         let mut gpu_hits_acc: u64 = 0;
         let mut gpu_misses_acc: u64 = 0;
         for (i, &id) in target.iter().enumerate() {
-            // VRAM (GPU) tier — Phase 2 three-tier hierarchy. The cache
+            // Logical GPU-admission tier. The cache
             // shadows RAM; on hit we still resolve the authoritative
             // `ExpertResident` from RAM below, but the counter reflects
             // the promotion-policy decision.
@@ -2350,9 +2352,8 @@ impl Engine {
                 debug!(expert = id, "cache hit");
                 cache_hits_per_expert[i] = true;
                 // RAM hit: bump the per-expert hit counter and, if we
-                // have a VRAM tier configured, enqueue a fire-and-forget
-                // promotion only on the threshold crossing, and only if
-                // the expert is not already resident in the GPU cache.
+                // have GPU admission configured, claim one fire-and-forget
+                // promotion request after the threshold.
                 let new_hits = r.record_hit();
                 // Tier 4 precision feedback: the first hit on a
                 // shadow-backed resident means a speculative prefetch
@@ -2365,10 +2366,10 @@ impl Engine {
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
                 ) {
-                    let crossed_promote_threshold = gpu.should_promote(new_hits)
-                        && !gpu.should_promote(new_hits.saturating_sub(1));
-                    if crossed_promote_threshold && !gpu.get(id).is_hit() {
-                        let _ = tx.send((id, r.clone()));
+                    if gpu.claim_promotion(id, new_hits)
+                        && tx.send((id, r.clone())).is_err()
+                    {
+                        gpu.cancel_promotion(id);
                     }
                 }
                 residents[i] = Some(r);
@@ -2380,7 +2381,7 @@ impl Engine {
                 miss_handles.push((i, tokio::spawn(async move { me.fetch(id).await })));
             }
         }
-        // Aggregate VRAM-tier outcome for this routing decision.
+        // Aggregate logical GPU-admission outcome for this routing decision.
         if let Some(p) = self.metrics.prom.as_ref() {
             if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
                 p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
@@ -2474,13 +2475,8 @@ impl Engine {
             // it again — that would double-count every miss after
             // SSD-read dedup (gist Phase 1) was introduced.
             stats.bytes_read += r.buffer.len() as u64;
-            // Synchronous VRAM promotion: this miss just paid the full
-            // NVMe load cost, so pin the freshly-loaded expert into the
-            // GpuExpertCache now (budget permitting). The *next* dispatch
-            // of this expert then hits `GpuBackend::expert_matmul`'s VRAM
-            // fast path instead of returning `Err(Miss)` and falling back
-            // to CPU. No-op when no GPU cache is installed or the dtype
-            // is not GPU-eligible; never touches the CPU fallback path.
+            // Synchronous logical admission after the NVMe load; the next GPU
+            // routed dispatch performs authoritative physical lookup/upload.
             self.try_promote_resident_to_gpu(&r);
             residents[i] = Some(r);
         }
@@ -2578,7 +2574,7 @@ impl Engine {
                     // infrastructure, not strict-hybrid qualification. PR3's
                     // policy applies only to real-model `moe_step`.
                     // CandleBackend::expert_matmul bails unconditionally, so we
-                    // always guard behind is_gpu(). A VRAM miss returns Err
+                    // always guard behind is_gpu(). A logical/physical miss returns Err
                     // and we fall through to the CPU path below. Both F32 and
                     // (block-aligned) Q4_0 experts are eligible — see
                     // `Engine::gpu_eligible_dtype`.
@@ -3181,13 +3177,13 @@ impl Engine {
                         );
                         return;
                     }
-                    // **Eager VRAM promotion.** A speculative prefetch is
+                    // **Eager logical GPU admission.** A speculative prefetch is
                     // a strong "about to be routed" signal, so try to
-                    // stage the bytes into the GPU LRU Edge *now* instead
+                    // stage the host bytes into the admission LRU *now* instead
                     // of waiting for `promote_after_hits` RAM hits — the
                     // lazy path can leave a predicted expert on the CPU
-                    // fallback for its first N activations (one CPU
-                    // Only attempt eager VRAM promotion when the cache definitely has room;
+                    // fallback path for its first few activations.
+                    // Only attempt eager admission when the logical cache has room;
                     // otherwise we would copy ~expert_size bytes into a Vec only to have the
                     // non-evicting promotion path immediately reject it.
                     if let Some(gpu) = me.core.gpu_cache.as_ref() {
@@ -4243,7 +4239,7 @@ impl Engine {
             tokio::task::JoinHandle<Result<Arc<ExpertResident>, ExpertReadError>>,
         )> = Vec::new();
         let mut cache_hits_per_expert: Vec<bool> = Vec::with_capacity(target.len());
-        // VRAM (GPU) tier — aggregate hits/misses across this routing
+        // Logical GPU-admission tier — aggregate hits/misses across this routing
         // decision and record once, rather than incrementing Prometheus
         // counters per activation on the hot path.
         let mut gpu_hits_acc: u64 = 0;
@@ -4269,20 +4265,14 @@ impl Engine {
                     self.core.gpu_cache.as_ref(),
                     self.core.gpu_promotion_tx.as_ref(),
                 ) {
-                    // Edge-triggered: only enqueue a promotion on the
-                    // single hit that *crosses* `promote_after_hits`,
-                    // not on every subsequent hit. Mirrors the same
-                    // crossing check in `Engine::generate` — without
-                    // it, every hot-path hit after the threshold
-                    // floods the unbounded mpsc with redundant
-                    // promotions (each one paying a `to_vec()` copy +
-                    // mutex-guarded insert on the background worker).
-                    // See gist feedback #2 (`moe_step` level- vs.
-                    // edge-trigger).
-                    let crossed_promote_threshold = gpu.should_promote(new_hits)
-                        && !gpu.should_promote(new_hits.saturating_sub(1));
-                    if crossed_promote_threshold && !gpu.get(id).is_hit() {
-                        let _ = tx.send((id, r.clone()));
+                    // One outstanding claim prevents queue flooding while
+                    // allowing a new request after logical eviction, even
+                    // though the RAM resident's hit count no longer has a
+                    // fresh threshold-crossing edge.
+                    if gpu.claim_promotion(id, new_hits)
+                        && tx.send((id, r.clone())).is_err()
+                    {
+                        gpu.cancel_promotion(id);
                     }
                 }
                 residents[i] = Some(r);
@@ -4302,7 +4292,7 @@ impl Engine {
             crate::stage_timing::EXPERT_CACHE_LOOKUP,
             cache_lookup_start.elapsed(),
         );
-        // Aggregate VRAM-tier outcome for this routing decision.
+        // Aggregate logical GPU-admission outcome for this routing decision.
         if let Some(p) = self.metrics.prom.as_ref() {
             if gpu_hits_acc > 0 || gpu_misses_acc > 0 {
                 p.record_gpu_cache(gpu_hits_acc, gpu_misses_acc);
@@ -5147,30 +5137,28 @@ pub struct EngineReport {
     /// nothing.
     pub speculator_dmodel_mismatch: u64,
     /// Expert activations that fell back from the GPU fast path to the
-    /// CPU path because the VRAM dispatch errored (typically a VRAM
-    /// miss). Non-zero rates explain mixed GPU/CPU token latency.
+    /// CPU path because physical GPU expert dispatch errored. Non-zero rates
+    /// explain mixed GPU/CPU token latency in serving-fallback mode.
     pub gpu_cpu_fallbacks: u64,
-    /// Phase 2 / 3-tier hierarchy: whether the engine has a VRAM (GPU)
-    /// expert cache attached. `false` keeps the historical 2-tier
-    /// behaviour bit-for-bit; `true` adds the SSD → RAM → VRAM tier.
+    /// Whether the engine has a logical GPU-admission cache attached.
     pub gpu_cache_enabled: bool,
-    /// Bytes currently resident in the VRAM tier (sum of anchor + LRU).
-    /// `0` when no VRAM cache is attached.
+    /// Compatibility field: logical host payload bytes admitted across the
+    /// GPU Anchor + LRU. Not physical wgpu allocation bytes.
     pub vram_used_bytes: u64,
-    /// Total bytes addressable in the VRAM tier (anchor + LRU budget).
-    /// `0` when no VRAM cache is attached.
+    /// Compatibility field: logical admission budget. The same configured
+    /// value caps physical expert weights; fixed workspaces are separate.
     pub vram_capacity_bytes: u64,
-    /// Cumulative RAM → VRAM promotions performed by the background
+    /// Cumulative RAM → logical-admission promotions performed by the background
     /// promotion task. Promotions are gated by the per-expert
     /// `promote_after_hits` threshold.
     pub gpu_promotions: u64,
-    /// VRAM cache hit count (anchor + LRU).
+    /// Logical GPU-admission hit count (anchor + LRU).
     pub gpu_cache_hits: u64,
-    /// VRAM cache miss count.
+    /// Logical GPU-admission miss count.
     pub gpu_cache_misses: u64,
-    /// Number of experts in the VRAM anchor (hot-pin) region.
+    /// Number of experts in the logical admission anchor region.
     pub gpu_anchor_count: usize,
-    /// Number of experts in the VRAM LRU (cold-edge) region.
+    /// Number of experts in the logical admission LRU region.
     pub gpu_lru_count: usize,
     /// **Tier 4.** Speculative prefetches that landed in cache and were
     /// then consumed by a hit before eviction (precision numerator).
@@ -5519,6 +5507,7 @@ mod tests {
         use crate::backend::GpuExpertDispatchErrorKind as Kind;
         for (label, kind) in [
             ("residency", Kind::ResidencyMiss),
+            ("physical-capacity", Kind::PhysicalCapacity),
             ("upload", Kind::Upload),
             ("validation", Kind::ValidationDispatch),
             ("submission", Kind::Submission),
@@ -5645,6 +5634,10 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 0);
         assert_eq!(cpu_expert_forward_calls(&engine), 1);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert!(
+            engine.gpu_expert_memory_snapshot().is_none(),
+            "CPU plans must not depend on a physical GPU expert registry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
