@@ -686,7 +686,7 @@ mod tests {
             std::sync::Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16)),
             |_| {
                 Ok(std::sync::Arc::new(crate::backend::BackendBox::TestGpu(
-                    crate::backend::CandleBackend::new(),
+                    crate::backend::TestGpuBackend::success(1.0),
                 )))
             },
         )

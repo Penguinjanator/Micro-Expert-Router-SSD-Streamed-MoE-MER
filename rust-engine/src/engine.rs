@@ -843,6 +843,10 @@ pub(crate) struct Counters {
     /// miss). Invisible mixed GPU/CPU execution is a major source of
     /// inconsistent token latency, so make it countable.
     gpu_cpu_fallbacks: AtomicU64,
+    /// Hardware-independent CPU routed-expert forward spy. Test-only so the
+    /// public fallback metric keeps its production schema and meaning.
+    #[cfg(test)]
+    cpu_expert_forward_calls: AtomicU64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -882,6 +886,16 @@ pub enum ExpertExecutionPolicy {
     Auto,
     SequentialExpertsRowParallel,
     ParallelExpertsSingleThread,
+}
+
+/// Runtime recovery contract after the authoritative plan selects GPU routed
+/// experts. PR3 keeps this engine-scoped: current entry points retain the
+/// compatibility default, while qualification can opt in before inference.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RoutedExpertGpuFailurePolicy {
+    StrictFailClosed,
+    #[default]
+    ServingCpuFallback,
 }
 
 /// Run-time options that affect how `Engine::generate` executes a token.
@@ -1111,6 +1125,8 @@ pub(crate) struct EngineCore {
     /// engine and its associated real model. Routed-expert dispatch reads the
     /// backend selected by this context; it never reconstructs one privately.
     pub(super) execution_context: Arc<crate::backend::ExecutionContext>,
+    /// Immutable once the engine is shared for inference.
+    pub(super) routed_expert_gpu_failure_policy: RoutedExpertGpuFailurePolicy,
     /// **Tier 4 — adaptive prefetch admission controller.** Always
     /// present; constructed in the transparent pass-through state unless
     /// [`EngineOptions::prefetch_governor`] is set, in which case it
@@ -1402,6 +1418,7 @@ impl EngineCore {
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
             execution_context,
+            routed_expert_gpu_failure_policy: RoutedExpertGpuFailurePolicy::default(),
             governor,
         }
     }
@@ -1536,7 +1553,12 @@ pub enum MoeStepError {
     ExpertCompute {
         layer: u32,
         expert: u32,
-        detail: String,
+        source: ExpertWeightsError,
+    },
+    /// Strict GPU routed-expert dispatch failure, kept distinct from storage,
+    /// CPU weight, attention, degraded-substitution, and startup errors.
+    GpuExpertDispatch {
+        source: crate::backend::GpuExpertDispatchError,
     },
 }
 
@@ -1554,11 +1576,12 @@ impl std::fmt::Display for MoeStepError {
             MoeStepError::ExpertCompute {
                 layer,
                 expert,
-                detail,
+                source,
             } => write!(
                 f,
-                "routed expert {expert} (layer {layer}) failed to execute: {detail}"
+                "routed expert {expert} (layer {layer}) failed to execute: {source}"
             ),
+            MoeStepError::GpuExpertDispatch { source } => write!(f, "{source}"),
         }
     }
 }
@@ -1567,7 +1590,8 @@ impl std::error::Error for MoeStepError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             MoeStepError::ExpertFetch { source, .. } => Some(source),
-            MoeStepError::ExpertCompute { .. } => None,
+            MoeStepError::ExpertCompute { source, .. } => Some(source),
+            MoeStepError::GpuExpertDispatch { source } => Some(source),
         }
     }
 }
@@ -1801,6 +1825,20 @@ impl Engine {
             },
         )
         .is_ok()
+    }
+
+    /// Select the policy before placing the engine behind an `Arc`; there is
+    /// intentionally no runtime setter.
+    pub fn with_routed_expert_gpu_failure_policy(
+        mut self,
+        policy: RoutedExpertGpuFailurePolicy,
+    ) -> Self {
+        self.core.routed_expert_gpu_failure_policy = policy;
+        self
+    }
+
+    pub fn routed_expert_gpu_failure_policy(&self) -> RoutedExpertGpuFailurePolicy {
+        self.core.routed_expert_gpu_failure_policy
     }
 
     /// Synchronously promote a freshly-loaded RAM resident into the
@@ -2536,6 +2574,9 @@ impl Engine {
                 let mut outputs: Vec<InferenceOutput> = Vec::with_capacity(residents.len());
                 for r in &residents {
                     // ── Phase 3: GPU fast path ────────────────────────────────
+                    // This synthetic path is compatibility/diagnostic
+                    // infrastructure, not strict-hybrid qualification. PR3's
+                    // policy applies only to real-model `moe_step`.
                     // CandleBackend::expert_matmul bails unconditionally, so we
                     // always guard behind is_gpu(). A VRAM miss returns Err
                     // and we fall through to the CPU path below. Both F32 and
@@ -3919,15 +3960,14 @@ impl Engine {
         r: &ExpertResident,
         x: &HiddenState,
         timings: Option<&crate::stage_timing::StageTimings>,
-    ) -> Result<HiddenState, ExpertWeightsError> {
-        // ── Phase 3: GPU fast path ────────────────────────────────────
-        // If the backend is GPU and the expert is VRAM-resident, dispatch
-        // the SwiGLU FFN via wgpu. CandleBackend::expert_matmul bails
-        // unconditionally, so we always guard behind is_gpu(). A VRAM
-        // miss returns Err and we fall through to the CPU path below.
-        // Both F32 and (block-aligned) Q4_0 experts are eligible —
-        // see `Engine::gpu_eligible_dtype`.
-        if self.routed_expert_backend().is_gpu() && self.gpu_eligible_dtype() {
+    ) -> Result<HiddenState, MoeStepError> {
+        // The authoritative plan decides the execution plane. CPU plans never
+        // invoke the GPU boundary; GPU plans must produce GPU output or take
+        // the explicitly configured strict-vs-serving branch.
+        if self.execution_context().plan().routed_experts()
+            == crate::backend::ExecutionPlane::Gpu
+        {
+            let backend = self.routed_expert_backend();
             let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
             let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
             let x_view = crate::backend::TensorView {
@@ -3940,23 +3980,46 @@ impl Engine {
                 rows: 1,
                 cols: self.core.shape.d_model,
             };
-            let matmul_res = self.routed_expert_backend().expert_matmul(
-                layer as usize,
-                r.id,
-                x_view,
-                self.core.shape.d_model,
-                self.core.shape.d_ff,
-                &mut out_view,
-            );
+            let matmul_res = if !backend.is_gpu() {
+                Err(crate::backend::GpuExpertDispatchError::new(
+                    layer,
+                    r.id,
+                    crate::backend::GpuExpertDispatchErrorKind::RuntimeInvariant,
+                    "authoritative GPU routed-expert plan resolved to a non-GPU backend",
+                ))
+            } else if !self.gpu_eligible_dtype() {
+                Err(crate::backend::GpuExpertDispatchError::new(
+                    layer,
+                    r.id,
+                    crate::backend::GpuExpertDispatchErrorKind::RuntimeInvariant,
+                    format!(
+                        "authoritative GPU plan is incompatible with dtype {:?}, d_model={}, d_ff={}",
+                        self.core.options.dtype, self.core.shape.d_model, self.core.shape.d_ff
+                    ),
+                ))
+            } else {
+                backend.routed_expert_matmul(
+                    layer,
+                    r.id,
+                    x_view,
+                    self.core.shape.d_model,
+                    self.core.shape.d_ff,
+                    &mut out_view,
+                )
+            };
             match matmul_res {
                 Ok(()) => {
                     return Ok(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>());
                 }
-                Err(e) => {
-                    // VRAM miss — fall through to CPU. Count it:
-                    // invisible mixed GPU/CPU execution (one CPU
-                    // expert dominating an otherwise-GPU token)
-                    // is a major source of inconsistent TPS.
+                Err(source)
+                    if self.core.routed_expert_gpu_failure_policy
+                        == RoutedExpertGpuFailurePolicy::StrictFailClosed =>
+                {
+                    return Err(MoeStepError::GpuExpertDispatch { source });
+                }
+                Err(source) => {
+                    // Only an actual serving-mode CPU recovery increments the
+                    // fallback counter.
                     let prev = self
                         .metrics
                         .counters
@@ -3968,7 +4031,7 @@ impl Engine {
                     if prev == 0 {
                         warn!(
                             expert = r.id,
-                            error = %e,
+                            error = %source,
                             "GPU expert dispatch fell back to CPU \
                              (further fallbacks counted in mer_gpu_cpu_fallbacks_total)"
                         );
@@ -3976,6 +4039,12 @@ impl Engine {
                 }
             }
         }
+
+        #[cfg(test)]
+        self.metrics
+            .counters
+            .cpu_expert_forward_calls
+            .fetch_add(1, Ordering::Relaxed);
 
         dispatch_expert_forward(
             self.core.options.dtype,
@@ -3989,6 +4058,11 @@ impl Engine {
             timings,
         )
         .map(|(_out, y)| y)
+        .map_err(|source| MoeStepError::ExpertCompute {
+            layer,
+            expert: r.id,
+            source,
+        })
     }
 
     pub async fn moe_step_with_timing(
@@ -4357,6 +4431,7 @@ impl Engine {
                                 };
                                 match self.forward_moe_resident(token_idx, layer, r, x, timings) {
                                     Ok(y) => Ok(y),
+                                    Err(e @ MoeStepError::GpuExpertDispatch { .. }) => Err(e),
                                     Err(e) if allow_degraded => {
                                         self.metrics
                                             .counters
@@ -4374,11 +4449,7 @@ impl Engine {
                                         // that combine outside the engine.
                                         Ok(vec![0.0f32; self.core.shape.d_model])
                                     }
-                                    Err(e) => Err(MoeStepError::ExpertCompute {
-                                        layer,
-                                        expert: r.id,
-                                        detail: e.to_string(),
-                                    }),
+                                    Err(e) => Err(e),
                                 }
                             };
                             let per_expert_y: Result<Vec<HiddenState>, MoeStepError> =
@@ -4417,6 +4488,7 @@ impl Engine {
                                         }
                                         Ok(())
                                     }
+                                    Err(e @ MoeStepError::GpuExpertDispatch { .. }) => Err(e),
                                     Err(e) if allow_degraded => {
                                         self.metrics
                                             .counters
@@ -4432,11 +4504,7 @@ impl Engine {
                                         );
                                         Ok(())
                                     }
-                                    Err(e) => Err(MoeStepError::ExpertCompute {
-                                        layer,
-                                        expert: r.id,
-                                        detail: e.to_string(),
-                                    }),
+                                    Err(e) => Err(e),
                                 }
                             };
                             match expert_policy {
@@ -5172,7 +5240,7 @@ mod tests {
     use crate::io_provider::{generate_synthetic_experts, NvmeStorage, StorageConfig};
     use crate::router::{PredictiveLoader, TopKRouter};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     /// Self-cleaning unique temp directory for test fixtures.
     struct TempDir {
@@ -5281,12 +5349,89 @@ mod tests {
         )
     }
 
+    fn rebuild_with_test_gpu(
+        base: &Arc<Engine>,
+        test_gpu: crate::backend::TestGpuBackend,
+        failure_policy: Option<RoutedExpertGpuFailurePolicy>,
+        expert_execution_policy: ExpertExecutionPolicy,
+        allow_degraded_experts: bool,
+    ) -> Arc<Engine> {
+        let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024, 0.5, 16,
+        ));
+        let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu));
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Hybrid,
+            true,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 16,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: base.core.shape.d_model,
+                v_head_dim: base.core.shape.d_model,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: base.core.options.dtype,
+                d_model: base.core.shape.d_model,
+                d_ff: base.core.shape.d_ff,
+            },
+            gpu_expert_cache,
+            |_| Ok(backend),
+        )
+        .expect("test hybrid execution context");
+
+        let mut options = base.core.options;
+        options.expert_execution_policy = expert_execution_policy;
+        options.policy.allow_degraded_experts = allow_degraded_experts;
+        let engine = Engine::with_options_and_execution_context(
+            base.core.cache.clone(),
+            base.core.pool.clone(),
+            base.core.storage.clone(),
+            base.core.router.clone(),
+            base.core.predictor.clone(),
+            base.core.shape,
+            options,
+            context,
+        );
+        Arc::new(match failure_policy {
+            Some(policy) => engine.with_routed_expert_gpu_failure_policy(policy),
+            None => engine,
+        })
+    }
+
+    fn cpu_expert_forward_calls(engine: &Engine) -> u64 {
+        engine
+            .metrics
+            .counters
+            .cpu_expert_forward_calls
+            .load(Ordering::Relaxed)
+    }
+
+    fn assert_gpu_dispatch_error(
+        error: MoeStepError,
+        expected_kind: crate::backend::GpuExpertDispatchErrorKind,
+        expected_layer: u32,
+        expected_expert: u32,
+    ) {
+        match error {
+            MoeStepError::GpuExpertDispatch { source } => {
+                assert_eq!(source.kind, expected_kind);
+                assert_eq!(source.layer, expected_layer);
+                assert_eq!(source.expert_id, expected_expert);
+                assert!(!source.detail.is_empty());
+            }
+            other => panic!("expected typed GPU expert dispatch error, got: {other}"),
+        }
+    }
+
     #[tokio::test]
     async fn engine_consumes_the_exact_resolved_hybrid_context() {
         let dir = TempDir::new("execution-context-identity");
         let base = build_engine(&dir.path, 4, 8, 16, 2, 2, 0, 7);
         let gpu_backend = Arc::new(crate::backend::BackendBox::TestGpu(
-            crate::backend::CandleBackend::new(),
+            crate::backend::TestGpuBackend::success(1.0),
         ));
         let expected_backend = gpu_backend.clone();
         let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16));
@@ -5342,6 +5487,288 @@ mod tests {
 
         let other = crate::backend::cpu_execution_context();
         assert_ne!(engine.execution_context().id(), other.id());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_gpu_expert_success_never_enters_cpu_or_fallback_accounting() {
+        let dir = TempDir::new("strict-gpu-success");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x301);
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let engine = rebuild_with_test_gpu(
+            &base,
+            test_gpu.clone(),
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x301);
+        let output = engine
+            .moe_step(0, 3, &hidden, &[2])
+            .await
+            .expect("injected GPU success must complete");
+        let expected = half::f16::from_f32(0.25).to_f32();
+        assert_eq!(output.len(), 1);
+        assert!(output[0].iter().all(|&value| value == expected));
+        assert_eq!(test_gpu.expert_calls(), 1);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_gpu_expert_failures_are_typed_and_never_recover_on_cpu() {
+        use crate::backend::GpuExpertDispatchErrorKind as Kind;
+        for (label, kind) in [
+            ("residency", Kind::ResidencyMiss),
+            ("upload", Kind::Upload),
+            ("validation", Kind::ValidationDispatch),
+            ("submission", Kind::Submission),
+            ("readback-channel", Kind::ReadbackChannel),
+            ("readback-map", Kind::ReadbackMap),
+            ("device-loss", Kind::DeviceLost),
+        ] {
+            let dir = TempDir::new(label);
+            let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x302);
+            let test_gpu = crate::backend::TestGpuBackend::failure(kind);
+            let engine = rebuild_with_test_gpu(
+                &base,
+                test_gpu.clone(),
+                Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+                ExpertExecutionPolicy::SequentialExpertsRowParallel,
+                false,
+            );
+            let hidden = crate::inference::synth_hidden_state(0, 16, 0x302);
+            let error = engine
+                .moe_step(0, 7, &hidden, &[3])
+                .await
+                .expect_err("strict injected GPU failure must fail the MoE step");
+            assert_gpu_dispatch_error(error, kind, 7, 3);
+            assert_eq!(test_gpu.expert_calls(), 1, "{label}");
+            assert_eq!(cpu_expert_forward_calls(&engine), 0, "{label}");
+            let report = engine.report();
+            assert_eq!(report.gpu_cpu_fallbacks, 0, "{label}");
+            assert_eq!(report.degraded_expert_substitutions, 0, "{label}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_gpu_failure_falls_back_once_and_returns_cpu_result() {
+        let dir = TempDir::new("serving-gpu-fallback");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x303);
+        let test_gpu = crate::backend::TestGpuBackend::failure(
+            crate::backend::GpuExpertDispatchErrorKind::ValidationDispatch,
+        );
+        let engine = rebuild_with_test_gpu(
+            &base,
+            test_gpu.clone(),
+            None,
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        assert_eq!(
+            engine.routed_expert_gpu_failure_policy(),
+            RoutedExpertGpuFailurePolicy::ServingCpuFallback
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x303);
+        let output = engine
+            .moe_step(0, 0, &hidden, &[3])
+            .await
+            .expect("serving mode must recover on CPU");
+        let resident = engine.core.cache.get(3).expect("expert resident after step");
+        let expected = dispatch_expert_forward(
+            engine.core.options.dtype,
+            engine.core.options.use_qmm_for_q4,
+            0,
+            &resident,
+            &hidden,
+            engine.core.shape.d_model,
+            engine.core.shape.d_ff,
+            engine.core.options.policy.expert_size_tolerance(),
+            None,
+        )
+        .expect("reference CPU expert forward")
+        .1;
+        assert_eq!(output, vec![expected]);
+        assert_eq!(test_gpu.expert_calls(), 1);
+        assert_eq!(cpu_expert_forward_calls(&engine), 1);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_plan_never_invokes_gpu_routed_expert_dispatch() {
+        let dir = TempDir::new("cpu-plan-no-gpu-dispatch");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x304);
+        let test_gpu = crate::backend::TestGpuBackend::success(9.0);
+        let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu.clone()));
+        let gpu_init_calls = Arc::new(AtomicU64::new(0));
+        let init_calls = gpu_init_calls.clone();
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Auto,
+            true,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 16,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 16,
+                v_head_dim: 16,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: 16,
+                d_ff: 32,
+            },
+            Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16)),
+            move |_| {
+                init_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(backend)
+            },
+        )
+        .expect("Auto + strict attention resolves to CPU");
+        assert_eq!(context.plan().routed_experts(), crate::backend::ExecutionPlane::Cpu);
+        assert_eq!(gpu_init_calls.load(Ordering::Relaxed), 0);
+        let engine = Arc::new(Engine::with_options_and_execution_context(
+            base.core.cache.clone(),
+            base.core.pool.clone(),
+            base.core.storage.clone(),
+            base.core.router.clone(),
+            base.core.predictor.clone(),
+            base.core.shape,
+            base.core.options,
+            context,
+        ));
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x304);
+        engine
+            .moe_step(0, 0, &hidden, &[1])
+            .await
+            .expect("CPU plan remains unchanged");
+        assert_eq!(test_gpu.expert_calls(), 0);
+        assert_eq!(cpu_expert_forward_calls(&engine), 1);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_gpu_plan_with_cpu_runtime_backend_fails_closed() {
+        let dir = TempDir::new("strict-plan-runtime-invariant");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x305);
+        let context = crate::backend::test_gpu_execution_context_unchecked(
+            Arc::new(crate::backend::BackendBox::Cpu(
+                crate::backend::CandleBackend::new(),
+            )),
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: 16,
+                d_ff: 32,
+            },
+        );
+        let engine = Arc::new(
+            Engine::with_options_and_execution_context(
+                base.core.cache.clone(),
+                base.core.pool.clone(),
+                base.core.storage.clone(),
+                base.core.router.clone(),
+                base.core.predictor.clone(),
+                base.core.shape,
+                base.core.options,
+                context,
+            )
+            .with_routed_expert_gpu_failure_policy(
+                RoutedExpertGpuFailurePolicy::StrictFailClosed,
+            ),
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x305);
+        let error = engine
+            .moe_step(0, 4, &hidden, &[2])
+            .await
+            .expect_err("runtime/backend mismatch must fail closed");
+        assert_gpu_dispatch_error(
+            error,
+            crate::backend::GpuExpertDispatchErrorKind::RuntimeInvariant,
+            4,
+            2,
+        );
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn degraded_expert_policy_cannot_swallow_strict_gpu_failure() {
+        let dir = TempDir::new("strict-gpu-beats-degraded");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x306);
+        let test_gpu = crate::backend::TestGpuBackend::failure(
+            crate::backend::GpuExpertDispatchErrorKind::Upload,
+        );
+        let engine = rebuild_with_test_gpu(
+            &base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            true,
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x306);
+        let error = engine
+            .moe_step(0, 5, &hidden, &[3])
+            .await
+            .expect_err("allow_degraded_experts must not swallow strict GPU failure");
+        assert_gpu_dispatch_error(
+            error,
+            crate::backend::GpuExpertDispatchErrorKind::Upload,
+            5,
+            3,
+        );
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert_eq!(engine.report().degraded_expert_substitutions, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_top_k_strict_gpu_failure_has_no_cpu_recovery() {
+        let dir = TempDir::new("strict-gpu-parallel-top-k");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x307);
+        let test_gpu = crate::backend::TestGpuBackend::failure(
+            crate::backend::GpuExpertDispatchErrorKind::ReadbackMap,
+        );
+        let engine = rebuild_with_test_gpu(
+            &base,
+            test_gpu.clone(),
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::ParallelExpertsSingleThread,
+            false,
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x307);
+        let error = engine
+            .moe_step(0, 6, &hidden, &[1, 2])
+            .await
+            .expect_err("one parallel GPU failure must fail the whole step");
+        match error {
+            MoeStepError::GpuExpertDispatch { source } => {
+                assert_eq!(source.kind, crate::backend::GpuExpertDispatchErrorKind::ReadbackMap);
+                assert_eq!(source.layer, 6);
+                assert!([1, 2].contains(&source.expert_id));
+            }
+            other => panic!("expected typed parallel GPU failure, got: {other}"),
+        }
+        assert!(test_gpu.expert_calls() >= 1);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+    }
+
+    #[test]
+    fn real_inference_error_preserves_typed_gpu_dispatch_source() {
+        let gpu_error = crate::backend::GpuExpertDispatchError::new(
+            9,
+            17,
+            crate::backend::GpuExpertDispatchErrorKind::DeviceLost,
+            "injected request-boundary device loss",
+        );
+        let real_error: crate::model::RealInferenceError =
+            MoeStepError::GpuExpertDispatch { source: gpu_error.clone() }.into();
+        match real_error {
+            crate::model::RealInferenceError::MoeStep(
+                MoeStepError::GpuExpertDispatch { source },
+            ) => assert_eq!(source, gpu_error),
+            other => panic!("typed GPU source was flattened at real inference boundary: {other}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
