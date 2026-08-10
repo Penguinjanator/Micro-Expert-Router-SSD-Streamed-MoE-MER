@@ -988,14 +988,15 @@ impl GpuExpertCache {
     pub fn try_promote_lru_no_evict(&self, resident: Arc<GpuResident>) -> bool {
         let bytes = resident.byte_len();
         let mut g = self.inner.lock();
-        g.promotion_pending.remove(&resident.id);
-        g.promotion_rearm.remove(&resident.id);
         if bytes == 0 {
             return false;
         }
         // Already resident anywhere: nothing to do. Don't touch LRU
-        // recency — the caller is a warm-up path, not a real access.
+        // recency — the caller is a warm-up path, not a real access. Any
+        // promotion markers for this already-satisfied id are stale.
         if g.anchor.contains_key(&resident.id) || g.lru.peek(&resident.id).is_some() {
+            g.promotion_pending.remove(&resident.id);
+            g.promotion_rearm.remove(&resident.id);
             return false;
         }
         // Strictly non-evicting: must fit in whatever LRU budget is
@@ -1011,6 +1012,8 @@ impl GpuExpertCache {
             return false;
         };
         let admission = GpuAdmission { resident, generation };
+        g.promotion_pending.remove(&admission.resident.id);
+        g.promotion_rearm.remove(&admission.resident.id);
         g.lru.put(admission.resident.id, admission);
         g.lru_used_bytes = g
             .lru_used_bytes
@@ -1368,6 +1371,36 @@ mod tests {
         assert!(!cache.try_promote_lru_no_evict(gpu_res(9, 32)));
         assert_eq!(cache.promotions(), 1);
         assert_eq!(cache.used_bytes(), 32);
+    }
+
+    #[test]
+    fn failed_no_evict_promotion_preserves_eviction_rearm() {
+        let cache = GpuExpertCache::new(20, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(1, 8)));
+        assert!(cache.promote_sync(gpu_res(2, 20)));
+        assert!(!cache.contains(1), "id 1 must be rearmed by logical eviction");
+
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
+        assert!(
+            cache.claim_promotion(1, 99),
+            "failed opportunistic admission must leave one rearm claim"
+        );
+        assert!(!cache.claim_promotion(1, 100), "rearm remains one-shot");
+    }
+
+    #[test]
+    fn failed_no_evict_promotion_preserves_pending_claim() {
+        let cache = GpuExpertCache::new(20, 0.0, 3);
+        assert!(cache.promote_sync(gpu_res(1, 8)));
+        assert!(cache.promote_sync(gpu_res(2, 20)));
+        assert!(!cache.contains(1));
+        assert!(cache.claim_promotion(1, 3));
+
+        assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
+        assert!(
+            !cache.claim_promotion(1, 3),
+            "failed opportunistic admission must keep the existing claim pending"
+        );
     }
 
     #[test]

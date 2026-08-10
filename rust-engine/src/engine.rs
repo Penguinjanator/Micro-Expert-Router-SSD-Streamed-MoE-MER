@@ -3182,7 +3182,7 @@ impl Engine {
                     // stage the host bytes into the admission LRU *now* instead
                     // of waiting for `promote_after_hits` RAM hits — the
                     // lazy path can leave a predicted expert on the CPU
-                    // fallback for its first N activations (one CPU
+                    // fallback path for its first few activations.
                     // Only attempt eager admission when the logical cache has room;
                     // otherwise we would copy ~expert_size bytes into a Vec only to have the
                     // non-evicting promotion path immediately reject it.

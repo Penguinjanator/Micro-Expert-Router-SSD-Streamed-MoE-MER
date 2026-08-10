@@ -16,9 +16,9 @@
 //! * Header strip with status pill, uptime, and per-second throughput
 //!   (with restart-recovery: TPS resets to zero on a backwards jump
 //!   of `tokens_generated`);
-//! * hit-grid (GPU admission / RAM / SSD) rendered as three side-by-side
-//!   sparklines plotting the **delta** of each tier's hit counter
-//!   per refresh tick — i.e. pulse/load, not a cumulative staircase;
+//! * activity grid rendered as three side-by-side sparklines plotting the
+//!   per-refresh **delta** of logical GPU-admission hits, RAM hits, and SSD
+//!   reads — i.e. pulse/load, not a cumulative staircase;
 //! * logical GPU-admission and RAM utilisation bars;
 //! * I/O reactor pulse — a sparkline of the per-tick miss delta
 //!   (i.e. SSD reads required this tick), surfacing backpressure
@@ -84,7 +84,7 @@ struct AppState {
     last: HealthSnapshot,
     last_tokens: u64,
     tokens_per_sec: u64,
-    /// Per-tier hit *delta* history (cap 60). Each push is
+    /// Per-series activity *delta* history (cap 60). Each push is
     /// `current_counter - prev_counter` so the sparkline shows the
     /// pulse/load per refresh tick rather than the cumulative
     /// staircase the previous revision rendered. Phase 1 telemetry
@@ -340,13 +340,13 @@ fn draw_tiers(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     // panel renders **delta** sparklines below (gist Phase 1).
     let vram_hits = app.last.gpu_cache_hits;
     let ram_hits = app.last.cache_hits;
-    let ssd_hits = app.last.cache_misses;
+    let ssd_reads = app.last.cache_misses;
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
-            " 3-TIER HIT GRID · Δ per tick ",
+            " 3-TIER ACTIVITY · Δ per tick ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(block, area);
@@ -380,8 +380,8 @@ fn draw_tiers(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
     draw_tier_sparkline(
         f,
         columns[2],
-        "SSD ",
-        ssd_hits,
+        "SSD READ",
+        ssd_reads,
         &app.ssd_hits_history,
         Color::LightYellow,
     );
@@ -482,11 +482,11 @@ fn draw_vram(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_pulse(f: &mut ratatui::Frame, area: Rect, app: &AppState) {
-    // Reactor pulse — per-tick SSD-miss delta sourced from
+    // Reactor pulse — per-tick SSD-read delta sourced from
     // `ssd_hits_history` (a RAM miss == an SSD read). A flat-zero
-    // line means every routed expert was served from RAM/logical admission
-    // (no I/O stall); tall bars are direct evidence of backpressure
-    // on the inference critical path.
+    // line means only that no SSD read was recorded during the tick; RAM,
+    // logical admission, or physical GPU residency may have served work.
+    // Tall bars are direct evidence of critical-path I/O backpressure.
     let last_delta = app.ssd_hits_history.back().copied().unwrap_or(0);
     let title = format!(" I/O REACTOR · stall pulse · last Δ {last_delta} ");
     let block = Block::default()

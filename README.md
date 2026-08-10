@@ -702,7 +702,7 @@ The Rust crate (`rust-engine/`) is organised into single-responsibility modules:
 | `numa` | Startup CPU placement helpers. By default MER applies no artificial CPU mask. Operators can opt in with global `--cpu-mask <CPULIST>` or `[performance].cpu_mask`; legacy `MER_PIN_CORES=N` remains a lower-precedence fallback. On Linux this uses `sched_setaffinity(2)` best-effort; elsewhere MER logs and continues. |
 | `metrics` | Prometheus `Registry` + handles for every counter / histogram exported on `/metrics`. |
 | `config` | TOML schema for `serve --config`: `[server]`, `[security]`, `[sampling]`, `[model]`, `[storage]`, `[tokenizer]`, `[real_transformer]`, `[predictive]`, `[gpu_cache]`. Validated at startup. |
-| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), a hit grid with one **delta-calculated** sparkline per tier (logical GPU admission / RAM / SSD, pulse per refresh tick, not a cumulative staircase), a logical-admission/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-miss delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
+| `tui` (with `--features tui`) | Native "Amalgafy"-style terminal dashboard rendered with `ratatui` + `crossterm`. The `monitor` subcommand (`micro-expert-router monitor --url http://127.0.0.1:8080 --refresh-ms 250`) polls `/v1/admin/health/experts` and draws a header (status / uptime / TPS, with restart-recovery: TPS resets to zero on a backwards jump of `tokens_generated`), an activity grid with **delta-calculated** sparklines for logical GPU-admission hits, RAM hits, and SSD reads (pulse per refresh tick, not a cumulative staircase), a logical-admission/RAM utilisation gauge, and an I/O reactor stall pulse driven by the per-tick SSD-read delta. All sparkline histories are capped at 60 points to bound memory growth. Uses a hand-rolled minimal HTTP/1.1 client over `tokio::net::TcpStream` to avoid pulling in `reqwest`. |
 | `server` | OpenAI-compatible HTTP server (`axum`): `/health`, `/metrics`, `/v1/completions`, `/v1/chat/completions` (both streaming SSE and one-shot), `DELETE /v1/sessions/{id}`, plus the operator endpoints `GET /v1/admin/health/experts` and `POST /v1/admin/evict`. Calls `run_engine_warmup` before binding the listener so the first user token never pays the cold-start cost (best-effort; failures only `tracing::warn!`). |
 | `middleware` | Production-readiness HTTP middleware layered onto the `server` router via `axum::middleware::from_fn_with_state`: per-request UUID tracing span, optional **API-key gate** (`[security].api_keys`; `401` when configured and missing/unknown), optional **per-key token-bucket rate limit** (`rate_limit_rps` / `rate_limit_burst`; `429` on overflow), and **admission control** (`[server].max_concurrent_requests`, `[server].admission_min_free_blocks` against the paged-KV pool; `503` when saturated). Defaults are fully permissive so legacy benchmark / development flows are byte-identical. |
 | `rpc` | Sharded `RouteExperts` RPC frames (gist Part 4): the deterministic `shard_for_expert` routing function plus the packed `RouteExpertsRequest` / `RouteExpertsResponse` f16 wire frames documented in `docs/distributed.md`. Dependency-free so the default build stays slim; the real `tonic`/`prost` gRPC transport in `grpc` (behind `--features grpc`) reuses these frames and their f16 pack/unpack helpers as the single source of truth for the on-wire layout. |
@@ -3487,7 +3487,7 @@ The legacy 2-tier `SSD → RAM` substrate is bit-for-bit unchanged when
 the engine layers host-side logical GPU admission over RAM, while the GPU
 backend separately materializes generation-matched physical weights:
 
-```
+```text
    SSD ──read──▶ ExpertCache (RAM) ──promote──▶ GpuExpertCache (host admission)
                                                   │ current generation
                                                   ▼
@@ -3536,13 +3536,14 @@ the Amalgafy-style monochromatic tech-noir layout:
 * a header with status / uptime / TPS, the TPS counter resets to
   zero when `tokens_generated` jumps backwards (server restart) so
   the rate stays meaningful across engine restarts;
-* a hit grid with one sparkline per tier (logical GPU admission / RAM / SSD).
-  Each sparkline plots the **delta** of the tier's cumulative
-  counter per refresh tick, so the trace shows real load pulse, not
-  a cumulative staircase;
+* an activity grid with sparklines for logical GPU-admission hits, RAM hits,
+  and SSD reads. Each sparkline plots the **delta** of its cumulative counter
+  per refresh tick, so the trace shows real load pulse, not a cumulative
+  staircase. A zero SSD-read delta means only that no SSD read was recorded
+  during that tick; physical GPU residency can also avoid a read;
 * a logical GPU-admission gauge (anchor + LRU regions) and a RAM
   occupancy gauge driven by the `/metrics` companion gauges; and
-* an I/O reactor stall pulse, a sparkline of the per-tick SSD-miss
+* an I/O reactor stall pulse, a sparkline of the per-tick SSD-read
   delta, surfacing backpressure on the inference critical path.
 
 All sparkline histories are capped at 60 points to bound memory

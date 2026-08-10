@@ -420,6 +420,16 @@ impl fmt::Display for PhysicalCapacityError {
 enum PhysicalRegistryAcquire<T: PhysicalRegistryEntry> {
     Hit(Arc<T>),
     Install(PhysicalInstallPermit<T>),
+    StaleRequester,
+}
+
+/// Directional generation result for one expert-id lookup. A newer request
+/// may retire an older stored generation; an older request must never disturb
+/// a newer stored generation.
+enum PhysicalRegistryLookup<T: PhysicalRegistryEntry> {
+    Hit(Arc<T>),
+    Miss,
+    StaleRequester,
 }
 
 struct PhysicalInstallPermit<T: PhysicalRegistryEntry> {
@@ -454,7 +464,7 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
     /// Return an addressable physical entry only when its logical generation
     /// still matches. This is the routed-expert fast path: it performs one
     /// registry lock and no upload planning or host-weight copy.
-    fn lookup_current(&self, key: PhysicalExpertKey) -> Option<Arc<T>> {
+    fn lookup_current(&self, key: PhysicalExpertKey) -> PhysicalRegistryLookup<T> {
         let mut inner = self.inner.lock();
         Self::lookup_current_locked(&mut inner, key)
     }
@@ -462,14 +472,27 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
     fn lookup_current_locked(
         inner: &mut PhysicalRegistryInner<T>,
         key: PhysicalExpertKey,
-    ) -> Option<Arc<T>> {
-        let existing = inner.entries.peek(&key.expert_id).cloned()?;
-        if existing.physical_key() == key {
-            return inner.entries.get(&key.expert_id).cloned();
+    ) -> PhysicalRegistryLookup<T> {
+        let Some(existing) = inner.entries.peek(&key.expert_id).cloned() else {
+            return PhysicalRegistryLookup::Miss;
+        };
+        let stored_key = existing.physical_key();
+        debug_assert_eq!(stored_key.expert_id, key.expert_id);
+        if stored_key.generation == key.generation {
+            return PhysicalRegistryLookup::Hit(
+                inner
+                    .entries
+                    .get(&key.expert_id)
+                    .cloned()
+                    .expect("validated physical entry must remain present under lock"),
+            );
+        }
+        if stored_key.generation > key.generation {
+            return PhysicalRegistryLookup::StaleRequester;
         }
 
         Self::retire_entry_locked(inner, key.expert_id);
-        None
+        PhysicalRegistryLookup::Miss
     }
 
     fn retire_entry_locked(inner: &mut PhysicalRegistryInner<T>, expert_id: u32) {
@@ -501,8 +524,14 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
 
         let mut inner = self.inner.lock();
         loop {
-            if let Some(hit) = Self::lookup_current_locked(&mut inner, key) {
-                return Ok(PhysicalRegistryAcquire::Hit(hit));
+            match Self::lookup_current_locked(&mut inner, key) {
+                PhysicalRegistryLookup::Hit(hit) => {
+                    return Ok(PhysicalRegistryAcquire::Hit(hit));
+                }
+                PhysicalRegistryLookup::Miss => {}
+                PhysicalRegistryLookup::StaleRequester => {
+                    return Ok(PhysicalRegistryAcquire::StaleRequester);
+                }
             }
 
             if inner
@@ -676,6 +705,8 @@ impl<T: PhysicalRegistryEntry> PhysicalInstallPermit<T> {
             return Err("physical install entry does not match its reservation".to_string());
         }
         let mut inner = self.registry.inner.lock();
+        // On every error below, this local guard must drop before the by-value
+        // permit argument runs `Drop` and re-locks the same registry.
         let reservation = *inner
             .installing
             .get(&self.key)
@@ -1800,17 +1831,7 @@ impl GpuBackend {
             self.min_storage_buffer_offset_alignment(),
         )
         .map_err(|e| anyhow!(e))?;
-        anyhow::ensure!(
-            weight_bytes.len() >= layout.required_bytes,
-            "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
-            weight_bytes.len(), layout.required_bytes, d_ff, d_model
-        );
-        let device_bytes = u64::try_from(weight_bytes.len())
-            .map_err(|_| anyhow!("F32 expert buffer length does not fit u64"))?;
-        Ok(F32ExpertUploadPlan {
-            device_bytes,
-            projection_offset: layout.projection_offset,
-        })
+        f32_expert_upload_plan(layout, weight_bytes.len(), d_model, d_ff)
     }
 
     fn plan_expert_upload_q4_0(
@@ -1903,7 +1924,10 @@ impl GpuBackend {
             mapped_at_creation: false,
         });
         debug_assert_eq!(weight_buf.size(), plan.device_bytes);
-        self.queue.write_buffer(&weight_buf, 0, weight_bytes);
+        let upload_bytes = usize::try_from(plan.device_bytes)
+            .map_err(|_| anyhow!("F32 device buffer size does not fit usize"))?;
+        self.queue
+            .write_buffer(&weight_buf, 0, &weight_bytes[..upload_bytes]);
         let allocation = permit.charge_allocation().map_err(|e| anyhow!(e))?;
 
         Ok(VramExpertEntry {
@@ -2692,20 +2716,31 @@ impl GpuBackend {
             expert_id,
             generation: admission.generation(),
         };
-        if let Some(entry) = self.physical_expert_registry.lookup_current(key) {
-            if !self
-                .gpu_expert_cache
-                .contains_generation(expert_id, key.generation)
-            {
-                self.physical_expert_registry.retire_key_if_present(key);
+        match self.physical_expert_registry.lookup_current(key) {
+            PhysicalRegistryLookup::Hit(entry) => {
+                if !self
+                    .gpu_expert_cache
+                    .contains_generation(expert_id, key.generation)
+                {
+                    self.physical_expert_registry.retire_key_if_present(key);
+                    return Err(GpuExpertDispatchError::new(
+                        layer,
+                        expert_id,
+                        GpuExpertDispatchErrorKind::ResidencyMiss,
+                        "logical GPU admission changed before physical dispatch",
+                    ));
+                }
+                return self.expert_matmul_from_vram(layer, expert_id, &entry, x, out);
+            }
+            PhysicalRegistryLookup::Miss => {}
+            PhysicalRegistryLookup::StaleRequester => {
                 return Err(GpuExpertDispatchError::new(
                     layer,
                     expert_id,
                     GpuExpertDispatchErrorKind::ResidencyMiss,
-                    "logical GPU admission changed before physical dispatch",
+                    "physical GPU residency has a newer logical generation",
                 ));
             }
-            return self.expert_matmul_from_vram(layer, expert_id, &entry, x, out);
         }
 
         let resident = admission.resident();
@@ -2728,6 +2763,14 @@ impl GpuBackend {
             ))?;
         let entry = match acquisition {
             PhysicalRegistryAcquire::Hit(entry) => entry,
+            PhysicalRegistryAcquire::StaleRequester => {
+                return Err(GpuExpertDispatchError::new(
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::ResidencyMiss,
+                    "physical GPU residency advanced before acquisition",
+                ));
+            }
             PhysicalRegistryAcquire::Install(mut permit) => {
                 if !self
                     .gpu_expert_cache
@@ -3402,6 +3445,31 @@ fn f32_expert_projection_layout(
         projection_bytes,
         projection_offset,
         required_bytes,
+    })
+}
+
+/// Convert a validated F32 projection layout into the exact device upload
+/// plan. Host payloads may include storage padding beyond the three logical
+/// projections; that padding is neither allocated nor copied to the GPU.
+fn f32_expert_upload_plan(
+    layout: F32ExpertProjectionLayout,
+    host_bytes: usize,
+    d_model: usize,
+    d_ff: usize,
+) -> anyhow::Result<F32ExpertUploadPlan> {
+    anyhow::ensure!(
+        host_bytes >= layout.required_bytes,
+        "expert weight buffer too small: got {} bytes, need {} (3 × d_ff={} × d_model={} × 4)",
+        host_bytes,
+        layout.required_bytes,
+        d_ff,
+        d_model
+    );
+    let device_bytes = u64::try_from(layout.required_bytes)
+        .map_err(|_| anyhow!("F32 expert buffer length does not fit u64"))?;
+    Ok(F32ExpertUploadPlan {
+        device_bytes,
+        projection_offset: layout.projection_offset,
     })
 }
 
@@ -4231,6 +4299,9 @@ mod tests {
                     _allocation: allocation,
                 }))
             }
+            PhysicalRegistryAcquire::StaleRequester => {
+                Err("physical install requester generation is stale".to_string())
+            }
         }
     }
 
@@ -4261,17 +4332,64 @@ mod tests {
         let old = install_test_physical_entry(&registry, g1, 32).unwrap();
         let g2 = physical_key(7, 2);
         let current = install_test_physical_entry(&registry, g2, 32).unwrap();
-        registry.retire_key_if_present(g1);
         assert!(!registry.contains_key(g1));
         assert!(registry.contains_key(g2));
-        let snapshot = registry.snapshot(32);
-        assert_eq!(snapshot.physical_installs, 2);
-        assert_eq!(snapshot.stale_retirements, 1);
-        assert_eq!(snapshot.expert_registry_bytes, 32);
-        assert_eq!(snapshot.expert_live_bytes, 64);
+        let after_reinstall = registry.snapshot(32);
+        assert_eq!(after_reinstall.physical_installs, 2);
+        assert_eq!(after_reinstall.stale_retirements, 1);
+        assert_eq!(after_reinstall.expert_registry_bytes, 32);
+        assert_eq!(after_reinstall.expert_live_bytes, 64);
+
+        registry.retire_key_if_present(g1);
+        assert_eq!(
+            registry.snapshot(32),
+            after_reinstall,
+            "retiring the old key must be a no-op against stored G2"
+        );
+        assert!(registry.contains_key(g2));
         drop(old);
         assert_eq!(registry.snapshot(32).expert_live_bytes, 32);
         drop(current);
+    }
+
+    #[test]
+    fn physical_registry_stale_requester_cannot_retire_newer_generation() {
+        let registry = test_physical_registry(128, 0);
+        let g1 = physical_key(7, 1);
+        let g2 = physical_key(7, 2);
+        let current = install_test_physical_entry(&registry, g2, 32).unwrap();
+        let before = registry.snapshot(32);
+
+        assert!(matches!(
+            registry.lookup_current(g1),
+            PhysicalRegistryLookup::StaleRequester
+        ));
+        assert_eq!(registry.snapshot(32), before);
+        assert!(registry.contains_key(g2));
+        assert!(!registry.contains_key(g1));
+        assert_eq!(current.physical_key(), g2);
+    }
+
+    #[test]
+    fn physical_registry_acquire_rejects_request_staled_after_fast_miss() {
+        let registry = test_physical_registry(128, 0);
+        let g1 = physical_key(7, 1);
+        let g2 = physical_key(7, 2);
+        assert!(matches!(
+            registry.lookup_current(g1),
+            PhysicalRegistryLookup::Miss
+        ));
+
+        let current = install_test_physical_entry(&registry, g2, 32).unwrap();
+        let before = registry.snapshot(32);
+        assert!(matches!(
+            registry.acquire_or_reserve(g1, 32).unwrap(),
+            PhysicalRegistryAcquire::StaleRequester
+        ));
+        assert_eq!(registry.snapshot(32), before);
+        assert!(registry.contains_key(g2));
+        assert!(!registry.contains_key(g1));
+        assert_eq!(current.physical_key(), g2);
     }
 
     #[test]
@@ -4306,6 +4424,28 @@ mod tests {
         assert_eq!(snapshot.expert_registry_bytes, 60);
         assert!(snapshot.expert_registry_bytes <= snapshot.expert_capacity_bytes);
         assert_eq!(snapshot.physical_evictions, 1);
+    }
+
+    #[test]
+    fn matching_physical_lookup_updates_registry_lru_recency() {
+        let registry = test_physical_registry(60, 0);
+        let g1 = physical_key(1, 1);
+        let g2 = physical_key(2, 1);
+        let g3 = physical_key(3, 1);
+        drop(install_test_physical_entry(&registry, g1, 30).unwrap());
+        drop(install_test_physical_entry(&registry, g2, 30).unwrap());
+
+        let hit = match registry.lookup_current(g1) {
+            PhysicalRegistryLookup::Hit(hit) => hit,
+            PhysicalRegistryLookup::Miss => panic!("expected physical hit"),
+            PhysicalRegistryLookup::StaleRequester => panic!("unexpected stale requester"),
+        };
+        drop(hit);
+        drop(install_test_physical_entry(&registry, g3, 30).unwrap());
+
+        assert!(registry.contains_key(g1), "matched lookup must make G1 MRU");
+        assert!(!registry.contains_key(g2), "G2 must remain the LRU victim");
+        assert!(registry.contains_key(g3));
     }
 
     #[test]
@@ -4362,6 +4502,7 @@ mod tests {
         let permit = match registry.acquire_or_reserve(key, 32).unwrap() {
             PhysicalRegistryAcquire::Install(permit) => permit,
             PhysicalRegistryAcquire::Hit(_) => panic!("unexpected physical hit"),
+            PhysicalRegistryAcquire::StaleRequester => panic!("unexpected stale requester"),
         };
         drop(permit);
         assert_eq!(registry.snapshot(0).expert_live_bytes, 0);
@@ -4369,6 +4510,7 @@ mod tests {
         let mut permit = match registry.acquire_or_reserve(key, 32).unwrap() {
             PhysicalRegistryAcquire::Install(permit) => permit,
             PhysicalRegistryAcquire::Hit(_) => panic!("unexpected physical hit"),
+            PhysicalRegistryAcquire::StaleRequester => panic!("unexpected stale requester"),
         };
         let allocation = permit.charge_allocation().unwrap();
         drop(permit);
@@ -4666,6 +4808,21 @@ mod tests {
         assert_eq!(layout.projection_bytes, 32 * 64 * 4);
         assert_eq!(layout.projection_offset, (32 * 64 * 4) as u64);
         assert_eq!(layout.required_bytes, 3 * 32 * 64 * 4);
+    }
+
+    #[test]
+    fn f32_upload_plan_excludes_trailing_host_padding() {
+        let layout = f32_expert_projection_layout(
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            256,
+        )
+        .unwrap();
+        let host_bytes = layout.required_bytes + 4096;
+        let plan = f32_expert_upload_plan(layout, host_bytes, 32, 64).unwrap();
+
+        assert_eq!(plan.device_bytes, layout.required_bytes as u64);
+        assert_eq!(plan.projection_offset, layout.projection_offset);
+        assert!(plan.device_bytes < host_bytes as u64);
     }
 
     #[test]
