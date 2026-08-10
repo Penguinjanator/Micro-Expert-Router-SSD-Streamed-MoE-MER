@@ -642,6 +642,76 @@ impl GpuLookup {
     }
 }
 
+/// A selected foreground expert could not be installed in the logical GPU
+/// admission LRU. The engine maps this to its typed routed-GPU failure policy;
+/// this cache never performs a CPU fallback itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuDemandAdmissionError {
+    EmptyPayload,
+    PayloadExceedsLruCapacity { bytes: usize, capacity: usize },
+    GenerationExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuDemandAdmissionPreflight {
+    AlreadyAdmitted,
+    NeedsPayload,
+}
+
+/// Precise result of one threshold-driven logical GPU promotion attempt.
+///
+/// `MovedLruToAnchor`, `InstalledAnchor`, and `InstalledLru` are the only
+/// outcomes that change logical cache state and therefore the only outcomes
+/// counted by `GpuExpertCache::promotions` and `mer_promotions_total`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuHotPromotionOutcome {
+    /// The existing admission was moved intact from LRU Edge to Anchor Core.
+    MovedLruToAnchor,
+    /// A previously absent expert was installed directly in Anchor Core.
+    InstalledAnchor,
+    /// A previously absent expert was installed in LRU Edge because Anchor
+    /// Core lacked room.
+    InstalledLru,
+    /// The expert was already in Anchor Core; no state changed.
+    AlreadyAnchor,
+    /// The expert remains in LRU Edge because Anchor Core lacks room.
+    AlreadyLruAnchorFull,
+    /// No logical admission exists yet, so the caller must obtain an owned
+    /// host payload before completing the hot promotion.
+    PayloadRequired,
+    /// The payload cannot fit either eligible logical region.
+    NoCapacity,
+    /// A new admission could not allocate a unique logical generation.
+    GenerationExhausted,
+}
+
+impl GpuHotPromotionOutcome {
+    /// Whether this outcome performed exactly one logical cache transition.
+    pub fn is_transition(self) -> bool {
+        matches!(
+            self,
+            Self::MovedLruToAnchor | Self::InstalledAnchor | Self::InstalledLru
+        )
+    }
+}
+
+impl std::fmt::Display for GpuDemandAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyPayload => f.write_str("expert payload is empty"),
+            Self::PayloadExceedsLruCapacity { bytes, capacity } => write!(
+                f,
+                "expert payload {bytes} bytes exceeds logical GPU demand LRU capacity {capacity} bytes"
+            ),
+            Self::GenerationExhausted => {
+                f.write_str("logical GPU admission generation space exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuDemandAdmissionError {}
+
 /// Thread-safe logical GPU-admission cache implementing the **Segmented
 /// Hybrid Policy** from the Phase 2 spec:
 ///
@@ -671,10 +741,11 @@ pub struct GpuExpertCache {
     /// `0` disables Anchor Core promotions (everything routes to the
     /// LRU Edge).
     promote_after_hits: u64,
-    /// Total promotions performed since startup. Mirror of the
-    /// `mer_promotions_total` Prometheus counter; exposed here too so
-    /// the admin health endpoint can render the value without going
-    /// through the Prometheus registry.
+    /// Total successful logical promotion transitions since startup: new
+    /// Anchor/LRU admissions plus LRU-to-Anchor graduation. Mirror of the
+    /// `mer_promotions_total` Prometheus counter; exposed here too so the
+    /// admin health endpoint can render the value without going through the
+    /// Prometheus registry.
     promotions: AtomicU64,
     /// Logical host payload bytes admitted across Anchor + LRU.
     logical_admitted_bytes: AtomicU64,
@@ -857,10 +928,11 @@ impl GpuExpertCache {
             return false;
         }
         let mut g = self.inner.lock();
-        if g.anchor.contains_key(&id)
-            || g.lru.peek(&id).is_some()
-            || g.promotion_pending.contains(&id)
-        {
+        // An LRU-resident expert may still need to graduate into Anchor Core.
+        // LRU residency is deliberately not a rejection condition: the
+        // ordinary threshold / rearm rules below still ensure at most one
+        // queued request, without touching LRU recency.
+        if g.anchor.contains_key(&id) || g.promotion_pending.contains(&id) {
             return false;
         }
         let threshold_crossed = ram_hits == self.promote_after_hits;
@@ -876,6 +948,154 @@ impl GpuExpertCache {
         let mut g = self.inner.lock();
         if g.promotion_pending.remove(&id) {
             g.promotion_rearm.insert(id);
+        }
+    }
+
+    /// Resolve an already-admitted threshold-hot expert without copying a RAM
+    /// payload. An LRU admission is moved atomically into Anchor Core when
+    /// capacity permits; the exact [`GpuAdmission`] (including generation and
+    /// `Arc<GpuResident>`) is retained. No unrelated LRU recency is touched.
+    ///
+    /// [`GpuHotPromotionOutcome::PayloadRequired`] means the id is absent and
+    /// the caller may copy the RAM payload outside the cache mutex before
+    /// calling [`Self::promote_hot_sync`].
+    pub fn promote_hot_existing(&self, id: u32) -> GpuHotPromotionOutcome {
+        let mut g = self.inner.lock();
+        let outcome = match self.resolve_existing_hot_locked(&mut g, id) {
+            Some(outcome) => outcome,
+            None => return GpuHotPromotionOutcome::PayloadRequired,
+        };
+        drop(g);
+        self.record_hot_transition(outcome);
+        outcome
+    }
+
+    /// Complete a threshold-driven hot promotion after the caller obtained an
+    /// owned payload. The locked existing-admission recheck makes the method
+    /// race-safe: if foreground demand installed the id in LRU after the
+    /// copy-free probe, that exact admission is moved to Anchor and this
+    /// redundant `resident` is dropped without replacing its generation.
+    pub fn promote_hot_sync(&self, resident: Arc<GpuResident>) -> GpuHotPromotionOutcome {
+        let id = resident.id;
+        let bytes = resident.byte_len();
+        let mut g = self.inner.lock();
+
+        if let Some(outcome) = self.resolve_existing_hot_locked(&mut g, id) {
+            drop(g);
+            self.record_hot_transition(outcome);
+            return outcome;
+        }
+
+        if bytes == 0 {
+            g.promotion_pending.remove(&id);
+            g.promotion_rearm.remove(&id);
+            return GpuHotPromotionOutcome::NoCapacity;
+        }
+
+        let use_anchor = bytes <= self.anchor_capacity_bytes
+            && g.anchor_used_bytes
+                .checked_add(bytes)
+                .is_some_and(|used| used <= self.anchor_capacity_bytes);
+        if !use_anchor && bytes > self.lru_capacity_bytes {
+            g.promotion_pending.remove(&id);
+            g.promotion_rearm.remove(&id);
+            return GpuHotPromotionOutcome::NoCapacity;
+        }
+        let Some(generation) = g.allocate_generation() else {
+            g.promotion_pending.remove(&id);
+            g.promotion_rearm.remove(&id);
+            return GpuHotPromotionOutcome::GenerationExhausted;
+        };
+        let admission = GpuAdmission { resident, generation };
+        g.promotion_pending.remove(&id);
+        g.promotion_rearm.remove(&id);
+
+        let outcome = if use_anchor {
+            g.anchor.insert(id, admission);
+            g.anchor_used_bytes = g
+                .anchor_used_bytes
+                .checked_add(bytes)
+                .expect("logical GPU anchor byte overflow after capacity check");
+            GpuHotPromotionOutcome::InstalledAnchor
+        } else {
+            while g
+                .lru_used_bytes
+                .checked_add(bytes)
+                .is_none_or(|used| used > self.lru_capacity_bytes)
+            {
+                let (evicted_id, victim) = g
+                    .lru
+                    .pop_lru()
+                    .expect("hot payload fits an empty LRU by prior capacity check");
+                g.lru_used_bytes = g
+                    .lru_used_bytes
+                    .checked_sub(victim.byte_len())
+                    .expect("logical GPU LRU byte underflow during hot admission");
+                g.promotion_rearm.insert(evicted_id);
+            }
+            let previous = g.lru.put(id, admission);
+            debug_assert!(previous.is_none(), "hot admission rechecked under lock");
+            g.lru_used_bytes = g
+                .lru_used_bytes
+                .checked_add(bytes)
+                .expect("logical GPU LRU byte overflow after capacity check");
+            GpuHotPromotionOutcome::InstalledLru
+        };
+        drop(g);
+
+        self.record_hot_transition(outcome);
+        self.refresh_used_bytes();
+        outcome
+    }
+
+    /// Resolve Anchor/LRU state under the caller's cache lock. `None` means
+    /// the id is absent and a payload is required. Completed attempts always
+    /// clear their pending/rearm markers; an Anchor-full LRU entry is not
+    /// rearmed, preventing retry traffic on every later hit.
+    fn resolve_existing_hot_locked(
+        &self,
+        g: &mut GpuExpertCacheInner,
+        id: u32,
+    ) -> Option<GpuHotPromotionOutcome> {
+        if g.anchor.contains_key(&id) {
+            g.promotion_pending.remove(&id);
+            g.promotion_rearm.remove(&id);
+            return Some(GpuHotPromotionOutcome::AlreadyAnchor);
+        }
+
+        let bytes = g.lru.peek(&id).map(GpuAdmission::byte_len)?;
+        let anchor_has_room = bytes <= self.anchor_capacity_bytes
+            && g.anchor_used_bytes
+                .checked_add(bytes)
+                .is_some_and(|used| used <= self.anchor_capacity_bytes);
+        if !anchor_has_room {
+            g.promotion_pending.remove(&id);
+            g.promotion_rearm.remove(&id);
+            return Some(GpuHotPromotionOutcome::AlreadyLruAnchorFull);
+        }
+
+        let admission = g
+            .lru
+            .pop(&id)
+            .expect("peeked logical GPU LRU admission must remain under lock");
+        g.lru_used_bytes = g
+            .lru_used_bytes
+            .checked_sub(bytes)
+            .expect("logical GPU LRU byte underflow during Anchor graduation");
+        let previous = g.anchor.insert(id, admission);
+        debug_assert!(previous.is_none(), "Anchor presence checked under lock");
+        g.anchor_used_bytes = g
+            .anchor_used_bytes
+            .checked_add(bytes)
+            .expect("logical GPU anchor byte overflow after capacity check");
+        g.promotion_pending.remove(&id);
+        g.promotion_rearm.remove(&id);
+        Some(GpuHotPromotionOutcome::MovedLruToAnchor)
+    }
+
+    fn record_hot_transition(&self, outcome: GpuHotPromotionOutcome) {
+        if outcome.is_transition() {
+            self.promotions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1023,6 +1243,99 @@ impl GpuExpertCache {
         self.promotions.fetch_add(1, Ordering::Relaxed);
         self.refresh_used_bytes();
         true
+    }
+
+    /// Check whether a selected foreground expert needs an owned host payload
+    /// before attempting logical LRU admission. This probe never changes
+    /// routing telemetry, LRU recency, generations, or byte accounting.
+    pub fn demand_admission_preflight(
+        &self,
+        expert_id: u32,
+        payload_bytes: usize,
+    ) -> Result<GpuDemandAdmissionPreflight, GpuDemandAdmissionError> {
+        let g = self.inner.lock();
+        if g.anchor.contains_key(&expert_id) || g.lru.peek(&expert_id).is_some() {
+            return Ok(GpuDemandAdmissionPreflight::AlreadyAdmitted);
+        }
+        if payload_bytes == 0 {
+            return Err(GpuDemandAdmissionError::EmptyPayload);
+        }
+        if payload_bytes > self.lru_capacity_bytes {
+            return Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                bytes: payload_bytes,
+                capacity: self.lru_capacity_bytes,
+            });
+        }
+        Ok(GpuDemandAdmissionPreflight::NeedsPayload)
+    }
+
+    /// Ensure that one selected foreground expert has a current logical GPU
+    /// admission. New demand admissions always enter the evictable LRU Edge;
+    /// they never consume or evict Anchor Core entries. Physical upload stays
+    /// lazy and exclusively owned by `GpuBackend`.
+    ///
+    /// Existing admissions return `Ok(false)` without changing generation,
+    /// byte accounting, hit/miss telemetry, or LRU recency. A new admission
+    /// returns `Ok(true)` after evicting least-recently-used dynamic entries as
+    /// needed. Failures leave the existing admission state unchanged.
+    pub fn demand_admit_lru(
+        &self,
+        resident: Arc<GpuResident>,
+    ) -> Result<bool, GpuDemandAdmissionError> {
+        let bytes = resident.byte_len();
+        if bytes == 0 {
+            return Err(GpuDemandAdmissionError::EmptyPayload);
+        }
+
+        let mut g = self.inner.lock();
+        if g.anchor.contains_key(&resident.id) || g.lru.peek(&resident.id).is_some() {
+            return Ok(false);
+        }
+        if bytes > self.lru_capacity_bytes {
+            return Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                bytes,
+                capacity: self.lru_capacity_bytes,
+            });
+        }
+        // Allocate identity before eviction so generation exhaustion cannot
+        // disturb any existing admission or byte accounting.
+        let generation = g
+            .allocate_generation()
+            .ok_or(GpuDemandAdmissionError::GenerationExhausted)?;
+
+        while g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .is_none_or(|used| used > self.lru_capacity_bytes)
+        {
+            let (evicted_id, victim) = g
+                .lru
+                .pop_lru()
+                .expect("demand payload fits an empty LRU by prior capacity check");
+            g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
+            g.promotion_rearm.insert(evicted_id);
+        }
+
+        let id = resident.id;
+        g.promotion_pending.remove(&id);
+        g.promotion_rearm.remove(&id);
+        let previous = g.lru.put(
+            id,
+            GpuAdmission {
+                resident,
+                generation,
+            },
+        );
+        debug_assert!(previous.is_none(), "demand admission rechecked under lock");
+        g.lru_used_bytes = g
+            .lru_used_bytes
+            .checked_add(bytes)
+            .expect("logical GPU demand LRU byte overflow after capacity check");
+        drop(g);
+
+        self.promotions.fetch_add(1, Ordering::Relaxed);
+        self.refresh_used_bytes();
+        Ok(true)
     }
 
     /// Number of Anchor Core entries.
@@ -1450,6 +1763,395 @@ mod tests {
         assert!(cache.current_admission(99).is_none());
         assert_eq!(cache.hits(), 0);
         assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn demand_preflight_detects_anchor_without_state_changes() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert!(cache.promote_sync(gpu_res(99, 40)));
+        let generation = cache.current_generation(99).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let hits = cache.hits();
+        let misses = cache.misses();
+
+        assert_eq!(
+            cache.demand_admission_preflight(99, 40),
+            Ok(GpuDemandAdmissionPreflight::AlreadyAdmitted)
+        );
+        assert!(cache.contains_generation(99, generation));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.hits(), hits);
+        assert_eq!(cache.misses(), misses);
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 0);
+    }
+
+    #[test]
+    fn demand_preflight_detects_lru_without_touching_recency() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 10)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 10)), Ok(true));
+        let hits = cache.hits();
+        let misses = cache.misses();
+
+        assert_eq!(
+            cache.demand_admission_preflight(1, 10),
+            Ok(GpuDemandAdmissionPreflight::AlreadyAdmitted)
+        );
+        assert_eq!(cache.hits(), hits);
+        assert_eq!(cache.misses(), misses);
+        assert_eq!(cache.demand_admit_lru(gpu_res(3, 10)), Ok(true));
+        assert!(!cache.contains(1), "preflight must leave id 1 as LRU");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn demand_preflight_absent_fit_needs_payload_and_zero_is_typed() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert_eq!(
+            cache.demand_admission_preflight(7, 50),
+            Ok(GpuDemandAdmissionPreflight::NeedsPayload)
+        );
+        assert_eq!(
+            cache.demand_admission_preflight(7, 0),
+            Err(GpuDemandAdmissionError::EmptyPayload)
+        );
+    }
+
+    #[test]
+    fn oversized_demand_preflight_preserves_all_logical_state() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert!(cache.promote_sync(gpu_res(99, 40)));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 25)), Ok(true));
+        let anchor_generation = cache.current_generation(99).unwrap();
+        let lru_generation = cache.current_generation(1).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let next_generation = cache.inner.lock().next_generation;
+
+        assert_eq!(
+            cache.demand_admission_preflight(2, 51),
+            Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                bytes: 51,
+                capacity: 50,
+            })
+        );
+        assert!(cache.contains_generation(99, anchor_generation));
+        assert!(cache.contains_generation(1, lru_generation));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.inner.lock().next_generation, next_generation);
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 1);
+    }
+
+    #[test]
+    fn demand_install_rechecks_existing_admission_after_preflight() {
+        let cache = GpuExpertCache::new(100, 0.0, 0);
+        assert_eq!(
+            cache.demand_admission_preflight(7, 32),
+            Ok(GpuDemandAdmissionPreflight::NeedsPayload)
+        );
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 32)), Ok(true));
+        let generation = cache.current_generation(7).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let next_generation = cache.inner.lock().next_generation;
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 64)), Ok(false));
+        assert!(cache.contains_generation(7, generation));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.inner.lock().next_generation, next_generation);
+        assert_eq!(cache.lru_len(), 1);
+    }
+
+    #[test]
+    fn cold_demand_admits_to_lru_without_consuming_anchor() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 40)), Ok(true));
+        assert!(cache.current_admission(1).is_some());
+        assert_eq!(cache.anchor_len(), 0);
+        assert_eq!(cache.lru_len(), 1);
+        assert_eq!(cache.used_bytes(), 40);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn demand_admission_evicts_lru_and_preserves_anchor() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert!(cache.promote_sync(gpu_res(99, 40)));
+        let anchor_generation = cache.current_generation(99).unwrap();
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 25)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 25)), Ok(true));
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(3, 25)), Ok(true));
+        assert!(!cache.contains(1), "oldest dynamic entry must be evicted");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+        assert!(cache.contains_generation(99, anchor_generation));
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 2);
+    }
+
+    #[test]
+    fn existing_demand_preserves_generation_bytes_and_counters() {
+        let cache = GpuExpertCache::new(96, 0.0, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 32)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(8, 32)), Ok(true));
+        let generation = cache.current_generation(7).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let hits = cache.hits();
+        let misses = cache.misses();
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 48)), Ok(false));
+        assert!(cache.contains_generation(7, generation));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.hits(), hits);
+        assert_eq!(cache.misses(), misses);
+        assert_eq!(cache.lru_len(), 2);
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(9, 40)), Ok(true));
+        assert!(!cache.contains(7), "existing demand lookup must not touch LRU");
+        assert!(cache.contains(8));
+        assert!(cache.contains(9));
+    }
+
+    #[test]
+    fn demand_admitted_threshold_hot_lru_moves_to_anchor_with_exact_identity() {
+        let cache = GpuExpertCache::new(100, 0.5, 3);
+        let resident = gpu_res(7, 40);
+        assert_eq!(cache.demand_admit_lru(resident.clone()), Ok(true));
+        let admission_before = cache.current_admission(7).expect("LRU admission");
+        let generation = admission_before.generation();
+        let used = cache.used_bytes();
+        let next_generation = cache.inner.lock().next_generation;
+
+        assert!(!cache.claim_promotion(7, 2));
+        assert!(cache.claim_promotion(7, 3));
+        assert!(
+            !cache.claim_promotion(7, 3),
+            "threshold-hot LRU admission must have one pending request"
+        );
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+
+        let admission_after = cache.current_admission(7).expect("Anchor admission");
+        assert_eq!(admission_after.generation(), generation);
+        assert!(Arc::ptr_eq(admission_after.resident(), &resident));
+        assert!(Arc::ptr_eq(
+            admission_after.resident(),
+            admission_before.resident()
+        ));
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 0);
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), 2, "demand install + tier graduation");
+        let inner = cache.inner.lock();
+        assert_eq!(inner.anchor_used_bytes, 40);
+        assert_eq!(inner.lru_used_bytes, 0);
+        assert_eq!(inner.next_generation, next_generation);
+        assert!(!inner.promotion_pending.contains(&7));
+        assert!(!inner.promotion_rearm.contains(&7));
+    }
+
+    #[test]
+    fn hot_lru_move_preserves_unrelated_lru_recency() {
+        let cache = GpuExpertCache::new(120, 0.5, 3);
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 20)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 20)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(3, 20)), Ok(true));
+
+        assert!(cache.claim_promotion(2, 3));
+        assert_eq!(
+            cache.promote_hot_existing(2),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        assert_eq!(cache.demand_admit_lru(gpu_res(4, 40)), Ok(true));
+
+        assert!(!cache.contains(1), "oldest unrelated LRU entry must remain victim");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+        assert!(cache.contains(4));
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 2);
+    }
+
+    #[test]
+    fn anchor_full_hot_lru_is_unchanged_and_does_not_requeue() {
+        let cache = GpuExpertCache::new(100, 0.5, 3);
+        assert_eq!(
+            cache.promote_hot_sync(gpu_res(99, 50)),
+            GpuHotPromotionOutcome::InstalledAnchor
+        );
+        let resident = gpu_res(7, 25);
+        assert_eq!(cache.demand_admit_lru(resident.clone()), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(8, 25)), Ok(true));
+        let generation = cache.current_generation(7).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let next_generation = cache.inner.lock().next_generation;
+
+        assert!(cache.claim_promotion(7, 3));
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            GpuHotPromotionOutcome::AlreadyLruAnchorFull
+        );
+        assert_eq!(cache.current_generation(7), Some(generation));
+        assert!(Arc::ptr_eq(
+            cache.current_admission(7).unwrap().resident(),
+            &resident
+        ));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.inner.lock().next_generation, next_generation);
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 2);
+        assert!(!cache.claim_promotion(7, 4));
+        assert!(!cache.claim_promotion(7, 99));
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(9, 25)), Ok(true));
+        assert!(!cache.contains(7), "Anchor-full attempt must not touch LRU recency");
+        assert!(cache.contains(8));
+        assert!(cache.contains(9));
+    }
+
+    #[test]
+    fn already_anchor_hot_promotion_is_uncounted_noop() {
+        let cache = GpuExpertCache::new(100, 0.5, 3);
+        let resident = gpu_res(7, 40);
+        assert_eq!(
+            cache.promote_hot_sync(resident.clone()),
+            GpuHotPromotionOutcome::InstalledAnchor
+        );
+        let generation = cache.current_generation(7).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+
+        assert!(!cache.claim_promotion(7, 3));
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            GpuHotPromotionOutcome::AlreadyAnchor
+        );
+        assert_eq!(cache.current_generation(7), Some(generation));
+        assert!(Arc::ptr_eq(
+            cache.current_admission(7).unwrap().resident(),
+            &resident
+        ));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+    }
+
+    #[test]
+    fn demand_wins_threshold_race_then_existing_admission_moves_intact() {
+        let cache = GpuExpertCache::new(100, 0.5, 3);
+        assert!(cache.claim_promotion(7, 3));
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            GpuHotPromotionOutcome::PayloadRequired
+        );
+        let demand_resident = gpu_res(7, 40);
+        assert_eq!(cache.demand_admit_lru(demand_resident.clone()), Ok(true));
+        let generation = cache.current_generation(7).unwrap();
+
+        assert_eq!(
+            cache.promote_hot_sync(gpu_res(7, 40)),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        let current = cache.current_admission(7).unwrap();
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), &demand_resident));
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 0);
+        assert_eq!(cache.promotions(), 2);
+    }
+
+    #[test]
+    fn background_wins_threshold_race_then_demand_recheck_is_noop() {
+        let cache = GpuExpertCache::new(100, 0.5, 3);
+        assert_eq!(
+            cache.demand_admission_preflight(7, 40),
+            Ok(GpuDemandAdmissionPreflight::NeedsPayload)
+        );
+        assert!(cache.claim_promotion(7, 3));
+        assert_eq!(
+            cache.promote_hot_existing(7),
+            GpuHotPromotionOutcome::PayloadRequired
+        );
+        let background_resident = gpu_res(7, 40);
+        assert_eq!(
+            cache.promote_hot_sync(background_resident.clone()),
+            GpuHotPromotionOutcome::InstalledAnchor
+        );
+        let generation = cache.current_generation(7).unwrap();
+        let next_generation = cache.inner.lock().next_generation;
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 40)), Ok(false));
+        let current = cache.current_admission(7).unwrap();
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), &background_resident));
+        assert_eq!(cache.inner.lock().next_generation, next_generation);
+        assert_eq!(cache.promotions(), 1);
+        assert_eq!(cache.anchor_len(), 1);
+        assert_eq!(cache.lru_len(), 0);
+    }
+
+    #[test]
+    fn demand_readmission_allocates_a_newer_generation() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 10)), Ok(true));
+        let first = cache.current_generation(7).unwrap();
+        assert_eq!(cache.demand_admit_lru(gpu_res(8, 20)), Ok(true));
+        assert!(!cache.contains(7));
+        assert_eq!(cache.demand_admit_lru(gpu_res(7, 10)), Ok(true));
+        let second = cache.current_generation(7).unwrap();
+        assert!(second > first);
+    }
+
+    #[test]
+    fn oversized_demand_fails_without_mutating_existing_state() {
+        let cache = GpuExpertCache::new(100, 0.5, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 25)), Ok(true));
+        let generation = cache.current_generation(1).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+
+        assert_eq!(
+            cache.demand_admit_lru(gpu_res(2, 51)),
+            Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                bytes: 51,
+                capacity: 50,
+            })
+        );
+        assert!(cache.contains_generation(1, generation));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+    }
+
+    #[test]
+    fn generation_exhaustion_does_not_evict_existing_demand() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 10)), Ok(true));
+        let generation = cache.current_generation(1).unwrap();
+        cache.inner.lock().next_generation = u64::MAX;
+
+        assert_eq!(
+            cache.demand_admit_lru(gpu_res(2, 20)),
+            Err(GpuDemandAdmissionError::GenerationExhausted)
+        );
+        assert!(cache.contains_generation(1, generation));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.used_bytes(), 10);
     }
 
     #[test]

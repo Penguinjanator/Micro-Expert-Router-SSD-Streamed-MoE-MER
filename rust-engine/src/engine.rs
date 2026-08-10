@@ -16,7 +16,9 @@
 use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
-use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
+use crate::expert_cache::{
+    ExpertResident, GpuExpertCache, GpuHotPromotionOutcome, GpuResident,
+};
 use crate::gating::Router;
 use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
@@ -34,6 +36,7 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -843,10 +846,40 @@ pub(crate) struct Counters {
     /// mixed GPU/CPU execution is a major source of
     /// inconsistent token latency, so make it countable.
     gpu_cpu_fallbacks: AtomicU64,
+    /// Routed expert activations selected by the real MoE routing path.
+    selected_routed_experts: AtomicU64,
+    /// Routed-expert activations entering the GPU dispatch boundary. This
+    /// includes activations rejected by pre-backend runtime-invariant guards,
+    /// so GPU-plan attempts stay equal to `selected_routed_experts`.
+    gpu_dispatch_attempts: AtomicU64,
+    /// Physical GPU routed-expert dispatches that returned output.
+    gpu_dispatch_successes: AtomicU64,
+    /// Physical GPU routed-expert dispatches that returned a typed failure.
+    gpu_dispatch_failures: AtomicU64,
+    /// Routed expert activations executed by the CPU backend. This includes
+    /// CPU plans and explicit serving-mode fallbacks, but never strict GPU
+    /// failures.
+    cpu_routed_expert_dispatches: AtomicU64,
     /// Hardware-independent CPU routed-expert forward spy. Test-only so the
     /// public fallback metric keeps its production schema and meaning.
     #[cfg(test)]
     cpu_expert_forward_calls: AtomicU64,
+}
+
+/// Monotonic execution counters for real routed-expert activations.
+///
+/// These counters deliberately exclude the synthetic [`Engine::generate`]
+/// path. They are a qualification seam rather than a second Prometheus
+/// telemetry surface.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RoutedExpertExecutionSnapshot {
+    pub selected_routed_experts: u64,
+    pub gpu_dispatch_attempts: u64,
+    pub gpu_dispatch_successes: u64,
+    pub gpu_dispatch_failures: u64,
+    pub cpu_routed_expert_dispatches: u64,
+    pub gpu_cpu_fallbacks: u64,
+    pub degraded_expert_substitutions: u64,
 }
 
 /// Shape parameters of the SwiGLU expert FFN executed by the engine.
@@ -1842,11 +1875,62 @@ impl Engine {
 
     /// Exact MER-owned routed-expert GPU weight/workspace ledger for PR5.
     /// Returns `None` when the resolved execution context has no GPU backend.
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
     pub fn gpu_expert_memory_snapshot(
         &self,
     ) -> Option<crate::backend::GpuExpertMemorySnapshot> {
         self.core.execution_context.gpu_expert_memory_snapshot()
+    }
+
+    /// Identity of the adapter already selected by the authoritative
+    /// execution context. This never performs adapter rediscovery.
+    pub fn gpu_device_identity(&self) -> Option<crate::backend::GpuDeviceIdentity> {
+        self.core.execution_context.gpu_device_identity()
+    }
+
+    /// Monotonic routed-expert GPU transfer/submission counters.
+    pub fn gpu_expert_io_snapshot(&self) -> Option<crate::backend::GpuExpertIoSnapshot> {
+        self.core.execution_context.gpu_expert_io_snapshot()
+    }
+
+    /// Snapshot the qualification-only real routed-expert execution counters.
+    pub fn routed_expert_execution_snapshot(&self) -> RoutedExpertExecutionSnapshot {
+        RoutedExpertExecutionSnapshot {
+            selected_routed_experts: self
+                .metrics
+                .counters
+                .selected_routed_experts
+                .load(Ordering::Relaxed),
+            gpu_dispatch_attempts: self
+                .metrics
+                .counters
+                .gpu_dispatch_attempts
+                .load(Ordering::Relaxed),
+            gpu_dispatch_successes: self
+                .metrics
+                .counters
+                .gpu_dispatch_successes
+                .load(Ordering::Relaxed),
+            gpu_dispatch_failures: self
+                .metrics
+                .counters
+                .gpu_dispatch_failures
+                .load(Ordering::Relaxed),
+            cpu_routed_expert_dispatches: self
+                .metrics
+                .counters
+                .cpu_routed_expert_dispatches
+                .load(Ordering::Relaxed),
+            gpu_cpu_fallbacks: self
+                .metrics
+                .counters
+                .gpu_cpu_fallbacks
+                .load(Ordering::Relaxed),
+            degraded_expert_substitutions: self
+                .metrics
+                .counters
+                .degraded_expert_substitutions
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Synchronously copy a freshly-loaded RAM resident into the logical GPU
@@ -1906,6 +1990,97 @@ impl Engine {
         }
     }
 
+    /// Establish the current selected expert's logical GPU admission at the
+    /// real routed-compute boundary. Routing remains authoritative for normal
+    /// logical hit/miss telemetry and LRU touches; this demand path only fills
+    /// a missing admission and never uses Anchor Core. Physical upload remains
+    /// lazy in `GpuBackend`.
+    fn demand_admit_resident_to_gpu(
+        &self,
+        layer: u32,
+        resident: &ExpertResident,
+    ) -> Result<(), crate::backend::GpuExpertDispatchError> {
+        use crate::expert_cache::GpuDemandAdmissionPreflight;
+
+        let gpu = self.execution_context().gpu_expert_cache();
+        let admission_error = |error| {
+            crate::backend::GpuExpertDispatchError::new(
+                layer,
+                resident.id,
+                crate::backend::GpuExpertDispatchErrorKind::ResidencyMiss,
+                format!("foreground demand admission failed: {error}"),
+            )
+        };
+        match gpu.demand_admission_preflight(resident.id, resident.data().len()) {
+            Ok(GpuDemandAdmissionPreflight::AlreadyAdmitted) => return Ok(()),
+            Ok(GpuDemandAdmissionPreflight::NeedsPayload) => {}
+            Err(error) => return Err(admission_error(error)),
+        }
+
+        // The preflight eliminates copies for admissions already visible at
+        // the probe and for deterministically oversized payloads, then drops
+        // the cache lock before this memcpy. `demand_admit_lru` rechecks under
+        // its own lock for identity/accounting correctness. A concurrent
+        // admission between the probe and install may therefore cause one
+        // redundant host copy followed by `Ok(false)`; avoiding that bounded
+        // race would require reservation/singleflight machinery and is
+        // intentionally deferred unless profiling demonstrates a need.
+        let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+            resident.id,
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
+        match gpu.demand_admit_lru(gpu_resident) {
+            Ok(newly_admitted) => {
+                if newly_admitted {
+                    if let Some(prom) = self.metrics.prom.as_ref() {
+                        prom.record_promotions(1);
+                        prom.set_vram_used_bytes(gpu.used_bytes());
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(admission_error(error)),
+        }
+    }
+
+    /// Process one threshold-driven promotion request. Existing logical
+    /// admissions are resolved first so an LRU entry can move to Anchor Core
+    /// without copying its multi-megabyte RAM payload. Only an absent id
+    /// requires a payload copy, followed by a locked recheck that preserves a
+    /// foreground demand admission if it won the race.
+    fn complete_background_gpu_promotion(
+        gpu: &GpuExpertCache,
+        prom: Option<&Metrics>,
+        id: u32,
+        resident: &ExpertResident,
+        dtype: WeightDtype,
+    ) -> GpuHotPromotionOutcome {
+        let initial = gpu.promote_hot_existing(id);
+        let outcome = if initial == GpuHotPromotionOutcome::PayloadRequired {
+            // The cache lock was released by `promote_hot_existing` before
+            // this copy. `promote_hot_sync` rechecks under its own lock, so a
+            // concurrent demand admission is moved intact rather than
+            // replaced by this redundant payload.
+            let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+                id,
+                resident.data().to_vec(),
+                dtype,
+            ));
+            gpu.promote_hot_sync(gpu_resident)
+        } else {
+            initial
+        };
+
+        if outcome.is_transition() {
+            if let Some(prom) = prom {
+                prom.record_promotions(1);
+                prom.set_vram_used_bytes(gpu.used_bytes());
+            }
+        }
+        outcome
+    }
+
     /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.
     ///
     /// Spawns a background Tokio task that drains an MPSC channel of
@@ -1936,24 +2111,16 @@ impl Engine {
         }
         tokio::spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
-                // `promote_sync` copies resident bytes into the host logical
-                // admission Anchor/LRU under the parking_lot mutex; safe to
-                // call from a Tokio worker because it never .awaits.
-                // Bytes are promoted verbatim; the dtype tag tells the
-                // GPU backend which matmul pipeline to dispatch (shared
-                // with the synchronous warm-up promotion path).
-                let gpu_res = Arc::new(GpuResident::new_with_dtype(
+                // Existing LRU admissions graduate atomically without a host
+                // payload copy. Absent ids copy outside the cache mutex and
+                // are rechecked under lock before final hot admission.
+                Self::complete_background_gpu_promotion(
+                    gpu_for_task.as_ref(),
+                    prom_for_task.as_ref(),
                     id,
-                    resident.data().to_vec(),
+                    resident.as_ref(),
                     promote_dtype,
-                ));
-                let promoted = gpu_for_task.promote_sync(gpu_res);
-                if promoted {
-                    if let Some(p) = prom_for_task.as_ref() {
-                        p.record_promotions(1);
-                        p.set_vram_used_bytes(gpu_for_task.used_bytes() as u64);
-                    }
-                }
+                );
             }
         });
         self.core.gpu_cache = Some(gpu.clone());
@@ -3963,6 +4130,10 @@ impl Engine {
         if self.execution_context().plan().routed_experts()
             == crate::backend::ExecutionPlane::Gpu
         {
+            self.metrics
+                .counters
+                .gpu_dispatch_attempts
+                .fetch_add(1, Ordering::Relaxed);
             let backend = self.routed_expert_backend();
             let mut out_f16 = vec![half::f16::ZERO; self.core.shape.d_model];
             let x_f16: Vec<half::f16> = x.iter().map(|&f| half::f16::from_f32(f)).collect();
@@ -3993,6 +4164,8 @@ impl Engine {
                         self.core.options.dtype, self.core.shape.d_model, self.core.shape.d_ff
                     ),
                 ))
+            } else if let Err(source) = self.demand_admit_resident_to_gpu(layer, r) {
+                Err(source)
             } else {
                 backend.routed_expert_matmul(
                     layer,
@@ -4005,15 +4178,27 @@ impl Engine {
             };
             match matmul_res {
                 Ok(()) => {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_successes
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(out_f16.iter().map(|h| h.to_f32()).collect::<Vec<f32>>());
                 }
                 Err(source)
                     if self.core.routed_expert_gpu_failure_policy
                         == RoutedExpertGpuFailurePolicy::StrictFailClosed =>
                 {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(MoeStepError::GpuExpertDispatch { source });
                 }
                 Err(source) => {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     // Only an actual serving-mode CPU recovery increments the
                     // fallback counter.
                     let prev = self
@@ -4035,6 +4220,11 @@ impl Engine {
                 }
             }
         }
+
+        self.metrics
+            .counters
+            .cpu_routed_expert_dispatches
+            .fetch_add(1, Ordering::Relaxed);
 
         #[cfg(test)]
         self.metrics
@@ -4134,6 +4324,10 @@ impl Engine {
         // Resolve aliases up front so the cache + predictor only ever
         // see canonical expert ids (mirrors `generate`).
         let target: Vec<u32> = experts.iter().map(|&id| self.resolve_alias(id)).collect();
+        self.metrics
+            .counters
+            .selected_routed_experts
+            .fetch_add(target.len() as u64, Ordering::Relaxed);
 
         // Locality monitor: observe and reconcile pinning. Same
         // semantics as in `generate`.
@@ -5148,9 +5342,9 @@ pub struct EngineReport {
     /// Compatibility field: logical admission budget. The same configured
     /// value caps physical expert weights; fixed workspaces are separate.
     pub vram_capacity_bytes: u64,
-    /// Cumulative RAM → logical-admission promotions performed by the background
-    /// promotion task. Promotions are gated by the per-expert
-    /// `promote_after_hits` threshold.
+    /// Cumulative successful logical GPU-promotion transitions: new
+    /// Anchor/LRU admissions plus LRU-to-Anchor graduation. No-op outcomes are
+    /// excluded; this mirrors `mer_promotions_total` when metrics are enabled.
     pub gpu_promotions: u64,
     /// Logical GPU-admission hit count (anchor + LRU).
     pub gpu_cache_hits: u64,
@@ -5344,8 +5538,28 @@ mod tests {
         expert_execution_policy: ExpertExecutionPolicy,
         allow_degraded_experts: bool,
     ) -> Arc<Engine> {
+        rebuild_with_test_gpu_capacity(
+            base,
+            test_gpu,
+            failure_policy,
+            expert_execution_policy,
+            allow_degraded_experts,
+            64 * 1024,
+        )
+    }
+
+    fn rebuild_with_test_gpu_capacity(
+        base: &Arc<Engine>,
+        test_gpu: crate::backend::TestGpuBackend,
+        failure_policy: Option<RoutedExpertGpuFailurePolicy>,
+        expert_execution_policy: ExpertExecutionPolicy,
+        allow_degraded_experts: bool,
+        gpu_capacity_bytes: usize,
+    ) -> Arc<Engine> {
         let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
-            1024, 0.5, 16,
+            gpu_capacity_bytes,
+            0.5,
+            16,
         ));
         let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu));
         let context = crate::backend::resolve_execution_context_with(
@@ -5395,6 +5609,18 @@ mod tests {
             .counters
             .cpu_expert_forward_calls
             .load(Ordering::Relaxed)
+    }
+
+    fn rendered_counter(metrics: &Metrics, name: &str) -> u64 {
+        let body = String::from_utf8(metrics.render().expect("render Prometheus metrics"))
+            .expect("metrics are UTF-8");
+        body.lines()
+            .find_map(|line| {
+                let (metric, value) = line.split_once(' ')?;
+                (metric == name)
+                    .then(|| value.parse::<f64>().expect("Prometheus counter value") as u64)
+            })
+            .unwrap_or_else(|| panic!("missing Prometheus counter {name} in:\n{body}"))
     }
 
     fn assert_gpu_dispatch_error(
@@ -5500,6 +5726,246 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 1);
         assert_eq!(cpu_expert_forward_calls(&engine), 0);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        let gpu_cache = engine.execution_context().gpu_expert_cache();
+        assert!(gpu_cache.current_admission(2).is_some());
+        assert_eq!(gpu_cache.anchor_len(), 0);
+        assert_eq!(gpu_cache.lru_len(), 1);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 1,
+                gpu_dispatch_failures: 0,
+                cpu_routed_expert_dispatches: 0,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn demand_wins_hot_promotion_race_keeps_internal_and_prometheus_equal() {
+        let dir = TempDir::new("hot-promotion-demand-wins");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30A);
+        let id = 2;
+        base.warm_with(&[id]).await.expect("warm RAM resident");
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let rebuilt = rebuild_with_test_gpu(
+            &base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        let metrics = Metrics::new();
+        let engine = match Arc::try_unwrap(rebuilt) {
+            Ok(engine) => engine.with_metrics(metrics.clone()),
+            Err(_) => panic!("test owns the sole rebuilt engine Arc"),
+        };
+        let resident = engine.core.cache.get(id).expect("RAM resident");
+        let gpu = engine.execution_context().gpu_expert_cache();
+
+        assert!(gpu.claim_promotion(id, 16));
+        engine
+            .demand_admit_resident_to_gpu(0, resident.as_ref())
+            .expect("foreground demand admission");
+        let demand_admission = gpu.current_admission(id).expect("demand LRU admission");
+        let generation = demand_admission.generation();
+
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu,
+                Some(&metrics),
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        let current = gpu.current_admission(id).expect("graduated admission");
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), demand_admission.resident()));
+        assert_eq!(gpu.promotions(), 2, "demand install + Anchor graduation");
+        assert_eq!(rendered_counter(&metrics, "mer_promotions_total"), 2);
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_wins_hot_promotion_race_keeps_demand_recheck_noop() {
+        let dir = TempDir::new("hot-promotion-background-wins");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30B);
+        let id = 2;
+        base.warm_with(&[id]).await.expect("warm RAM resident");
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let rebuilt = rebuild_with_test_gpu(
+            &base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+        );
+        let metrics = Metrics::new();
+        let engine = match Arc::try_unwrap(rebuilt) {
+            Ok(engine) => engine.with_metrics(metrics.clone()),
+            Err(_) => panic!("test owns the sole rebuilt engine Arc"),
+        };
+        let resident = engine.core.cache.get(id).expect("RAM resident");
+        let gpu = engine.execution_context().gpu_expert_cache();
+
+        assert_eq!(
+            gpu.demand_admission_preflight(id, resident.data().len()),
+            Ok(crate::expert_cache::GpuDemandAdmissionPreflight::NeedsPayload)
+        );
+        assert!(gpu.claim_promotion(id, 16));
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu,
+                Some(&metrics),
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::InstalledAnchor
+        );
+        let background_admission = gpu.current_admission(id).expect("Anchor admission");
+        let generation = background_admission.generation();
+
+        engine
+            .demand_admit_resident_to_gpu(0, resident.as_ref())
+            .expect("demand recheck must observe background admission");
+        let current = gpu.current_admission(id).expect("current admission");
+        assert_eq!(current.generation(), generation);
+        assert!(Arc::ptr_eq(current.resident(), background_admission.resident()));
+        assert_eq!(gpu.promotions(), 1);
+        assert_eq!(rendered_counter(&metrics, "mer_promotions_total"), 1);
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_demand_admitted_hot_expert_graduates_to_anchor() {
+        let dir = TempDir::new("serving-demand-hot-graduation");
+        let base = build_engine(&dir.path, 4, 8, 16, 4, 1, 0, 0x30C);
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let gpu = Arc::new(crate::expert_cache::GpuExpertCache::new(64 * 1024, 0.5, 3));
+        let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu.clone()));
+        let context = crate::backend::resolve_execution_context_with(
+            crate::backend::ComputeOffload::Hybrid,
+            true,
+            crate::backend::GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 16,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: base.core.shape.d_model,
+                v_head_dim: base.core.shape.d_model,
+                q4_truncation_tolerance: 0,
+            },
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: base.core.options.dtype,
+                d_model: base.core.shape.d_model,
+                d_ff: base.core.shape.d_ff,
+            },
+            gpu.clone(),
+            |_| Ok(backend),
+        )
+        .expect("test Hybrid context");
+        let mut engine = Engine::with_options_and_execution_context(
+            base.core.cache.clone(),
+            base.core.pool.clone(),
+            base.core.storage.clone(),
+            base.core.router.clone(),
+            base.core.predictor.clone(),
+            base.core.shape,
+            base.core.options,
+            context,
+        );
+        assert_eq!(
+            engine.routed_expert_gpu_failure_policy(),
+            RoutedExpertGpuFailurePolicy::ServingCpuFallback
+        );
+        let mut rx = engine.install_gpu_cache_for_test(gpu.clone());
+        let engine = Arc::new(engine);
+        let id = 2;
+        let hidden = crate::inference::synth_hidden_state(0, 8, 0x30C);
+
+        for token in 0..3 {
+            engine
+                .moe_step(token, 0, &hidden, &[id])
+                .await
+                .expect("serving demand GPU execution");
+        }
+        let (queued_id, resident) = rx.try_recv().expect("threshold promotion request");
+        assert_eq!(queued_id, id);
+        assert!(rx.try_recv().is_err(), "only one threshold request is queued");
+        let generation = gpu.current_generation(id).expect("demand LRU generation");
+        assert_eq!(gpu.anchor_len(), 0);
+        assert_eq!(gpu.lru_len(), 1);
+
+        assert_eq!(
+            Engine::complete_background_gpu_promotion(
+                gpu.as_ref(),
+                None,
+                id,
+                resident.as_ref(),
+                engine.core.options.dtype,
+            ),
+            GpuHotPromotionOutcome::MovedLruToAnchor
+        );
+        assert_eq!(gpu.current_generation(id), Some(generation));
+        assert_eq!(gpu.anchor_len(), 1);
+        assert_eq!(gpu.lru_len(), 0);
+        assert_eq!(test_gpu.expert_calls(), 3);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_gpu_demand_admission_failure_never_reaches_backend_or_cpu() {
+        let dir = TempDir::new("strict-gpu-demand-admission-failure");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x309);
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let engine = rebuild_with_test_gpu_capacity(
+            &base,
+            test_gpu.clone(),
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+            4 * 1024,
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x309);
+        let error = engine
+            .moe_step(0, 5, &hidden, &[2])
+            .await
+            .expect_err("oversized foreground demand must fail closed");
+        assert_gpu_dispatch_error(
+            error,
+            crate::backend::GpuExpertDispatchErrorKind::ResidencyMiss,
+            5,
+            2,
+        );
+        assert_eq!(test_gpu.expert_calls(), 0);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert!(engine
+            .execution_context()
+            .gpu_expert_cache()
+            .current_admission(2)
+            .is_none());
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 1,
+                cpu_routed_expert_dispatches: 0,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5536,6 +6002,19 @@ mod tests {
             let report = engine.report();
             assert_eq!(report.gpu_cpu_fallbacks, 0, "{label}");
             assert_eq!(report.degraded_expert_substitutions, 0, "{label}");
+            assert_eq!(
+                engine.routed_expert_execution_snapshot(),
+                RoutedExpertExecutionSnapshot {
+                    selected_routed_experts: 1,
+                    gpu_dispatch_attempts: 1,
+                    gpu_dispatch_successes: 0,
+                    gpu_dispatch_failures: 1,
+                    cpu_routed_expert_dispatches: 0,
+                    gpu_cpu_fallbacks: 0,
+                    degraded_expert_substitutions: 0,
+                },
+                "{label}"
+            );
         }
     }
 
@@ -5580,6 +6059,18 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 1);
         assert_eq!(cpu_expert_forward_calls(&engine), 1);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 1);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 1,
+                cpu_routed_expert_dispatches: 1,
+                gpu_cpu_fallbacks: 1,
+                degraded_expert_substitutions: 0,
+            }
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5634,6 +6125,18 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 0);
         assert_eq!(cpu_expert_forward_calls(&engine), 1);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 0,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 0,
+                cpu_routed_expert_dispatches: 1,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
         assert!(
             engine.gpu_expert_memory_snapshot().is_none(),
             "CPU plans must not depend on a physical GPU expert registry"
@@ -5858,6 +6361,11 @@ mod tests {
         assert!(
             r.predictor_observations > 0,
             "predictor should have logged at least one transition"
+        );
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot::default(),
+            "synthetic Engine::generate traffic must not qualify as real routed execution"
         );
     }
 

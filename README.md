@@ -1940,6 +1940,41 @@ optimal.
   --greedy
 ```
 
+#### Strict Hybrid native-Q4_0 qualification
+
+`bench-real` remains the CPU real-transformer benchmark compatibility command.
+`qualify-hybrid-q4` is a separate, fail-closed execution-integrity check for an
+exact Hybrid plan: embeddings, LM head, dense projections, attention, KV, and
+router on CPU, with native-Q4_0 routed experts on a hardware GPU.
+
+```bash
+./target/release/micro-expert-router qualify-hybrid-q4 \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --prompt "Write a small Rust function." \
+  --output-tokens 32 \
+  --warmup-runs 0 \
+  --report-out qualification.json
+```
+
+The command always uses greedy decoding and measures exactly one real
+autoregressive request after any warmups. PASS proves the execution contract;
+it does not prove or require 10 generated tokens/s. CPU routed-expert recovery
+is forbidden. Synthetic `run` throughput is not qualification throughput.
+
+The report's `decode_tps` and `real_generated_tps` fields both measure steady
+autoregressive decode throughput as
+`generated_tokens.saturating_sub(1) / decode_seconds`, matching `bench-real`.
+The first generated token is excluded because it is produced before decode
+timing begins. `end_to_end_generated_tps` instead divides all actual generated
+tokens by `total_seconds`; it includes prompt processing and time to first token
+and is not the commercial decode-TPS metric.
+
+The report's internal GPU-memory fields cover only MER-owned physical routed-
+expert buffers and fixed routed-expert workspaces. They are not total driver or
+device memory. `--external-gpu-memory-artifact <STRING>` stores an opaque
+reference to separately collected PR6 evidence; this command does not invoke
+NVML or `nvidia-smi`.
+
 Increase log verbosity:
 
 ```bash
@@ -2332,6 +2367,16 @@ micro-expert-router bench-real
                               Cache reset policy between runs.
   --greedy                   Force deterministic greedy decoding.
   --format <human|json>      Output format.
+
+micro-expert-router qualify-hybrid-q4
+  --config <PATH>            Strict Hybrid native-Q4_0 TOML config.
+  --prompt <TEXT>            Prompt text; conflicts with --request-json.
+  --request-json <PATH>      OpenAI-style prompt/messages request JSON.
+  --output-tokens <N>        Completion tokens; overrides request max_tokens.
+  --warmup-runs <N>          Strict greedy warmups (default 0).
+  --report-out <PATH>        Write typed JSON there (default: stdout).
+  --external-gpu-memory-artifact <STRING>
+                              Opaque reference to separate external evidence.
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance
