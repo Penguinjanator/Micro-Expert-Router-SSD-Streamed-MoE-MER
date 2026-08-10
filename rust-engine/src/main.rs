@@ -2509,6 +2509,26 @@ fn fail_qualification(
     Err(summary.into())
 }
 
+fn qualification_artifact_failure(
+    errors: &[String],
+) -> crate::qualification::QualificationFailure {
+    crate::qualification::QualificationFailure::new(
+        crate::qualification::FailureStage::Preflight,
+        "artifact-identity-unavailable",
+        errors.join("; "),
+    )
+}
+
+fn qualification_metadata_failure(
+    detail: impl Into<String>,
+) -> crate::qualification::QualificationFailure {
+    crate::qualification::QualificationFailure::new(
+        crate::qualification::FailureStage::Preflight,
+        "expert-metadata-unreadable",
+        detail,
+    )
+}
+
 fn qualification_inference_failure(
     error: &(dyn std::error::Error + 'static),
 ) -> crate::qualification::QualificationFailure {
@@ -2544,9 +2564,10 @@ async fn cmd_qualify_hybrid_q4(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::qualification::{
         gpu_io_delta, request_evidence, routed_execution_delta, validate_device,
-        validate_execution_plan, validate_gpu_failure_policy, validate_memory,
-        validate_postconditions, validate_preflight, BuildProvenance, FailureStage,
-        PreflightEvidence, QualificationFailure, QualificationReport, QualificationTiming,
+        validate_execution_plan, validate_gpu_failure_policy, validate_gpu_io,
+        validate_memory, validate_postconditions, validate_preflight, BuildProvenance,
+        FailureStage, PreflightEvidence, QualificationFailure, QualificationReport,
+        QualificationTiming,
     };
 
     // Config/request parse errors retain normal CLI error behavior. Once both
@@ -2576,11 +2597,7 @@ async fn cmd_qualify_hybrid_q4(
     if !artifact_errors.is_empty() {
         return fail_qualification(
             report,
-            QualificationFailure::new(
-                FailureStage::Preflight,
-                "artifact-identity-unavailable",
-                artifact_errors.join("; "),
-            ),
+            qualification_artifact_failure(&artifact_errors),
             args.report_out.as_deref(),
         );
     }
@@ -2589,11 +2606,7 @@ async fn cmd_qualify_hybrid_q4(
         Err(detail) => {
             return fail_qualification(
                 report,
-                QualificationFailure::new(
-                    FailureStage::Preflight,
-                    "q4-layout-not-standard",
-                    detail,
-                ),
+                qualification_metadata_failure(detail),
                 args.report_out.as_deref(),
             );
         }
@@ -2811,6 +2824,9 @@ async fn cmd_qualify_hybrid_q4(
     };
     report.routed_experts = Some(routed_delta);
     report.gpu_io = Some(io_delta);
+    if let Err(failure) = validate_gpu_io(io_delta, &mut report.qualification_checks) {
+        return fail_qualification(report, failure, args.report_out.as_deref());
+    }
     for snapshot in [memory_before, memory_after] {
         if let Err(failure) = validate_memory(snapshot) {
             return fail_qualification(report, failure, args.report_out.as_deref());
@@ -3819,6 +3835,32 @@ enum RealCliRuntimeMode {
     StrictHybridQualification,
 }
 
+fn strict_hybrid_gpu_geometry(
+    cfg: &crate::config::Config,
+    resolved_advanced: &crate::model::AdvancedConfig,
+) -> crate::backend::GpuBackendGeometry {
+    let rt = &cfg.real_transformer;
+    let head_dim = if rt.head_dim == 0 {
+        cfg.model.d_model / rt.num_heads
+    } else {
+        rt.head_dim
+    };
+    crate::backend::GpuBackendGeometry {
+        num_layers: cfg.model.num_layers,
+        max_seq_len: if rt.window_size == 0 {
+            4096
+        } else {
+            rt.window_size
+        },
+        num_heads: rt.num_heads,
+        num_kv_heads: rt.num_kv_heads,
+        head_dim,
+        // Zero preserves GpuBackendGeometry's symmetric fallback to head_dim.
+        v_head_dim: resolved_advanced.v_head_dim.unwrap_or(0),
+        q4_truncation_tolerance: 0,
+    }
+}
+
 async fn build_bench_real_runtime(
     config_path: &Path,
 ) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
@@ -3873,28 +3915,10 @@ async fn build_real_cli_runtime(
                 cfg.gpu_cache.vram_anchor_ratio,
                 cfg.gpu_cache.promote_after_hits,
             ));
-            let rt = &cfg.real_transformer;
-            let head_dim = if rt.head_dim == 0 {
-                cfg.model.d_model / rt.num_heads
-            } else {
-                rt.head_dim
-            };
             let context = crate::backend::resolve_execution_context(
                 cfg.real_transformer.compute_offload,
                 true,
-                crate::backend::GpuBackendGeometry {
-                    num_layers: cfg.model.num_layers,
-                    max_seq_len: if rt.window_size == 0 {
-                        4096
-                    } else {
-                        rt.window_size
-                    },
-                    num_heads: rt.num_heads,
-                    num_kv_heads: rt.num_kv_heads,
-                    head_dim,
-                    v_head_dim: 0,
-                    q4_truncation_tolerance: 0,
-                },
+                strict_hybrid_gpu_geometry(&cfg, &resolved_advanced),
                 crate::backend::RoutedExpertGpuSpec {
                     dtype: cfg.model.dtype,
                     d_model: cfg.model.d_model,
@@ -8384,6 +8408,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qualification_metadata_read_failure_has_distinct_typed_code() {
+        let failure = qualification_metadata_failure("malformed metadata JSON");
+        assert_eq!(
+            failure.stage,
+            crate::qualification::FailureStage::Preflight
+        );
+        assert_eq!(failure.code, "expert-metadata-unreadable");
+        assert_eq!(failure.detail, "malformed metadata JSON");
+    }
+
+    #[test]
+    fn configured_missing_artifact_produces_typed_identity_failure() {
+        let dir = tempdir_unique("qualification-missing-artifact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, b"# qualification fixture\n").unwrap();
+        std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+
+        let missing_tokenizer = dir.join("missing-tokenizer.json");
+        let mut cfg = minimal_bench_cfg();
+        cfg.model.data_dir = dir.clone();
+        cfg.tokenizer.path = Some(missing_tokenizer.clone());
+        let (artifacts, errors) = qualification_artifacts(&config_path, &cfg);
+
+        assert!(artifacts.tokenizer.is_none());
+        assert_eq!(errors.len(), 1);
+        let missing_tokenizer = missing_tokenizer.display().to_string();
+        assert!(errors[0].contains(&missing_tokenizer));
+        let failure = qualification_artifact_failure(&errors);
+        assert_eq!(
+            failure.stage,
+            crate::qualification::FailureStage::Preflight
+        );
+        assert_eq!(failure.code, "artifact-identity-unavailable");
+        assert!(failure.detail.contains("missing-tokenizer.json"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A distinctive tiny Qwen3-MoE `config.json` (checkpoint dims differ from
     /// [`minimal_bench_cfg`]) with `norm_topk_prob = true`.
     fn write_qwen3_moe_config_json(dir: &Path) {
@@ -8529,6 +8593,25 @@ mod tests {
             &advanced,
         )
         .expect("asymmetric V geometry must be accepted");
+    }
+
+    #[test]
+    fn strict_hybrid_geometry_uses_resolved_asymmetric_v_head_dim() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.num_heads = 4;
+        cfg.real_transformer.num_kv_heads = 2;
+        cfg.real_transformer.head_dim = 24;
+        let advanced = crate::model::AdvancedConfig {
+            v_head_dim: Some(16),
+            ..Default::default()
+        };
+
+        let geometry = strict_hybrid_gpu_geometry(&cfg, &advanced);
+        assert_eq!(geometry.head_dim, 24);
+        assert_eq!(geometry.v_head_dim, 16);
+
+        let symmetric = crate::model::AdvancedConfig::default();
+        assert_eq!(strict_hybrid_gpu_geometry(&cfg, &symmetric).v_head_dim, 0);
     }
 
     #[test]

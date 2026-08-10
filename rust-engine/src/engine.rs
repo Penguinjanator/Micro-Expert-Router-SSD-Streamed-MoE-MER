@@ -846,7 +846,9 @@ pub(crate) struct Counters {
     gpu_cpu_fallbacks: AtomicU64,
     /// Routed expert activations selected by the real MoE routing path.
     selected_routed_experts: AtomicU64,
-    /// Physical GPU routed-expert dispatch attempts.
+    /// Routed-expert activations entering the GPU dispatch boundary. This
+    /// includes activations rejected by pre-backend runtime-invariant guards,
+    /// so GPU-plan attempts stay equal to `selected_routed_experts`.
     gpu_dispatch_attempts: AtomicU64,
     /// Physical GPU routed-expert dispatches that returned output.
     gpu_dispatch_successes: AtomicU64,
@@ -1871,7 +1873,6 @@ impl Engine {
 
     /// Exact MER-owned routed-expert GPU weight/workspace ledger for PR5.
     /// Returns `None` when the resolved execution context has no GPU backend.
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
     pub fn gpu_expert_memory_snapshot(
         &self,
     ) -> Option<crate::backend::GpuExpertMemorySnapshot> {
@@ -1984,6 +1985,60 @@ impl Engine {
                 p.record_promotions(1);
                 p.set_vram_used_bytes(gpu.used_bytes() as u64);
             }
+        }
+    }
+
+    /// Establish the current selected expert's logical GPU admission at the
+    /// real routed-compute boundary. Routing remains authoritative for normal
+    /// logical hit/miss telemetry and LRU touches; this demand path only fills
+    /// a missing admission and never uses Anchor Core. Physical upload remains
+    /// lazy in `GpuBackend`.
+    fn demand_admit_resident_to_gpu(
+        &self,
+        layer: u32,
+        resident: &ExpertResident,
+    ) -> Result<(), crate::backend::GpuExpertDispatchError> {
+        use crate::expert_cache::GpuDemandAdmissionPreflight;
+
+        let gpu = self.execution_context().gpu_expert_cache();
+        let admission_error = |error| {
+            crate::backend::GpuExpertDispatchError::new(
+                layer,
+                resident.id,
+                crate::backend::GpuExpertDispatchErrorKind::ResidencyMiss,
+                format!("foreground demand admission failed: {error}"),
+            )
+        };
+        match gpu.demand_admission_preflight(resident.id, resident.data().len()) {
+            Ok(GpuDemandAdmissionPreflight::AlreadyAdmitted) => return Ok(()),
+            Ok(GpuDemandAdmissionPreflight::NeedsPayload) => {}
+            Err(error) => return Err(admission_error(error)),
+        }
+
+        // The preflight eliminates copies for admissions already visible at
+        // the probe and for deterministically oversized payloads, then drops
+        // the cache lock before this memcpy. `demand_admit_lru` rechecks under
+        // its own lock for identity/accounting correctness. A concurrent
+        // admission between the probe and install may therefore cause one
+        // redundant host copy followed by `Ok(false)`; avoiding that bounded
+        // race would require reservation/singleflight machinery and is
+        // intentionally deferred unless profiling demonstrates a need.
+        let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+            resident.id,
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
+        match gpu.demand_admit_lru(gpu_resident) {
+            Ok(newly_admitted) => {
+                if newly_admitted {
+                    if let Some(prom) = self.metrics.prom.as_ref() {
+                        prom.record_promotions(1);
+                        prom.set_vram_used_bytes(gpu.used_bytes());
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => Err(admission_error(error)),
         }
     }
 
@@ -4078,6 +4133,8 @@ impl Engine {
                         self.core.options.dtype, self.core.shape.d_model, self.core.shape.d_ff
                     ),
                 ))
+            } else if let Err(source) = self.demand_admit_resident_to_gpu(layer, r) {
+                Err(source)
             } else {
                 backend.routed_expert_matmul(
                     layer,
@@ -5450,8 +5507,28 @@ mod tests {
         expert_execution_policy: ExpertExecutionPolicy,
         allow_degraded_experts: bool,
     ) -> Arc<Engine> {
+        rebuild_with_test_gpu_capacity(
+            base,
+            test_gpu,
+            failure_policy,
+            expert_execution_policy,
+            allow_degraded_experts,
+            64 * 1024,
+        )
+    }
+
+    fn rebuild_with_test_gpu_capacity(
+        base: &Arc<Engine>,
+        test_gpu: crate::backend::TestGpuBackend,
+        failure_policy: Option<RoutedExpertGpuFailurePolicy>,
+        expert_execution_policy: ExpertExecutionPolicy,
+        allow_degraded_experts: bool,
+        gpu_capacity_bytes: usize,
+    ) -> Arc<Engine> {
         let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
-            1024, 0.5, 16,
+            gpu_capacity_bytes,
+            0.5,
+            16,
         ));
         let backend = Arc::new(crate::backend::BackendBox::TestGpu(test_gpu));
         let context = crate::backend::resolve_execution_context_with(
@@ -5606,6 +5683,10 @@ mod tests {
         assert_eq!(test_gpu.expert_calls(), 1);
         assert_eq!(cpu_expert_forward_calls(&engine), 0);
         assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        let gpu_cache = engine.execution_context().gpu_expert_cache();
+        assert!(gpu_cache.current_admission(2).is_some());
+        assert_eq!(gpu_cache.anchor_len(), 0);
+        assert_eq!(gpu_cache.lru_len(), 1);
         assert_eq!(
             engine.routed_expert_execution_snapshot(),
             RoutedExpertExecutionSnapshot {
@@ -5613,6 +5694,52 @@ mod tests {
                 gpu_dispatch_attempts: 1,
                 gpu_dispatch_successes: 1,
                 gpu_dispatch_failures: 0,
+                cpu_routed_expert_dispatches: 0,
+                gpu_cpu_fallbacks: 0,
+                degraded_expert_substitutions: 0,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_gpu_demand_admission_failure_never_reaches_backend_or_cpu() {
+        let dir = TempDir::new("strict-gpu-demand-admission-failure");
+        let base = build_engine(&dir.path, 8, 16, 32, 4, 2, 1, 0x309);
+        let test_gpu = crate::backend::TestGpuBackend::success(0.25);
+        let engine = rebuild_with_test_gpu_capacity(
+            &base,
+            test_gpu.clone(),
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+            4 * 1024,
+        );
+        let hidden = crate::inference::synth_hidden_state(0, 16, 0x309);
+        let error = engine
+            .moe_step(0, 5, &hidden, &[2])
+            .await
+            .expect_err("oversized foreground demand must fail closed");
+        assert_gpu_dispatch_error(
+            error,
+            crate::backend::GpuExpertDispatchErrorKind::ResidencyMiss,
+            5,
+            2,
+        );
+        assert_eq!(test_gpu.expert_calls(), 0);
+        assert_eq!(cpu_expert_forward_calls(&engine), 0);
+        assert_eq!(engine.report().gpu_cpu_fallbacks, 0);
+        assert!(engine
+            .execution_context()
+            .gpu_expert_cache()
+            .current_admission(2)
+            .is_none());
+        assert_eq!(
+            engine.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                gpu_dispatch_attempts: 1,
+                gpu_dispatch_successes: 0,
+                gpu_dispatch_failures: 1,
                 cpu_routed_expert_dispatches: 0,
                 gpu_cpu_fallbacks: 0,
                 degraded_expert_substitutions: 0,

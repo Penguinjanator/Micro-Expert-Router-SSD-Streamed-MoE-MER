@@ -97,7 +97,7 @@ pub struct ArtifactDigest {
 
 pub fn hash_small_file(path: &Path) -> io::Result<ArtifactDigest> {
     let mut file = File::open(path)?;
-    let byte_length = file.metadata()?.len();
+    let mut byte_length = 0u64;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -105,6 +105,18 @@ pub fn hash_small_file(path: &Path) -> io::Result<ArtifactDigest> {
         if read == 0 {
             break;
         }
+        let read_u64 = u64::try_from(read).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact read length cannot be represented as u64",
+            )
+        })?;
+        byte_length = byte_length.checked_add(read_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact byte length overflowed u64",
+            )
+        })?;
         hasher.update(&buffer[..read]);
     }
     Ok(ArtifactDigest {
@@ -116,9 +128,7 @@ pub fn hash_small_file(path: &Path) -> io::Result<ArtifactDigest> {
 }
 
 pub fn hash_optional_small_file(path: Option<&Path>) -> io::Result<Option<ArtifactDigest>> {
-    path.filter(|path| path.is_file())
-        .map(hash_small_file)
-        .transpose()
+    path.map(hash_small_file).transpose()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -312,6 +322,7 @@ pub struct QualificationChecks {
     pub canonical_q4_layout: bool,
     pub hardware_gpu_adapter: bool,
     pub strict_gpu_failure_policy: bool,
+    pub observed_routed_gpu_io: bool,
     pub generated_tokens: bool,
     pub observed_routed_experts: bool,
     pub all_selected_experts_attempted_on_gpu: bool,
@@ -331,6 +342,7 @@ impl QualificationChecks {
             && self.canonical_q4_layout
             && self.hardware_gpu_adapter
             && self.strict_gpu_failure_policy
+            && self.observed_routed_gpu_io
             && self.generated_tokens
             && self.observed_routed_experts
             && self.all_selected_experts_attempted_on_gpu
@@ -694,6 +706,26 @@ pub fn validate_memory(snapshot: GpuExpertMemorySnapshot) -> Result<(), Qualific
             format!("invalid PR4 physical memory snapshot: {snapshot:?}"),
         ));
     }
+    Ok(())
+}
+
+pub fn validate_gpu_io(
+    io: GpuExpertIoSnapshot,
+    checks: &mut QualificationChecks,
+) -> Result<(), QualificationFailure> {
+    if io.hidden_state_uploads == 0
+        || io.queue_submissions == 0
+        || io.map_requests == 0
+        || io.readback_completions == 0
+        || io.readback_bytes == 0
+    {
+        return Err(QualificationFailure::new(
+            FailureStage::Postcondition,
+            "no-routed-gpu-io-observed",
+            format!("measured request did not complete routed GPU I/O: {io:?}"),
+        ));
+    }
+    checks.observed_routed_gpu_io = true;
     Ok(())
 }
 
@@ -1262,6 +1294,59 @@ mod tests {
     }
 
     #[test]
+    fn routed_gpu_io_requires_completed_dispatch_evidence() {
+        let io = GpuExpertIoSnapshot {
+            // A warmed physical resident need not upload its weights again.
+            expert_weight_uploads: 0,
+            expert_weight_upload_bytes: 0,
+            hidden_state_uploads: 1,
+            hidden_state_upload_bytes: 8,
+            queue_submissions: 1,
+            map_requests: 1,
+            readback_completions: 1,
+            readback_bytes: 8,
+        };
+        let mut checks = QualificationChecks::default();
+        validate_gpu_io(io, &mut checks).unwrap();
+        assert!(checks.observed_routed_gpu_io);
+    }
+
+    #[test]
+    fn missing_routed_gpu_io_is_a_typed_postcondition_failure() {
+        let complete = GpuExpertIoSnapshot {
+            expert_weight_uploads: 0,
+            expert_weight_upload_bytes: 0,
+            hidden_state_uploads: 1,
+            hidden_state_upload_bytes: 8,
+            queue_submissions: 1,
+            map_requests: 1,
+            readback_completions: 1,
+            readback_bytes: 8,
+        };
+        for missing in [
+            "hidden_state_uploads",
+            "queue_submissions",
+            "map_requests",
+            "readback_completions",
+            "readback_bytes",
+        ] {
+            let mut io = complete;
+            match missing {
+                "hidden_state_uploads" => io.hidden_state_uploads = 0,
+                "queue_submissions" => io.queue_submissions = 0,
+                "map_requests" => io.map_requests = 0,
+                "readback_completions" => io.readback_completions = 0,
+                "readback_bytes" => io.readback_bytes = 0,
+                _ => unreachable!(),
+            }
+            let failure =
+                validate_gpu_io(io, &mut QualificationChecks::default()).unwrap_err();
+            assert_eq!(failure.stage, FailureStage::Postcondition, "{missing}");
+            assert_eq!(failure.code, "no-routed-gpu-io-observed", "{missing}");
+        }
+    }
+
+    #[test]
     fn pr4_memory_snapshot_invariants_and_serialization() {
         let snapshot = GpuExpertMemorySnapshot {
             logical_admitted_bytes: 7,
@@ -1317,7 +1402,8 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(hash_optional_small_file(Some(&path)).unwrap(), None);
+        assert!(hash_optional_small_file(Some(&path)).is_err());
+        assert_eq!(hash_optional_small_file(None).unwrap(), None);
     }
 
     #[test]
@@ -1415,7 +1501,15 @@ mod tests {
             1, 1, 1, 1.0, 0.0, 1.0,
         ));
         report.routed_experts = Some(routed_success());
-        report.gpu_io = Some(GpuExpertIoSnapshot::default());
+        report.gpu_io = Some(GpuExpertIoSnapshot {
+            hidden_state_uploads: 1,
+            hidden_state_upload_bytes: 1,
+            queue_submissions: 1,
+            map_requests: 1,
+            readback_completions: 1,
+            readback_bytes: 1,
+            ..Default::default()
+        });
         let memory = GpuExpertMemorySnapshot {
             expert_capacity_bytes: 1,
             ..Default::default()
@@ -1431,6 +1525,7 @@ mod tests {
             canonical_q4_layout: true,
             hardware_gpu_adapter: true,
             strict_gpu_failure_policy: true,
+            observed_routed_gpu_io: true,
             generated_tokens: true,
             observed_routed_experts: true,
             all_selected_experts_attempted_on_gpu: true,

@@ -720,7 +720,6 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
         }
     }
 
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5; PR4 tests invariants here.
     fn snapshot(&self, logical_admitted_bytes: u64) -> GpuExpertMemorySnapshot {
         let inner = self.inner.lock();
         let expert_live_bytes = self.ledger.expert_live_bytes();
@@ -2967,7 +2966,6 @@ impl GpuBackend {
         self.expert_matmul_from_vram(layer, expert_id, &entry, x, out)
     }
 
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
     fn gpu_expert_memory_snapshot(&self) -> GpuExpertMemorySnapshot {
         self.physical_expert_registry
             .snapshot(self.gpu_expert_cache.used_bytes())
@@ -3218,7 +3216,6 @@ impl BackendBox {
     /// Exact PR4 routed-expert physical-memory ledger when this is a
     /// production GPU backend. CPU and hardware-independent test backends do
     /// not own physical wgpu expert allocations.
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
     pub fn gpu_expert_memory_snapshot(&self) -> Option<GpuExpertMemorySnapshot> {
         match self {
             Self::Gpu(gpu) => Some(gpu.gpu_expert_memory_snapshot()),
@@ -3859,7 +3856,6 @@ impl ExecutionContext {
     /// Narrow snapshot seam for PR5. Existing compatibility telemetry remains
     /// logical-admission based; this API exposes exact MER-owned physical
     /// expert and workspace bytes without log parsing.
-    #[allow(dead_code)] // Public snapshot callers arrive in PR5.
     pub fn gpu_expert_memory_snapshot(&self) -> Option<GpuExpertMemorySnapshot> {
         self.gpu_backend
             .as_ref()

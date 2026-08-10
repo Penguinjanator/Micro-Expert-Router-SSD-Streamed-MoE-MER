@@ -45,6 +45,10 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        repo.join(".git/logs/HEAD").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         repo.join(".git/index").display()
     );
     // Once any `rerun-if-changed` directive is emitted Cargo stops using its
