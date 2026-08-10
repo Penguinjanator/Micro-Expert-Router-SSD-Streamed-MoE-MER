@@ -2669,17 +2669,15 @@ impl GpuBackend {
         d_ff: usize,
         out: &mut TensorViewMut<'_>,
     ) -> std::result::Result<(), GpuExpertDispatchError> {
-        use crate::expert_cache::GpuLookup;
-
         if let Some(detail) = self.device_loss.detail() {
             return Err(GpuExpertDispatchError::new(
                 layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
             ));
         }
 
-        let admission = match self.gpu_expert_cache.get(expert_id) {
-            GpuLookup::AnchorHit(admission) | GpuLookup::LruHit(admission) => admission,
-            GpuLookup::Miss => {
+        let admission = match self.gpu_expert_cache.current_admission(expert_id) {
+            Some(admission) => admission,
+            None => {
                 self.physical_expert_registry
                     .retire_logical_miss(expert_id);
                 return Err(GpuExpertDispatchError::new(

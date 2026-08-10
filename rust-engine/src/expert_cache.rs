@@ -806,6 +806,18 @@ impl GpuExpertCache {
         GpuLookup::Miss
     }
 
+    /// Clone the current logical admission without recording a routing probe
+    /// or changing logical LRU recency. Physical backends use this to validate
+    /// identity after routing has already performed the authoritative
+    /// telemetry/recency lookup.
+    pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
+        let g = self.inner.lock();
+        g.anchor
+            .get(&id)
+            .or_else(|| g.lru.peek(&id))
+            .cloned()
+    }
+
     /// Check whether an expert is currently resident in either the
     /// anchor or LRU regions, without mutating recency or counters.
     pub fn contains(&self, id: u32) -> bool {
@@ -1356,6 +1368,72 @@ mod tests {
         assert!(!cache.try_promote_lru_no_evict(gpu_res(9, 32)));
         assert_eq!(cache.promotions(), 1);
         assert_eq!(cache.used_bytes(), 32);
+    }
+
+    #[test]
+    fn current_admission_anchor_does_not_change_counters() {
+        let cache = GpuExpertCache::new(100, 1.0, 0);
+        let resident = gpu_res(1, 32);
+        assert!(cache.promote_sync(resident.clone()));
+        assert_eq!(cache.anchor_len(), 1);
+
+        let admission = cache.current_admission(1).expect("anchor admission");
+        assert!(Arc::ptr_eq(admission.resident(), &resident));
+        assert_eq!(admission.generation(), cache.current_generation(1).unwrap());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn current_admission_lru_does_not_change_counters() {
+        let cache = GpuExpertCache::new(100, 0.0, 0);
+        let resident = gpu_res(2, 32);
+        assert!(cache.promote_sync(resident.clone()));
+        assert_eq!(cache.lru_len(), 1);
+
+        let admission = cache.current_admission(2).expect("LRU admission");
+        assert!(Arc::ptr_eq(admission.resident(), &resident));
+        assert_eq!(admission.generation(), cache.current_generation(2).unwrap());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn current_admission_lru_does_not_update_recency() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.promote_sync(gpu_res(1, 10)));
+        assert!(cache.promote_sync(gpu_res(2, 10)));
+
+        assert!(cache.current_admission(1).is_some());
+        assert!(cache.promote_sync(gpu_res(3, 10)));
+        assert!(!cache.contains(1), "non-mutating lookup must leave id 1 LRU");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn current_admission_miss_does_not_increment_misses() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.current_admission(99).is_none());
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 0);
+    }
+
+    #[test]
+    fn get_retains_counter_and_lru_recency_behavior() {
+        let cache = GpuExpertCache::new(20, 0.0, 0);
+        assert!(cache.promote_sync(gpu_res(1, 10)));
+        assert!(cache.promote_sync(gpu_res(2, 10)));
+
+        assert!(matches!(cache.get(1), GpuLookup::LruHit(_)));
+        assert!(matches!(cache.get(99), GpuLookup::Miss));
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(cache.misses(), 1);
+
+        assert!(cache.promote_sync(gpu_res(3, 10)));
+        assert!(cache.contains(1), "mutating get must make id 1 MRU");
+        assert!(!cache.contains(2), "id 2 must remain the LRU victim");
+        assert!(cache.contains(3));
     }
 
     #[test]
