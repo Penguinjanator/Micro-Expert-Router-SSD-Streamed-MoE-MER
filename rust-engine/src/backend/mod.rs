@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as ParkingMutex;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -200,6 +200,76 @@ pub struct TensorViewMut<'a> {
     pub rows: usize,
     pub cols: usize,
 }
+
+/// Failure stage for one routed-expert GPU activation.
+///
+/// `wgpu` 0.20 exposes buffer-map results and a device-loss callback, but
+/// `Queue::submit` itself returns only a submission index. Validation and
+/// submission therefore remain typed boundaries that hardware-independent
+/// tests can inject; production does not claim synchronous detection where
+/// the API cannot attribute an error to one concurrent expert dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuExpertDispatchErrorKind {
+    ResidencyMiss,
+    Upload,
+    #[allow(dead_code)] // wgpu 0.20 has no per-dispatch synchronous validation result.
+    ValidationDispatch,
+    #[allow(dead_code)] // Queue::submit returns only a SubmissionIndex in wgpu 0.20.
+    Submission,
+    ReadbackChannel,
+    ReadbackMap,
+    DeviceLost,
+    RuntimeInvariant,
+}
+
+impl fmt::Display for GpuExpertDispatchErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::ResidencyMiss => "residency-miss",
+            Self::Upload => "upload",
+            Self::ValidationDispatch => "validation-dispatch",
+            Self::Submission => "submission",
+            Self::ReadbackChannel => "readback-channel",
+            Self::ReadbackMap => "readback-map",
+            Self::DeviceLost => "device-lost",
+            Self::RuntimeInvariant => "runtime-invariant",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Typed boundary between GPU routed-expert execution and the engine's
+/// strict-vs-serving recovery policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuExpertDispatchError {
+    pub layer: u32,
+    pub expert_id: u32,
+    pub kind: GpuExpertDispatchErrorKind,
+    pub detail: String,
+}
+
+impl GpuExpertDispatchError {
+    pub(crate) fn new(
+        layer: u32,
+        expert_id: u32,
+        kind: GpuExpertDispatchErrorKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self { layer, expert_id, kind, detail: detail.into() }
+    }
+}
+
+impl fmt::Display for GpuExpertDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GPU routed expert {} (layer {}) failed at {}: {}",
+            self.expert_id, self.layer, self.kind, self.detail
+        )
+    }
+}
+
+impl std::error::Error for GpuExpertDispatchError {}
 
 /// Abstraction over GPU-resident storage for expert weight buffers.
 ///
@@ -487,9 +557,38 @@ struct ExpertWorkspace {
     scratch: Vec<f32>,
 }
 
+#[derive(Default)]
+struct DeviceLossState {
+    lost: AtomicBool,
+    detail: ParkingMutex<Option<String>>,
+}
+
+impl DeviceLossState {
+    fn record(&self, reason: wgpu::DeviceLostReason, message: String) {
+        *self.detail.lock() = Some(format!("{reason:?}: {message}"));
+        self.lost.store(true, Ordering::Release);
+    }
+
+    fn detail(&self) -> Option<String> {
+        if self.lost.load(Ordering::Acquire) {
+            Some(
+                self.detail
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "wgpu device-loss callback fired".to_string()),
+            )
+        } else {
+            None
+        }
+    }
+}
+
 pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// `wgpu` 0.20 has no synchronous device-loss return from submit, so
+    /// dispatch checks this per-device callback state at entry and after poll.
+    device_loss: Arc<DeviceLossState>,
     device_name: String,
     compute_plane: String,
 
@@ -754,6 +853,12 @@ impl GpuBackend {
                 unsupported.join(" | ")
             ));
         };
+
+        let device_loss = Arc::new(DeviceLossState::default());
+        let device_loss_callback = device_loss.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            device_loss_callback.record(reason, message);
+        });
 
         let compute_plane = wgpu_compute_plane(info.backend);
         let device_name = format!("{}-{}", compute_plane, info.name);
@@ -1087,6 +1192,7 @@ impl GpuBackend {
         Ok(Self {
             device,
             queue,
+            device_loss,
             device_name,
             compute_plane,
             matmul_pipeline,
@@ -1337,12 +1443,14 @@ impl GpuBackend {
     /// encode and submit.
     fn expert_matmul_from_vram(
         &self,
+        layer:  u32,
+        expert_id: u32,
         entry: &VramExpertEntry,
         x:     TensorView<'_>,
         out:   &mut TensorViewMut<'_>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
         let mut ws = self.acquire_expert_workspace();
-        let result = self.expert_ffn_dispatch(entry, x, out, &mut ws);
+        let result = self.expert_ffn_dispatch(layer, expert_id, entry, x, out, &mut ws);
         // Always return the workspace — including on error paths — or
         // the pool would leak a slot per failed dispatch.
         self.release_expert_workspace(ws);
@@ -1351,23 +1459,46 @@ impl GpuBackend {
 
     fn expert_ffn_dispatch(
         &self,
+        layer:  u32,
+        expert_id: u32,
         entry: &VramExpertEntry,
         x:     TensorView<'_>,
         out:   &mut TensorViewMut<'_>,
         ws:    &mut ExpertWorkspace,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
         use std::num::NonZeroU64;
 
         let d_model = entry.d_model;
         let d_ff    = entry.d_ff;
 
-        debug_assert_eq!(x.data.len(),   d_model);
-        debug_assert_eq!(out.data.len(), d_model);
+        if let Some(detail) = self.device_loss.detail() {
+            return Err(GpuExpertDispatchError::new(
+                layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
+            ));
+        }
+        if x.data.len() != d_model || out.data.len() != d_model {
+            return Err(GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                format!(
+                    "dispatch buffers disagree with resident geometry: x={} out={} d_model={d_model}",
+                    x.data.len(), out.data.len()
+                ),
+            ));
+        }
 
         // ── Upload x to the workspace's private x_buf ─────────────────────────
         // Per-workspace scratch: no contention with other dispatches or
         // with the dense ops' backend-global conversion scratch.
-        assert!(d_model <= ws.scratch.len());
+        if d_model > ws.scratch.len() {
+            return Err(GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                format!("d_model {d_model} exceeds GPU expert workspace {}", ws.scratch.len()),
+            ));
+        }
         for i in 0..d_model {
             ws.scratch[i] = x.data[i].to_f32();
         }
@@ -1542,9 +1673,25 @@ impl GpuBackend {
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
         self.device.poll(wgpu::Maintain::wait_for(submission));
 
+        if let Some(detail) = self.device_loss.detail() {
+            return Err(GpuExpertDispatchError::new(
+                layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
+            ));
+        }
+
         rx.recv()
-            .map_err(|e| anyhow::anyhow!("channel error on expert readback: {e:?}"))?
-            .map_err(|e| anyhow::anyhow!("buffer map error on expert readback: {e:?}"))?;
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::ReadbackChannel,
+                format!("expert readback callback channel failed: {e:?}"),
+            ))?
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::ReadbackMap,
+                format!("expert readback buffer map failed: {e:?}"),
+            ))?;
 
         {
             use half::slice::HalfFloatSliceExt;
@@ -1915,48 +2062,66 @@ impl Backend for GpuBackend {
         d_ff:     usize,
         out:      &mut TensorViewMut<'_>,
     ) -> Result<()> {
-        use crate::expert_cache::GpuLookup;
-        let _ = layer_idx;
-
-        // ── Fast path: expert weights already VRAM-resident ──────────────────
-        // Clone the Arc handle and release the map lock *before* the
-        // GPU dispatch so concurrent callers can probe / install
-        // other experts while this one executes.
-        let cached_entry = self.vram_expert_bufs.lock().get(&expert_id).cloned();
-        if let Some(entry) = cached_entry {
-            return self.expert_matmul_from_vram(&entry, x, out);
-        }
-
-        // Slow path: evict stale entries whose GpuExpertCache slot was reclaimed.
-        self.vram_expert_bufs
-            .lock()
-            .retain(|id, _| self.gpu_expert_cache.contains(*id));
-
-        // ── Promote from GpuExpertCache bytes → VRAM entry ────────────────────
-        match self.gpu_expert_cache.get(expert_id) {
-            GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => {
-                // Native Q4_0 residents go through the inline-dequant
-                // pipeline; everything else is the dense F32 layout.
-                let entry = Arc::new(match r.dtype() {
-                    crate::inference::WeightDtype::Q4_0 => {
-                        self.build_expert_entry_q4_0(r.data(), d_model, d_ff)?
-                    }
-                    _ => self.build_expert_entry(r.data(), d_model, d_ff)?,
-                });
-                self.vram_expert_bufs.lock().insert(expert_id, entry.clone());
-                self.expert_matmul_from_vram(&entry, x, out)
-            }
-            GpuLookup::Miss => {
-                anyhow::bail!(
-                    "expert {} not VRAM-resident; caller must fall back to CPU path",
-                    expert_id
-                )
-            }
-        }
+        let layer = u32::try_from(layer_idx)
+            .map_err(|_| anyhow!("expert layer index {layer_idx} exceeds u32"))?;
+        self.routed_expert_matmul(layer, expert_id, x, d_model, d_ff, out)
+            .map_err(anyhow::Error::new)
     }
 }
 
 impl GpuBackend {
+    fn routed_expert_matmul(
+        &self,
+        layer: u32,
+        expert_id: u32,
+        x: TensorView<'_>,
+        d_model: usize,
+        d_ff: usize,
+        out: &mut TensorViewMut<'_>,
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
+        use crate::expert_cache::GpuLookup;
+
+        if let Some(detail) = self.device_loss.detail() {
+            return Err(GpuExpertDispatchError::new(
+                layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
+            ));
+        }
+
+        let cached_entry = self.vram_expert_bufs.lock().get(&expert_id).cloned();
+        if let Some(entry) = cached_entry {
+            return self.expert_matmul_from_vram(layer, expert_id, &entry, x, out);
+        }
+
+        self.vram_expert_bufs
+            .lock()
+            .retain(|id, _| self.gpu_expert_cache.contains(*id));
+
+        match self.gpu_expert_cache.get(expert_id) {
+            GpuLookup::AnchorHit(r) | GpuLookup::LruHit(r) => {
+                // Re-run every PR2 compatibility check at the actual
+                // on-demand allocation/upload boundary.
+                let entry = match r.dtype() {
+                    crate::inference::WeightDtype::Q4_0 => {
+                        self.build_expert_entry_q4_0(r.data(), d_model, d_ff)
+                    }
+                    _ => self.build_expert_entry(r.data(), d_model, d_ff),
+                }
+                .map_err(|e| GpuExpertDispatchError::new(
+                    layer, expert_id, GpuExpertDispatchErrorKind::Upload, e.to_string(),
+                ))?;
+                let entry = Arc::new(entry);
+                self.vram_expert_bufs.lock().insert(expert_id, entry.clone());
+                self.expert_matmul_from_vram(layer, expert_id, &entry, x, out)
+            }
+            GpuLookup::Miss => Err(GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::ResidencyMiss,
+                "expert is not present in the GPU expert cache",
+            )),
+        }
+    }
+
     fn compute_plane(&self) -> &str {
         &self.compute_plane
     }
@@ -2113,6 +2278,63 @@ impl Backend for CandleBackend {
     }
 }
 
+/// Hardware-independent routed-expert GPU boundary used only by unit tests.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestGpuBackend {
+    cpu: CandleBackend,
+    outcome: TestGpuExpertOutcome,
+    expert_calls: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TestGpuExpertOutcome {
+    Success(f32),
+    Failure(GpuExpertDispatchErrorKind),
+}
+
+#[cfg(test)]
+impl TestGpuBackend {
+    pub(crate) fn success(value: f32) -> Self {
+        Self {
+            cpu: CandleBackend::new(),
+            outcome: TestGpuExpertOutcome::Success(value),
+            expert_calls: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn failure(kind: GpuExpertDispatchErrorKind) -> Self {
+        Self {
+            cpu: CandleBackend::new(),
+            outcome: TestGpuExpertOutcome::Failure(kind),
+            expert_calls: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn expert_calls(&self) -> u64 {
+        self.expert_calls.load(Ordering::Relaxed)
+    }
+
+    fn routed_expert_matmul(
+        &self,
+        layer: u32,
+        expert_id: u32,
+        out: &mut TensorViewMut<'_>,
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
+        self.expert_calls.fetch_add(1, Ordering::Relaxed);
+        match self.outcome {
+            TestGpuExpertOutcome::Success(value) => {
+                out.data.fill(half::f16::from_f32(value));
+                Ok(())
+            }
+            TestGpuExpertOutcome::Failure(kind) => Err(GpuExpertDispatchError::new(
+                layer, expert_id, kind, format!("injected {kind} failure"),
+            )),
+        }
+    }
+}
+
 // =====================================================================
 // BackendBox Dispatch Enum (Zero-cost dispatch, no dyn/vtable)
 // =====================================================================
@@ -2121,7 +2343,7 @@ pub enum BackendBox {
     Gpu(GpuBackend),
     Cpu(CandleBackend),
     #[cfg(test)]
-    TestGpu(CandleBackend),
+    TestGpu(TestGpuBackend),
 }
 
 impl BackendBox {
@@ -2131,6 +2353,31 @@ impl BackendBox {
             BackendBox::Cpu(_) => "cpu-fallback",
             #[cfg(test)]
             BackendBox::TestGpu(_) => "test-gpu",
+        }
+    }
+
+    /// Typed dispatch for real-model routed experts. The legacy trait method
+    /// maps this to anyhow only for synthetic compatibility diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routed_expert_matmul(
+        &self,
+        layer: u32,
+        expert_id: u32,
+        x: TensorView<'_>,
+        d_model: usize,
+        d_ff: usize,
+        out: &mut TensorViewMut<'_>,
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
+        match self {
+            Self::Gpu(gpu) => gpu.routed_expert_matmul(layer, expert_id, x, d_model, d_ff, out),
+            Self::Cpu(_) => Err(GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                "resolved GPU routed-expert plan selected a CPU backend",
+            )),
+            #[cfg(test)]
+            Self::TestGpu(gpu) => gpu.routed_expert_matmul(layer, expert_id, out),
         }
     }
 }
@@ -2159,7 +2406,7 @@ impl Backend for BackendBox {
             BackendBox::Gpu(gpu) => gpu.matmul_into(a, b, out),
             BackendBox::Cpu(cpu) => cpu.matmul_into(a, b, out),
             #[cfg(test)]
-            BackendBox::TestGpu(cpu) => cpu.matmul_into(a, b, out),
+            BackendBox::TestGpu(gpu) => gpu.cpu.matmul_into(a, b, out),
         }
     }
 
@@ -2168,7 +2415,7 @@ impl Backend for BackendBox {
             BackendBox::Gpu(gpu) => gpu.swiglu_into(gate, up, out),
             BackendBox::Cpu(cpu) => cpu.swiglu_into(gate, up, out),
             #[cfg(test)]
-            BackendBox::TestGpu(cpu) => cpu.swiglu_into(gate, up, out),
+            BackendBox::TestGpu(gpu) => gpu.cpu.swiglu_into(gate, up, out),
         }
     }
 
@@ -2177,7 +2424,7 @@ impl Backend for BackendBox {
             BackendBox::Gpu(gpu) => gpu.softmax(x),
             BackendBox::Cpu(cpu) => cpu.softmax(x),
             #[cfg(test)]
-            BackendBox::TestGpu(cpu) => cpu.softmax(x),
+            BackendBox::TestGpu(gpu) => gpu.cpu.softmax(x),
         }
     }
 
@@ -2192,7 +2439,7 @@ impl Backend for BackendBox {
             BackendBox::Gpu(gpu) => gpu.kv_cache_insert(layer, position, k, v),
             BackendBox::Cpu(cpu) => cpu.kv_cache_insert(layer, position, k, v),
             #[cfg(test)]
-            BackendBox::TestGpu(cpu) => cpu.kv_cache_insert(layer, position, k, v),
+            BackendBox::TestGpu(gpu) => gpu.cpu.kv_cache_insert(layer, position, k, v),
         }
     }
 
@@ -2207,7 +2454,7 @@ impl Backend for BackendBox {
             BackendBox::Gpu(gpu) => gpu.kv_attend(layer, q, seq_len, out),
             BackendBox::Cpu(cpu) => cpu.kv_attend(layer, q, seq_len, out),
             #[cfg(test)]
-            BackendBox::TestGpu(cpu) => cpu.kv_attend(layer, q, seq_len, out),
+            BackendBox::TestGpu(gpu) => gpu.cpu.kv_attend(layer, q, seq_len, out),
         }
     }
 
@@ -2220,12 +2467,10 @@ impl Backend for BackendBox {
         d_ff:     usize,
         out:      &mut TensorViewMut<'_>,
     ) -> Result<()> {
-        match self {
-            Self::Gpu(g) => g.expert_matmul(layer_idx, expert_id, x, d_model, d_ff, out),
-            Self::Cpu(c) => c.expert_matmul(layer_idx, expert_id, x, d_model, d_ff, out),
-            #[cfg(test)]
-            Self::TestGpu(c) => c.expert_matmul(layer_idx, expert_id, x, d_model, d_ff, out),
-        }
+        let layer = u32::try_from(layer_idx)
+            .map_err(|_| anyhow!("expert layer index {layer_idx} exceeds u32"))?;
+        self.routed_expert_matmul(layer, expert_id, x, d_model, d_ff, out)
+            .map_err(anyhow::Error::new)
     }
 }
 
@@ -3057,6 +3302,33 @@ where
     )
 }
 
+/// Intentionally unchecked context for the one engine invariant regression
+/// proving that a strict GPU plan cannot silently execute through CPU.
+#[cfg(test)]
+pub(crate) fn test_gpu_execution_context_unchecked(
+    routed_expert_backend: Arc<BackendBox>,
+    routed_expert_gpu_spec: RoutedExpertGpuSpec,
+) -> Arc<ExecutionContext> {
+    let context_id = next_execution_context_id();
+    let plan = ResolvedExecutionPlan::from_resolution(
+        BackendResolution {
+            requested: ComputeOffload::Hybrid,
+            resolved: ResolvedBackend::HybridCpuAttentionGpuExperts,
+            fallback_occurred: false,
+            reason: None,
+        },
+        context_id,
+        true,
+        routed_expert_gpu_spec,
+        true,
+    );
+    Arc::new(ExecutionContext::new(
+        plan,
+        Some(routed_expert_backend),
+        Arc::new(crate::expert_cache::GpuExpertCache::new(1024, 0.5, 16)),
+    ))
+}
+
 fn resolve_execution_context_with_device_limits<F>(
     requested: ComputeOffload,
     strict_attention: bool,
@@ -3311,7 +3583,7 @@ mod tests {
     }
 
     fn test_gpu_backend() -> Arc<BackendBox> {
-        Arc::new(BackendBox::TestGpu(CandleBackend::new()))
+        Arc::new(BackendBox::TestGpu(TestGpuBackend::success(1.0)))
     }
 
     fn test_gpu_expert_cache(capacity_bytes: usize) -> Arc<crate::expert_cache::GpuExpertCache> {
