@@ -251,6 +251,7 @@ historical baseline.
 
 | Document | What it contains |
 |---|---|
+| [`docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md) | NVIDIA L4 numerical qualification for canonical raw Q4_0 WGSL cases, one complete checkpoint expert, and physical-residency reuse; not a model-quality or TPS claim. |
 | [`docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md) | Strict CPU-only `bench-real` validation for one Qwen3-Coder 30B-A3B Q8_0 checkpoint, with generated tokens/s and cache-capacity caveats. |
 | [`docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md`](docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md) | July 2026 observed VM validation for Rayon/autotune, including fast/slow compute-regime caveats. |
 | [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md) | Historical full cache-scaling suite for Mixtral Q4_0 on GCP local NVMe. |
