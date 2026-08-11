@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 /// Maximum routed-expert workspace dimension supported for both `d_model` and
 /// `d_ff`. Sized for Mixtral-8x7B (`d_ff = 14336`).
 const MAX_EXPERT_D_FF: usize = 16_384;
+const DENSE_WORK_MAX_ELEMS: usize = 4096 * 4096;
+const DENSE_BUFFER_BYTES: u64 = (DENSE_WORK_MAX_ELEMS * std::mem::size_of::<f32>()) as u64;
 
 // Embed WGSL shaders using include_str
 const MATMUL_SHADER: &str = include_str!("wgpu_shaders/matmul.wgsl");
@@ -24,6 +26,104 @@ const ATTENTION_SHADER: &str = include_str!("wgpu_shaders/attention.wgsl");
 /// WARP, etc.) as an allowed wgpu plane. The normal `--gpu` path should
 /// never report these as a real GPU benchmark.
 const ALLOW_SOFTWARE_WGPU_ADAPTER_ENV: &str = "MER_WGPU_ALLOW_SOFTWARE_ADAPTER";
+
+/// Explicit construction mode for the authoritative wgpu backend.
+///
+/// `RoutedExpertsOnly` is the strict Hybrid capability set: it owns the
+/// adapter/device and routed-expert resources, but no dense, attention, or KV
+/// resources. `Full` preserves the existing legacy GPU resource set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuBackendMode {
+    RoutedExpertsOnly,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuCapability {
+    RoutedExperts,
+    Dense,
+    Attention,
+    Kv,
+}
+
+/// Typed fail-closed error returned when code calls a GPU component that the
+/// authoritative execution plan deliberately left on CPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuCapabilityUnavailable {
+    pub mode: GpuBackendMode,
+    pub capability: GpuCapability,
+}
+
+impl fmt::Display for GpuCapabilityUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GPU capability {:?} is unavailable in {:?} backend mode",
+            self.capability, self.mode
+        )
+    }
+}
+
+impl std::error::Error for GpuCapabilityUnavailable {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuResourceInvariantError {
+    mode: GpuBackendMode,
+    resource: &'static str,
+}
+
+impl fmt::Display for GpuResourceInvariantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GPU resource plan for {:?} requires {}, but it was not constructed",
+            self.mode, self.resource
+        )
+    }
+}
+
+impl std::error::Error for GpuResourceInvariantError {}
+
+/// Typed startup allocation error emitted before `Device::create_buffer`, so
+/// oversized planned resources cannot reach wgpu's uncaptured-error handler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GpuStartupAllocationError {
+    ExceedsMaxBufferSize {
+        label: String,
+        requested: u64,
+        maximum: u64,
+    },
+    ExceedsMaxStorageBindingSize {
+        label: String,
+        requested: u64,
+        maximum: u64,
+    },
+}
+
+impl fmt::Display for GpuStartupAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExceedsMaxBufferSize {
+                label,
+                requested,
+                maximum,
+            } => write!(
+                f,
+                "GPU startup buffer {label:?} requests {requested} bytes, exceeding device max_buffer_size {maximum}"
+            ),
+            Self::ExceedsMaxStorageBindingSize {
+                label,
+                requested,
+                maximum,
+            } => write!(
+                f,
+                "GPU startup storage buffer {label:?} requests {requested} bytes, exceeding device max_storage_buffer_binding_size {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GpuStartupAllocationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AdapterMetadata {
@@ -1140,11 +1240,11 @@ impl GpuStorage for VramExpertEntry {
 const EXPERT_WORKSPACE_POOL: usize = 4;
 const EXPERT_WORKSPACE_DEVICE_BUFFERS: u64 = 5;
 
-fn expert_workspace_device_bytes(buffer_bytes: u64, workspace_count: usize) -> u64 {
+fn expert_workspace_device_bytes(buffer_bytes: u64, workspace_count: usize) -> Option<u64> {
+    let workspace_count = u64::try_from(workspace_count).ok()?;
     buffer_bytes
         .checked_mul(EXPERT_WORKSPACE_DEVICE_BUFFERS)
-        .and_then(|per_workspace| per_workspace.checked_mul(workspace_count as u64))
-        .expect("routed-expert workspace byte calculation overflow")
+        .and_then(|per_workspace| per_workspace.checked_mul(workspace_count))
 }
 
 /// Private buffer set for one in-flight expert FFN dispatch.
@@ -1216,6 +1316,136 @@ impl DeviceLossState {
     }
 }
 
+struct DenseGpuResources {
+    work_a: wgpu::Buffer,
+    work_b: wgpu::Buffer,
+    work_out: wgpu::Buffer,
+    _staging_up: wgpu::Buffer,
+    staging_dn: wgpu::Buffer,
+    matmul_bind_group: wgpu::BindGroup,
+    swiglu_bind_group: wgpu::BindGroup,
+    softmax_pipeline: wgpu::ComputePipeline,
+    softmax_bind_group: wgpu::BindGroup,
+    conversion_scratch: ParkingMutex<Vec<f32>>,
+}
+
+struct AttentionGpuResources {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    kv_cache: GpuKvCache,
+}
+
+/// Optional component resources constructed from the authoritative GPU plan.
+/// Production and hardware-independent tests share this exact factory/access
+/// seam, so disabled branches cannot diverge from the methods that consume
+/// the resulting resources.
+struct GpuComponentResources<D, A> {
+    plan: GpuResourcePlan,
+    dense: Option<D>,
+    attention: Option<A>,
+}
+
+impl<D, A> GpuComponentResources<D, A> {
+    fn try_new(
+        plan: GpuResourcePlan,
+        build_dense: impl FnOnce() -> Result<D>,
+        build_attention: impl FnOnce(&D) -> Result<A>,
+    ) -> Result<Self> {
+        let dense = if plan.constructs_dense_resources() {
+            Some(build_dense()?)
+        } else {
+            None
+        };
+        let attention = if plan.constructs_attention_resources() {
+            let dense = dense.as_ref().ok_or_else(|| {
+                anyhow::Error::new(GpuResourceInvariantError {
+                    mode: plan.mode(),
+                    resource: "dense resources required by attention",
+                })
+            })?;
+            Some(build_attention(dense)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            plan,
+            dense,
+            attention,
+        })
+    }
+
+    const fn plan(&self) -> GpuResourcePlan {
+        self.plan
+    }
+
+    fn require_capability(&self, capability: GpuCapability) -> Result<()> {
+        self.plan
+            .require_capability(capability)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn dense(&self, capability: GpuCapability) -> Result<&D> {
+        self.require_capability(capability)?;
+        self.dense.as_ref().ok_or_else(|| {
+            anyhow::Error::new(GpuResourceInvariantError {
+                mode: self.plan.mode(),
+                resource: "dense resources",
+            })
+        })
+    }
+
+    fn attention(&self) -> Result<&A> {
+        self.require_capability(GpuCapability::Attention)?;
+        self.attention.as_ref().ok_or_else(|| {
+            anyhow::Error::new(GpuResourceInvariantError {
+                mode: self.plan.mode(),
+                resource: "attention resources",
+            })
+        })
+    }
+}
+
+fn validate_startup_buffer(
+    label: &str,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    limits: &wgpu::Limits,
+) -> std::result::Result<(), GpuStartupAllocationError> {
+    if size > limits.max_buffer_size {
+        return Err(GpuStartupAllocationError::ExceedsMaxBufferSize {
+            label: label.to_string(),
+            requested: size,
+            maximum: limits.max_buffer_size,
+        });
+    }
+    let max_storage = u64::from(limits.max_storage_buffer_binding_size);
+    if usage.contains(wgpu::BufferUsages::STORAGE) && size > max_storage {
+        return Err(
+            GpuStartupAllocationError::ExceedsMaxStorageBindingSize {
+                label: label.to_string(),
+                requested: size,
+                maximum: max_storage,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn create_startup_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    size: u64,
+    usage: wgpu::BufferUsages,
+) -> std::result::Result<wgpu::Buffer, GpuStartupAllocationError> {
+    validate_startup_buffer(label, size, usage, &device.limits())?;
+    Ok(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    }))
+}
+
 pub struct GpuBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1226,36 +1456,13 @@ pub struct GpuBackend {
     compute_plane: String,
     adapter_metadata: AdapterMetadata,
     expert_io: GpuExpertIoCounters,
+    component_resources: GpuComponentResources<DenseGpuResources, AttentionGpuResources>,
 
-    matmul_pipeline: wgpu::ComputePipeline,
+    matmul_pipeline: Option<wgpu::ComputePipeline>,
     /// Q4_0 inline-dequant GEMV pipeline (`matmul_q4_0.wgsl`) for expert
     /// FFN passes whose weights stay in native GGUF Q4_0 blocks in VRAM.
-    matmul_q4_0_pipeline: wgpu::ComputePipeline,
+    matmul_q4_0_pipeline: Option<wgpu::ComputePipeline>,
     swiglu_pipeline: wgpu::ComputePipeline,
-    softmax_pipeline: wgpu::ComputePipeline,
-    attention_pipeline: wgpu::ComputePipeline,
-
-    work_a: wgpu::Buffer,
-    work_b: wgpu::Buffer,
-    work_out: wgpu::Buffer,
-
-    _staging_up: wgpu::Buffer,
-    staging_dn: wgpu::Buffer,
-
-    kv_cache: GpuKvCache,
-
-    matmul_bind_group: wgpu::BindGroup,
-    swiglu_bind_group: wgpu::BindGroup,
-    softmax_bind_group: wgpu::BindGroup,
-    attention_bind_group: wgpu::BindGroup,
-
-    /// f16→f32 staging scratch for buffer uploads. A real `Mutex` (not
-    /// `UnsafeCell`) so concurrent callers — e.g. two Tokio tasks that
-    /// share the same `Arc<GpuBackend>` when the batch scheduler fuses
-    /// requests — serialize instead of aliasing `&mut` into the same
-    /// buffer. The lock only covers a host-side convert + `write_buffer`
-    /// (microseconds), so contention is negligible.
-    conversion_scratch: ParkingMutex<Vec<f32>>,
 
     /// Serializes the *whole* dense-op execution (`matmul_into`,
     /// `swiglu_into`, `softmax`, `kv_attend`) against the backend-global
@@ -1309,16 +1516,34 @@ impl GpuBackend {
             .max(1)
     }
 
-    pub async fn try_new(
-        num_layers: usize,
-        max_seq_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        v_head_dim: usize,
+    fn dense_resources(
+        &self,
+        capability: GpuCapability,
+    ) -> Result<&DenseGpuResources> {
+        self.component_resources.dense(capability)
+    }
+
+    fn attention_resources(&self) -> Result<&AttentionGpuResources> {
+        self.component_resources.attention()
+    }
+
+    async fn try_new(
+        resource_plan: GpuResourcePlan,
+        geometry: GpuBackendGeometry,
         gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
-        q4_truncation_tolerance: usize,
     ) -> Result<Self> {
+        resource_plan
+            .require_capability(GpuCapability::RoutedExperts)
+            .map_err(anyhow::Error::new)?;
+        let GpuBackendGeometry {
+            num_layers,
+            max_seq_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            v_head_dim,
+            q4_truncation_tolerance,
+        } = geometry;
         // GQA models have num_kv_heads < num_heads; 0 means MHA.
         let num_kv_heads = if num_kv_heads == 0 { num_heads } else { num_kv_heads };
         // Finding 12: `v_head_dim == 0` means "symmetric" (V uses the query
@@ -1503,18 +1728,28 @@ impl GpuBackend {
             device = format_args!("{:#06x}", info.device),
             driver = %info.driver,
             driver_info = %info.driver_info,
+            mode = ?resource_plan.mode(),
+            dense_gpu_bytes = resource_plan.dense_allocation_bytes(),
+            kv_gpu_bytes = resource_plan.kv_allocation_bytes(),
+            expert_workspace_gpu_bytes = resource_plan.expert_workspace_allocation_bytes(),
             "selected wgpu compute plane"
         );
 
-        // Compile modules
-        let matmul_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("matmul_shader"),
-            source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
+        // Compile only the matmul format(s) required by the authoritative
+        // component-scoped resource plan. Strict Hybrid Q4_0 therefore never
+        // constructs the dense F32 shader/pipeline.
+        let matmul_module = resource_plan.constructs_f32_matmul_pipeline().then(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("matmul_shader"),
+                source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
+            })
         });
 
-        let matmul_q4_0_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("matmul_q4_0_shader"),
-            source: wgpu::ShaderSource::Wgsl(MATMUL_Q4_0_SHADER.into()),
+        let matmul_q4_0_module = resource_plan.constructs_q4_0_matmul_pipeline().then(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("matmul_q4_0_shader"),
+                source: wgpu::ShaderSource::Wgsl(MATMUL_Q4_0_SHADER.into()),
+            })
         });
 
         let swiglu_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1522,27 +1757,29 @@ impl GpuBackend {
             source: wgpu::ShaderSource::Wgsl(SWIGLU_SHADER.into()),
         });
 
-        let softmax_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("softmax_shader"),
-            source: wgpu::ShaderSource::Wgsl(SOFTMAX_SHADER.into()),
+        let softmax_module = resource_plan.constructs_dense_resources().then(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("softmax_shader"),
+                source: wgpu::ShaderSource::Wgsl(SOFTMAX_SHADER.into()),
+            })
         });
 
-        // Compile attention shader, injecting dynamic MAX_SEQ_LEN, MAX_HEAD_DIM
-        // and MAX_V_HEAD_DIM (Finding 12: the V accumulator / output width is
-        // sized by the value head dim, which may differ from head_dim).
-        let attention_src = ATTENTION_SHADER.replace(
-            "const MAX_SEQ_LEN: u32 = 4096u;",
-            &format!("const MAX_SEQ_LEN: u32 = {}u;", max_seq_len),
-        ).replace(
-            "const MAX_HEAD_DIM: u32 = 256u;",
-            &format!("const MAX_HEAD_DIM: u32 = {}u;", head_dim),
-        ).replace(
-            "const MAX_V_HEAD_DIM: u32 = 256u;",
-            &format!("const MAX_V_HEAD_DIM: u32 = {}u;", v_head_dim),
-        );
-        let attention_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("attention_shader"),
-            source: wgpu::ShaderSource::Wgsl(attention_src.into()),
+        // Attention/KV shader construction is absent in RoutedExpertsOnly.
+        let attention_module = resource_plan.constructs_attention_resources().then(|| {
+            let attention_src = ATTENTION_SHADER.replace(
+                "const MAX_SEQ_LEN: u32 = 4096u;",
+                &format!("const MAX_SEQ_LEN: u32 = {}u;", max_seq_len),
+            ).replace(
+                "const MAX_HEAD_DIM: u32 = 256u;",
+                &format!("const MAX_HEAD_DIM: u32 = {}u;", head_dim),
+            ).replace(
+                "const MAX_V_HEAD_DIM: u32 = 256u;",
+                &format!("const MAX_V_HEAD_DIM: u32 = {}u;", v_head_dim),
+            );
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("attention_shader"),
+                source: wgpu::ShaderSource::Wgsl(attention_src.into()),
+            })
         });
 
         // Setup layouts manually for pipelines since push constants are used
@@ -1582,7 +1819,7 @@ impl GpuBackend {
             ],
         });
 
-        let layout_1_buffer = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let layout_1_buffer = resource_plan.constructs_dense_resources().then(|| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("layout_1_buffer"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -1596,7 +1833,7 @@ impl GpuBackend {
                     count: None,
                 },
             ],
-        });
+        }));
 
         let matmul_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("matmul_pipeline_layout"),
@@ -1616,44 +1853,52 @@ impl GpuBackend {
             }],
         });
 
-        let softmax_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("softmax_pipeline_layout"),
-            bind_group_layouts: &[&layout_1_buffer],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..16,
-            }],
+        let softmax_pipeline_layout = layout_1_buffer.as_ref().map(|layout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("softmax_pipeline_layout"),
+                bind_group_layouts: &[layout],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..16,
+                }],
+            })
         });
 
-        let attention_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("attention_pipeline_layout"),
-            bind_group_layouts: &[&layout_3_buffers],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::COMPUTE,
-                // 6 × u32 + 2 × u32 padding = 32 bytes, matching the
-                // 32-byte limit requested in `required_limits`.
-                range: 0..32,
-            }],
-        });
+        let attention_pipeline_layout = resource_plan
+            .constructs_attention_resources()
+            .then(|| device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("attention_pipeline_layout"),
+                bind_group_layouts: &[&layout_3_buffers],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    // 6 × u32 + 2 × u32 padding = 32 bytes, matching the
+                    // 32-byte limit requested in `required_limits`.
+                    range: 0..32,
+                }],
+            }));
 
         // Compute pipelines
-        let matmul_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("matmul_pipeline"),
-            layout: Some(&matmul_pipeline_layout),
-            module: &matmul_module,
-            entry_point: "matmul_main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        let matmul_pipeline = matmul_module.as_ref().map(|module| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("matmul_pipeline"),
+                layout: Some(&matmul_pipeline_layout),
+                module,
+                entry_point: "matmul_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
         });
 
         // Same bind-group shape (read, read, read-write) and the same
         // 16-byte push-constant block as the dense pipeline, so the
         // pipeline layout is shared; only the module/entry differ.
-        let matmul_q4_0_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("matmul_q4_0_pipeline"),
-            layout: Some(&matmul_pipeline_layout),
-            module: &matmul_q4_0_module,
-            entry_point: "matmul_q4_0_main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        let matmul_q4_0_pipeline = matmul_q4_0_module.as_ref().map(|module| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("matmul_q4_0_pipeline"),
+                layout: Some(&matmul_pipeline_layout),
+                module,
+                entry_point: "matmul_q4_0_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
         });
 
         let swiglu_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1664,93 +1909,76 @@ impl GpuBackend {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        let softmax_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("softmax_pipeline"),
-            layout: Some(&softmax_pipeline_layout),
-            module: &softmax_module,
-            entry_point: "softmax_main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        let mut softmax_pipeline = softmax_module.as_ref().map(|module| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("softmax_pipeline"),
+                layout: softmax_pipeline_layout.as_ref(),
+                module,
+                entry_point: "softmax_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
         });
 
-        let attention_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("attention_pipeline"),
-            layout: Some(&attention_pipeline_layout),
-            module: &attention_module,
-            entry_point: "attention_main",
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        });
-
-        // Pre-allocated buffers
-        const MAX_ELEM: usize = 4096 * 4096;
-        let work_a = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("work_a"),
-            size: (MAX_ELEM * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let work_b = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("work_b"),
-            size: (MAX_ELEM * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let work_out = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("work_out"),
-            size: (MAX_ELEM * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        let mut attention_pipeline = attention_module.as_ref().map(|module| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("attention_pipeline"),
+                layout: attention_pipeline_layout.as_ref(),
+                module,
+                entry_point: "attention_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
         });
 
         // Per-dispatch expert FFN workspaces — see [`ExpertWorkspace`].
-        let workspace_bytes = (MAX_EXPERT_D_FF * 4) as u64;
+        let workspace_bytes = (MAX_EXPERT_D_FF * std::mem::size_of::<f32>()) as u64;
         let storage_usage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
         let expert_workspaces: Vec<ExpertWorkspace> = (0..EXPERT_WORKSPACE_POOL)
-            .map(|i| ExpertWorkspace {
-                x_buf: device.create_buffer(&wgpu::BufferDescriptor {
-                    label:              Some(&format!("expert_ws{i}_x")),
-                    size:               workspace_bytes,
-                    usage:              storage_usage,
-                    mapped_at_creation: false,
-                }),
-                mid_1: device.create_buffer(&wgpu::BufferDescriptor {
-                    label:              Some(&format!("expert_ws{i}_mid_1")),
-                    size:               workspace_bytes,
-                    usage:              storage_usage,
-                    mapped_at_creation: false,
-                }),
-                mid_2: device.create_buffer(&wgpu::BufferDescriptor {
-                    label:              Some(&format!("expert_ws{i}_mid_2")),
-                    size:               workspace_bytes,
-                    usage:              storage_usage,
-                    mapped_at_creation: false,
-                }),
-                ffn_out: device.create_buffer(&wgpu::BufferDescriptor {
-                    label:              Some(&format!("expert_ws{i}_ffn_out")),
-                    size:               workspace_bytes,
-                    usage:              storage_usage,
-                    mapped_at_creation: false,
-                }),
-                staging: device.create_buffer(&wgpu::BufferDescriptor {
-                    label:              Some(&format!("expert_ws{i}_staging")),
-                    size:               workspace_bytes,
-                    usage:              wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                scratch: vec![0.0f32; MAX_EXPERT_D_FF],
+            .map(|i| -> Result<ExpertWorkspace> {
+                Ok(ExpertWorkspace {
+                    x_buf: create_startup_buffer(
+                        &device,
+                        &format!("expert_ws{i}_x"),
+                        workspace_bytes,
+                        storage_usage,
+                    )?,
+                    mid_1: create_startup_buffer(
+                        &device,
+                        &format!("expert_ws{i}_mid_1"),
+                        workspace_bytes,
+                        storage_usage,
+                    )?,
+                    mid_2: create_startup_buffer(
+                        &device,
+                        &format!("expert_ws{i}_mid_2"),
+                        workspace_bytes,
+                        storage_usage,
+                    )?,
+                    ffn_out: create_startup_buffer(
+                        &device,
+                        &format!("expert_ws{i}_ffn_out"),
+                        workspace_bytes,
+                        storage_usage,
+                    )?,
+                    staging: create_startup_buffer(
+                        &device,
+                        &format!("expert_ws{i}_staging"),
+                        workspace_bytes,
+                        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    )?,
+                    scratch: vec![0.0f32; MAX_EXPERT_D_FF],
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let actual_expert_workspace_bytes = expert_workspaces
             .iter()
             .map(ExpertWorkspace::device_bytes)
             .try_fold(0u64, u64::checked_add)
-            .expect("routed-expert workspace byte total overflow");
+            .ok_or_else(|| anyhow!("routed-expert workspace byte total overflow"))?;
         debug_assert_eq!(
             actual_expert_workspace_bytes,
-            expert_workspace_device_bytes(workspace_bytes, EXPERT_WORKSPACE_POOL)
+            resource_plan.expert_workspace_allocation_bytes()
         );
         let expert_capacity_bytes = u64::try_from(gpu_expert_cache.capacity_bytes())
             .map_err(|_| anyhow!("GPU expert capacity does not fit u64"))?;
@@ -1761,82 +1989,154 @@ impl GpuBackend {
         let physical_expert_registry =
             PhysicalGpuExpertRegistry::new(expert_memory_ledger);
 
-        let staging_up = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_up"),
-            size: (MAX_ELEM * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let staging_dn = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_dn"),
-            size: (MAX_ELEM * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // KV cache — asymmetric K/V widths (Finding 12). K uses the query
-        // head dim (`num_kv_heads × head_dim`); V uses the value head dim
-        // (`num_kv_heads × v_head_dim`). They coincide for every symmetric
-        // architecture. Each layer stores `[K | V]` = `max_seq_len × (k_dim
-        // + v_dim)` f32 elements.
-        let k_dim = num_kv_heads * head_dim;
-        let v_dim = num_kv_heads * v_head_dim;
-        let kv_cache_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kv_cache"),
-            size: (num_layers * max_seq_len * (k_dim + v_dim) * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let kv_cache = GpuKvCache {
-            buffer: kv_cache_buffer,
-            num_layers,
-            max_seq_len,
-            k_dim,
-            v_dim,
-        };
-
-        // Pre-build bind groups
-        let matmul_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("matmul_bind_group"),
-            layout: &layout_3_buffers,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: work_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
-            ],
-        });
-
-        let swiglu_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("swiglu_bind_group"),
-            layout: &layout_3_buffers,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: work_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
-            ],
-        });
-
-        let softmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("softmax_bind_group"),
-            layout: &layout_1_buffer,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
-            ],
-        });
-
-        let attention_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("attention_bind_group"),
-            layout: &layout_3_buffers,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: work_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: kv_cache.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: work_out.as_entire_binding() },
-            ],
-        });
-
-        let conversion_scratch = ParkingMutex::new(vec![0.0f32; MAX_ELEM]);
+        let component_resources = GpuComponentResources::try_new(
+            resource_plan,
+            || {
+                let storage_usage = wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC;
+                let work_a =
+                    create_startup_buffer(&device, "work_a", DENSE_BUFFER_BYTES, storage_usage)?;
+                let work_b =
+                    create_startup_buffer(&device, "work_b", DENSE_BUFFER_BYTES, storage_usage)?;
+                let work_out = create_startup_buffer(
+                    &device,
+                    "work_out",
+                    DENSE_BUFFER_BYTES,
+                    storage_usage,
+                )?;
+                let staging_up = create_startup_buffer(
+                    &device,
+                    "staging_up",
+                    DENSE_BUFFER_BYTES,
+                    wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                )?;
+                let staging_dn = create_startup_buffer(
+                    &device,
+                    "staging_dn",
+                    DENSE_BUFFER_BYTES,
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                )?;
+                let matmul_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("matmul_bind_group"),
+                    layout: &layout_3_buffers,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: work_a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: work_b.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: work_out.as_entire_binding(),
+                        },
+                    ],
+                });
+                let swiglu_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("swiglu_bind_group"),
+                    layout: &layout_3_buffers,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: work_a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: work_b.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: work_out.as_entire_binding(),
+                        },
+                    ],
+                });
+                let softmax_layout = layout_1_buffer.as_ref().ok_or_else(|| {
+                    anyhow::Error::new(GpuResourceInvariantError {
+                        mode: resource_plan.mode(),
+                        resource: "softmax bind-group layout",
+                    })
+                })?;
+                let softmax_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("softmax_bind_group"),
+                    layout: softmax_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: work_a.as_entire_binding(),
+                    }],
+                });
+                let softmax_pipeline = softmax_pipeline.take().ok_or_else(|| {
+                    anyhow::Error::new(GpuResourceInvariantError {
+                        mode: resource_plan.mode(),
+                        resource: "softmax pipeline",
+                    })
+                })?;
+                Ok(DenseGpuResources {
+                    work_a,
+                    work_b,
+                    work_out,
+                    _staging_up: staging_up,
+                    staging_dn,
+                    matmul_bind_group,
+                    swiglu_bind_group,
+                    softmax_pipeline,
+                    softmax_bind_group,
+                    conversion_scratch: ParkingMutex::new(vec![0.0f32; DENSE_WORK_MAX_ELEMS]),
+                })
+            },
+            |dense| {
+                let k_dim = num_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+                    anyhow!("GPU KV key geometry overflow after validation")
+                })?;
+                let v_dim = num_kv_heads.checked_mul(v_head_dim).ok_or_else(|| {
+                    anyhow!("GPU KV value geometry overflow after validation")
+                })?;
+                let kv_cache_buffer = create_startup_buffer(
+                    &device,
+                    "kv_cache",
+                    resource_plan.kv_allocation_bytes(),
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                )?;
+                let kv_cache = GpuKvCache {
+                    buffer: kv_cache_buffer,
+                    num_layers,
+                    max_seq_len,
+                    k_dim,
+                    v_dim,
+                };
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("attention_bind_group"),
+                    layout: &layout_3_buffers,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: dense.work_a.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: kv_cache.buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: dense.work_out.as_entire_binding(),
+                        },
+                    ],
+                });
+                let pipeline = attention_pipeline.take().ok_or_else(|| {
+                    anyhow::Error::new(GpuResourceInvariantError {
+                        mode: resource_plan.mode(),
+                        resource: "attention pipeline",
+                    })
+                })?;
+                Ok(AttentionGpuResources {
+                    pipeline,
+                    bind_group,
+                    kv_cache,
+                })
+            },
+        )?;
 
         Ok(Self {
             device,
@@ -1846,22 +2146,10 @@ impl GpuBackend {
             compute_plane,
             adapter_metadata: info,
             expert_io: GpuExpertIoCounters::default(),
+            component_resources,
             matmul_pipeline,
             matmul_q4_0_pipeline,
             swiglu_pipeline,
-            softmax_pipeline,
-            attention_pipeline,
-            work_a,
-            work_b,
-            work_out,
-            _staging_up: staging_up,
-            staging_dn,
-            kv_cache,
-            matmul_bind_group,
-            swiglu_bind_group,
-            softmax_bind_group,
-            attention_bind_group,
-            conversion_scratch,
             dense_exec_lock: ParkingMutex::new(()),
             num_heads,
             num_kv_heads,
@@ -2231,10 +2519,23 @@ impl GpuBackend {
         // submit+readback; paying it per dispatch is what frees the expert
         // path from the shared `work_*` buffers (and the execution lock
         // that serialized them).
-        let matmul_bgl = match entry.layout {
-            VramWeightLayout::F32  => self.matmul_pipeline.get_bind_group_layout(0),
-            VramWeightLayout::Q4_0 => self.matmul_q4_0_pipeline.get_bind_group_layout(0),
-        };
+        let matmul_pipeline = match entry.layout {
+            VramWeightLayout::F32 => self.matmul_pipeline.as_ref(),
+            VramWeightLayout::Q4_0 => self.matmul_q4_0_pipeline.as_ref(),
+        }
+        .ok_or_else(|| {
+            GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                format!(
+                    "routed-expert {:?} pipeline is unavailable in {:?} backend mode",
+                    entry.layout,
+                    self.component_resources.plan().mode()
+                ),
+            )
+        })?;
+        let matmul_bgl = matmul_pipeline.get_bind_group_layout(0);
         let swiglu_bgl = self.swiglu_pipeline.get_bind_group_layout(0);
 
         // Weight binding for a projection pass. F32 binds the projection's
@@ -2294,7 +2595,7 @@ impl GpuBackend {
             });
             match entry.layout {
                 VramWeightLayout::F32 => {
-                    cpass.set_pipeline(&self.matmul_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &gate_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
@@ -2302,7 +2603,7 @@ impl GpuBackend {
                     cpass.dispatch_workgroups(1, (d_ff as u32 + 15) / 16, 1);
                 }
                 VramWeightLayout::Q4_0 => {
-                    cpass.set_pipeline(&self.matmul_q4_0_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &gate_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
@@ -2320,7 +2621,7 @@ impl GpuBackend {
             });
             match entry.layout {
                 VramWeightLayout::F32 => {
-                    cpass.set_pipeline(&self.matmul_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &up_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32, w_block_off: 0,
@@ -2328,7 +2629,7 @@ impl GpuBackend {
                     cpass.dispatch_workgroups(1, (d_ff as u32 + 15) / 16, 1);
                 }
                 VramWeightLayout::Q4_0 => {
-                    cpass.set_pipeline(&self.matmul_q4_0_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &up_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_ff as u32, n: 1, k: d_model as u32,
@@ -2364,7 +2665,7 @@ impl GpuBackend {
             });
             match entry.layout {
                 VramWeightLayout::F32 => {
-                    cpass.set_pipeline(&self.matmul_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &down_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_model as u32, n: 1, k: d_ff as u32, w_block_off: 0,
@@ -2372,7 +2673,7 @@ impl GpuBackend {
                     cpass.dispatch_workgroups(1, (d_model as u32 + 15) / 16, 1);
                 }
                 VramWeightLayout::Q4_0 => {
-                    cpass.set_pipeline(&self.matmul_q4_0_pipeline);
+                    cpass.set_pipeline(matmul_pipeline);
                     cpass.set_bind_group(0, &down_bg, &[]);
                     cpass.set_push_constants(0, bytemuck::bytes_of(&MatmulPushConstants {
                         m: d_model as u32, n: 1, k: d_ff as u32,
@@ -2450,6 +2751,10 @@ impl Backend for GpuBackend {
     }
 
     fn matmul_into(&self, a: TensorView, b: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let dense = self.dense_resources(GpuCapability::Dense)?;
+        let matmul_pipeline = self.matmul_pipeline.as_ref().ok_or_else(|| {
+            anyhow!("full GPU resource plan is missing the dense F32 matmul pipeline")
+        })?;
         // Serialize the whole op: the shared `work_*`/`staging_dn` buffers
         // and bind groups can't be safely shared across concurrent callers
         // (see `dense_exec_lock`). Held until readback completes.
@@ -2461,7 +2766,7 @@ impl Backend for GpuBackend {
         // Host-side conversions + uploads. The `dense_exec_lock` already
         // serializes callers, so `conversion_scratch` is uncontended here.
         {
-            let mut scratch = self.conversion_scratch.lock();
+            let mut scratch = dense.conversion_scratch.lock();
             assert!(a_len <= scratch.len());
             assert!(b_len <= scratch.len());
             assert!(out_len <= scratch.len());
@@ -2470,13 +2775,13 @@ impl Backend for GpuBackend {
             for i in 0..a_len {
                 scratch[i] = a.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..a_len]));
+            self.queue.write_buffer(&dense.work_a, 0, bytemuck::cast_slice(&scratch[..a_len]));
 
             // Upload B
             for i in 0..b_len {
                 scratch[i] = b.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..b_len]));
+            self.queue.write_buffer(&dense.work_b, 0, bytemuck::cast_slice(&scratch[..b_len]));
         }
 
         // Dispatch
@@ -2495,8 +2800,8 @@ impl Backend for GpuBackend {
                 label: Some("matmul_pass"),
                 timestamp_writes: None,
             });
-            compute_pass.set_pipeline(&self.matmul_pipeline);
-            compute_pass.set_bind_group(0, &self.matmul_bind_group, &[]);
+            compute_pass.set_pipeline(matmul_pipeline);
+            compute_pass.set_bind_group(0, &dense.matmul_bind_group, &[]);
             compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
             compute_pass.dispatch_workgroups(
                 (b.cols as u32 + 15) / 16,
@@ -2507,11 +2812,11 @@ impl Backend for GpuBackend {
 
         // Readback
         let out_bytes = (out_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&dense.work_out, 0, &dense.staging_dn, 0, out_bytes);
         // Wait only for this submission, not the whole device queue.
         let submission = self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_dn.slice(0..out_bytes);
+        let slice = dense.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2529,11 +2834,12 @@ impl Backend for GpuBackend {
                 out.data[i] = half::f16::from_f32(floats[i]);
             }
         }
-        self.staging_dn.unmap();
+        dense.staging_dn.unmap();
         Ok(())
     }
 
     fn swiglu_into(&self, gate: TensorView, up: TensorView, out: &mut TensorViewMut) -> Result<()> {
+        let dense = self.dense_resources(GpuCapability::Dense)?;
         // Serialize the whole op against the shared `work_*`/`staging_dn`
         // buffers (see `dense_exec_lock`).
         let _exec = self.dense_exec_lock.lock();
@@ -2544,20 +2850,20 @@ impl Backend for GpuBackend {
 
         // Host-side conversions + uploads (serialized by `dense_exec_lock`).
         {
-            let mut scratch = self.conversion_scratch.lock();
+            let mut scratch = dense.conversion_scratch.lock();
             assert!(len <= scratch.len());
 
             // Upload gate
             for i in 0..len {
                 scratch[i] = gate.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
+            self.queue.write_buffer(&dense.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
 
             // Upload up
             for i in 0..len {
                 scratch[i] = up.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_b, 0, bytemuck::cast_slice(&scratch[..len]));
+            self.queue.write_buffer(&dense.work_b, 0, bytemuck::cast_slice(&scratch[..len]));
         }
 
         // Dispatch
@@ -2577,18 +2883,18 @@ impl Backend for GpuBackend {
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.swiglu_pipeline);
-            compute_pass.set_bind_group(0, &self.swiglu_bind_group, &[]);
+            compute_pass.set_bind_group(0, &dense.swiglu_bind_group, &[]);
             compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
             compute_pass.dispatch_workgroups((len as u32 + 255) / 256, 1, 1);
         }
 
         // Readback
         let out_bytes = (len * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&dense.work_out, 0, &dense.staging_dn, 0, out_bytes);
         // Wait only for this submission, not the whole device queue.
         let submission = self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_dn.slice(0..out_bytes);
+        let slice = dense.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2606,11 +2912,12 @@ impl Backend for GpuBackend {
                 out.data[i] = half::f16::from_f32(floats[i]);
             }
         }
-        self.staging_dn.unmap();
+        dense.staging_dn.unmap();
         Ok(())
     }
 
     fn softmax(&self, x: &mut TensorViewMut) -> Result<()> {
+        let dense = self.dense_resources(GpuCapability::Dense)?;
         // Serialize the whole op against the shared `work_a`/`staging_dn`
         // buffers (see `dense_exec_lock`).
         let _exec = self.dense_exec_lock.lock();
@@ -2618,14 +2925,14 @@ impl Backend for GpuBackend {
 
         // Host-side upload (serialized by `dense_exec_lock`).
         {
-            let mut scratch = self.conversion_scratch.lock();
+            let mut scratch = dense.conversion_scratch.lock();
             assert!(len <= scratch.len());
 
             // Upload x
             for i in 0..len {
                 scratch[i] = x.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
+            self.queue.write_buffer(&dense.work_a, 0, bytemuck::cast_slice(&scratch[..len]));
         }
 
         // Dispatch
@@ -2644,19 +2951,19 @@ impl Backend for GpuBackend {
                 label: Some("softmax_pass"),
                 timestamp_writes: None,
             });
-            compute_pass.set_pipeline(&self.softmax_pipeline);
-            compute_pass.set_bind_group(0, &self.softmax_bind_group, &[]);
+            compute_pass.set_pipeline(&dense.softmax_pipeline);
+            compute_pass.set_bind_group(0, &dense.softmax_bind_group, &[]);
             compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
             compute_pass.dispatch_workgroups(x.rows as u32, 1, 1);
         }
 
         // Readback from work_a (in-place)
         let out_bytes = (len * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.work_a, 0, &self.staging_dn, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&dense.work_a, 0, &dense.staging_dn, 0, out_bytes);
         // Wait only for this submission, not the whole device queue.
         let submission = self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_dn.slice(0..out_bytes);
+        let slice = dense.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2674,7 +2981,7 @@ impl Backend for GpuBackend {
                 x.data[i] = half::f16::from_f32(floats[i]);
             }
         }
-        self.staging_dn.unmap();
+        dense.staging_dn.unmap();
         Ok(())
     }
 
@@ -2685,6 +2992,8 @@ impl Backend for GpuBackend {
         _k: TensorView,
         _v: TensorView,
     ) -> Result<()> {
+        self.component_resources
+            .require_capability(GpuCapability::Kv)?;
         // The VRAM KV cache is process-wide and addressed only by
         // `(layer, position)`. BatchScheduler can run multiple requests at
         // the same position concurrently against this backend, so using the
@@ -2703,6 +3012,8 @@ impl Backend for GpuBackend {
         seq_len: usize,
         out: &mut TensorViewMut,
     ) -> Result<()> {
+        let dense = self.dense_resources(GpuCapability::Attention)?;
+        let attention = self.attention_resources()?;
         // Serialize the whole op against the shared `work_*`/`staging_dn`
         // buffers (see `dense_exec_lock`).
         let _exec = self.dense_exec_lock.lock();
@@ -2711,7 +3022,7 @@ impl Backend for GpuBackend {
 
         // Host-side Q upload (serialized by `dense_exec_lock`).
         {
-            let mut scratch = self.conversion_scratch.lock();
+            let mut scratch = dense.conversion_scratch.lock();
             assert!(q_len <= scratch.len());
             assert!(out_len <= scratch.len());
 
@@ -2719,14 +3030,14 @@ impl Backend for GpuBackend {
             for i in 0..q_len {
                 scratch[i] = q.data[i].to_f32();
             }
-            self.queue.write_buffer(&self.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
+            self.queue.write_buffer(&dense.work_a, 0, bytemuck::cast_slice(&scratch[..q_len]));
         }
 
         // Dispatch
         // Pass the layer offset in f32 *elements*: a byte offset cast to
         // u32 silently wraps past 4 GiB for deep models with large KV
         // slices. Guard the (4× larger) element range explicitly.
-        let layer_off_elems = self.kv_cache.offset_bytes(layer, 0, 0) / 4;
+        let layer_off_elems = attention.kv_cache.offset_bytes(layer, 0, 0) / 4;
         if layer_off_elems > u32::MAX as u64 {
             return Err(anyhow!(
                 "KV layer offset {layer_off_elems} elements exceeds u32 push-constant range"
@@ -2751,19 +3062,19 @@ impl Backend for GpuBackend {
                 label: Some("attention_pass"),
                 timestamp_writes: None,
             });
-            compute_pass.set_pipeline(&self.attention_pipeline);
-            compute_pass.set_bind_group(0, &self.attention_bind_group, &[]);
+            compute_pass.set_pipeline(&attention.pipeline);
+            compute_pass.set_bind_group(0, &attention.bind_group, &[]);
             compute_pass.set_push_constants(0, bytemuck::bytes_of(&pcs));
             compute_pass.dispatch_workgroups(self.num_heads as u32, 1, 1);
         }
 
         // Readback
         let out_bytes = (out_len * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.work_out, 0, &self.staging_dn, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(&dense.work_out, 0, &dense.staging_dn, 0, out_bytes);
         // Wait only for this submission, not the whole device queue.
         let submission = self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_dn.slice(0..out_bytes);
+        let slice = dense.staging_dn.slice(0..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2781,7 +3092,7 @@ impl Backend for GpuBackend {
                 out.data[i] = half::f16::from_f32(floats[i]);
             }
         }
-        self.staging_dn.unmap();
+        dense.staging_dn.unmap();
         Ok(())
     }
 
@@ -3782,6 +4093,134 @@ impl ResolvedExecutionPlan {
             ("experts", self.routed_experts),
         ]
     }
+
+    /// GPU construction capability derived from this authoritative component
+    /// plan. Hybrid owns only routed-expert resources; the legacy GPU plan
+    /// retains the full resource set.
+    pub const fn gpu_backend_mode(&self) -> Option<GpuBackendMode> {
+        match (self.attention, self.kv, self.routed_experts) {
+            (ExecutionPlane::Cpu, ExecutionPlane::Cpu, ExecutionPlane::Gpu) => {
+                Some(GpuBackendMode::RoutedExpertsOnly)
+            }
+            (ExecutionPlane::Gpu, ExecutionPlane::Gpu, _) => Some(GpuBackendMode::Full),
+            _ => None,
+        }
+    }
+}
+
+/// Hardware-independent startup resource plan for one authoritative resolved
+/// execution plan. Tests use this seam to prove Hybrid allocates no dense,
+/// attention, or KV resources without requiring a live adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuResourcePlan {
+    mode: GpuBackendMode,
+    routed_expert_dtype: crate::inference::WeightDtype,
+    kv_allocation_bytes: u64,
+    dense_allocation_bytes: u64,
+    expert_workspace_allocation_bytes: u64,
+}
+
+impl GpuResourcePlan {
+    fn from_execution_plan(
+        plan: &ResolvedExecutionPlan,
+        geometry: GpuBackendGeometry,
+    ) -> std::result::Result<Self, BackendResolutionError> {
+        let mode = plan.gpu_backend_mode().ok_or_else(|| {
+            BackendResolutionError::InvalidGeometry {
+                detail: "CPU-only execution plan cannot construct a GPU resource plan".to_string(),
+            }
+        })?;
+        geometry.validate_for_mode(mode)?;
+        let full = mode == GpuBackendMode::Full;
+        let routed_expert_dtype = plan.routed_expert_gpu_spec().dtype;
+        let kv_allocation_bytes = if full {
+            geometry.kv_allocation_bytes()?
+        } else {
+            0
+        };
+        let dense_allocation_bytes = if full {
+            DENSE_BUFFER_BYTES
+                .checked_mul(5)
+                .ok_or_else(|| BackendResolutionError::InvalidGeometry {
+                    detail: "dense GPU startup allocation byte total overflow".to_string(),
+                })?
+        } else {
+            0
+        };
+        let workspace_buffer_bytes = (MAX_EXPERT_D_FF * std::mem::size_of::<f32>()) as u64;
+        let expert_workspace_allocation_bytes = expert_workspace_device_bytes(
+            workspace_buffer_bytes,
+            EXPERT_WORKSPACE_POOL,
+        )
+        .ok_or_else(|| BackendResolutionError::InvalidGeometry {
+            detail: "routed-expert workspace byte total overflow".to_string(),
+        })?;
+        Ok(Self {
+            mode,
+            routed_expert_dtype,
+            kv_allocation_bytes,
+            dense_allocation_bytes,
+            expert_workspace_allocation_bytes,
+        })
+    }
+
+    const fn mode(self) -> GpuBackendMode {
+        self.mode
+    }
+
+    const fn kv_allocation_bytes(self) -> u64 {
+        self.kv_allocation_bytes
+    }
+
+    const fn dense_allocation_bytes(self) -> u64 {
+        self.dense_allocation_bytes
+    }
+
+    const fn expert_workspace_allocation_bytes(self) -> u64 {
+        self.expert_workspace_allocation_bytes
+    }
+
+    const fn constructs_attention_resources(self) -> bool {
+        matches!(self.mode, GpuBackendMode::Full)
+    }
+
+    const fn constructs_dense_resources(self) -> bool {
+        matches!(self.mode, GpuBackendMode::Full)
+    }
+
+    const fn constructs_f32_matmul_pipeline(self) -> bool {
+        matches!(self.mode, GpuBackendMode::Full)
+            || matches!(self.routed_expert_dtype, crate::inference::WeightDtype::F32)
+    }
+
+    const fn constructs_q4_0_matmul_pipeline(self) -> bool {
+        matches!(self.mode, GpuBackendMode::Full)
+            || matches!(self.routed_expert_dtype, crate::inference::WeightDtype::Q4_0)
+    }
+
+    const fn has_capability(self, capability: GpuCapability) -> bool {
+        match capability {
+            GpuCapability::RoutedExperts => true,
+            GpuCapability::Dense | GpuCapability::Attention => {
+                matches!(self.mode, GpuBackendMode::Full)
+            }
+            GpuCapability::Kv => self.kv_allocation_bytes > 0,
+        }
+    }
+
+    fn require_capability(
+        self,
+        capability: GpuCapability,
+    ) -> std::result::Result<(), GpuCapabilityUnavailable> {
+        if self.has_capability(capability) {
+            Ok(())
+        } else {
+            Err(GpuCapabilityUnavailable {
+                mode: self.mode,
+                capability,
+            })
+        }
+    }
 }
 
 /// The one authoritative backend context for a resolved runtime.
@@ -3901,7 +4340,13 @@ pub struct GpuBackendGeometry {
 }
 
 impl GpuBackendGeometry {
-    fn validate(&self) -> std::result::Result<(), BackendResolutionError> {
+    fn validate_for_mode(
+        &self,
+        mode: GpuBackendMode,
+    ) -> std::result::Result<(), BackendResolutionError> {
+        if mode == GpuBackendMode::RoutedExpertsOnly {
+            return Ok(());
+        }
         if self.num_layers == 0
             || self.max_seq_len == 0
             || self.num_heads == 0
@@ -3928,24 +4373,32 @@ impl GpuBackendGeometry {
                 ),
             });
         }
+        self.kv_allocation_bytes()?;
+        Ok(())
+    }
+
+    fn kv_allocation_bytes(&self) -> std::result::Result<u64, BackendResolutionError> {
+        let kv_heads = if self.num_kv_heads == 0 {
+            self.num_heads
+        } else {
+            self.num_kv_heads
+        };
         let v_head_dim = if self.v_head_dim == 0 {
             self.head_dim
         } else {
             self.v_head_dim
         };
-        let k_dim = kv_heads.checked_mul(self.head_dim);
-        let v_dim = kv_heads.checked_mul(v_head_dim);
-        let kv_elems = k_dim
-            .zip(v_dim)
+        kv_heads
+            .checked_mul(self.head_dim)
+            .zip(kv_heads.checked_mul(v_head_dim))
             .and_then(|(k, v)| k.checked_add(v))
             .and_then(|per_token| per_token.checked_mul(self.max_seq_len))
-            .and_then(|per_layer| per_layer.checked_mul(self.num_layers));
-        if kv_elems.is_none() {
-            return Err(BackendResolutionError::InvalidGeometry {
+            .and_then(|per_layer| per_layer.checked_mul(self.num_layers))
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| BackendResolutionError::InvalidGeometry {
                 detail: "GPU KV geometry overflows addressable memory".to_string(),
-            });
-        }
-        Ok(())
+            })
     }
 }
 
@@ -4180,22 +4633,17 @@ pub fn resolve_execution_context(
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
 ) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError> {
     let context_gpu_expert_cache = gpu_expert_cache.clone();
-    resolve_execution_context_with_device_limits(
+    resolve_execution_context_with_resource_plan(
         requested,
         strict_attention,
         geometry,
         routed_expert_gpu_spec,
         context_gpu_expert_cache,
-        move |geometry| {
+        move |geometry, resource_plan| {
             pollster::block_on(GpuBackend::try_new(
-                geometry.num_layers,
-                geometry.max_seq_len,
-                geometry.num_heads,
-                geometry.num_kv_heads,
-                geometry.head_dim,
-                geometry.v_head_dim,
+                *resource_plan,
+                *geometry,
                 gpu_expert_cache,
-                geometry.q4_truncation_tolerance,
             ))
             .map(|gpu| {
                 let min_storage_buffer_offset_alignment =
@@ -4262,6 +4710,7 @@ pub(crate) fn test_gpu_execution_context_unchecked(
     ))
 }
 
+#[cfg(test)]
 fn resolve_execution_context_with_device_limits<F>(
     requested: ComputeOffload,
     strict_attention: bool,
@@ -4273,6 +4722,35 @@ fn resolve_execution_context_with_device_limits<F>(
 where
     F: FnOnce(
         &GpuBackendGeometry,
+    ) -> std::result::Result<(Arc<BackendBox>, u64), String>,
+{
+    resolve_execution_context_with_resource_plan(
+        requested,
+        strict_attention,
+        geometry,
+        routed_expert_gpu_spec,
+        gpu_expert_cache,
+        move |geometry, _resource_plan| gpu_init(geometry),
+    )
+}
+
+/// Resource-aware core shared by production construction and focused tests.
+/// The factory receives the GPU resource plan derived from the authoritative
+/// component plan for successful initialization before it creates any device
+/// resources. An Auto initialization failure discards that candidate and
+/// publishes the ordinary all-CPU fallback plan.
+fn resolve_execution_context_with_resource_plan<F>(
+    requested: ComputeOffload,
+    strict_attention: bool,
+    geometry: GpuBackendGeometry,
+    routed_expert_gpu_spec: RoutedExpertGpuSpec,
+    gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+    gpu_init: F,
+) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError>
+where
+    F: FnOnce(
+        &GpuBackendGeometry,
+        &GpuResourcePlan,
     ) -> std::result::Result<(Arc<BackendBox>, u64), String>,
 {
     let gpu_expert_cache_available = gpu_expert_cache.capacity_bytes() > 0;
@@ -4288,14 +4766,36 @@ where
     if requested == ComputeOffload::Hybrid && !gpu_expert_cache_available {
         return Err(BackendResolutionError::RoutedExpertGpuCacheRequired);
     }
-    if gpu_initialization_may_run(requested, strict_attention) {
-        geometry.validate()?;
-    }
+
+    let context_id = next_execution_context_id();
+    let gpu_resource_plan = if gpu_initialization_may_run(requested, strict_attention) {
+        let successful_resolution = resolve_backend_selection_with_numerics(
+            requested,
+            strict_attention,
+            || Ok(()),
+        )?;
+        let successful_plan = ResolvedExecutionPlan::from_resolution(
+            successful_resolution,
+            context_id,
+            gpu_expert_cache_available,
+            routed_expert_gpu_spec,
+            expert_compatibility.is_ok(),
+        );
+        Some(GpuResourcePlan::from_execution_plan(
+            &successful_plan,
+            geometry,
+        )?)
+    } else {
+        None
+    };
 
     let mut gpu_backend = None;
     let mut min_storage_buffer_offset_alignment = None;
     let resolution = resolve_backend_selection_with_numerics(requested, strict_attention, || {
-        match gpu_init(&geometry) {
+        let resource_plan = gpu_resource_plan
+            .as_ref()
+            .ok_or_else(|| "GPU initialization requires a resource plan".to_string())?;
+        match gpu_init(&geometry, resource_plan) {
             Ok((backend, required_alignment)) if backend.is_gpu() => {
                 gpu_backend = Some(backend);
                 min_storage_buffer_offset_alignment = Some(required_alignment);
@@ -4325,7 +4825,6 @@ where
     let routed_expert_gpu_compatible =
         expert_compatibility.is_ok() && device_compatibility.is_ok();
 
-    let context_id = next_execution_context_id();
     let plan = ResolvedExecutionPlan::from_resolution(
         resolution,
         context_id,
@@ -4769,7 +5268,8 @@ mod tests {
     #[test]
     fn workspace_and_snapshot_accounting_are_exact_and_exclude_host_scratch() {
         let buffer_bytes = (MAX_EXPERT_D_FF * std::mem::size_of::<f32>()) as u64;
-        let workspace_bytes = expert_workspace_device_bytes(buffer_bytes, EXPERT_WORKSPACE_POOL);
+        let workspace_bytes = expert_workspace_device_bytes(buffer_bytes, EXPERT_WORKSPACE_POOL)
+            .expect("test workspace bytes");
         assert_eq!(
             workspace_bytes,
             buffer_bytes * EXPERT_WORKSPACE_DEVICE_BUFFERS * EXPERT_WORKSPACE_POOL as u64
@@ -4906,6 +5406,273 @@ mod tests {
             0.5,
             16,
         ))
+    }
+
+    fn test_resolved_plan(
+        resolved: ResolvedBackend,
+        dtype: crate::inference::WeightDtype,
+    ) -> ResolvedExecutionPlan {
+        let requested = match resolved {
+            ResolvedBackend::Cpu => ComputeOffload::Cpu,
+            ResolvedBackend::Gpu => ComputeOffload::Gpu,
+            ResolvedBackend::HybridCpuAttentionGpuExperts => ComputeOffload::Hybrid,
+        };
+        ResolvedExecutionPlan::from_resolution(
+            BackendResolution {
+                requested,
+                resolved,
+                fallback_occurred: false,
+                reason: None,
+            },
+            next_execution_context_id(),
+            true,
+            test_routed_expert_gpu_spec(dtype),
+            true,
+        )
+    }
+
+    fn qwen3_coder_geometry() -> GpuBackendGeometry {
+        GpuBackendGeometry {
+            num_layers: 48,
+            max_seq_len: 4096,
+            num_heads: 32,
+            num_kv_heads: 4,
+            head_dim: 128,
+            v_head_dim: 128,
+            q4_truncation_tolerance: 0,
+        }
+    }
+
+    #[test]
+    fn hybrid_q4_resource_plan_is_routed_expert_only_with_zero_kv() {
+        let plan = test_resolved_plan(
+            ResolvedBackend::HybridCpuAttentionGpuExperts,
+            crate::inference::WeightDtype::Q4_0,
+        );
+        let resources = GpuResourcePlan::from_execution_plan(&plan, qwen3_coder_geometry())
+            .expect("strict Hybrid Q4 resource plan");
+
+        assert_eq!(resources.mode(), GpuBackendMode::RoutedExpertsOnly);
+        assert_eq!(resources.kv_allocation_bytes(), 0);
+        assert_eq!(resources.dense_allocation_bytes(), 0);
+        assert!(!resources.constructs_dense_resources());
+        assert!(!resources.constructs_attention_resources());
+        assert!(!resources.constructs_f32_matmul_pipeline());
+        assert!(resources.constructs_q4_0_matmul_pipeline());
+        assert!(resources.has_capability(GpuCapability::RoutedExperts));
+        assert_eq!(resources.expert_workspace_allocation_bytes(), 1_310_720);
+    }
+
+    #[test]
+    fn hybrid_disabled_component_guards_return_typed_errors() {
+        let plan = test_resolved_plan(
+            ResolvedBackend::HybridCpuAttentionGpuExperts,
+            crate::inference::WeightDtype::Q4_0,
+        );
+        let resources = GpuResourcePlan::from_execution_plan(&plan, qwen3_coder_geometry())
+            .expect("strict Hybrid Q4 resource plan");
+
+        for capability in [
+            GpuCapability::Dense,
+            GpuCapability::Attention,
+            GpuCapability::Kv,
+        ] {
+            assert_eq!(
+                resources.require_capability(capability),
+                Err(GpuCapabilityUnavailable {
+                    mode: GpuBackendMode::RoutedExpertsOnly,
+                    capability,
+                })
+            );
+        }
+        assert_eq!(resources.require_capability(GpuCapability::RoutedExperts), Ok(()));
+    }
+
+    #[test]
+    fn hybrid_component_factory_skips_dense_attention_and_kv_construction() {
+        let plan = test_resolved_plan(
+            ResolvedBackend::HybridCpuAttentionGpuExperts,
+            crate::inference::WeightDtype::Q4_0,
+        );
+        let plan = GpuResourcePlan::from_execution_plan(&plan, qwen3_coder_geometry())
+            .expect("strict Hybrid Q4 resource plan");
+        let dense_called = std::cell::Cell::new(false);
+        let attention_called = std::cell::Cell::new(false);
+
+        let resources = GpuComponentResources::<(), ()>::try_new(
+            plan,
+            || {
+                dense_called.set(true);
+                Ok(())
+            },
+            |_| {
+                attention_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("Hybrid component resource construction");
+
+        assert!(!dense_called.get());
+        assert!(!attention_called.get());
+        for capability in [GpuCapability::Dense, GpuCapability::Attention] {
+            let err = resources
+                .dense(capability)
+                .expect_err("disabled production resource accessor must fail");
+            assert_eq!(
+                err.downcast_ref::<GpuCapabilityUnavailable>(),
+                Some(&GpuCapabilityUnavailable {
+                    mode: GpuBackendMode::RoutedExpertsOnly,
+                    capability,
+                })
+            );
+        }
+        let err = resources
+            .attention()
+            .expect_err("disabled production attention accessor must fail");
+        assert_eq!(
+            err.downcast_ref::<GpuCapabilityUnavailable>(),
+            Some(&GpuCapabilityUnavailable {
+                mode: GpuBackendMode::RoutedExpertsOnly,
+                capability: GpuCapability::Attention,
+            })
+        );
+        let err = resources
+            .require_capability(GpuCapability::Kv)
+            .expect_err("disabled production KV guard must fail");
+        assert_eq!(
+            err.downcast_ref::<GpuCapabilityUnavailable>(),
+            Some(&GpuCapabilityUnavailable {
+                mode: GpuBackendMode::RoutedExpertsOnly,
+                capability: GpuCapability::Kv,
+            })
+        );
+    }
+
+    #[test]
+    fn full_gpu_resource_plan_retains_dense_attention_and_exact_kv_geometry() {
+        let plan = test_resolved_plan(
+            ResolvedBackend::Gpu,
+            crate::inference::WeightDtype::Q4_0,
+        );
+        let geometry = qwen3_coder_geometry();
+        let resources = GpuResourcePlan::from_execution_plan(&plan, geometry)
+            .expect("full GPU resource plan");
+
+        assert_eq!(resources.mode(), GpuBackendMode::Full);
+        assert_eq!(resources.kv_allocation_bytes(), 805_306_368);
+        assert_eq!(resources.kv_allocation_bytes(), geometry.kv_allocation_bytes().unwrap());
+        assert_eq!(resources.dense_allocation_bytes(), DENSE_BUFFER_BYTES * 5);
+        assert!(resources.constructs_dense_resources());
+        assert!(resources.constructs_attention_resources());
+        assert!(resources.constructs_f32_matmul_pipeline());
+        assert!(resources.constructs_q4_0_matmul_pipeline());
+        for capability in [
+            GpuCapability::RoutedExperts,
+            GpuCapability::Dense,
+            GpuCapability::Attention,
+            GpuCapability::Kv,
+        ] {
+            assert!(resources.has_capability(capability));
+        }
+    }
+
+    #[test]
+    fn full_component_factory_constructs_and_exposes_all_optional_resources() {
+        let plan = test_resolved_plan(
+            ResolvedBackend::Gpu,
+            crate::inference::WeightDtype::Q4_0,
+        );
+        let plan = GpuResourcePlan::from_execution_plan(&plan, qwen3_coder_geometry())
+            .expect("full GPU resource plan");
+        let dense_called = std::cell::Cell::new(false);
+        let attention_called = std::cell::Cell::new(false);
+
+        let resources = GpuComponentResources::try_new(
+            plan,
+            || {
+                dense_called.set(true);
+                Ok(7u8)
+            },
+            |dense| {
+                attention_called.set(true);
+                assert_eq!(*dense, 7);
+                Ok(11u8)
+            },
+        )
+        .expect("Full component resource construction");
+
+        assert!(dense_called.get());
+        assert!(attention_called.get());
+        assert_eq!(*resources.dense(GpuCapability::Dense).unwrap(), 7);
+        assert_eq!(*resources.attention().unwrap(), 11);
+        assert!(resources.require_capability(GpuCapability::Kv).is_ok());
+    }
+
+    #[test]
+    fn oversized_startup_buffer_is_rejected_before_wgpu_allocation() {
+        let limits = wgpu::Limits {
+            max_buffer_size: 268_435_456,
+            max_storage_buffer_binding_size: 268_435_456,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            validate_startup_buffer(
+                "kv_cache",
+                805_306_368,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                &limits,
+            ),
+            Err(GpuStartupAllocationError::ExceedsMaxBufferSize {
+                label: "kv_cache".to_string(),
+                requested: 805_306_368,
+                maximum: 268_435_456,
+            })
+        );
+
+        let limits = wgpu::Limits {
+            max_buffer_size: 1_000,
+            max_storage_buffer_binding_size: 100,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            validate_startup_buffer(
+                "storage",
+                200,
+                wgpu::BufferUsages::STORAGE,
+                &limits,
+            ),
+            Err(GpuStartupAllocationError::ExceedsMaxStorageBindingSize {
+                label: "storage".to_string(),
+                requested: 200,
+                maximum: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn resolver_passes_hybrid_component_plan_to_gpu_factory() {
+        let mut observed = None;
+        let context = resolve_execution_context_with_resource_plan(
+            ComputeOffload::Hybrid,
+            true,
+            qwen3_coder_geometry(),
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::Q4_0),
+            test_gpu_expert_cache(1024),
+            |_, resources| {
+                observed = Some(*resources);
+                Ok((test_gpu_backend(), 256))
+            },
+        )
+        .expect("strict Hybrid resolves with injected GPU");
+
+        let resources = observed.expect("resource-aware factory was called");
+        assert_eq!(resources.mode(), GpuBackendMode::RoutedExpertsOnly);
+        assert_eq!(resources.kv_allocation_bytes(), 0);
+        assert!(!resources.constructs_dense_resources());
+        assert!(!resources.constructs_attention_resources());
+        assert_eq!(context.plan().kv(), ExecutionPlane::Cpu);
+        assert_eq!(context.plan().attention(), ExecutionPlane::Cpu);
+        assert_eq!(context.plan().routed_experts(), ExecutionPlane::Gpu);
     }
 
     #[test]
@@ -5285,6 +6052,7 @@ mod tests {
             plan.resolved(),
             ResolvedBackend::HybridCpuAttentionGpuExperts
         );
+        assert!(!plan.fallback_occurred());
         assert_eq!(plan.embeddings(), ExecutionPlane::Cpu);
         assert_eq!(plan.lm_head(), ExecutionPlane::Cpu);
         assert_eq!(plan.dense_projections(), ExecutionPlane::Cpu);
@@ -5381,13 +6149,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gpu_geometry_fails_before_factory_or_runtime() {
+    fn invalid_full_gpu_geometry_fails_before_factory_or_runtime() {
         let mut attempts = 0;
         let mut geometry = test_gpu_geometry();
         geometry.num_heads = 0;
         let err = resolve_execution_context_with(
-            ComputeOffload::Hybrid,
-            true,
+            ComputeOffload::Gpu,
+            false,
             geometry,
             test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
             test_gpu_expert_cache(1024),
@@ -5402,6 +6170,31 @@ mod tests {
             err,
             BackendResolutionError::InvalidGeometry { .. }
         ));
+    }
+
+    #[test]
+    fn hybrid_plan_does_not_validate_unused_attention_or_kv_geometry() {
+        let mut geometry = test_gpu_geometry();
+        geometry.num_layers = 0;
+        geometry.max_seq_len = 0;
+        geometry.num_heads = 0;
+        geometry.num_kv_heads = 0;
+        geometry.head_dim = 0;
+        geometry.v_head_dim = 0;
+        let context = resolve_execution_context_with_resource_plan(
+            ComputeOffload::Hybrid,
+            true,
+            geometry,
+            test_routed_expert_gpu_spec(crate::inference::WeightDtype::Q4_0),
+            test_gpu_expert_cache(1024),
+            |_, resources| {
+                assert_eq!(resources.mode(), GpuBackendMode::RoutedExpertsOnly);
+                assert_eq!(resources.kv_allocation_bytes(), 0);
+                Ok((test_gpu_backend(), 256))
+            },
+        )
+        .expect("unused attention/KV geometry cannot reject Hybrid expert resources");
+        assert_eq!(context.plan().routed_experts(), ExecutionPlane::Gpu);
     }
 
     #[test]
