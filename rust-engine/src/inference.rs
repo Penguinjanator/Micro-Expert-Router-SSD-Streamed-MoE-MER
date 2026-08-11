@@ -3283,6 +3283,28 @@ pub fn run_inference_q4_0(
     Ok((out, y))
 }
 
+/// Fail-loud authoritative CPU reference for strict Q4_0 numerical
+/// qualification. Unlike [`run_inference_q4_0`], this never routes a Candle
+/// error through `ExpertWeights::forward`'s legacy zero-output compatibility
+/// behavior. The decoder, matrix layout, SwiGLU clamp, and CPU math are the
+/// same production implementations.
+pub(crate) fn q4_0_cpu_reference_forward(
+    bytes: &[u8],
+    x: &[f32],
+    d_model: usize,
+    d_ff: usize,
+) -> Result<HiddenState, ExpertWeightsError> {
+    let owned = OwnedExpertWeights::from_bytes_q4_0(bytes, d_model, d_ff)?;
+    ExpertWeights {
+        d_model: owned.d_model,
+        d_ff: owned.d_ff,
+        gate: &owned.gate,
+        up: &owned.up,
+        down: &owned.down,
+    }
+    .forward_candle(x)
+}
+
 /// Legacy Q8_0 dequantisation reference: materialises the resident
 /// bytes (a stream of GGUF Q8_0 34-byte blocks, each holding an `f16`
 /// scale and 32 signed `i8` weights) into an owned `Vec<f32>` (via

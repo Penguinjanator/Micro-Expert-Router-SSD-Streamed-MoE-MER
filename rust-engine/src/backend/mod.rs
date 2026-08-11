@@ -433,6 +433,16 @@ pub struct GpuExpertMemorySnapshot {
     pub stale_retirements: u64,
 }
 
+/// Non-mutating identity evidence for one physically resident expert. This is
+/// exposed only through the crate-private numerical-qualification seam; it
+/// neither touches physical LRU recency nor participates in serving dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct GpuPhysicalExpertResidency {
+    pub(crate) expert_id: u32,
+    pub(crate) generation: u64,
+    pub(crate) device_bytes: u64,
+}
+
 /// Monotonic counters for only the routed-expert GPU path. Dense and
 /// attention operations are deliberately excluded.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -838,6 +848,18 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
             physical_evictions: inner.evictions,
             stale_retirements: inner.stale_retirements,
         }
+    }
+
+    fn residency_evidence(&self, expert_id: u32) -> Option<GpuPhysicalExpertResidency> {
+        let inner = self.inner.lock();
+        inner.entries.peek(&expert_id).map(|entry| {
+            let key = entry.physical_key();
+            GpuPhysicalExpertResidency {
+                expert_id: key.expert_id,
+                generation: key.generation,
+                device_bytes: entry.device_bytes(),
+            }
+        })
     }
 
     #[cfg(test)]
@@ -3113,6 +3135,202 @@ impl Backend for GpuBackend {
 }
 
 impl GpuBackend {
+    /// Execute the already-constructed production Q4_0 WGSL pipeline over a
+    /// small canonical block stream and return its f32 result. This seam is
+    /// crate-private and is called only by `qualify-hybrid-q4-parity`: it owns
+    /// ephemeral buffers, does not consult or mutate logical admission, does
+    /// not touch the physical expert registry, and does not increment routed
+    /// expert I/O counters.
+    fn qualification_q4_0_matvec(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        columns: usize,
+        w_block_off: usize,
+    ) -> std::result::Result<Vec<f32>, String> {
+        use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS};
+
+        if let Some(detail) = self.device_loss.detail() {
+            return Err(format!("GPU device is lost before raw Q4_0 dispatch: {detail}"));
+        }
+        if rows == 0 || columns == 0 || !columns.is_multiple_of(Q4_0_BLOCK_ELEMS) {
+            return Err(format!(
+                "invalid raw Q4_0 geometry rows={rows} columns={columns}; columns must be a non-zero multiple of {Q4_0_BLOCK_ELEMS}"
+            ));
+        }
+        if input.len() != columns || input.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "raw Q4_0 input has {} values for {columns} columns or contains a nonfinite value",
+                input.len()
+            ));
+        }
+        let blocks_per_row = columns / Q4_0_BLOCK_ELEMS;
+        let accessed_blocks = rows
+            .checked_mul(blocks_per_row)
+            .and_then(|count| w_block_off.checked_add(count))
+            .ok_or_else(|| "raw Q4_0 block geometry overflow".to_string())?;
+        let required_weight_bytes = accessed_blocks
+            .checked_mul(Q4_0_BLOCK_BYTES)
+            .ok_or_else(|| "raw Q4_0 byte length overflow".to_string())?;
+        if weights.len() < required_weight_bytes
+            || !weights.len().is_multiple_of(Q4_0_BLOCK_BYTES)
+        {
+            return Err(format!(
+                "raw Q4_0 weights have {} bytes, require at least {required_weight_bytes} bytes in complete {Q4_0_BLOCK_BYTES}-byte blocks",
+                weights.len()
+            ));
+        }
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| format!("raw Q4_0 rows {rows} exceed u32"))?;
+        let columns_u32 = u32::try_from(columns)
+            .map_err(|_| format!("raw Q4_0 columns {columns} exceed u32"))?;
+        let block_off_u32 = u32::try_from(w_block_off)
+            .map_err(|_| format!("raw Q4_0 w_block_off {w_block_off} exceeds u32"))?;
+        let weight_size = weights
+            .len()
+            .checked_add(3)
+            .ok_or_else(|| "raw Q4_0 padded weight size overflow".to_string())?
+            / 4
+            * 4;
+        let input_size = columns
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "raw Q4_0 input byte size overflow".to_string())?;
+        let output_size = rows
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "raw Q4_0 output byte size overflow".to_string())?;
+        let weight_size_u64 = u64::try_from(weight_size)
+            .map_err(|_| "raw Q4_0 weight size does not fit u64".to_string())?;
+        let input_size_u64 = u64::try_from(input_size)
+            .map_err(|_| "raw Q4_0 input size does not fit u64".to_string())?;
+        let output_size_u64 = u64::try_from(output_size)
+            .map_err(|_| "raw Q4_0 output size does not fit u64".to_string())?;
+        let pipeline = self.matmul_q4_0_pipeline.as_ref().ok_or_else(|| {
+            format!(
+                "Q4_0 pipeline is unavailable in {:?} backend mode",
+                self.component_resources.plan().mode()
+            )
+        })?;
+
+        // Capture qualification-created validation/OOM errors rather than
+        // letting wgpu route them through the process-wide uncaptured handler.
+        self.device
+            .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let result = (|| -> std::result::Result<Vec<f32>, String> {
+            let weight_buf = create_startup_buffer(
+                &self.device,
+                "q4_parity_weights",
+                weight_size_u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )
+            .map_err(|error| error.to_string())?;
+            let input_buf = create_startup_buffer(
+                &self.device,
+                "q4_parity_input",
+                input_size_u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )
+            .map_err(|error| error.to_string())?;
+            let output_buf = create_startup_buffer(
+                &self.device,
+                "q4_parity_output",
+                output_size_u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )
+            .map_err(|error| error.to_string())?;
+            let staging = create_startup_buffer(
+                &self.device,
+                "q4_parity_staging",
+                output_size_u64,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            )
+            .map_err(|error| error.to_string())?;
+
+            if weights.len() == weight_size {
+                self.queue.write_buffer(&weight_buf, 0, weights);
+            } else {
+                let mut padded = Vec::with_capacity(weight_size);
+                padded.extend_from_slice(weights);
+                padded.resize(weight_size, 0);
+                self.queue.write_buffer(&weight_buf, 0, &padded);
+            }
+            self.queue
+                .write_buffer(&input_buf, 0, bytemuck::cast_slice(input));
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("q4_parity_bind_group"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weight_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("q4_parity_encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("q4_parity_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(
+                    0,
+                    bytemuck::bytes_of(&MatmulPushConstants {
+                        m: rows_u32,
+                        n: 1,
+                        k: columns_u32,
+                        w_block_off: block_off_u32,
+                    }),
+                );
+                pass.dispatch_workgroups((rows_u32 + 63) / 64, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&output_buf, 0, &staging, 0, output_size_u64);
+            let submission = self.queue.submit(Some(encoder.finish()));
+            let slice = staging.slice(..output_size_u64);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |mapped| {
+                let _ = tx.send(mapped);
+            });
+            self.device.poll(wgpu::Maintain::wait_for(submission));
+            if let Some(detail) = self.device_loss.detail() {
+                return Err(format!("GPU device was lost during raw Q4_0 dispatch: {detail}"));
+            }
+            rx.recv()
+                .map_err(|error| format!("raw Q4_0 readback callback channel failed: {error}"))?
+                .map_err(|error| format!("raw Q4_0 staging map failed: {error:?}"))?;
+            let output = {
+                let view = slice.get_mapped_range();
+                bytemuck::cast_slice::<u8, f32>(&view).to_vec()
+            };
+            staging.unmap();
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err("raw Q4_0 GPU output contains a nonfinite value".to_string());
+            }
+            Ok(output)
+        })();
+        let validation_error = pollster::block_on(self.device.pop_error_scope());
+        let oom_error = pollster::block_on(self.device.pop_error_scope());
+        if let Some(error) = validation_error.or(oom_error) {
+            return Err(format!("wgpu raw Q4_0 qualification error: {error}"));
+        }
+        result
+    }
+
     fn routed_expert_matmul(
         &self,
         layer: u32,
@@ -3292,6 +3510,14 @@ impl GpuBackend {
 
     fn gpu_expert_io_snapshot(&self) -> GpuExpertIoSnapshot {
         self.expert_io.snapshot()
+    }
+
+    fn gpu_physical_expert_residency(
+        &self,
+        expert_id: u32,
+    ) -> Option<GpuPhysicalExpertResidency> {
+        self.physical_expert_registry
+            .residency_evidence(expert_id)
     }
 }
 
@@ -3551,6 +3777,43 @@ impl BackendBox {
             Self::Cpu(_) => None,
             #[cfg(test)]
             Self::TestGpu(_) => None,
+        }
+    }
+
+    pub(crate) fn gpu_physical_expert_residency(
+        &self,
+        expert_id: u32,
+    ) -> Option<GpuPhysicalExpertResidency> {
+        match self {
+            Self::Gpu(gpu) => gpu.gpu_physical_expert_residency(expert_id),
+            Self::Cpu(_) => None,
+            #[cfg(test)]
+            Self::TestGpu(_) => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn qualification_q4_0_matvec(
+        &self,
+        weights: &[u8],
+        input: &[f32],
+        rows: usize,
+        columns: usize,
+        w_block_off: usize,
+    ) -> std::result::Result<Vec<f32>, String> {
+        match self {
+            Self::Gpu(gpu) => {
+                gpu.qualification_q4_0_matvec(weights, input, rows, columns, w_block_off)
+            }
+            Self::Cpu(_) => Err(
+                "raw Q4_0 qualification requires the authoritative production GPU backend"
+                    .to_string(),
+            ),
+            #[cfg(test)]
+            Self::TestGpu(_) => Err(
+                "raw Q4_0 qualification cannot run against the hardware-independent test backend"
+                    .to_string(),
+            ),
         }
     }
 

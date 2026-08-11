@@ -1975,6 +1975,50 @@ device memory. `--external-gpu-memory-artifact <STRING>` stores an opaque
 reference to separately collected PR6 evidence; this command does not invoke
 NVML or `nvidia-smi`.
 
+#### Strict Hybrid Q4_0 numerical parity
+
+`qualify-hybrid-q4-parity` is a separate fail-closed numerical qualification.
+It first compares deterministic, literal `ggml-standard-v1` Q4_0 blocks against
+the existing `matmul_q4_0.wgsl` pipeline, then fetches one complete converted
+checkpoint expert and compares MER's authoritative CPU Q4_0 forward result with
+the existing production routed-expert GPU path. `--expert-id` is a required
+global expert ID in `0..num_layers*num_experts_per_layer`; the report also
+records its derived layer and layer-local ID. It is never wrapped or
+reinterpreted.
+
+```bash
+./target/release/micro-expert-router qualify-hybrid-q4-parity \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expert-id 257 \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out q4-parity.json
+```
+
+The raw comparison uses fixed absolute `1e-5` and relative `1e-4` tolerances.
+The complete-expert comparison uses fixed absolute `2e-3` and relative `5e-3`
+tolerances and compares `f16(CPU f32)` against the returned GPU f16 value. Both
+apply `abs_error <= absolute + relative * abs(reference)`; any nonfinite result
+fails immediately. The report preserves the original CPU f32, rounded CPU f16,
+GPU f16, per-element errors, allowed errors, and worst index.
+
+PASS additionally requires a clean-provenance release build, strict Hybrid
+component planes, canonical metadata, exact checkpoint payload size, an exact
+hardware adapter-name match, and strict fail-closed GPU policy. Per-vector
+before/after evidence must show one initial physical install, stable generation
+and physical reuse thereafter, no repeated expert-weight upload, complete GPU
+I/O/readback, a valid PR4 capacity ledger, and no eviction, stale retirement,
+CPU execution, fallback, degraded substitution, or dispatch failure. Raw WGSL
+buffers are ephemeral and must leave production expert residency and I/O state
+unchanged. This is numerical correctness evidence, not a batching or throughput
+claim.
+
+The complete-expert section distinguishes canonical, unpadded Q4_0 weight bytes
+from the header-stripped, block-aligned checkpoint payload slot. PASS requires
+the slot to have exactly the converter-defined aligned size and every alignment
+byte to be zero. It reports hashes and lengths for both forms; physical
+residency and upload evidence uses the kernel's separately checked 4-byte-padded
+VRAM length.
+
 Increase log verbosity:
 
 ```bash
@@ -2377,6 +2421,13 @@ micro-expert-router qualify-hybrid-q4
   --report-out <PATH>        Write typed JSON there (default: stdout).
   --external-gpu-memory-artifact <STRING>
                               Opaque reference to separate external evidence.
+
+micro-expert-router qualify-hybrid-q4-parity
+  --config <PATH>            Strict Hybrid native-Q4_0 TOML config.
+  --expert-id <ID>           Required global expert ID (never layer-local).
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Write typed JSON there (default: stdout).
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance

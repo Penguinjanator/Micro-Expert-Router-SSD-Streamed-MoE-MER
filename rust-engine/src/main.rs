@@ -160,6 +160,7 @@ mod parallel;
 mod prefetch_governor;
 mod pregate;
 mod qualification;
+mod q4_parity;
 mod rayon_autotune;
 mod residency;
 mod router;
@@ -877,6 +878,23 @@ enum Cmd {
         external_gpu_memory_artifact: Option<String>,
     },
 
+    /// Qualify canonical Q4_0 WGSL math and one complete extracted routed
+    /// expert against MER's authoritative CPU implementation.
+    QualifyHybridQ4Parity {
+        /// Path to the strict Hybrid native-Q4_0 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Global expert id: layer * num_experts_per_layer + layer-local id.
+        #[arg(long)]
+        expert_id: u32,
+        /// Exact wgpu adapter name required for this qualification run.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the typed JSON report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+    },
+
     /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
     ///
     /// This is intentionally separate from `bench-real`: it isolates Q/K/V/O,
@@ -1522,7 +1540,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_config = match &cli.cmd {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
-        | Cmd::QualifyHybridQ4 { config, .. } => Some(crate::config::Config::from_file(config)?),
+        | Cmd::QualifyHybridQ4 { config, .. }
+        | Cmd::QualifyHybridQ4Parity { config, .. } => {
+            Some(crate::config::Config::from_file(config)?)
+        }
         _ => None,
     };
 
@@ -1638,7 +1659,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fatal; legacy deterministic dtype/geometry bypass remains visible in
     // the resolved component plan.
     let run_gpu_requested = matches!(cli.cmd, Cmd::Run { gpu: true, .. });
-    if !matches!(cli.cmd, Cmd::Serve { .. } | Cmd::QualifyHybridQ4 { .. }) && !run_gpu_requested {
+    if !matches!(
+        cli.cmd,
+        Cmd::Serve { .. }
+            | Cmd::QualifyHybridQ4 { .. }
+            | Cmd::QualifyHybridQ4Parity { .. }
+    ) && !run_gpu_requested
+    {
         crate::backend::install_default();
         let b = crate::backend::current();
         info!(
@@ -1892,6 +1919,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 progress_watchdog,
             }))
         }
+        Cmd::QualifyHybridQ4Parity {
+            config,
+            expert_id,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_qualify_hybrid_q4_parity(
+                QualifyHybridQ4ParityArgs {
+                    config,
+                    expert_id,
+                    expected_adapter_name,
+                    report_out,
+                },
+            ))
+        }
         Cmd::MatvecMicrobench {
             backend,
             warmup_runs,
@@ -2111,6 +2156,13 @@ struct QualifyHybridQ4Args {
     report_out: Option<PathBuf>,
     external_gpu_memory_artifact: Option<String>,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct QualifyHybridQ4ParityArgs {
+    config: PathBuf,
+    expert_id: u32,
+    expected_adapter_name: String,
+    report_out: Option<PathBuf>,
 }
 
 struct MatvecMicrobenchArgs {
@@ -2509,6 +2561,33 @@ fn fail_qualification(
     Err(summary.into())
 }
 
+fn emit_q4_parity_report(
+    report: &crate::q4_parity::Q4ParityReport,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = serde_json::to_vec_pretty(report)?;
+    json.push(b'\n');
+    if let Some(path) = report_out {
+        std::fs::write(path, json)?;
+        eprintln!("Q4_0 parity report written to {}", path.display());
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&json)?;
+    }
+    Ok(())
+}
+
+fn fail_q4_parity(
+    mut report: crate::q4_parity::Q4ParityReport,
+    failure: crate::qualification::QualificationFailure,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = format!("{}: {}", failure.code, failure.detail);
+    report.fail(failure);
+    emit_q4_parity_report(&report, report_out)?;
+    Err(summary.into())
+}
+
 fn qualification_artifact_failure(
     errors: &[String],
 ) -> crate::qualification::QualificationFailure {
@@ -2851,6 +2930,368 @@ async fn cmd_qualify_hybrid_q4(
         return fail_qualification(report, failure, args.report_out.as_deref());
     }
     emit_qualification_report(&report, args.report_out.as_deref())
+}
+
+async fn cmd_qualify_hybrid_q4_parity(
+    args: QualifyHybridQ4ParityArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{
+        validate_device, validate_execution_plan, validate_gpu_failure_policy,
+        validate_memory, validate_preflight, BuildProvenance, FailureStage, PreflightEvidence,
+        QualificationChecks, QualificationFailure,
+    };
+
+    let cfg = crate::config::Config::from_file(&args.config)?;
+    let provenance = BuildProvenance::embedded();
+    let (artifacts, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let metadata_result = crate::qualification::read_expert_metadata(&metadata_path);
+    let metadata = metadata_result.clone().ok();
+    let mut report = crate::q4_parity::Q4ParityReport::new(
+        provenance.clone(),
+        artifacts,
+        metadata.clone(),
+        args.expected_adapter_name.clone(),
+    );
+
+    if !artifact_errors.is_empty() {
+        return fail_q4_parity(
+            report,
+            qualification_artifact_failure(&artifact_errors),
+            args.report_out.as_deref(),
+        );
+    }
+    let metadata = match metadata_result {
+        Ok(metadata) => metadata,
+        Err(detail) => {
+            return fail_q4_parity(
+                report,
+                qualification_metadata_failure(detail),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let weight_policy = cfg.real_transformer.resolve_weight_policy();
+    if !matches!(weight_policy, Ok(crate::config::RealWeightPolicy::StrictReal)) {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "non-strict-weight-policy",
+                weight_policy
+                    .err()
+                    .unwrap_or_else(|| "resolved weight policy is SeededDev".to_string()),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let preflight = PreflightEvidence {
+        provenance,
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        requested_mode: cfg.real_transformer.compute_offload,
+        routed_expert_dtype: cfg.model.dtype,
+        metadata,
+    };
+    let mut base_checks = QualificationChecks::default();
+    if let Err(failure) = validate_preflight(&preflight, &mut base_checks) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    report.checks.clean_build = base_checks.clean_build;
+    report.checks.strict_hybrid_preflight = base_checks.strict_real_checkpoint
+        && base_checks.requested_hybrid
+        && base_checks.native_q4_0_routed_experts;
+    report.checks.canonical_q4_0_layout = base_checks.canonical_q4_layout;
+
+    let runtime = match build_real_cli_runtime(
+        &args.config,
+        RealCliRuntimeMode::StrictHybridQualification,
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return fail_q4_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "startup-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    if !runtime.model.load_status.strict
+        || runtime.model.load_status.seeded_fallback_remained
+        || runtime.model.load_status.loaded_tensors != runtime.model.load_status.required_tensors
+    {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "seeded-model-loaded",
+                format!(
+                    "strict={} loaded={}/{} seeded_fallback_remained={}",
+                    runtime.model.load_status.strict,
+                    runtime.model.load_status.loaded_tensors,
+                    runtime.model.load_status.required_tensors,
+                    runtime.model.load_status.seeded_fallback_remained
+                ),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+
+    let context = runtime.engine.execution_context();
+    report.execution_plan = Some(context.plan().into());
+    if let Err(failure) = validate_execution_plan(context.plan(), &mut base_checks) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    report.checks.exact_execution_plan = base_checks.resolved_planes_match_contract;
+
+    let device = runtime.engine.gpu_device_identity();
+    report.device = device.clone();
+    if let Err(failure) = validate_device(device.as_ref(), &mut base_checks) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    report.checks.hardware_gpu_adapter = base_checks.hardware_gpu_adapter;
+    let Some(device) = device else {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "gpu-device-unavailable",
+                "validated authoritative GPU identity unexpectedly disappeared",
+            ),
+            args.report_out.as_deref(),
+        );
+    };
+    if device.name != args.expected_adapter_name {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "unexpected-gpu-adapter",
+                format!(
+                    "selected adapter {:?}, expected exact name {:?}",
+                    device.name, args.expected_adapter_name
+                ),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    report.checks.expected_adapter_exact_match = true;
+    if let Err(failure) = validate_gpu_failure_policy(
+        runtime.engine.routed_expert_gpu_failure_policy(),
+        &mut base_checks,
+    ) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    report.checks.strict_gpu_failure_policy = base_checks.strict_gpu_failure_policy;
+
+    let identity = match crate::q4_parity::expert_identity(
+        args.expert_id,
+        runtime.cfg.model.num_layers,
+        runtime.cfg.model.num_experts,
+    ) {
+        Ok(identity) => identity,
+        Err(failure) => {
+            return fail_q4_parity(report, failure, args.report_out.as_deref());
+        }
+    };
+    report.checks.global_expert_identity_valid = true;
+
+    // Raw canonical blocks use only ephemeral qualification buffers. Prove
+    // they leave logical/physical expert state and production I/O counters
+    // unchanged before beginning the complete-expert evidence window.
+    let backend = context.routed_expert_backend();
+    let raw_memory_before = runtime.engine.gpu_expert_memory_snapshot();
+    let raw_io_before = runtime.engine.gpu_expert_io_snapshot();
+    let raw_physical_before = backend.gpu_physical_expert_residency(args.expert_id);
+    let Some(raw_memory_before) = raw_memory_before else {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "gpu-device-unavailable",
+                "raw Q4_0 qualification has no physical-memory snapshot",
+            ),
+            args.report_out.as_deref(),
+        );
+    };
+    let Some(raw_io_before) = raw_io_before else {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "gpu-device-unavailable",
+                "raw Q4_0 qualification has no routed-expert I/O snapshot",
+            ),
+            args.report_out.as_deref(),
+        );
+    };
+    if let Err(failure) = validate_memory(raw_memory_before) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    if raw_memory_before.logical_admitted_bytes != 0
+        || raw_memory_before.expert_live_bytes != 0
+        || raw_memory_before.expert_registry_bytes != 0
+        || raw_memory_before.physical_entries != 0
+        || raw_memory_before.physical_installs != 0
+        || raw_memory_before.physical_evictions != 0
+        || raw_memory_before.stale_retirements != 0
+        || raw_io_before != crate::backend::GpuExpertIoSnapshot::default()
+        || raw_physical_before.is_some()
+    {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Startup,
+                "physical-registry-not-cold",
+                "complete-expert parity requires a fresh logical/physical expert registry and zero routed GPU-I/O counters",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let raw_cases = match crate::q4_parity::run_raw_shader_cases(backend) {
+        Ok(cases) => cases,
+        Err(failure) => {
+            return fail_q4_parity(report, failure, args.report_out.as_deref());
+        }
+    };
+    report.raw_cases = raw_cases;
+    report.checks.raw_shader_cases_passed = true;
+    let raw_memory_after = runtime.engine.gpu_expert_memory_snapshot();
+    let raw_io_after = runtime.engine.gpu_expert_io_snapshot();
+    let raw_physical_after = backend.gpu_physical_expert_residency(args.expert_id);
+    let Some(raw_memory_after) = raw_memory_after else {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Postcondition,
+                "gpu-device-unavailable",
+                "raw Q4_0 qualification lost its physical-memory snapshot",
+            ),
+            args.report_out.as_deref(),
+        );
+    };
+    let Some(raw_io_after) = raw_io_after else {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Postcondition,
+                "gpu-device-unavailable",
+                "raw Q4_0 qualification lost its routed-expert I/O snapshot",
+            ),
+            args.report_out.as_deref(),
+        );
+    };
+    report.raw_isolation = Some(crate::q4_parity::RawIsolationEvidence {
+        memory_before: raw_memory_before,
+        memory_after: raw_memory_after,
+        gpu_io_before: raw_io_before,
+        gpu_io_after: raw_io_after,
+        selected_physical_before: raw_physical_before,
+        selected_physical_after: raw_physical_after,
+    });
+    if let Err(failure) = validate_memory(raw_memory_after) {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    if raw_memory_after != raw_memory_before
+        || raw_io_after != raw_io_before
+        || raw_physical_after != raw_physical_before
+    {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Postcondition,
+                "raw-q4-contaminated-expert-residency",
+                "raw Q4_0 dispatch changed production expert residency, memory, or I/O evidence",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    report.checks.raw_dispatch_isolated_from_expert_registry = true;
+
+    let inputs = crate::q4_parity::deterministic_complete_inputs(runtime.cfg.model.d_model);
+    let execution = match runtime
+        .engine
+        .qualify_q4_0_complete_expert(args.expert_id, identity.layer_index, &inputs)
+        .await
+    {
+        Ok(execution) => execution,
+        Err(detail) => {
+            return fail_q4_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Inference,
+                    "complete-expert-dispatch-failed",
+                    detail,
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let expected_payload = crate::inference::expert_weight_bytes_for(
+        runtime.cfg.model.d_model,
+        runtime.cfg.model.d_ff,
+        crate::inference::WeightDtype::Q4_0,
+    );
+    if execution.payload_bytes != expected_payload {
+        return fail_q4_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Postcondition,
+                "expert-payload-size-mismatch",
+                format!(
+                    "complete expert has {} logical bytes, expected exactly {expected_payload}",
+                    execution.payload_bytes
+                ),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    report.checks.exact_expert_payload_size = true;
+    let complete_validation = match crate::q4_parity::validate_complete_expert(
+        identity,
+        execution,
+        runtime.cfg.model.d_model,
+    ) {
+        Ok(complete) => complete,
+        Err(failure) => {
+            return fail_q4_parity(report, failure, args.report_out.as_deref());
+        }
+    };
+    report.complete_expert = Some(complete_validation.report);
+    if let Some(failure) = complete_validation.tolerance_failure {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    report.checks.initial_physical_install_exactly_once = true;
+    report.checks.subsequent_dispatches_reused_generation = true;
+    report.checks.subsequent_dispatches_uploaded_zero_weight_bytes = true;
+    report.checks.every_dispatch_completed_gpu_io = true;
+    report.checks.zero_evictions_or_stale_retirements = true;
+    report.checks.zero_cpu_fallback_or_degraded_execution = true;
+    report.checks.complete_expert_vectors_passed = true;
+    if let Err(failure) = report.finish() {
+        return fail_q4_parity(report, failure, args.report_out.as_deref());
+    }
+    emit_q4_parity_report(&report, args.report_out.as_deref())
 }
 
 async fn with_progress_timeout<T, F>(
@@ -8318,6 +8759,53 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn q4_parity_cli_requires_and_preserves_global_expert_and_adapter() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-hybrid-q4-parity",
+            "--config",
+            "config.toml",
+            "--expert-id",
+            "257",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+        ])
+        .unwrap();
+        let Cmd::QualifyHybridQ4Parity {
+            expert_id,
+            expected_adapter_name,
+            report_out,
+            ..
+        } = cli.cmd
+        else {
+            panic!("expected qualify-hybrid-q4-parity command");
+        };
+        assert_eq!(expert_id, 257);
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, None);
+    }
+
+    #[test]
+    fn q4_parity_cli_rejects_missing_explicit_identity_inputs() {
+        for missing in ["--expert-id", "--expected-adapter-name"] {
+            let mut args = vec![
+                "micro-expert-router",
+                "qualify-hybrid-q4-parity",
+                "--config",
+                "config.toml",
+                "--expert-id",
+                "257",
+                "--expected-adapter-name",
+                "NVIDIA L4",
+            ];
+            let index = args.iter().position(|value| *value == missing).unwrap();
+            args.drain(index..=index + 1);
+            let error = <Cli as clap::Parser>::try_parse_from(args).unwrap_err();
+            assert!(error.to_string().contains(missing), "{error}");
+        }
     }
 
     #[test]
