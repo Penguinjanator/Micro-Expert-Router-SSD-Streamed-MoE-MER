@@ -1962,6 +1962,9 @@ impl Engine {
             ));
         }
 
+        let block_align = self.core.storage.config().block_align;
+        crate::q4_parity::validate_checkpoint_block_align(block_align)?;
+
         self.core
             .storage
             .validate_expert_file_layout(std::iter::once(global_expert_id))
@@ -1971,22 +1974,17 @@ impl Engine {
                 )
             })?;
 
-        let resident = self
-            .fetch_with_retry(global_expert_id)
-            .await
-            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
         let expected_payload = crate::inference::expert_weight_bytes_for(
             self.core.shape.d_model,
             self.core.shape.d_ff,
             WeightDtype::Q4_0,
         );
-        let block_align = self.core.storage.config().block_align;
-        let checkpoint_payload_bytes = expected_payload
-            .checked_add(block_align.checked_sub(1).ok_or_else(|| {
-                "complete-expert parity requires non-zero storage block alignment".to_string()
-            })?)
-            .map(|bytes| bytes / block_align * block_align)
-            .ok_or_else(|| "aligned checkpoint payload size overflowed usize".to_string())?;
+        let checkpoint_payload_bytes =
+            crate::q4_parity::aligned_checkpoint_payload_bytes(expected_payload, block_align)?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
         if resident.data().len() != checkpoint_payload_bytes {
             return Err(format!(
                 "global expert {global_expert_id} checkpoint payload has {} bytes, expected exactly {checkpoint_payload_bytes} ({expected_payload} canonical Q4_0 bytes plus alignment padding)",
@@ -2032,13 +2030,14 @@ impl Engine {
                 .gpu_expert_cache()
                 .get(global_expert_id);
             let before = self.q4_parity_dispatch_snapshot(global_expert_id)?;
-            let gpu_f16 = self
-                .forward_moe_resident(0, layer_index, resident.as_ref(), &input, None)
-                .map_err(|error| {
-                    format!(
-                        "global expert {global_expert_id} layer {layer_index} GPU dispatch failed: {error}"
-                    )
-                })?;
+            let gpu_f16 = run_compute_donated(|| {
+                self.forward_moe_resident(0, layer_index, resident.as_ref(), &input, None)
+            })
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} layer {layer_index} GPU dispatch failed: {error}"
+                )
+            })?;
             let after = self.q4_parity_dispatch_snapshot(global_expert_id)?;
             dispatches.push(crate::q4_parity::CompleteDispatchExecution {
                 input,

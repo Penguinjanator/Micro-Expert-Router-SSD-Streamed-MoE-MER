@@ -16,9 +16,11 @@ use crate::qualification::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 pub const SCHEMA_VERSION: &str = "mer.strict-hybrid-q4-parity.v1";
 pub const MODE: &str = "strict-hybrid-q4-parity";
+pub const RAW_CASE_COUNT: usize = 8;
 
 /// Raw shader output remains f32, but its block-local operation order differs
 /// slightly from materialising every scaled CPU weight before the dot product.
@@ -76,12 +78,64 @@ pub struct RawQ4CaseReport {
     pub cpu_f32: Vec<f32>,
     pub gpu_f32: Vec<f32>,
     pub absolute_errors: Vec<f32>,
+    /// `f32::MAX` means relative error is undefined because the CPU
+    /// reference is zero while absolute error is nonzero. PASS still uses the
+    /// finite combined absolute-plus-relative allowance.
     pub relative_errors: Vec<f32>,
     pub allowed_errors: Vec<f32>,
     pub worst_index: usize,
+    pub worst_cpu_f32: f32,
+    pub worst_gpu_f32: f32,
+    pub worst_absolute_error: f32,
+    pub worst_relative_error: f32,
     pub max_absolute_error: f32,
     pub max_relative_error: f32,
     pub passed: bool,
+}
+
+/// Raw shader evidence plus the first observed tolerance failure. A tolerance
+/// miss is data, not a control-flow error: all safe deterministic cases keep
+/// running and every completed report is retained.
+#[derive(Debug)]
+pub struct RawShaderValidation {
+    pub reports: Vec<RawQ4CaseReport>,
+    pub tolerance_failure: Option<QualificationFailure>,
+}
+
+impl RawShaderValidation {
+    fn new() -> Self {
+        Self {
+            reports: Vec::with_capacity(RAW_CASE_COUNT),
+            tolerance_failure: None,
+        }
+    }
+
+    fn record(&mut self, report: RawQ4CaseReport) {
+        if !report.passed {
+            self.tolerance_failure.get_or_insert_with(|| {
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "raw-q4-tolerance-failed",
+                    format!(
+                        "{} failed at output {}: cpu={} gpu={} abs_error={} allowed={}",
+                        report.name,
+                        report.worst_index,
+                        report.worst_cpu_f32,
+                        report.worst_gpu_f32,
+                        report.worst_absolute_error,
+                        report.allowed_errors[report.worst_index]
+                    ),
+                )
+            });
+        }
+        self.reports.push(report);
+    }
+
+    pub fn all_cases_passed(&self) -> bool {
+        self.tolerance_failure.is_none()
+            && self.reports.len() == RAW_CASE_COUNT
+            && self.reports.iter().all(|report| report.passed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -187,6 +241,8 @@ pub struct CompleteExpertVectorReport {
     pub cpu_f16: Vec<f32>,
     pub gpu_f16: Vec<f32>,
     pub absolute_errors: Vec<f32>,
+    /// Uses the same finite `f32::MAX` sentinel as raw reports when the rounded
+    /// CPU f16 reference is zero and absolute error is nonzero.
     pub relative_errors: Vec<f32>,
     pub allowed_errors: Vec<f32>,
     pub worst_index: usize,
@@ -224,7 +280,21 @@ pub struct CompleteExpertReport {
 #[derive(Debug)]
 pub struct CompleteExpertValidation {
     pub report: CompleteExpertReport,
+    pub invariants: CompleteExpertInvariantOutcomes,
     pub tolerance_failure: Option<QualificationFailure>,
+}
+
+/// Observed completion invariants used verbatim to populate the top-level PASS
+/// checks. Every value is calculated from dispatch snapshots and counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompleteExpertInvariantOutcomes {
+    pub initial_physical_install_exactly_once: bool,
+    pub subsequent_dispatches_reused_generation: bool,
+    pub subsequent_dispatches_uploaded_zero_weight_bytes: bool,
+    pub every_dispatch_completed_gpu_io: bool,
+    pub zero_evictions_or_stale_retirements: bool,
+    pub zero_cpu_fallback_or_degraded_execution: bool,
+    pub complete_expert_vectors_passed: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -337,7 +407,7 @@ impl Q4ParityReport {
             || self.expert_metadata.is_none()
             || self.execution_plan.is_none()
             || self.device.is_none()
-            || self.raw_cases.is_empty()
+            || self.raw_cases.len() != RAW_CASE_COUNT
             || self.raw_isolation.is_none()
             || self.complete_expert.is_none()
         {
@@ -351,6 +421,31 @@ impl Q4ParityReport {
         self.failure = None;
         Ok(())
     }
+}
+
+/// Validate the checkpoint storage alignment before any aligned payload-size
+/// arithmetic. The qualification path deliberately fails instead of relying
+/// on a lower-level aligned-buffer assertion.
+pub(crate) fn validate_checkpoint_block_align(block_align: usize) -> Result<(), String> {
+    if block_align == 0 || !block_align.is_power_of_two() {
+        return Err(format!(
+            "storage block_align {block_align} must be a positive power of two for complete-expert parity"
+        ));
+    }
+    Ok(())
+}
+
+/// Round canonical expert bytes to the exact header-stripped checkpoint slot
+/// size with checked arithmetic.
+pub(crate) fn aligned_checkpoint_payload_bytes(
+    payload_bytes: usize,
+    block_align: usize,
+) -> Result<usize, String> {
+    validate_checkpoint_block_align(block_align)?;
+    payload_bytes
+        .checked_add(block_align - 1)
+        .map(|bytes| bytes / block_align * block_align)
+        .ok_or_else(|| "aligned checkpoint payload size overflowed usize".to_string())
 }
 
 fn canonical_block(scale: f32, nibbles: [u8; 16]) -> Vec<u8> {
@@ -387,6 +482,16 @@ pub fn canonical_raw_cases() -> Vec<RawQ4Case> {
     let multiple_blocks = [
         canonical_block(0.125, alternating),
         canonical_block(-0.25, ramp),
+    ]
+    .concat();
+
+    // Block zero is an unused prefix. Blocks one and two are deliberately
+    // distinct so rows=2 validates both row stride and output indexing from a
+    // nonzero, byte-unaligned Q4_0 block offset.
+    let multi_row_stream = [
+        canonical_block(0.0, alternating),
+        canonical_block(0.125, ramp),
+        canonical_block(-0.25, inverse_ramp),
     ]
     .concat();
 
@@ -453,6 +558,15 @@ pub fn canonical_raw_cases() -> Vec<RawQ4Case> {
             rows: 1,
             columns: 32,
             w_block_off: 2,
+        },
+        RawQ4Case {
+            name: "multi-row-offset-row-stride",
+            projection: "standalone",
+            weights: multi_row_stream,
+            input: deterministic_input(32, 8),
+            rows: 2,
+            columns: 32,
+            w_block_off: 1,
         },
     ]
 }
@@ -542,6 +656,10 @@ fn validate_raw_case(case: &RawQ4Case) -> Result<(), String> {
     Ok(())
 }
 
+/// Schema-v1 relative-error encoding. A zero reference with nonzero absolute
+/// error has no finite mathematical relative error, so the already-published
+/// schema retains `f32::MAX` as a finite JSON-safe sentinel. Tolerance PASS is
+/// determined independently from the combined absolute allowance.
 fn relative_error(reference: f32, absolute_error: f32) -> f32 {
     if reference == 0.0 {
         if absolute_error == 0.0 {
@@ -618,83 +736,85 @@ fn compare_vectors(
     ))
 }
 
+fn build_raw_case_report(
+    case: &RawQ4Case,
+    cpu: Vec<f32>,
+    gpu: Vec<f32>,
+) -> Result<RawQ4CaseReport, QualificationFailure> {
+    let (
+        absolute_errors,
+        relative_errors,
+        allowed_errors,
+        worst_index,
+        max_absolute_error,
+        max_relative_error,
+        passed,
+    ) = compare_vectors(&cpu, &gpu, RAW_TOLERANCE).map_err(|detail| {
+        QualificationFailure::new(
+            FailureStage::Postcondition,
+            "raw-q4-comparison-invalid",
+            format!("{}: {detail}", case.name),
+        )
+    })?;
+    let byte_offset = case.w_block_off * Q4_0_BLOCK_BYTES;
+    Ok(RawQ4CaseReport {
+        name: case.name.to_string(),
+        projection: case.projection.to_string(),
+        rows: case.rows,
+        columns: case.columns,
+        w_block_off: case.w_block_off,
+        byte_offset,
+        starts_on_unaligned_18_byte_boundary: !byte_offset.is_multiple_of(4),
+        weight_bytes: case.weights.len(),
+        weights_sha256: format!("{:x}", Sha256::digest(&case.weights)),
+        input_sha256: hash_f32(&case.input),
+        worst_cpu_f32: cpu[worst_index],
+        worst_gpu_f32: gpu[worst_index],
+        worst_absolute_error: absolute_errors[worst_index],
+        worst_relative_error: relative_errors[worst_index],
+        cpu_f32: cpu,
+        gpu_f32: gpu,
+        absolute_errors,
+        relative_errors,
+        allowed_errors,
+        worst_index,
+        max_absolute_error,
+        max_relative_error,
+        passed,
+    })
+}
+
+/// Execute all deterministic raw fixtures through the existing production
+/// Q4_0 pipeline. Structural/dispatch errors stop immediately; tolerance
+/// failures retain their reports and do not prevent later safe cases running.
 pub fn run_raw_shader_cases(
     backend: &BackendBox,
-) -> Result<Vec<RawQ4CaseReport>, QualificationFailure> {
-    canonical_raw_cases()
-        .into_iter()
-        .map(|case| {
-            let cpu = cpu_q4_matvec(&case).map_err(|detail| {
-                QualificationFailure::new(FailureStage::Preflight, "raw-q4-case-invalid", detail)
-            })?;
-            let gpu = backend
-                .qualification_q4_0_matvec(
-                    &case.weights,
-                    &case.input,
-                    case.rows,
-                    case.columns,
-                    case.w_block_off,
-                )
-                .map_err(|detail| {
-                    QualificationFailure::new(
-                        FailureStage::Inference,
-                        "raw-q4-gpu-dispatch-failed",
-                        format!("{}: {detail}", case.name),
-                    )
-                })?;
-            let (
-                absolute_errors,
-                relative_errors,
-                allowed_errors,
-                worst_index,
-                max_absolute_error,
-                max_relative_error,
-                passed,
-            ) = compare_vectors(&cpu, &gpu, RAW_TOLERANCE).map_err(|detail| {
+    readback_timeout: Duration,
+) -> Result<RawShaderValidation, QualificationFailure> {
+    let mut validation = RawShaderValidation::new();
+    for case in canonical_raw_cases() {
+        let cpu = cpu_q4_matvec(&case).map_err(|detail| {
+            QualificationFailure::new(FailureStage::Preflight, "raw-q4-case-invalid", detail)
+        })?;
+        let gpu = backend
+            .qualification_q4_0_matvec(
+                &case.weights,
+                &case.input,
+                case.rows,
+                case.columns,
+                case.w_block_off,
+                readback_timeout,
+            )
+            .map_err(|error| {
                 QualificationFailure::new(
-                    FailureStage::Postcondition,
-                    "raw-q4-comparison-invalid",
-                    format!("{}: {detail}", case.name),
+                    FailureStage::Inference,
+                    "raw-q4-gpu-dispatch-failed",
+                    format!("{}: {error}", case.name),
                 )
             })?;
-            if !passed {
-                return Err(QualificationFailure::new(
-                    FailureStage::Postcondition,
-                    "raw-q4-tolerance-failed",
-                    format!(
-                        "{} failed at output {worst_index}: cpu={} gpu={} abs_error={} allowed={}",
-                        case.name,
-                        cpu[worst_index],
-                        gpu[worst_index],
-                        absolute_errors[worst_index],
-                        allowed_errors[worst_index]
-                    ),
-                ));
-            }
-            let byte_offset = case.w_block_off * Q4_0_BLOCK_BYTES;
-            Ok(RawQ4CaseReport {
-                name: case.name.to_string(),
-                projection: case.projection.to_string(),
-                rows: case.rows,
-                columns: case.columns,
-                w_block_off: case.w_block_off,
-                byte_offset,
-                starts_on_unaligned_18_byte_boundary: !byte_offset.is_multiple_of(4),
-                weight_bytes: case.weights.len(),
-                weights_sha256: format!("{:x}", Sha256::digest(&case.weights)),
-                input_sha256: hash_f32(&case.input),
-                cpu_f32: cpu,
-                gpu_f32: gpu,
-                absolute_errors,
-                relative_errors,
-                allowed_errors,
-                worst_index,
-                max_absolute_error,
-                max_relative_error,
-                passed,
-            })
-        })
-        .collect()
+        validation.record(build_raw_case_report(&case, cpu, gpu)?);
+    }
+    Ok(validation)
 }
 
 fn subtract_io(
@@ -846,11 +966,18 @@ pub fn validate_complete_expert(
                 "d_model * sizeof(f32) overflowed u64",
             )
         })?;
-    let mut reports = Vec::with_capacity(execution.dispatches.len());
+    let dispatch_count = execution.dispatches.len();
+    let mut reports = Vec::with_capacity(dispatch_count);
     let mut stable_generation = None;
     let mut stable_physical = None;
     let mut previous_after = None;
     let mut tolerance_failure = None;
+    let mut initial_physical_install_exactly_once = false;
+    let mut subsequent_dispatches_reused_generation = true;
+    let mut subsequent_dispatches_uploaded_zero_weight_bytes = true;
+    let mut every_dispatch_completed_gpu_io = true;
+    let mut zero_evictions_or_stale_retirements = true;
+    let mut zero_cpu_fallback_or_degraded_execution = true;
 
     for (vector_index, dispatch) in execution.dispatches.into_iter().enumerate() {
         for snapshot in [dispatch.before.memory, dispatch.after.memory] {
@@ -997,33 +1124,37 @@ pub fn validate_complete_expert(
             .memory
             .stale_retirements
             .checked_sub(dispatch.before.memory.stale_retirements);
-        if eviction_delta != Some(0) || stale_delta != Some(0) {
+        let no_registry_churn = eviction_delta == Some(0) && stale_delta == Some(0);
+        zero_evictions_or_stale_retirements &= no_registry_churn;
+        if !no_registry_churn {
             return Err(QualificationFailure::new(
                 FailureStage::Postcondition,
                 "physical-registry-churn",
                 format!("vector {vector_index} evicted or retired a physical entry"),
             ));
         }
-        if io_delta.hidden_state_uploads != 1
-            || io_delta.hidden_state_upload_bytes != output_bytes
-            || io_delta.queue_submissions != 1
-            || io_delta.map_requests != 1
-            || io_delta.readback_completions != 1
-            || io_delta.readback_bytes != output_bytes
-        {
+        let gpu_io_completed = io_delta.hidden_state_uploads == 1
+            && io_delta.hidden_state_upload_bytes == output_bytes
+            && io_delta.queue_submissions == 1
+            && io_delta.map_requests == 1
+            && io_delta.readback_completions == 1
+            && io_delta.readback_bytes == output_bytes;
+        every_dispatch_completed_gpu_io &= gpu_io_completed;
+        if !gpu_io_completed {
             return Err(QualificationFailure::new(
                 FailureStage::Postcondition,
                 "incomplete-per-vector-gpu-io",
                 format!("vector {vector_index} GPU I/O delta is {io_delta:?}"),
             ));
         }
-        if routed_delta.gpu_dispatch_attempts != 1
-            || routed_delta.gpu_dispatch_successes != 1
-            || routed_delta.gpu_dispatch_failures != 0
-            || routed_delta.cpu_routed_expert_dispatches != 0
-            || routed_delta.gpu_cpu_fallbacks != 0
-            || routed_delta.degraded_expert_substitutions != 0
-        {
+        let gpu_dispatch_succeeded = routed_delta.gpu_dispatch_attempts == 1
+            && routed_delta.gpu_dispatch_successes == 1
+            && routed_delta.gpu_dispatch_failures == 0;
+        let no_cpu_or_degraded_execution = routed_delta.cpu_routed_expert_dispatches == 0
+            && routed_delta.gpu_cpu_fallbacks == 0
+            && routed_delta.degraded_expert_substitutions == 0;
+        zero_cpu_fallback_or_degraded_execution &= no_cpu_or_degraded_execution;
+        if !gpu_dispatch_succeeded || !no_cpu_or_degraded_execution {
             return Err(QualificationFailure::new(
                 FailureStage::Postcondition,
                 "invalid-per-vector-routed-execution",
@@ -1032,21 +1163,21 @@ pub fn validate_complete_expert(
         }
 
         if vector_index == 0 {
-            if dispatch.before.physical.is_some()
-                || dispatch.before.logical_generation.is_some()
-                || dispatch.before.memory.logical_admitted_bytes != 0
-                || dispatch.before.memory.expert_live_bytes != 0
-                || dispatch.before.memory.physical_entries != 0
-                || dispatch.before.memory.expert_registry_bytes != 0
-                || dispatch.before.memory.physical_installs != 0
-                || dispatch.before.memory.physical_evictions != 0
-                || dispatch.before.memory.stale_retirements != 0
-                || dispatch.before.gpu_io != GpuExpertIoSnapshot::default()
-                || dispatch.before.routed != RoutedExpertExecutionSnapshot::default()
-                || memory_install_delta != Some(1)
-                || io_delta.expert_weight_uploads != 1
-                || io_delta.expert_weight_upload_bytes != after_physical.device_bytes
-            {
+            initial_physical_install_exactly_once = dispatch.before.physical.is_none()
+                && dispatch.before.logical_generation.is_none()
+                && dispatch.before.memory.logical_admitted_bytes == 0
+                && dispatch.before.memory.expert_live_bytes == 0
+                && dispatch.before.memory.physical_entries == 0
+                && dispatch.before.memory.expert_registry_bytes == 0
+                && dispatch.before.memory.physical_installs == 0
+                && dispatch.before.memory.physical_evictions == 0
+                && dispatch.before.memory.stale_retirements == 0
+                && dispatch.before.gpu_io == GpuExpertIoSnapshot::default()
+                && dispatch.before.routed == RoutedExpertExecutionSnapshot::default()
+                && memory_install_delta == Some(1)
+                && io_delta.expert_weight_uploads == 1
+                && io_delta.expert_weight_upload_bytes == after_physical.device_bytes;
+            if !initial_physical_install_exactly_once {
                 return Err(QualificationFailure::new(
                     FailureStage::Postcondition,
                     "initial-physical-install-not-exactly-once",
@@ -1058,23 +1189,27 @@ pub fn validate_complete_expert(
             }
             stable_generation = Some(after_generation);
             stable_physical = Some(after_physical);
-        } else if dispatch.before.logical_generation != stable_generation
-            || dispatch.before.physical != stable_physical
-            || dispatch.after.logical_generation != stable_generation
-            || dispatch.after.physical != stable_physical
-            || dispatch.before.memory.physical_entries != 1
-            || dispatch.before.memory.expert_registry_bytes != physical_device_bytes
-            || memory_install_delta != Some(0)
-            || io_delta.expert_weight_uploads != 0
-            || io_delta.expert_weight_upload_bytes != 0
-        {
-            return Err(QualificationFailure::new(
-                FailureStage::Postcondition,
-                "physical-expert-not-reused",
-                format!(
-                    "vector {vector_index} changed generation/residency or re-uploaded weights"
-                ),
-            ));
+        } else {
+            let reused_generation = dispatch.before.logical_generation == stable_generation
+                && dispatch.before.physical == stable_physical
+                && dispatch.after.logical_generation == stable_generation
+                && dispatch.after.physical == stable_physical
+                && dispatch.before.memory.physical_entries == 1
+                && dispatch.before.memory.expert_registry_bytes == physical_device_bytes
+                && memory_install_delta == Some(0);
+            let uploaded_zero_weight_bytes = io_delta.expert_weight_uploads == 0
+                && io_delta.expert_weight_upload_bytes == 0;
+            subsequent_dispatches_reused_generation &= reused_generation;
+            subsequent_dispatches_uploaded_zero_weight_bytes &= uploaded_zero_weight_bytes;
+            if !reused_generation || !uploaded_zero_weight_bytes {
+                return Err(QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "physical-expert-not-reused",
+                    format!(
+                        "vector {vector_index} changed generation/residency or re-uploaded weights"
+                    ),
+                ));
+            }
         }
 
         reports.push(CompleteExpertVectorReport {
@@ -1103,6 +1238,9 @@ pub fn validate_complete_expert(
         previous_after = Some(dispatch.after);
     }
 
+    let complete_expert_vectors_passed = tolerance_failure.is_none()
+        && reports.len() == dispatch_count
+        && reports.iter().all(|report| report.passed);
     Ok(CompleteExpertValidation {
         report: CompleteExpertReport {
             identity,
@@ -1116,6 +1254,15 @@ pub fn validate_complete_expert(
             payload_sha256: execution.payload_sha256,
             checkpoint_payload_sha256: execution.checkpoint_payload_sha256,
             vectors: reports,
+        },
+        invariants: CompleteExpertInvariantOutcomes {
+            initial_physical_install_exactly_once,
+            subsequent_dispatches_reused_generation,
+            subsequent_dispatches_uploaded_zero_weight_bytes,
+            every_dispatch_completed_gpu_io,
+            zero_evictions_or_stale_retirements,
+            zero_cpu_fallback_or_degraded_execution,
+            complete_expert_vectors_passed,
         },
         tolerance_failure,
     })
@@ -1252,6 +1399,7 @@ mod tests {
     #[test]
     fn canonical_cases_cover_required_scale_offsets_and_projections() {
         let cases = canonical_raw_cases();
+        assert_eq!(cases.len(), RAW_CASE_COUNT);
         assert!(cases.iter().any(|case| case.name.contains("zero-scale")));
         assert!(cases
             .iter()
@@ -1268,6 +1416,13 @@ mod tests {
             .find(|case| case.name.contains("unaligned"))
             .unwrap();
         assert_ne!((unaligned.w_block_off * Q4_0_BLOCK_BYTES) % 4, 0);
+
+        let multi_row = cases.iter().find(|case| case.rows >= 2).unwrap();
+        assert!(multi_row.w_block_off > 0);
+        assert_ne!((multi_row.w_block_off * Q4_0_BLOCK_BYTES) % 4, 0);
+        let output = cpu_q4_matvec(multi_row).unwrap();
+        assert_eq!(output.len(), multi_row.rows);
+        assert_ne!(output[0], output[1]);
     }
 
     #[test]
@@ -1326,6 +1481,78 @@ mod tests {
                 .unwrap()
                 .6
         );
+    }
+
+    #[test]
+    fn zero_reference_uses_finite_relative_sentinel_but_absolute_rule_decides_pass() {
+        let within = compare_vectors(
+            &[0.0],
+            &[RAW_ABSOLUTE_TOLERANCE * 0.5],
+            RAW_TOLERANCE,
+        )
+        .unwrap();
+        assert_eq!(within.1, vec![f32::MAX]);
+        assert!(within.6);
+
+        let outside = compare_vectors(
+            &[0.0],
+            &[RAW_ABSOLUTE_TOLERANCE * 2.0],
+            RAW_TOLERANCE,
+        )
+        .unwrap();
+        assert_eq!(outside.1, vec![f32::MAX]);
+        assert!(!outside.6);
+    }
+
+    #[test]
+    fn failed_raw_case_retains_diagnostics_and_first_failure_while_later_cases_run() {
+        let cases = canonical_raw_cases();
+        let mut validation = RawShaderValidation::new();
+
+        let first_cpu = cpu_q4_matvec(&cases[0]).unwrap();
+        validation.record(
+            build_raw_case_report(&cases[0], first_cpu.clone(), first_cpu).unwrap(),
+        );
+
+        let second_cpu = cpu_q4_matvec(&cases[1]).unwrap();
+        let mut second_gpu = second_cpu.clone();
+        second_gpu[0] += 0.25;
+        validation.record(
+            build_raw_case_report(&cases[1], second_cpu.clone(), second_gpu).unwrap(),
+        );
+
+        let third_cpu = cpu_q4_matvec(&cases[2]).unwrap();
+        let mut third_gpu = third_cpu.clone();
+        third_gpu[0] -= 0.5;
+        validation.record(build_raw_case_report(&cases[2], third_cpu, third_gpu).unwrap());
+
+        assert_eq!(validation.reports.len(), 3);
+        assert!(validation.reports[0].passed);
+        let failed = &validation.reports[1];
+        assert!(!failed.passed);
+        assert_eq!(failed.cpu_f32.len(), 1);
+        assert_eq!(failed.gpu_f32.len(), 1);
+        assert_eq!(failed.absolute_errors.len(), 1);
+        assert_eq!(failed.relative_errors.len(), 1);
+        assert_eq!(failed.allowed_errors.len(), 1);
+        assert_eq!(failed.worst_index, 0);
+        assert_eq!(failed.worst_cpu_f32, failed.cpu_f32[0]);
+        assert_eq!(failed.worst_gpu_f32, failed.gpu_f32[0]);
+        assert!(validation.reports[2].name.contains("negative-scale"));
+        let first_failure = validation.tolerance_failure.unwrap();
+        assert!(first_failure.detail.contains("positive-scale-extrema"));
+        assert!(!first_failure.detail.contains("negative-scale-sign"));
+    }
+
+    #[test]
+    fn checkpoint_payload_alignment_rejects_invalid_values_before_arithmetic() {
+        assert!(aligned_checkpoint_payload_bytes(54, 0)
+            .unwrap_err()
+            .contains("storage block_align 0"));
+        assert!(aligned_checkpoint_payload_bytes(54, 48)
+            .unwrap_err()
+            .contains("positive power of two"));
+        assert_eq!(aligned_checkpoint_payload_bytes(54, 64).unwrap(), 64);
     }
 
     #[test]
@@ -1397,6 +1624,18 @@ mod tests {
         let (identity, execution) = valid_complete_execution();
         let validation = validate_complete_expert(identity, execution, 2).unwrap();
         assert!(validation.tolerance_failure.is_none());
+        assert_eq!(
+            validation.invariants,
+            CompleteExpertInvariantOutcomes {
+                initial_physical_install_exactly_once: true,
+                subsequent_dispatches_reused_generation: true,
+                subsequent_dispatches_uploaded_zero_weight_bytes: true,
+                every_dispatch_completed_gpu_io: true,
+                zero_evictions_or_stale_retirements: true,
+                zero_cpu_fallback_or_degraded_execution: true,
+                complete_expert_vectors_passed: true,
+            }
+        );
         let report = validation.report;
         assert_eq!(report.vectors.len(), 3);
         assert_eq!(report.vectors[0].gpu_io_delta.expert_weight_uploads, 1);
@@ -1477,6 +1716,17 @@ mod tests {
             validation.tolerance_failure.unwrap().code,
             "complete-expert-tolerance-failed"
         );
+        assert!(validation.invariants.initial_physical_install_exactly_once);
+        assert!(validation.invariants.subsequent_dispatches_reused_generation);
+        assert!(validation
+            .invariants
+            .subsequent_dispatches_uploaded_zero_weight_bytes);
+        assert!(validation.invariants.every_dispatch_completed_gpu_io);
+        assert!(validation.invariants.zero_evictions_or_stale_retirements);
+        assert!(validation
+            .invariants
+            .zero_cpu_fallback_or_degraded_execution);
+        assert!(!validation.invariants.complete_expert_vectors_passed);
         assert!(!validation.report.vectors[0].passed);
         assert_eq!(validation.report.vectors[0].cpu_f32[0], 1.0001);
         assert_eq!(validation.report.vectors[0].cpu_f16[0], 1.0);

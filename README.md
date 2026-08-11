@@ -1985,7 +1985,9 @@ checkpoint expert and compares MER's authoritative CPU Q4_0 forward result with
 the existing production routed-expert GPU path. `--expert-id` is a required
 global expert ID in `0..num_layers*num_experts_per_layer`; the report also
 records its derived layer and layer-local ID. It is never wrapped or
-reinterpreted.
+reinterpreted. The current raw matrix contains eight cases, including a direct
+two-row dispatch with distinct row blocks and a nonzero, byte-unaligned Q4_0
+block offset.
 
 ```bash
 ./target/release/micro-expert-router qualify-hybrid-q4-parity \
@@ -2001,6 +2003,13 @@ tolerances and compares `f16(CPU f32)` against the returned GPU f16 value. Both
 apply `abs_error <= absolute + relative * abs(reference)`; any nonfinite result
 fails immediately. The report preserves the original CPU f32, rounded CPU f16,
 GPU f16, per-element errors, allowed errors, and worst index.
+
+In schema `mer.strict-hybrid-q4-parity.v1`, a relative error whose reference is
+zero and absolute error is nonzero is encoded as finite `f32::MAX`; it means
+“relative error undefined because reference is zero.” PASS does not compare
+that sentinel to the relative threshold. It continues to use the documented
+combined allowance, which reduces to the absolute tolerance at a zero
+reference.
 
 PASS additionally requires a clean-provenance release build, strict Hybrid
 component planes, canonical metadata, exact checkpoint payload size, an exact
@@ -2019,6 +2028,14 @@ the slot to have exactly the converter-defined aligned size and every alignment
 byte to be zero. It reports hashes and lengths for both forms; physical
 residency and upload evidence uses the kernel's separately checked 4-byte-padded
 VRAM length.
+
+This strict command also requires a positive
+`performance.progress_timeout_secs` (or `--progress-timeout-secs`). That value
+bounds raw qualification readback with nonblocking WGPU polling and a deadline.
+The complete-expert half intentionally calls the unchanged production
+routed-expert path; its synchronous production readback is not made
+preemptible by this qualification-only deadline. A separately scoped serving
+change would be required to bound that shared production wait safely.
 
 Increase log verbosity:
 

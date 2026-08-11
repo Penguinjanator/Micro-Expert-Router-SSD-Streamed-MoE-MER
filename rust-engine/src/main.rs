@@ -1934,6 +1934,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     expert_id,
                     expected_adapter_name,
                     report_out,
+                    progress_watchdog,
                 },
             ))
         }
@@ -2163,6 +2164,7 @@ struct QualifyHybridQ4ParityArgs {
     expert_id: u32,
     expected_adapter_name: String,
     report_out: Option<PathBuf>,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
 struct MatvecMicrobenchArgs {
@@ -2584,8 +2586,25 @@ fn fail_q4_parity(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let summary = format!("{}: {}", failure.code, failure.detail);
     report.fail(failure);
-    emit_q4_parity_report(&report, report_out)?;
-    Err(summary.into())
+    match emit_q4_parity_report(&report, report_out) {
+        Ok(()) => Err(summary.into()),
+        Err(emit_error) => Err(format!(
+            "{summary}; additionally failed to emit Q4_0 parity report: {emit_error}"
+        )
+        .into()),
+    }
+}
+
+fn q4_parity_readback_timeout(
+    args: &QualifyHybridQ4ParityArgs,
+) -> Result<std::time::Duration, crate::qualification::QualificationFailure> {
+    args.progress_watchdog.timeout.ok_or_else(|| {
+        crate::qualification::QualificationFailure::new(
+            crate::qualification::FailureStage::Preflight,
+            "progress-watchdog-required",
+            "strict Q4_0 parity requires a positive performance.progress_timeout_secs or --progress-timeout-secs so raw GPU readback is bounded",
+        )
+    })
 }
 
 fn qualification_artifact_failure(
@@ -2953,6 +2972,12 @@ async fn cmd_qualify_hybrid_q4_parity(
         metadata.clone(),
         args.expected_adapter_name.clone(),
     );
+    let raw_readback_timeout = match q4_parity_readback_timeout(&args) {
+        Ok(timeout) => timeout,
+        Err(failure) => {
+            return fail_q4_parity(report, failure, args.report_out.as_deref());
+        }
+    };
 
     if !artifact_errors.is_empty() {
         return fail_q4_parity(
@@ -3168,36 +3193,42 @@ async fn cmd_qualify_hybrid_q4_parity(
             args.report_out.as_deref(),
         );
     }
-    let raw_cases = match crate::q4_parity::run_raw_shader_cases(backend) {
-        Ok(cases) => cases,
+    let raw_validation = match crate::q4_parity::run_raw_shader_cases(
+        backend,
+        raw_readback_timeout,
+    ) {
+        Ok(validation) => validation,
         Err(failure) => {
             return fail_q4_parity(report, failure, args.report_out.as_deref());
         }
     };
-    report.raw_cases = raw_cases;
-    report.checks.raw_shader_cases_passed = true;
+    report.checks.raw_shader_cases_passed = raw_validation.all_cases_passed();
+    let mut raw_failure = raw_validation.tolerance_failure;
+    report.raw_cases = raw_validation.reports;
     let raw_memory_after = runtime.engine.gpu_expert_memory_snapshot();
     let raw_io_after = runtime.engine.gpu_expert_io_snapshot();
     let raw_physical_after = backend.gpu_physical_expert_residency(args.expert_id);
     let Some(raw_memory_after) = raw_memory_after else {
+        let missing = QualificationFailure::new(
+            FailureStage::Postcondition,
+            "gpu-device-unavailable",
+            "raw Q4_0 qualification lost its physical-memory snapshot",
+        );
         return fail_q4_parity(
             report,
-            QualificationFailure::new(
-                FailureStage::Postcondition,
-                "gpu-device-unavailable",
-                "raw Q4_0 qualification lost its physical-memory snapshot",
-            ),
+            raw_failure.unwrap_or(missing),
             args.report_out.as_deref(),
         );
     };
     let Some(raw_io_after) = raw_io_after else {
+        let missing = QualificationFailure::new(
+            FailureStage::Postcondition,
+            "gpu-device-unavailable",
+            "raw Q4_0 qualification lost its routed-expert I/O snapshot",
+        );
         return fail_q4_parity(
             report,
-            QualificationFailure::new(
-                FailureStage::Postcondition,
-                "gpu-device-unavailable",
-                "raw Q4_0 qualification lost its routed-expert I/O snapshot",
-            ),
+            raw_failure.unwrap_or(missing),
             args.report_out.as_deref(),
         );
     };
@@ -3209,24 +3240,28 @@ async fn cmd_qualify_hybrid_q4_parity(
         selected_physical_before: raw_physical_before,
         selected_physical_after: raw_physical_after,
     });
-    if let Err(failure) = validate_memory(raw_memory_after) {
+    let memory_after_valid = match validate_memory(raw_memory_after) {
+        Ok(()) => true,
+        Err(failure) => {
+            raw_failure.get_or_insert(failure);
+            false
+        }
+    };
+    let raw_state_unchanged = raw_memory_after == raw_memory_before
+        && raw_io_after == raw_io_before
+        && raw_physical_after == raw_physical_before;
+    if !raw_state_unchanged {
+        raw_failure.get_or_insert_with(|| QualificationFailure::new(
+            FailureStage::Postcondition,
+            "raw-q4-contaminated-expert-residency",
+            "raw Q4_0 dispatch changed production expert residency, memory, or I/O evidence",
+        ));
+    }
+    report.checks.raw_dispatch_isolated_from_expert_registry =
+        memory_after_valid && raw_state_unchanged;
+    if let Some(failure) = raw_failure {
         return fail_q4_parity(report, failure, args.report_out.as_deref());
     }
-    if raw_memory_after != raw_memory_before
-        || raw_io_after != raw_io_before
-        || raw_physical_after != raw_physical_before
-    {
-        return fail_q4_parity(
-            report,
-            QualificationFailure::new(
-                FailureStage::Postcondition,
-                "raw-q4-contaminated-expert-residency",
-                "raw Q4_0 dispatch changed production expert residency, memory, or I/O evidence",
-            ),
-            args.report_out.as_deref(),
-        );
-    }
-    report.checks.raw_dispatch_isolated_from_expert_registry = true;
 
     let inputs = crate::q4_parity::deterministic_complete_inputs(runtime.cfg.model.d_model);
     let execution = match runtime
@@ -3277,17 +3312,27 @@ async fn cmd_qualify_hybrid_q4_parity(
             return fail_q4_parity(report, failure, args.report_out.as_deref());
         }
     };
-    report.complete_expert = Some(complete_validation.report);
-    if let Some(failure) = complete_validation.tolerance_failure {
+    let crate::q4_parity::CompleteExpertValidation {
+        report: complete_report,
+        invariants: outcomes,
+        tolerance_failure,
+    } = complete_validation;
+    report.complete_expert = Some(complete_report);
+    report.checks.initial_physical_install_exactly_once =
+        outcomes.initial_physical_install_exactly_once;
+    report.checks.subsequent_dispatches_reused_generation =
+        outcomes.subsequent_dispatches_reused_generation;
+    report.checks.subsequent_dispatches_uploaded_zero_weight_bytes =
+        outcomes.subsequent_dispatches_uploaded_zero_weight_bytes;
+    report.checks.every_dispatch_completed_gpu_io = outcomes.every_dispatch_completed_gpu_io;
+    report.checks.zero_evictions_or_stale_retirements =
+        outcomes.zero_evictions_or_stale_retirements;
+    report.checks.zero_cpu_fallback_or_degraded_execution =
+        outcomes.zero_cpu_fallback_or_degraded_execution;
+    report.checks.complete_expert_vectors_passed = outcomes.complete_expert_vectors_passed;
+    if let Some(failure) = tolerance_failure {
         return fail_q4_parity(report, failure, args.report_out.as_deref());
     }
-    report.checks.initial_physical_install_exactly_once = true;
-    report.checks.subsequent_dispatches_reused_generation = true;
-    report.checks.subsequent_dispatches_uploaded_zero_weight_bytes = true;
-    report.checks.every_dispatch_completed_gpu_io = true;
-    report.checks.zero_evictions_or_stale_retirements = true;
-    report.checks.zero_cpu_fallback_or_degraded_execution = true;
-    report.checks.complete_expert_vectors_passed = true;
     if let Err(failure) = report.finish() {
         return fail_q4_parity(report, failure, args.report_out.as_deref());
     }
@@ -8806,6 +8851,58 @@ mod tests {
             let error = <Cli as clap::Parser>::try_parse_from(args).unwrap_err();
             assert!(error.to_string().contains(missing), "{error}");
         }
+    }
+
+    #[test]
+    fn q4_parity_command_receives_configured_progress_watchdog() {
+        let args = QualifyHybridQ4ParityArgs {
+            config: PathBuf::from("config.toml"),
+            expert_id: 0,
+            expected_adapter_name: "NVIDIA L4".to_string(),
+            report_out: None,
+            progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig {
+                timeout: Some(std::time::Duration::from_secs(17)),
+            },
+        };
+        assert_eq!(
+            q4_parity_readback_timeout(&args).unwrap(),
+            std::time::Duration::from_secs(17)
+        );
+
+        let disabled = QualifyHybridQ4ParityArgs {
+            progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig::disabled(),
+            ..args
+        };
+        assert_eq!(
+            q4_parity_readback_timeout(&disabled).unwrap_err().code,
+            "progress-watchdog-required"
+        );
+    }
+
+    #[test]
+    fn q4_parity_report_emission_error_preserves_primary_failure_first() {
+        let report = crate::q4_parity::Q4ParityReport::new(
+            crate::qualification::BuildProvenance::embedded(),
+            crate::qualification::QualificationArtifacts::default(),
+            None,
+            "NVIDIA L4".to_string(),
+        );
+        let failure = crate::qualification::QualificationFailure::new(
+            crate::qualification::FailureStage::Postcondition,
+            "primary-q4-failure",
+            "primary detail",
+        );
+        let directory = tempdir_unique("q4-parity-report-is-directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let error = fail_q4_parity(report, failure, Some(&directory))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("primary-q4-failure: primary detail;"), "{error}");
+        assert!(
+            error.contains("additionally failed to emit Q4_0 parity report"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

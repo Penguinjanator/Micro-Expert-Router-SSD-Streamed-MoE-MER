@@ -24,6 +24,13 @@ expert, and checkpoint artifact. It is not a model-quality evaluation, does
 not validate generated-token quality, and makes no throughput or production
 TPS claim. PR7 batching has not started.
 
+> **Post-report hardening status:** this immutable live result covers the seven
+> raw cases and exact commit recorded below. The current PR head adds an eighth,
+> direct multi-row/offset case plus qualification-evidence hardening. Those
+> changes require a fresh clean NVIDIA L4 run before they can replace or extend
+> this historical seven-case result; this document does not claim that rerun
+> has happened.
+
 ## 2. Provenance and environment
 
 | Field | Qualified value |
@@ -95,6 +102,11 @@ report also retains the original CPU f32 output, rounded CPU f16 output, GPU
 f16 output, per-element absolute and relative errors, allowed error, and the
 worst comparison index. Any nonfinite CPU or GPU value fails before tolerance
 evaluation.
+
+Schema v1 serializes `f32::MAX` as the finite sentinel for an undefined relative
+error when the reference is zero and absolute error is nonzero. PASS remains
+controlled by the combined absolute-plus-relative allowance, which uses only
+the absolute component at a zero reference.
 
 ## 5. Raw WGSL block parity
 
