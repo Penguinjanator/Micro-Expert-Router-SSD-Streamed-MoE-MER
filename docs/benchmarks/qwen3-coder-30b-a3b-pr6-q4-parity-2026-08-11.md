@@ -304,7 +304,7 @@ jq -e '
   .failure == null and
   .provenance.git_sha ==
     "08c05ff1079b7676623642d354d13c15994af1ea" and
-  (.provenance.dirty | not) and
+  .provenance.dirty == false and
   .provenance.package_version == "0.1.0" and
   .device.name == "NVIDIA L4" and
   .device.vendor_id == 4318 and
