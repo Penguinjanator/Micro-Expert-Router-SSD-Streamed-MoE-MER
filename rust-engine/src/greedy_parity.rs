@@ -453,7 +453,6 @@ pub(crate) fn cpu_plan_exact(plan: &ExecutionPlanEvidence) -> bool {
         && plan.routed_experts == "cpu"
         && plan.routed_expert_dtype == "q4_0"
         && !plan.fallback_occurred
-        && plan.reason.is_none()
 }
 
 pub(crate) fn hybrid_plan_exact(plan: &ExecutionPlanEvidence) -> bool {
@@ -468,7 +467,6 @@ pub(crate) fn hybrid_plan_exact(plan: &ExecutionPlanEvidence) -> bool {
         && plan.routed_experts == "gpu"
         && plan.routed_expert_dtype == "q4_0"
         && !plan.fallback_occurred
-        && plan.reason.is_none()
 }
 
 fn cpu_counters_exact(routed: RoutedExpertExecutionSnapshot) -> bool {
@@ -1251,14 +1249,44 @@ mod tests {
             reason: None,
         };
         assert!(cpu_plan_exact(&cpu));
+        let mut cpu_with_reason = cpu.clone();
+        cpu_with_reason.reason = Some("CPU control selected for qualification".to_string());
+        assert!(cpu_plan_exact(&cpu_with_reason));
+
         let mut hybrid = cpu.clone();
         hybrid.context_id = "ctx-hybrid".to_string();
         hybrid.requested = "hybrid".to_string();
         hybrid.resolved = "hybrid-cpu-attention-gpu-experts".to_string();
         hybrid.routed_experts = "gpu".to_string();
+        hybrid.reason = Some(
+            "hybrid: attention pinned to the checked CPU path; routed-expert FFN compute offloaded to the GPU"
+                .to_string(),
+        );
         assert!(hybrid_plan_exact(&hybrid));
-        hybrid.attention = "gpu".to_string();
-        assert!(!hybrid_plan_exact(&hybrid));
+
+        let mut hybrid_without_reason = hybrid.clone();
+        hybrid_without_reason.reason = None;
+        assert!(hybrid_plan_exact(&hybrid_without_reason));
+
+        let mut bad_attention = hybrid.clone();
+        bad_attention.attention = "gpu".to_string();
+        assert!(!hybrid_plan_exact(&bad_attention));
+
+        let mut bad_experts = hybrid.clone();
+        bad_experts.routed_experts = "cpu".to_string();
+        assert!(!hybrid_plan_exact(&bad_experts));
+
+        let mut bad_dtype = hybrid.clone();
+        bad_dtype.routed_expert_dtype = "f16".to_string();
+        assert!(!hybrid_plan_exact(&bad_dtype));
+
+        let mut bad_resolution = hybrid.clone();
+        bad_resolution.resolved = "gpu".to_string();
+        assert!(!hybrid_plan_exact(&bad_resolution));
+
+        let mut bad_fallback = hybrid;
+        bad_fallback.fallback_occurred = true;
+        assert!(!hybrid_plan_exact(&bad_fallback));
     }
 
     #[test]
