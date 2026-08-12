@@ -10,7 +10,7 @@ use crate::qualification::{
     BuildProvenance, ExecutionPlanEvidence, ExpertMetadataEvidence, QualificationArtifacts,
     QualificationFailure, QualificationStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
@@ -21,6 +21,9 @@ pub const CORPUS_VERSION: u32 = 1;
 pub const OUTPUT_TOKEN_LIMIT: usize = 16;
 pub const CORPUS_CASE_COUNT: usize = 4;
 pub const MAX_DECODED_PREFIX_BYTES: usize = 512;
+pub const WORKER_PROTOCOL_VERSION: &str = "mer.strict-hybrid-q4-greedy-worker.v1";
+pub const MAX_WORKER_STDOUT_BYTES: usize = 1024 * 1024;
+pub const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FixedCorpusCase {
@@ -83,6 +86,13 @@ pub fn token_ids_sha256(ids: &[u32]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub fn fixed_case(name: &str) -> Option<FixedCorpusCase> {
+    FIXED_CORPUS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.name == name)
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -116,13 +126,119 @@ impl CorpusEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GreedySamplingEvidence {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
     pub seed: u64,
     pub deterministic_greedy: bool,
+}
+
+/// Exact typed stdin contract between the aggregate orchestrator and one
+/// short-lived Hybrid worker. It intentionally contains token IDs, not prompt
+/// text, so the worker has no encoding surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridWorkerRequest {
+    pub protocol_version: String,
+    pub worker_id: String,
+    pub case_name: String,
+    pub prompt_sha256: String,
+    pub resolved_config_sha256: String,
+    pub expected_adapter_name: String,
+    pub prompt_token_ids: Vec<u32>,
+    pub prompt_token_ids_sha256: String,
+    pub output_token_limit: usize,
+    pub sampling: GreedySamplingEvidence,
+    pub executable_sha256: String,
+    pub build_git_sha: String,
+}
+
+impl HybridWorkerRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        worker_id: String,
+        case: FixedCorpusCase,
+        resolved_config_sha256: String,
+        expected_adapter_name: String,
+        prompt_token_ids: Vec<u32>,
+        executable_sha256: String,
+        build_git_sha: String,
+    ) -> Self {
+        Self {
+            protocol_version: WORKER_PROTOCOL_VERSION.to_string(),
+            worker_id,
+            case_name: case.name.to_string(),
+            prompt_sha256: sha256_hex(case.prompt.as_bytes()),
+            resolved_config_sha256,
+            expected_adapter_name,
+            prompt_token_ids_sha256: token_ids_sha256(&prompt_token_ids),
+            prompt_token_ids,
+            output_token_limit: OUTPUT_TOKEN_LIMIT,
+            sampling: GreedySamplingEvidence::fixed(),
+            executable_sha256,
+            build_git_sha,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridWorkerIdentityEvidence {
+    pub protocol_version_verified: bool,
+    pub case_identity_verified: bool,
+    pub config_identity_verified: bool,
+    pub expected_adapter_verified: bool,
+    pub prompt_token_identity_verified: bool,
+    pub output_token_limit_verified: bool,
+    pub greedy_sampling_identity_verified: bool,
+    pub executable_identity_verified: bool,
+    pub build_sha_identity_verified: bool,
+}
+
+impl HybridWorkerIdentityEvidence {
+    pub fn all_verified(&self) -> bool {
+        self.protocol_version_verified
+            && self.case_identity_verified
+            && self.config_identity_verified
+            && self.expected_adapter_verified
+            && self.prompt_token_identity_verified
+            && self.output_token_limit_verified
+            && self.greedy_sampling_identity_verified
+            && self.executable_identity_verified
+            && self.build_sha_identity_verified
+    }
+}
+
+pub fn validate_hybrid_worker_request(
+    request: &HybridWorkerRequest,
+    observed_config_sha256: &str,
+    observed_executable_sha256: &str,
+    observed_build_git_sha: Option<&str>,
+) -> HybridWorkerIdentityEvidence {
+    let fixed = fixed_case(&request.case_name);
+    HybridWorkerIdentityEvidence {
+        protocol_version_verified: request.protocol_version == WORKER_PROTOCOL_VERSION,
+        case_identity_verified: fixed.is_some_and(|case| {
+            request.prompt_sha256 == sha256_hex(case.prompt.as_bytes())
+        }),
+        config_identity_verified: is_sha256_hex(&request.resolved_config_sha256)
+            && request.resolved_config_sha256 == observed_config_sha256,
+        expected_adapter_verified: !request.expected_adapter_name.is_empty(),
+        prompt_token_identity_verified: !request.prompt_token_ids.is_empty()
+            && request.prompt_token_ids_sha256 == token_ids_sha256(&request.prompt_token_ids),
+        output_token_limit_verified: request.output_token_limit == OUTPUT_TOKEN_LIMIT,
+        greedy_sampling_identity_verified: request.sampling.is_exact(),
+        executable_identity_verified: is_sha256_hex(&request.executable_sha256)
+            && request.executable_sha256 == observed_executable_sha256,
+        build_sha_identity_verified: observed_build_git_sha.is_some_and(|sha| {
+            sha.len() == 40
+                && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && request.build_git_sha == sha
+        }),
+    }
 }
 
 impl GreedySamplingEvidence {
@@ -203,7 +319,8 @@ impl StrictHybridPreflightEvidence {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelLoadEvidence {
     pub strict: bool,
     pub loader: String,
@@ -224,7 +341,8 @@ impl ModelLoadEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeCacheSnapshot {
     pub ram_entries: usize,
     pub ram_hits: u64,
@@ -244,7 +362,8 @@ pub struct RuntimeCacheSnapshot {
     pub stale_retirements: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitialStateEvidence {
     pub context_id: String,
     pub resolved_config_sha256: String,
@@ -269,7 +388,7 @@ impl InitialStateEvidence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TerminationReason {
     LengthLimit,
@@ -279,7 +398,8 @@ pub enum TerminationReason {
     EndOfSequence,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerationEvidence {
     pub prompt_token_ids_sha256: String,
     pub generated_token_ids: Vec<u32>,
@@ -289,16 +409,18 @@ pub struct GenerationEvidence {
     pub termination_reason: TerminationReason,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackgroundShutdownEvidence {
     pub controlled_shutdown_requested: bool,
     pub all_runtime_resources_released: bool,
     pub poll_iterations: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneRunEvidence {
-    pub plane: &'static str,
+    pub plane: String,
     pub model_load: ModelLoadEvidence,
     pub execution_plan: ExecutionPlanEvidence,
     pub routed_expert_gpu_failure_policy: String,
@@ -311,6 +433,217 @@ pub struct PlaneRunEvidence {
     pub gpu_memory_before: Option<GpuExpertMemorySnapshot>,
     pub gpu_memory_after: Option<GpuExpertMemorySnapshot>,
     pub background_shutdown: BackgroundShutdownEvidence,
+    /// Populated by the parent only after the worker has exited and been
+    /// reaped. A worker cannot attest to its own process termination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_process: Option<HybridWorkerProcessEvidence>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridWorkerProcessEvidence {
+    pub worker_id: String,
+    pub child_process_spawned: bool,
+    pub process_id: Option<u32>,
+    pub executable_sha256: String,
+    pub build_git_sha: String,
+    pub executable_identity_verified: bool,
+    pub build_sha_identity_verified: bool,
+    pub case_identity_verified: bool,
+    pub config_identity_verified: bool,
+    pub expected_adapter_identity_verified: bool,
+    pub prompt_token_identity_verified: bool,
+    pub output_token_limit_verified: bool,
+    pub greedy_sampling_identity_verified: bool,
+    pub normal_zero_exit: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub process_reaped: bool,
+    pub timed_out: bool,
+    pub evidence_emitted: bool,
+}
+
+impl HybridWorkerProcessEvidence {
+    fn is_exact(&self) -> bool {
+        !self.worker_id.is_empty()
+            && self.child_process_spawned
+            && self.process_id.is_some()
+            && is_sha256_hex(&self.executable_sha256)
+            && self.build_git_sha.len() == 40
+            && self
+                .build_git_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.executable_identity_verified
+            && self.build_sha_identity_verified
+            && self.case_identity_verified
+            && self.config_identity_verified
+            && self.expected_adapter_identity_verified
+            && self.prompt_token_identity_verified
+            && self.output_token_limit_verified
+            && self.greedy_sampling_identity_verified
+            && self.normal_zero_exit
+            && self.exit_code == Some(0)
+            && self.signal.is_none()
+            && self.process_reaped
+            && !self.timed_out
+            && self.evidence_emitted
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HybridWorkerFailureEvidence {
+    pub worker_id: String,
+    pub case_name: String,
+    pub child_process_spawned: bool,
+    pub process_id: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub process_reaped: bool,
+    pub evidence_emitted: bool,
+    pub identity_validation_succeeded: bool,
+    pub identity_validation: Option<HybridWorkerParentValidation>,
+    pub stderr: String,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HybridWorkerResponse {
+    pub protocol_version: String,
+    pub worker_id: String,
+    pub case_name: String,
+    pub prompt_sha256: String,
+    pub resolved_config_sha256: String,
+    pub expected_adapter_name: String,
+    pub prompt_token_ids_sha256: String,
+    pub output_token_limit: usize,
+    pub sampling: GreedySamplingEvidence,
+    pub executable_sha256: String,
+    pub build_git_sha: String,
+    pub identity: HybridWorkerIdentityEvidence,
+    pub plane: Option<PlaneRunEvidence>,
+    pub failure: Option<String>,
+}
+
+impl HybridWorkerResponse {
+    pub fn from_request(
+        request: &HybridWorkerRequest,
+        observed_config_sha256: &str,
+        observed_executable_sha256: &str,
+        observed_build_git_sha: Option<&str>,
+        identity: HybridWorkerIdentityEvidence,
+        plane: Option<PlaneRunEvidence>,
+        failure: Option<String>,
+    ) -> Self {
+        Self {
+            protocol_version: WORKER_PROTOCOL_VERSION.to_string(),
+            worker_id: request.worker_id.clone(),
+            case_name: request.case_name.clone(),
+            prompt_sha256: request.prompt_sha256.clone(),
+            resolved_config_sha256: observed_config_sha256.to_string(),
+            expected_adapter_name: request.expected_adapter_name.clone(),
+            prompt_token_ids_sha256: request.prompt_token_ids_sha256.clone(),
+            output_token_limit: request.output_token_limit,
+            sampling: request.sampling,
+            executable_sha256: observed_executable_sha256.to_string(),
+            build_git_sha: observed_build_git_sha.unwrap_or_default().to_string(),
+            identity,
+            plane,
+            failure,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct HybridWorkerParentValidation {
+    pub executable_identity_verified: bool,
+    pub build_sha_identity_verified: bool,
+    pub case_identity_verified: bool,
+    pub config_identity_verified: bool,
+    pub expected_adapter_identity_verified: bool,
+    pub prompt_token_identity_verified: bool,
+    pub output_token_limit_verified: bool,
+    pub greedy_sampling_identity_verified: bool,
+}
+
+impl HybridWorkerParentValidation {
+    pub fn all_verified(self) -> bool {
+        self.executable_identity_verified
+            && self.build_sha_identity_verified
+            && self.case_identity_verified
+            && self.config_identity_verified
+            && self.expected_adapter_identity_verified
+            && self.prompt_token_identity_verified
+            && self.output_token_limit_verified
+            && self.greedy_sampling_identity_verified
+    }
+}
+
+pub fn validate_hybrid_worker_response(
+    request: &HybridWorkerRequest,
+    response: &HybridWorkerResponse,
+) -> HybridWorkerParentValidation {
+    HybridWorkerParentValidation {
+        executable_identity_verified: response.identity.executable_identity_verified
+            && response.executable_sha256 == request.executable_sha256,
+        build_sha_identity_verified: response.identity.build_sha_identity_verified
+            && response.build_git_sha == request.build_git_sha,
+        case_identity_verified: response.identity.protocol_version_verified
+            && response.protocol_version == WORKER_PROTOCOL_VERSION
+            && response.worker_id == request.worker_id
+            && response.case_name == request.case_name
+            && response.prompt_sha256 == request.prompt_sha256,
+        config_identity_verified: response.identity.config_identity_verified
+            && response.resolved_config_sha256 == request.resolved_config_sha256,
+        expected_adapter_identity_verified: response.identity.expected_adapter_verified
+            && response.expected_adapter_name == request.expected_adapter_name,
+        prompt_token_identity_verified: response.identity.prompt_token_identity_verified
+            && response.prompt_token_ids_sha256 == request.prompt_token_ids_sha256,
+        output_token_limit_verified: response.identity.output_token_limit_verified
+            && response.output_token_limit == request.output_token_limit,
+        greedy_sampling_identity_verified: response.identity.greedy_sampling_identity_verified
+            && response.sampling == request.sampling,
+    }
+}
+
+pub fn parse_hybrid_worker_request_exact(bytes: &[u8]) -> Result<HybridWorkerRequest, String> {
+    parse_exact_json(bytes, "worker request")
+}
+
+pub fn parse_hybrid_worker_response_exact(bytes: &[u8]) -> Result<HybridWorkerResponse, String> {
+    parse_exact_json(bytes, "worker response")
+}
+
+fn parse_exact_json<T>(bytes: &[u8], label: &str) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if bytes.is_empty() {
+        return Err(format!("missing {label}"));
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = T::deserialize(&mut deserializer)
+        .map_err(|error| format!("malformed {label}: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("trailing or duplicated {label} output: {error}"))?;
+    Ok(value)
+}
+
+pub fn hybrid_worker_id(
+    build_git_sha: &str,
+    executable_sha256: &str,
+    case_index: usize,
+    case_name: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_len_prefixed(&mut hasher, build_git_sha.as_bytes());
+    hash_len_prefixed(&mut hasher, executable_sha256.as_bytes());
+    hasher.update((case_index as u64).to_le_bytes());
+    hash_len_prefixed(&mut hasher, case_name.as_bytes());
+    format!("greedy-hybrid-{:x}", hasher.finalize())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -418,6 +751,8 @@ pub struct CaseReport {
     pub cpu: Option<PlaneRunEvidence>,
     pub hybrid: Option<PlaneRunEvidence>,
     pub comparison: Option<CaseComparisonEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_failure: Option<HybridWorkerFailureEvidence>,
     pub failure: Option<QualificationFailure>,
 }
 
@@ -436,6 +771,7 @@ impl CaseReport {
             cpu: None,
             hybrid: None,
             comparison: None,
+            worker_failure: None,
             failure: None,
         }
     }
@@ -511,6 +847,8 @@ pub struct GreedyParityChecks {
     pub fresh_state_every_run: bool,
     pub unique_execution_context_every_run: bool,
     pub controlled_background_shutdown_every_run: bool,
+    pub hybrid_worker_processes_exact: bool,
+    pub unique_hybrid_worker_identity: bool,
     pub cpu_plans_exact: bool,
     pub cpu_counter_invariants: bool,
     pub cpu_gpu_io_zero: bool,
@@ -541,6 +879,8 @@ impl GreedyParityChecks {
             && self.fresh_state_every_run
             && self.unique_execution_context_every_run
             && self.controlled_background_shutdown_every_run
+            && self.hybrid_worker_processes_exact
+            && self.unique_hybrid_worker_identity
             && self.cpu_plans_exact
             && self.cpu_counter_invariants
             && self.cpu_gpu_io_zero
@@ -571,6 +911,7 @@ pub struct GreedyParityReport {
     pub model_identity: Option<ModelIdentityEvidence>,
     pub source_preflight: Option<StrictHybridPreflightEvidence>,
     pub resolved_config_sha256: Option<String>,
+    pub orchestrator_executable_sha256: Option<String>,
     pub corpus: CorpusEvidence,
     pub sampling: GreedySamplingEvidence,
     pub expected_adapter_name: String,
@@ -596,6 +937,7 @@ impl GreedyParityReport {
             model_identity: None,
             source_preflight: None,
             resolved_config_sha256: None,
+            orchestrator_executable_sha256: None,
             corpus: CorpusEvidence::fixed(),
             sampling: GreedySamplingEvidence::fixed(),
             expected_adapter_name,
@@ -617,6 +959,7 @@ impl GreedyParityReport {
                     && report.prompt == fixed.prompt
                     && report.prompt_sha256 == sha256_hex(fixed.prompt.as_bytes())
                     && report.output_token_limit == OUTPUT_TOKEN_LIMIT
+                    && report.worker_failure.is_none()
                     && report.failure.is_none()
                     && report.cpu.is_some()
                     && report.hybrid.is_some()
@@ -695,6 +1038,32 @@ impl GreedyParityReport {
                     && hybrid.background_shutdown.controlled_shutdown_requested
                     && hybrid.background_shutdown.all_runtime_resources_released
             });
+        let hybrid_worker_processes_exact = exact_run_count
+            && self
+                .orchestrator_executable_sha256
+                .as_deref()
+                .is_some_and(is_sha256_hex)
+            && collected.iter().all(|(_, cpu, hybrid, _)| {
+                cpu.worker_process.is_none()
+                    && hybrid.worker_process.as_ref().is_some_and(|process| {
+                        process.is_exact()
+                            && Some(process.executable_sha256.as_str())
+                                == self.orchestrator_executable_sha256.as_deref()
+                            && Some(process.build_git_sha.as_str())
+                                == self.provenance.git_sha.as_deref()
+                    })
+            });
+        let worker_ids: HashSet<&str> = collected
+            .iter()
+            .filter_map(|(_, _, hybrid, _)| {
+                hybrid
+                    .worker_process
+                    .as_ref()
+                    .map(|process| process.worker_id.as_str())
+            })
+            .collect();
+        let unique_hybrid_worker_identity =
+            hybrid_worker_processes_exact && worker_ids.len() == CORPUS_CASE_COUNT;
         let cpu_plans_exact = exact_run_count
             && collected
                 .iter()
@@ -782,6 +1151,8 @@ impl GreedyParityReport {
             fresh_state_every_run,
             unique_execution_context_every_run,
             controlled_background_shutdown_every_run,
+            hybrid_worker_processes_exact,
+            unique_hybrid_worker_identity,
             cpu_plans_exact,
             cpu_counter_invariants,
             cpu_gpu_io_zero,
@@ -832,6 +1203,7 @@ impl GreedyParityReport {
             || self.model_identity.is_none()
             || self.source_preflight.is_none()
             || self.resolved_config_sha256.is_none()
+            || self.orchestrator_executable_sha256.is_none()
         {
             return Err(QualificationFailure::new(
                 crate::qualification::FailureStage::Postcondition,
@@ -917,7 +1289,7 @@ mod tests {
     fn plane_evidence(case_index: usize, hybrid: bool, ids: &[u32]) -> PlaneRunEvidence {
         let context_id = format!("{}-{case_index}", if hybrid { "hybrid" } else { "cpu" });
         PlaneRunEvidence {
-            plane: if hybrid { "hybrid" } else { "cpu" },
+            plane: if hybrid { "hybrid" } else { "cpu" }.to_string(),
             model_load: model_load(),
             execution_plan: plan(context_id.clone(), hybrid),
             routed_expert_gpu_failure_policy: if hybrid {
@@ -974,6 +1346,7 @@ mod tests {
                 all_runtime_resources_released: true,
                 poll_iterations: 1,
             },
+            worker_process: None,
         }
     }
 
@@ -1027,6 +1400,7 @@ mod tests {
             routed_expert_dtype: "q4_0".to_string(),
         });
         report.resolved_config_sha256 = Some("11".repeat(32));
+        report.orchestrator_executable_sha256 = Some("22".repeat(32));
         for (index, fixed) in FIXED_CORPUS.into_iter().enumerate() {
             let prompt_ids = vec![10 + index as u32, 20 + index as u32];
             let ids: Vec<u32> = (0..OUTPUT_TOKEN_LIMIT)
@@ -1036,6 +1410,38 @@ mod tests {
             let prompt_hash = case.prompt_token_ids_sha256.clone();
             let mut cpu = plane_evidence(index, false, &ids);
             let mut hybrid = plane_evidence(index, true, &ids);
+            hybrid.worker_process = Some(HybridWorkerProcessEvidence {
+                worker_id: hybrid_worker_id(
+                    report.provenance.git_sha.as_deref().unwrap(),
+                    report
+                        .orchestrator_executable_sha256
+                        .as_deref()
+                        .unwrap(),
+                    index,
+                    fixed.name,
+                ),
+                child_process_spawned: true,
+                process_id: Some(1000 + index as u32),
+                executable_sha256: report
+                    .orchestrator_executable_sha256
+                    .clone()
+                    .unwrap(),
+                build_git_sha: report.provenance.git_sha.clone().unwrap(),
+                executable_identity_verified: true,
+                build_sha_identity_verified: true,
+                case_identity_verified: true,
+                config_identity_verified: true,
+                expected_adapter_identity_verified: true,
+                prompt_token_identity_verified: true,
+                output_token_limit_verified: true,
+                greedy_sampling_identity_verified: true,
+                normal_zero_exit: true,
+                exit_code: Some(0),
+                signal: None,
+                process_reaped: true,
+                timed_out: false,
+                evidence_emitted: true,
+            });
             cpu.generation.prompt_token_ids_sha256 = prompt_hash.clone();
             hybrid.generation.prompt_token_ids_sha256 = prompt_hash;
             case.comparison = Some(
@@ -1520,5 +1926,239 @@ mod tests {
             .generated_token_ids_sha256 = "copied".to_string();
         assert!(bad_hash.finish().is_err());
         assert!(!bad_hash.checks.tokenized_once_and_shared);
+    }
+
+    fn worker_request() -> HybridWorkerRequest {
+        HybridWorkerRequest::new(
+            hybrid_worker_id(&"a".repeat(40), &"b".repeat(64), 0, FIXED_CORPUS[0].name),
+            FIXED_CORPUS[0],
+            "c".repeat(64),
+            "NVIDIA L4".to_string(),
+            vec![17, 29, 41, 53],
+            "b".repeat(64),
+            "a".repeat(40),
+        )
+    }
+
+    fn verified_worker_identity() -> HybridWorkerIdentityEvidence {
+        HybridWorkerIdentityEvidence {
+            protocol_version_verified: true,
+            case_identity_verified: true,
+            config_identity_verified: true,
+            expected_adapter_verified: true,
+            prompt_token_identity_verified: true,
+            output_token_limit_verified: true,
+            greedy_sampling_identity_verified: true,
+            executable_identity_verified: true,
+            build_sha_identity_verified: true,
+        }
+    }
+
+    fn worker_response(request: &HybridWorkerRequest) -> HybridWorkerResponse {
+        HybridWorkerResponse::from_request(
+            request,
+            &request.resolved_config_sha256,
+            &request.executable_sha256,
+            Some(&request.build_git_sha),
+            verified_worker_identity(),
+            Some(plane_evidence(0, true, &[1, 2, 3])),
+            None,
+        )
+    }
+
+    #[test]
+    fn greedy_parity_worker_transport_preserves_exact_token_ids_without_prompt_text() {
+        let request = worker_request();
+        let json = serde_json::to_vec(&request).unwrap();
+        assert!(!json
+            .windows(FIXED_CORPUS[0].prompt.len())
+            .any(|window| window == FIXED_CORPUS[0].prompt.as_bytes()));
+        let parsed = parse_hybrid_worker_request_exact(&json).unwrap();
+        assert_eq!(parsed, request);
+        assert_eq!(parsed.prompt_token_ids, vec![17, 29, 41, 53]);
+        assert_eq!(
+            parsed.prompt_token_ids_sha256,
+            token_ids_sha256(&[17, 29, 41, 53])
+        );
+    }
+
+    #[test]
+    fn greedy_parity_worker_request_validates_every_frozen_identity() {
+        let request = worker_request();
+        let valid = validate_hybrid_worker_request(
+            &request,
+            &request.resolved_config_sha256,
+            &request.executable_sha256,
+            Some(&request.build_git_sha),
+        );
+        assert!(valid.all_verified());
+
+        let mut drift = request.clone();
+        drift.prompt_token_ids[0] ^= 1;
+        assert!(!validate_hybrid_worker_request(
+            &drift,
+            &drift.resolved_config_sha256,
+            &drift.executable_sha256,
+            Some(&drift.build_git_sha),
+        )
+        .prompt_token_identity_verified);
+        let mut drift = request.clone();
+        drift.prompt_sha256 = "d".repeat(64);
+        assert!(!validate_hybrid_worker_request(
+            &drift,
+            &drift.resolved_config_sha256,
+            &drift.executable_sha256,
+            Some(&drift.build_git_sha),
+        )
+        .case_identity_verified);
+        assert!(!validate_hybrid_worker_request(
+            &request,
+            &"d".repeat(64),
+            &request.executable_sha256,
+            Some(&request.build_git_sha),
+        )
+        .config_identity_verified);
+    }
+
+    #[test]
+    fn greedy_parity_worker_response_requires_exact_parent_identities() {
+        let request = worker_request();
+        let response = worker_response(&request);
+        assert!(validate_hybrid_worker_response(&request, &response).all_verified());
+
+        let mut wrong_case = worker_response(&request);
+        wrong_case.case_name = FIXED_CORPUS[1].name.to_string();
+        assert!(!validate_hybrid_worker_response(&request, &wrong_case)
+            .case_identity_verified);
+        let mut wrong_config = worker_response(&request);
+        wrong_config.resolved_config_sha256 = "d".repeat(64);
+        assert!(!validate_hybrid_worker_response(&request, &wrong_config)
+            .config_identity_verified);
+        let mut wrong_token = worker_response(&request);
+        wrong_token.prompt_token_ids_sha256 = "e".repeat(64);
+        assert!(!validate_hybrid_worker_response(&request, &wrong_token)
+            .prompt_token_identity_verified);
+    }
+
+    #[test]
+    fn greedy_parity_worker_output_rejects_missing_malformed_duplicate_and_trailing_data() {
+        let request = worker_request();
+        let valid = serde_json::to_vec(&worker_response(&request)).unwrap();
+        assert!(parse_hybrid_worker_response_exact(&valid).is_ok());
+        assert!(parse_hybrid_worker_response_exact(b"").is_err());
+        assert!(parse_hybrid_worker_response_exact(b"{broken").is_err());
+
+        let mut duplicated = valid.clone();
+        duplicated.extend_from_slice(&valid);
+        assert!(parse_hybrid_worker_response_exact(&duplicated).is_err());
+        let mut trailing = valid;
+        trailing.extend_from_slice(b"unexpected");
+        assert!(parse_hybrid_worker_response_exact(&trailing).is_err());
+    }
+
+    #[test]
+    fn greedy_parity_process_evidence_is_fail_closed_for_absence_or_false_fields() {
+        let mut missing = passing_report();
+        missing.cases[0]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .worker_process = None;
+        assert!(missing.finish().is_err());
+        assert!(!missing.checks.hybrid_worker_processes_exact);
+
+        let original = passing_report().cases[0]
+            .hybrid
+            .as_ref()
+            .unwrap()
+            .worker_process
+            .clone()
+            .unwrap();
+        let mutations: [fn(&mut HybridWorkerProcessEvidence); 14] = [
+            |value| value.child_process_spawned = false,
+            |value| value.process_id = None,
+            |value| value.executable_identity_verified = false,
+            |value| value.build_sha_identity_verified = false,
+            |value| value.case_identity_verified = false,
+            |value| value.config_identity_verified = false,
+            |value| value.expected_adapter_identity_verified = false,
+            |value| value.prompt_token_identity_verified = false,
+            |value| value.output_token_limit_verified = false,
+            |value| value.greedy_sampling_identity_verified = false,
+            |value| value.normal_zero_exit = false,
+            |value| value.process_reaped = false,
+            |value| value.timed_out = true,
+            |value| value.evidence_emitted = false,
+        ];
+        for mutate in mutations {
+            let mut evidence = original.clone();
+            mutate(&mut evidence);
+            assert!(!evidence.is_exact());
+        }
+    }
+
+    #[test]
+    fn greedy_parity_requires_unique_worker_identity_for_all_four_cases() {
+        let mut report = passing_report();
+        report.finish().unwrap();
+        assert!(report.checks.unique_hybrid_worker_identity);
+
+        let reused = report.cases[0]
+            .hybrid
+            .as_ref()
+            .unwrap()
+            .worker_process
+            .as_ref()
+            .unwrap()
+            .worker_id
+            .clone();
+        report.cases[1]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .worker_process
+            .as_mut()
+            .unwrap()
+            .worker_id = reused;
+        assert!(report.finish().is_err());
+        assert!(!report.checks.unique_hybrid_worker_identity);
+    }
+
+    #[test]
+    fn greedy_parity_failure_report_preserves_completed_cases_and_worker_diagnostics() {
+        let mut report = passing_report();
+        report.cases.truncate(2);
+        let mut failed = CaseReport::new(FIXED_CORPUS[2], vec![1, 2]);
+        failed.worker_failure = Some(HybridWorkerFailureEvidence {
+            worker_id: "worker-3".to_string(),
+            case_name: FIXED_CORPUS[2].name.to_string(),
+            child_process_spawned: true,
+            process_id: Some(123),
+            exit_code: None,
+            signal: Some(15),
+            timed_out: false,
+            process_reaped: true,
+            evidence_emitted: false,
+            identity_validation_succeeded: false,
+            identity_validation: None,
+            stderr: "bounded diagnostic".to_string(),
+            stderr_truncated: false,
+        });
+        failed.failure = Some(QualificationFailure::new(
+            crate::qualification::FailureStage::Inference,
+            "hybrid-worker-failed",
+            "worker terminated",
+        ));
+        report.cases.push(failed);
+        report.fail(QualificationFailure::new(
+            crate::qualification::FailureStage::Inference,
+            "hybrid-worker-failed",
+            "worker terminated",
+        ));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["cases"].as_array().unwrap().len(), 3);
+        assert!(json["cases"][0]["comparison"].is_object());
+        assert!(json["cases"][1]["comparison"].is_object());
+        assert_eq!(json["cases"][2]["worker_failure"]["signal"], 15);
     }
 }

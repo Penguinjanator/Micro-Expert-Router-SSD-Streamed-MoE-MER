@@ -2055,8 +2055,12 @@ an all-CPU control and strict Hybrid execution exclusively from that frozen
 specification. A second CPU config is neither accepted nor inferred. Each
 plane and each corpus case receives a fresh engine, KV state, RAM/logical GPU
 cache, physical registry, counters, predictors, background state, and storage
-runtime. Controlled shutdown must release every resource family before the
-next isolated runtime is constructed.
+runtime. CPU controls remain fresh in-process runtimes. Every Hybrid plane runs
+in a separate short-lived child of the same immutable executable; the parent
+passes already-tokenized IDs through a typed stdin protocol, waits for a normal
+zero exit, and reaps the child before starting the next case. Controlled Rust
+shutdown remains reported, while process termination is the authoritative
+NVIDIA client/device teardown boundary.
 
 The versioned corpus `qwen3-coder-30b-a3b-greedy-v1` contains four cases:
 Rust function generation, Rust code correction, compact JSON transformation,
@@ -2084,6 +2088,10 @@ routing native Q4_0 experts to the exact named non-software GPU under
 on GPU; hidden uploads, queue submissions, map requests, completed readbacks,
 and readback bytes must all be nonzero; CPU expert execution, fallback,
 degraded substitution, and GPU failures must remain zero.
+Each Hybrid case must also prove its unique worker identity, matching executable
+and build SHA, case/config/token identities, normal zero exit, successful reap,
+and absence of timeout or signal termination. Missing worker-process evidence
+fails closed. Worker stderr is diagnostic-only and bounded in failure reports.
 
 PASS additionally requires exact generated token-ID equality at every position,
 identical generated count and termination reason, and identical decoded-text

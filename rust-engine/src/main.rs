@@ -910,6 +910,14 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Private same-binary worker for one strict-Hybrid greedy-parity plane.
+    #[command(name = "greedy-parity-hybrid-worker-internal", hide = true)]
+    GreedyParityHybridWorkerInternal {
+        /// The same strict Hybrid config parsed by the parent orchestrator.
+        #[arg(long)]
+        config: PathBuf,
+    },
+
     /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
     ///
     /// This is intentionally separate from `bench-real`: it isolates Q/K/V/O,
@@ -1063,13 +1071,25 @@ fn parse_positive_f64_value(s: &str) -> Result<f64, String> {
     }
 }
 
-fn init_logging(filter: &str) {
+fn init_logging(filter: &str, worker_protocol_stdout: bool) {
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .with_level(true)
-        .try_init();
+    if worker_protocol_stdout {
+        // The private worker reserves stdout for exactly one typed JSON value.
+        // All inherited diagnostics must stay on stderr or the parent rejects
+        // the protocol as corrupted.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_level(true)
+            .with_writer(std::io::stderr)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_level(true)
+            .try_init();
+    }
 }
 
 fn rayon_env_override_present() -> bool {
@@ -1546,7 +1566,11 @@ fn parse_autotune_probe_output(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
-    init_logging(&cli.log);
+    let worker_protocol_stdout = matches!(
+        cli.cmd,
+        Cmd::GreedyParityHybridWorkerInternal { .. }
+    );
+    init_logging(&cli.log, worker_protocol_stdout);
 
     // Load only enough startup configuration to resolve process-level
     // runtime controls before CPU placement / Rayon exist. The command
@@ -1557,7 +1581,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         | Cmd::BenchReal { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
-        | Cmd::QualifyHybridQ4GreedyParity { config, .. } => {
+        | Cmd::QualifyHybridQ4GreedyParity { config, .. }
+        | Cmd::GreedyParityHybridWorkerInternal { config } => {
             Some(crate::config::Config::from_file(config)?)
         }
         _ => None,
@@ -1681,6 +1706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Cmd::QualifyHybridQ4 { .. }
             | Cmd::QualifyHybridQ4Parity { .. }
             | Cmd::QualifyHybridQ4GreedyParity { .. }
+            | Cmd::GreedyParityHybridWorkerInternal { .. }
     ) && !run_gpu_requested
     {
         crate::backend::install_default();
@@ -1975,6 +2001,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::GreedyParityHybridWorkerInternal { config: _ } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_greedy_parity_hybrid_worker_internal(
+                GreedyParityHybridWorkerArgs {
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("greedy parity worker startup config was not parsed")?,
+                    progress_watchdog,
+                },
+            ))
+        }
         Cmd::MatvecMicrobench {
             backend,
             warmup_runs,
@@ -2209,6 +2248,11 @@ struct QualifyHybridQ4GreedyParityArgs {
     parsed_config: crate::config::Config,
     expected_adapter_name: String,
     report_out: Option<PathBuf>,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct GreedyParityHybridWorkerArgs {
+    parsed_config: crate::config::Config,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
@@ -3755,7 +3799,7 @@ async fn execute_greedy_parity_plane(
             gpu_io: io_before,
         };
         Ok(crate::greedy_parity::PlaneRunEvidence {
-            plane,
+            plane: plane.to_string(),
             model_load: greedy_parity_model_load(&runtime),
             execution_plan,
             routed_expert_gpu_failure_policy: greedy_parity_failure_policy_name(
@@ -3771,6 +3815,7 @@ async fn execute_greedy_parity_plane(
             gpu_memory_before: memory_before,
             gpu_memory_after: memory_after,
             background_shutdown: crate::greedy_parity::BackgroundShutdownEvidence::default(),
+            worker_process: None,
         })
     }
     .await;
@@ -3789,6 +3834,444 @@ async fn execute_greedy_parity_plane(
             Err(format!("{error}; isolated shutdown also failed: {shutdown_error}").into())
         }
     }
+}
+
+#[derive(Debug)]
+struct BoundedChildOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct GreedyParityWorkerCapture {
+    process_id: u32,
+    status: std::process::ExitStatus,
+    timed_out: bool,
+    reaped: bool,
+    stdout: BoundedChildOutput,
+    stderr: BoundedChildOutput,
+    transport_error: Option<String>,
+}
+
+fn read_child_output_bounded(
+    mut reader: impl std::io::Read,
+    limit: usize,
+) -> std::io::Result<BoundedChildOutput> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep != read;
+    }
+    Ok(BoundedChildOutput {
+        bytes: retained,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn child_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn child_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Spawn, feed, drain, bound, and reap one worker. Both pipes are drained on
+/// dedicated threads so verbose diagnostics cannot deadlock the child. A
+/// timeout always kills and then waits for the exact child before returning.
+async fn run_greedy_parity_worker_process(
+    mut command: std::process::Command,
+    request_json: Vec<u8>,
+    timeout: Duration,
+) -> Result<GreedyParityWorkerCapture, String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn Hybrid worker: {error}"))?;
+    let process_id = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("spawned Hybrid worker has no stdout pipe".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("spawned Hybrid worker has no stderr pipe".to_string());
+        }
+    };
+    let stdout_thread = std::thread::spawn(move || {
+        read_child_output_bounded(stdout, crate::greedy_parity::MAX_WORKER_STDOUT_BYTES)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        read_child_output_bounded(stderr, crate::greedy_parity::MAX_WORKER_STDERR_BYTES)
+    });
+
+    let mut transport_error = None;
+    match child.stdin.take() {
+        Some(mut stdin) => {
+            if let Err(error) = stdin.write_all(&request_json) {
+                transport_error = Some(format!("failed to write Hybrid worker request: {error}"));
+                let _ = child.kill();
+            }
+        }
+        None => {
+            transport_error = Some("spawned Hybrid worker has no stdin pipe".to_string());
+            let _ = child.kill();
+        }
+    }
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout && transport_error.is_none() => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(None) => {
+                timed_out = transport_error.is_none();
+                if let Err(error) = child.kill() {
+                    transport_error.get_or_insert_with(|| {
+                        format!("failed to kill Hybrid worker after timeout: {error}")
+                    });
+                }
+                break child
+                    .wait()
+                    .map_err(|error| format!("failed to reap Hybrid worker: {error}"))?;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to query Hybrid worker status: {error}"));
+            }
+        }
+    };
+
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "Hybrid worker stdout reader thread panicked".to_string())?
+        .map_err(|error| format!("failed to read Hybrid worker stdout: {error}"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "Hybrid worker stderr reader thread panicked".to_string())?
+        .map_err(|error| format!("failed to read Hybrid worker stderr: {error}"))?;
+    Ok(GreedyParityWorkerCapture {
+        process_id,
+        status,
+        timed_out,
+        reaped: true,
+        stdout,
+        stderr,
+        transport_error,
+    })
+}
+
+fn current_executable_identity() -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe()?;
+    let digest = crate::qualification::hash_small_file(&executable)?;
+    Ok((executable, digest.sha256))
+}
+
+fn emit_hybrid_worker_response(
+    response: &crate::greedy_parity::HybridWorkerResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, response)?;
+    locked.write_all(b"\n")?;
+    locked.flush()?;
+    Ok(())
+}
+
+/// Hidden same-binary entry point. It never tokenizes: the only prompt input
+/// accepted is the parent's typed token-ID vector on stdin.
+async fn cmd_greedy_parity_hybrid_worker_internal(
+    args: GreedyParityHybridWorkerArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take((crate::greedy_parity::MAX_WORKER_STDOUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > crate::greedy_parity::MAX_WORKER_STDOUT_BYTES {
+        return Err("Hybrid worker request exceeds the private protocol limit".into());
+    }
+    let request = crate::greedy_parity::parse_hybrid_worker_request_exact(&input)?;
+    let spec = resolve_real_cli_spec_from_config(
+        args.parsed_config,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let observed_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (_, observed_executable_sha256) = current_executable_identity()?;
+    let provenance = crate::qualification::BuildProvenance::embedded();
+    let identity = crate::greedy_parity::validate_hybrid_worker_request(
+        &request,
+        &observed_config_sha256,
+        &observed_executable_sha256,
+        provenance.git_sha.as_deref(),
+    );
+    if !identity.all_verified() {
+        let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+            &request,
+            &observed_config_sha256,
+            &observed_executable_sha256,
+            provenance.git_sha.as_deref(),
+            identity,
+            None,
+            Some("Hybrid worker request identity validation failed".to_string()),
+        );
+        emit_hybrid_worker_response(&response)?;
+        return Err("Hybrid worker request identity validation failed".into());
+    }
+
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let attempt = execute_greedy_parity_plane(
+        &spec,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        tokenizer,
+        &request.prompt_token_ids,
+        &request.prompt_token_ids_sha256,
+        &request.resolved_config_sha256,
+        &request.expected_adapter_name,
+        args.progress_watchdog,
+        &request.case_name,
+    )
+    .await;
+    match attempt {
+        Ok(plane) => {
+            let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                Some(plane),
+                None,
+            );
+            emit_hybrid_worker_response(&response)
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                None,
+                Some(detail.clone()),
+            );
+            emit_hybrid_worker_response(&response)?;
+            Err(detail.into())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GreedyParityWorkerCaseFailure {
+    detail: String,
+    evidence: crate::greedy_parity::HybridWorkerFailureEvidence,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_hybrid_worker(
+    executable: &Path,
+    config: &Path,
+    request: &crate::greedy_parity::HybridWorkerRequest,
+    timeout: Duration,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, GreedyParityWorkerCaseFailure> {
+    let request_json = serde_json::to_vec(request).map_err(|error| {
+        GreedyParityWorkerCaseFailure {
+            detail: format!("failed to serialize Hybrid worker request: {error}"),
+            evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+                worker_id: request.worker_id.clone(),
+                case_name: request.case_name.clone(),
+                child_process_spawned: false,
+                process_id: None,
+                exit_code: None,
+                signal: None,
+                timed_out: false,
+                process_reaped: false,
+                evidence_emitted: false,
+                identity_validation_succeeded: false,
+                identity_validation: None,
+                stderr: String::new(),
+                stderr_truncated: false,
+            },
+        }
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--progress-timeout-secs")
+        .arg(timeout.as_secs().to_string())
+        .arg("greedy-parity-hybrid-worker-internal")
+        .arg("--config")
+        .arg(config);
+    let capture = run_greedy_parity_worker_process(command, request_json, timeout)
+        .await
+        .map_err(|detail| GreedyParityWorkerCaseFailure {
+            detail,
+            evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+                worker_id: request.worker_id.clone(),
+                case_name: request.case_name.clone(),
+                child_process_spawned: false,
+                process_id: None,
+                exit_code: None,
+                signal: None,
+                timed_out: false,
+                process_reaped: false,
+                evidence_emitted: false,
+                identity_validation_succeeded: false,
+                identity_validation: None,
+                stderr: String::new(),
+                stderr_truncated: false,
+            },
+        })?;
+
+    let stderr = String::from_utf8_lossy(&capture.stderr.bytes).into_owned();
+    if !stderr.is_empty() {
+        eprintln!(
+            "greedy parity Hybrid worker {} stderr{}:\n{}",
+            request.case_name,
+            if capture.stderr.truncated {
+                " (bounded/truncated)"
+            } else {
+                ""
+            },
+            stderr
+        );
+    }
+    let response_result = if capture.stdout.truncated {
+        Err(format!(
+            "Hybrid worker stdout exceeded {} bytes",
+            crate::greedy_parity::MAX_WORKER_STDOUT_BYTES
+        ))
+    } else {
+        crate::greedy_parity::parse_hybrid_worker_response_exact(&capture.stdout.bytes)
+    };
+    let response = response_result.as_ref().ok();
+    let validation = response.map(|response| {
+        crate::greedy_parity::validate_hybrid_worker_response(request, response)
+    });
+    let exit_code = capture.status.code();
+    let signal = child_exit_signal(&capture.status);
+    let normal_zero_exit = capture.status.success()
+        && exit_code == Some(0)
+        && signal.is_none()
+        && !capture.timed_out
+        && capture.transport_error.is_none();
+    let process = crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.worker_id.clone(),
+        child_process_spawned: true,
+        process_id: Some(capture.process_id),
+        executable_sha256: request.executable_sha256.clone(),
+        build_git_sha: request.build_git_sha.clone(),
+        executable_identity_verified: validation
+            .is_some_and(|value| value.executable_identity_verified),
+        build_sha_identity_verified: validation
+            .is_some_and(|value| value.build_sha_identity_verified),
+        case_identity_verified: validation.is_some_and(|value| value.case_identity_verified),
+        config_identity_verified: validation
+            .is_some_and(|value| value.config_identity_verified),
+        expected_adapter_identity_verified: validation
+            .is_some_and(|value| value.expected_adapter_identity_verified),
+        prompt_token_identity_verified: validation
+            .is_some_and(|value| value.prompt_token_identity_verified),
+        output_token_limit_verified: validation
+            .is_some_and(|value| value.output_token_limit_verified),
+        greedy_sampling_identity_verified: validation
+            .is_some_and(|value| value.greedy_sampling_identity_verified),
+        normal_zero_exit,
+        exit_code,
+        signal,
+        process_reaped: capture.reaped,
+        timed_out: capture.timed_out,
+        evidence_emitted: response.is_some(),
+    };
+    let response_failure = response.and_then(|response| response.failure.as_deref());
+    let success = process.normal_zero_exit
+        && process.process_reaped
+        && validation.is_some_and(|value| value.all_verified())
+        && response.is_some_and(|response| {
+            response.failure.is_none()
+                && response.plane.is_some()
+                && response
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.worker_process.is_none())
+        });
+    if success {
+        let mut plane = response.unwrap().plane.clone().unwrap();
+        plane.worker_process = Some(process);
+        return Ok(plane);
+    }
+
+    let parse_detail = response_result.as_ref().err().cloned();
+    let detail = [
+        capture.transport_error.as_deref(),
+        parse_detail.as_deref(),
+        response_failure,
+        (!normal_zero_exit).then_some("Hybrid worker did not exit normally with status zero"),
+        (!capture.reaped).then_some("Hybrid worker was not reaped"),
+        validation
+            .is_some_and(|value| !value.all_verified())
+            .then_some("Hybrid worker response identity validation failed"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ");
+    Err(GreedyParityWorkerCaseFailure {
+        detail: if detail.is_empty() {
+            "Hybrid worker emitted no successful plane evidence".to_string()
+        } else {
+            detail
+        },
+        evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+            worker_id: request.worker_id.clone(),
+            case_name: request.case_name.clone(),
+            child_process_spawned: true,
+            process_id: Some(capture.process_id),
+            exit_code,
+            signal,
+            timed_out: capture.timed_out,
+            process_reaped: capture.reaped,
+            evidence_emitted: response.is_some(),
+            identity_validation_succeeded: validation
+                .is_some_and(|value| value.all_verified()),
+            identity_validation: validation,
+            stderr,
+            stderr_truncated: capture.stderr.truncated,
+        },
+    })
 }
 
 async fn cmd_qualify_hybrid_q4_greedy_parity(
@@ -3959,6 +4442,43 @@ async fn cmd_qualify_hybrid_q4_greedy_parity(
         }
     };
     report.resolved_config_sha256 = Some(resolved_config_sha256.clone());
+    let worker_timeout = args
+        .progress_watchdog
+        .timeout
+        .expect("positive progress timeout checked above");
+    let (worker_executable, executable_sha256) = match current_executable_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "worker-executable-identity-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.orchestrator_executable_sha256 = Some(executable_sha256.clone());
+    let build_git_sha = match report.provenance.git_sha.clone() {
+        Some(sha)
+            if sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            sha
+        }
+        _ => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "worker-build-identity-unavailable",
+                    "same-binary worker isolation requires an embedded immutable build git SHA",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
     let tokenizer = match load_real_cli_tokenizer(
         &spec.cfg,
         RealCliRuntimeMode::IsolatedGreedyParityHybrid,
@@ -3977,9 +4497,13 @@ async fn cmd_qualify_hybrid_q4_greedy_parity(
         }
     };
 
-    for fixed in crate::greedy_parity::FIXED_CORPUS {
-        // The sole encode call for this case happens here. Both fresh runtimes
-        // receive the same immutable ID slice and shared tokenizer instance.
+    for (case_index, fixed) in crate::greedy_parity::FIXED_CORPUS
+        .into_iter()
+        .enumerate()
+    {
+        // The sole encode call for this case happens here. The CPU runtime
+        // receives this immutable ID slice directly; the same IDs and frozen
+        // tokenizer artifact identity cross the typed worker protocol.
         let prompt_token_ids = match tokenizer.encode(fixed.prompt) {
             Ok(ids) if !ids.is_empty() => ids,
             Ok(_) => {
@@ -4030,23 +4554,42 @@ async fn cmd_qualify_hybrid_q4_greedy_parity(
         };
         case.cpu = Some(cpu);
 
-        let hybrid = execute_greedy_parity_plane(
-            &spec,
-            RealCliRuntimeMode::IsolatedGreedyParityHybrid,
-            tokenizer.clone(),
-            &case.prompt_token_ids,
-            &case.prompt_token_ids_sha256,
-            &resolved_config_sha256,
-            &args.expected_adapter_name,
-            args.progress_watchdog,
-            fixed.name,
+        let worker_request = crate::greedy_parity::HybridWorkerRequest::new(
+            crate::greedy_parity::hybrid_worker_id(
+                &build_git_sha,
+                &executable_sha256,
+                case_index,
+                fixed.name,
+            ),
+            fixed,
+            resolved_config_sha256.clone(),
+            args.expected_adapter_name.clone(),
+            case.prompt_token_ids.clone(),
+            executable_sha256.clone(),
+            build_git_sha.clone(),
+        );
+        let hybrid = execute_greedy_parity_hybrid_worker(
+            &worker_executable,
+            &args.config,
+            &worker_request,
+            worker_timeout,
         )
         .await;
         let hybrid = match hybrid {
             Ok(hybrid) => hybrid,
-            Err(error) => {
-                let mut failure = qualification_inference_failure(error.as_ref());
-                failure.detail = format!("fixed case {} strict Hybrid: {error}", fixed.name);
+            Err(worker_error) => {
+                let mut failure = QualificationFailure::new(
+                    FailureStage::Inference,
+                    "hybrid-worker-failed",
+                    format!(
+                        "fixed case {} strict Hybrid worker: {}",
+                        fixed.name, worker_error.detail
+                    ),
+                );
+                if worker_error.evidence.timed_out {
+                    failure.code = "hybrid-worker-timeout".to_string();
+                }
+                case.worker_failure = Some(worker_error.evidence);
                 case.failure = Some(failure.clone());
                 report.cases.push(case);
                 return fail_greedy_parity(report, failure, args.report_out.as_deref());
@@ -9925,6 +10468,119 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("background resources remained live"));
+    }
+
+    #[test]
+    fn greedy_parity_internal_worker_command_is_hidden_and_non_recursive() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "greedy-parity-hybrid-worker-internal",
+            "--config",
+            "strict-hybrid.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::GreedyParityHybridWorkerInternal { config }
+                if config == Path::new("strict-hybrid.toml")
+        ));
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("greedy-parity-hybrid-worker-internal"));
+    }
+
+    #[test]
+    fn greedy_parity_worker_stderr_is_bounded_while_input_is_fully_drained() {
+        let input = vec![b'x'; crate::greedy_parity::MAX_WORKER_STDERR_BYTES + 4096];
+        let bounded = read_child_output_bounded(
+            std::io::Cursor::new(input),
+            crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            bounded.bytes.len(),
+            crate::greedy_parity::MAX_WORKER_STDERR_BYTES
+        );
+        assert!(bounded.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_observes_success_and_zero_exit() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; printf '{\"ok\":true}'; printf diagnostic >&2");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            br#"{"request":true}"#.to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), Some(0));
+        assert_eq!(child_exit_signal(&capture.status), None);
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+        assert_eq!(capture.stdout.bytes, br#"{"ok":true}"#);
+        assert_eq!(capture.stderr.bytes, b"diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_preserves_nonzero_exit() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("cat >/dev/null; exit 7");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), Some(7));
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_preserves_signal_termination() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; kill -TERM $$");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), None);
+        assert_eq!(child_exit_signal(&capture.status), Some(15));
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_timeout_kills_and_reaps_exact_child() {
+        let mut command = Command::new("sleep");
+        command.arg("2");
+        let started = Instant::now();
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert!(capture.timed_out);
+        assert!(capture.reaped);
+        assert!(child_exit_signal(&capture.status).is_some());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

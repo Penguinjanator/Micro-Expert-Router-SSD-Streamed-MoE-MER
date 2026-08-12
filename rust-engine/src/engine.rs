@@ -36,7 +36,7 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -871,7 +871,7 @@ pub(crate) struct Counters {
 /// These counters deliberately exclude the synthetic [`Engine::generate`]
 /// path. They are a qualification seam rather than a second Prometheus
 /// telemetry surface.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoutedExpertExecutionSnapshot {
     pub selected_routed_experts: u64,
     pub gpu_dispatch_attempts: u64,
