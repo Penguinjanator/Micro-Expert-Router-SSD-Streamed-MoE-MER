@@ -9,9 +9,11 @@ and exited with code 0. All 18 required PASS checks were true.
 
 This is three distinct kinds of evidence:
 
-1. **Raw WGSL block parity:** seven deterministic canonical
+1. **Raw WGSL block parity:** eight deterministic canonical
    `ggml-standard-v1` Q4_0 fixtures compared MER's authoritative CPU decoder
-   with the existing WGSL Q4_0 matmul pipeline.
+   with the existing WGSL Q4_0 matmul pipeline. The eighth fixture directly
+   exercised multi-row output indexing and row stride at a nonzero Q4 block
+   offset.
 2. **Complete checkpoint-expert parity:** three deterministic hidden vectors
    ran through global expert 0 using the authoritative CPU Q4_0 expert forward
    and the production GPU routed-expert path.
@@ -24,30 +26,35 @@ expert, and checkpoint artifact. It is not a model-quality evaluation, does
 not validate generated-token quality, and makes no throughput or production
 TPS claim. PR7 batching has not started.
 
-> **Post-report hardening status:** this immutable live result covers the seven
-> raw cases and exact commit recorded below. The current PR head adds an eighth,
-> direct multi-row/offset case plus qualification-evidence hardening. Those
-> changes require a fresh clean NVIDIA L4 run before they can replace or extend
-> this historical seven-case result; this document does not claim that rerun
-> has happened.
+The authoritative hardened run was performed from a clean detached checkout of
+`08c05ff1079b7676623642d354d13c15994af1ea`, after the multi-row fixture and
+review hardening were present. The earlier seven-case run at `dac1d213...` is
+superseded historical evidence and does not qualify the hardened implementation.
 
 ## 2. Provenance and environment
 
 | Field | Qualified value |
 |---|---|
-| MER commit | `dac1d213cf641ba79a48e74c24f80bc2eca66548` |
+| MER commit | `08c05ff1079b7676623642d354d13c15994af1ea` |
 | Git worktree | clean (`dirty=false`) |
+| Package version | `0.1.0` |
 | Report schema | `mer.strict-hybrid-q4-parity.v1` |
+| Qualification mode | `strict-hybrid-q4-parity` |
 | Report status | `pass` |
 | Failure | `null` |
+| Process exit code | `0` |
+| Report filename | `pr6-q4-parity-08c05ff.json` |
+| Report SHA-256 | `f50e0915288de6eb0847ea77a0f3685e91966aa54d178c8d8d6ebb63b9326beb` |
+| Progress watchdog | 300 seconds |
 | Cloud VM | GCP `g2-standard-32` |
 | Adapter | `NVIDIA L4` |
-| Vendor/device | `0x10de` / `0x27b8` |
-| Device type | discrete GPU |
-| NVIDIA driver | `580.173.02` |
-| WGPU backend | Vulkan |
+| Vendor/device | `4318` (`0x10de`) / `10168` (`0x27b8`) |
+| Device type | `DiscreteGpu` |
+| NVIDIA driver/version | `NVIDIA` / `580.173.02` |
+| WGPU backend | `vulkan` |
 | Compute plane | `wgpu-vulkan` |
 | Software adapter | `false` |
+| Linux release build | `cargo build --release --features "avx512,blas,tokenizer,io_uring"` passed |
 
 The exact adapter-name gate required `NVIDIA L4`; a missing GPU, software
 adapter, different adapter name, incompatible layout, malformed geometry,
@@ -110,43 +117,53 @@ the absolute component at a zero reference.
 
 ## 5. Raw WGSL block parity
 
-All seven canonical cases passed with exactly zero observed absolute error and
-zero observed relative error:
+All eight canonical cases passed with exactly zero observed absolute error,
+zero observed relative error, and worst index 0:
 
-| Case | Projection | Columns | `w_block_off` | Byte offset | Unaligned 18-byte start | Max abs | Max rel | Result |
-|---|---|---:|---:|---:|---|---:|---:|---|
-| `zero-scale-extrema` | standalone | 32 | 0 | 0 | no | 0 | 0 | PASS |
-| `positive-scale-extrema` | standalone | 32 | 0 | 0 | no | 0 | 0 | PASS |
-| `negative-scale-sign` | standalone | 32 | 0 | 0 | no | 0 | 0 | PASS |
-| `multiple-blocks-nontrivial-hidden` | standalone | 64 | 0 | 0 | no | 0 | 0 | PASS |
-| `gate-projection-offset-zero` | gate | 32 | 0 | 0 | no | 0 | 0 | PASS |
-| `up-projection-offset-one-unaligned` | up | 32 | 1 | 18 | yes | 0 | 0 | PASS |
-| `down-projection-offset-two` | down | 32 | 2 | 36 | no | 0 | 0 | PASS |
+| Case | Projection | Rows | Columns | `w_block_off` | Byte offset | Unaligned 18-byte start | Max abs | Max rel | Worst index | Result |
+|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|
+| `zero-scale-extrema` | standalone | 1 | 32 | 0 | 0 | no | 0 | 0 | 0 | PASS |
+| `positive-scale-extrema` | standalone | 1 | 32 | 0 | 0 | no | 0 | 0 | 0 | PASS |
+| `negative-scale-sign` | standalone | 1 | 32 | 0 | 0 | no | 0 | 0 | 0 | PASS |
+| `multiple-blocks-nontrivial-hidden` | standalone | 1 | 64 | 0 | 0 | no | 0 | 0 | 0 | PASS |
+| `gate-projection-offset-zero` | gate | 1 | 32 | 0 | 0 | no | 0 | 0 | 0 | PASS |
+| `up-projection-offset-one-unaligned` | up | 1 | 32 | 1 | 18 | yes | 0 | 0 | 0 | PASS |
+| `down-projection-offset-two` | down | 1 | 32 | 2 | 36 | no | 0 | 0 | 0 | PASS |
+| `multi-row-offset-row-stride` | standalone | 2 | 32 | 1 | 18 | yes | 0 | 0 | 0 | PASS |
 
 The fixtures cover zero scale, positive and negative scale/sign behavior,
 extremal nibbles, multiple blocks, nontrivial hidden vectors, all three expert
 projection offsets, nonzero block offsets, and the unaligned 18-byte Q4_0
-boundary. The raw dispatch used ephemeral qualification buffers. Before and
-after raw dispatch, production expert residency and all production GPU-I/O
-counters remained zero, so the raw phase could not pre-populate the complete
-expert.
+boundary. The eighth case directly qualifies two-row output indexing and row
+stride using distinct row blocks at nonzero `w_block_off=1`. The raw dispatch
+used ephemeral qualification buffers. Before and after raw dispatch,
+production expert residency and all production GPU-I/O counters remained zero,
+so the raw phase could not pre-populate the complete expert.
 
 ## 6. Complete checkpoint-expert parity
 
 Three deterministic vectors passed against the extracted complete checkpoint
 expert:
 
-| Vector | Max absolute error | Max relative error | Expert upload | Hidden upload | Submit | Map | Completed readback |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 | `7.6293945e-06` | `0.0009451796` | 1 / 2,654,208 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
-| 1 | `9.536743e-07` | `0.0010615712` | 0 / 0 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
-| 2 | `0` | `0` | 0 / 0 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
+| Vector | Max absolute error | Max relative error | Worst index | Expert upload | Hidden upload | Submit | Map | Completed readback |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | `7.6293945e-06` | `0.0009451796` | 1831 | 1 / 2,654,208 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
+| 1 | `9.536743e-07` | `0.0010615712` | 1500 | 0 / 0 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
+| 2 | `0` | `0` | 0 | 0 / 0 B | 1 / 8,192 B | 1 | 1 | 1 / 8,192 B |
 
 The worst absolute error across all vectors was `7.6293945e-06`; the worst
 reported relative error was `0.0010615712`. Both are observations, not changed
 tolerances. Every vector recorded one GPU dispatch attempt and success, with
 zero dispatch failures, CPU routed-expert dispatches, GPU-to-CPU fallbacks, and
 degraded substitutions.
+
+Each vector's `routed_delta.selected_routed_experts` is zero by design. This
+qualification explicitly selects global expert 0 and invokes the existing
+production `forward_moe_resident` boundary; it does not run the model router and
+therefore must not increment the router-selection counter. This does not weaken
+dispatch evidence: every vector recorded GPU attempts/successes/failures of
+`1/1/0`, while CPU expert executions, GPU-to-CPU fallbacks, and degraded
+substitutions all remained zero.
 
 ## 7. Physical residency and capacity evidence
 
@@ -204,16 +221,16 @@ All 18 independently derived checks were true:
 The successful process exit and a separate typed `jq -e` validation both
 confirmed the fail-closed PASS contract.
 
-## 9. Qualified artifact and checksums
+## 9. Qualified checkpoint and report checksum
 
-The exact qualification artifact is published at
+The checkpoint artifact exercised by the qualification is published at
 [Amalgafy/Qwen3-Coder-30B-A3B-Instruct-MER-Q4-0](https://huggingface.co/Amalgafy/Qwen3-Coder-30B-A3B-Instruct-MER-Q4-0).
 
 | Artifact | SHA-256 |
 |---|---|
 | MER archive `qwen3-coder-30b-a3b-mer-q4_0-v1.tar.zst` | `659b8d31d0a83292c632aa109c8edb5301f4041b1a60ef43c6f23ec0404061fe` |
 | Pure Q4_0 GGUF `Qwen3-Coder-30B-A3B-Instruct-pure-Q4_0.gguf` | `8ddf61cadd354a5095905cc5ce535c44b777d0313ac241abcd2ceafa3362551b` |
-| Typed report `pr6-q4-parity.json` | `1d579a9e7ebc93191544ff162027e840dfbbd55ae7cc85e81021bb6e85784c60` |
+| Hardened typed report `pr6-q4-parity-08c05ff.json` | `f50e0915288de6eb0847ea77a0f3685e91966aa54d178c8d8d6ebb63b9326beb` |
 
 This is the current PR6 qualification artifact. Its pure Q4_0 GGUF was
 requantized from an already quantized GGUF using llama.cpp
@@ -230,13 +247,14 @@ The qualified implementation had the following pre-publication validation:
 
 | Command | Result |
 |---|---|
-| `cargo test q4_parity` | 14 passed |
+| `cargo test q4_parity` | 19 passed |
 | `cargo test q4_0_shader_logic_tests` | 4 passed |
 | `cargo test qualification` | 28 passed |
 | `cargo test strict` | 40 passed |
-| `cargo test` | 925 passed, 0 failed, 2 ignored |
+| `cargo test` | 932 passed, 0 failed, 2 ignored |
 | `cargo clippy --all-targets` | passed with existing warnings |
 | `git diff --check` | passed |
+| Local macOS `cargo build --release` | passed with existing warnings |
 | Linux release build with `avx512,blas,tokenizer,io_uring` | passed |
 
 The first commit on the branch is a separate test-only fix that gives server
@@ -251,20 +269,22 @@ Start from the exact qualified commit and require a clean checkout:
 
 ```bash
 git fetch origin feat/pr6-q4-numerical-correctness
-git switch --detach dac1d213cf641ba79a48e74c24f80bc2eca66548
+git switch --detach 08c05ff1079b7676623642d354d13c15994af1ea
 test "$(git rev-parse HEAD)" = \
-  dac1d213cf641ba79a48e74c24f80bc2eca66548
+  08c05ff1079b7676623642d354d13c15994af1ea
 test -z "$(git status --porcelain)"
 
 cd rust-engine
 cargo build --release \
   --features "avx512,blas,tokenizer,io_uring"
 
-./target/release/micro-expert-router qualify-hybrid-q4-parity \
+./target/release/micro-expert-router \
+  --progress-timeout-secs 300 \
+  qualify-hybrid-q4-parity \
   --config "$HOME/mer-pr6/qwen3-coder-strict-hybrid-q4.toml" \
   --expert-id 0 \
   --expected-adapter-name "NVIDIA L4" \
-  --report-out "$HOME/mer-pr6/pr6-q4-parity.json"
+  --report-out "$HOME/mer-pr6/pr6-q4-parity-08c05ff.json"
 ```
 
 The config must select strict Hybrid execution and the canonical converted
@@ -275,15 +295,17 @@ select or wrap either value.
 Validate the typed report:
 
 ```bash
-REPORT="$HOME/mer-pr6/pr6-q4-parity.json"
+REPORT="$HOME/mer-pr6/pr6-q4-parity-08c05ff.json"
 
 jq -e '
   .schema_version == "mer.strict-hybrid-q4-parity.v1" and
+  .mode == "strict-hybrid-q4-parity" and
   .status == "pass" and
   .failure == null and
   .provenance.git_sha ==
-    "dac1d213cf641ba79a48e74c24f80bc2eca66548" and
+    "08c05ff1079b7676623642d354d13c15994af1ea" and
   (.provenance.dirty | not) and
+  .provenance.package_version == "0.1.0" and
   .device.name == "NVIDIA L4" and
   .device.vendor_id == 4318 and
   .device.device_id == 10168 and
@@ -292,29 +314,43 @@ jq -e '
   .execution_plan.requested == "hybrid" and
   .execution_plan.resolved ==
     "hybrid-cpu-attention-gpu-experts" and
+  .execution_plan.embeddings == "cpu" and
+  .execution_plan.lm_head == "cpu" and
+  .execution_plan.dense_projections == "cpu" and
+  .execution_plan.attention == "cpu" and
+  .execution_plan.kv == "cpu" and
+  .execution_plan.router == "cpu" and
+  .execution_plan.routed_experts == "gpu" and
+  .execution_plan.routed_expert_dtype == "q4_0" and
   (.execution_plan.fallback_occurred | not) and
-  (.raw_cases | length == 7) and
+  (.raw_cases | length == 8) and
   (all(.raw_cases[];
     .passed and .max_absolute_error == 0 and
-    .max_relative_error == 0)) and
+    .max_relative_error == 0 and .worst_index == 0)) and
+  (any(.raw_cases[];
+    .name == "multi-row-offset-row-stride" and
+    .rows == 2 and .columns == 32 and
+    .w_block_off == 1)) and
+  .complete_expert.identity.global_expert_id == 0 and
+  .complete_expert.identity.layer_index == 0 and
+  .complete_expert.identity.layer_local_expert_id == 0 and
   (.complete_expert.vectors | length == 3) and
-  (all(.complete_expert.vectors[]; .passed)) and
+  (all(.complete_expert.vectors[];
+    .passed and
+    .routed_delta.selected_routed_experts == 0 and
+    .routed_delta.gpu_dispatch_attempts == 1 and
+    .routed_delta.gpu_dispatch_successes == 1 and
+    .routed_delta.gpu_dispatch_failures == 0 and
+    .routed_delta.cpu_routed_expert_dispatches == 0 and
+    .routed_delta.gpu_cpu_fallbacks == 0 and
+    .routed_delta.degraded_expert_substitutions == 0)) and
   (.checks | to_entries | length == 18 and
     all(.value == true))
 ' "$REPORT"
-```
-
-To verify the published evidence independently without copying any VM-local
-paths into documentation:
-
-```bash
-curl -L \
-  https://huggingface.co/Amalgafy/Qwen3-Coder-30B-A3B-Instruct-MER-Q4-0/resolve/main/evidence/pr6-q4-parity.json \
-  -o pr6-q4-parity.json
 
 printf '%s  %s\n' \
-  1d579a9e7ebc93191544ff162027e840dfbbd55ae7cc85e81021bb6e85784c60 \
-  pr6-q4-parity.json | sha256sum --check
+  f50e0915288de6eb0847ea77a0f3685e91966aa54d178c8d8d6ebb63b9326beb \
+  "$REPORT" | sha256sum --check
 ```
 
 ## 12. Remaining PR6 diagnostics and exclusions

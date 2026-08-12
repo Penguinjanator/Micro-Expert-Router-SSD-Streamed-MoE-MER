@@ -1989,6 +1989,15 @@ reinterpreted. The current raw matrix contains eight cases, including a direct
 two-row dispatch with distinct row blocks and a nonzero, byte-unaligned Q4_0
 block offset.
 
+The authoritative hardened NVIDIA L4 run at commit
+`08c05ff1079b7676623642d354d13c15994af1ea` passed all eight raw cases, all
+three complete-expert vectors, and all 18 fail-closed checks. Its typed report
+is `pr6-q4-parity-08c05ff.json`, SHA-256
+`f50e0915288de6eb0847ea77a0f3685e91966aa54d178c8d8d6ebb63b9326beb`.
+See the [PR6 Q4_0 numerical-parity evidence](docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md)
+for the exact device, execution-plan, residency, and validation record. This is
+numerical-correctness evidence, not a model-quality or performance claim.
+
 ```bash
 ./target/release/micro-expert-router qualify-hybrid-q4-parity \
   --config ./path/to/strict-hybrid-q4.toml \
