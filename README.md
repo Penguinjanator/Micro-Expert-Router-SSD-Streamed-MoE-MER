@@ -251,6 +251,7 @@ historical baseline.
 
 | Document | What it contains |
 |---|---|
+| [`docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md) | NVIDIA L4 numerical qualification for canonical raw Q4_0 WGSL cases, one complete checkpoint expert, and physical-residency reuse; not a model-quality or TPS claim. |
 | [`docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md`](docs/benchmarks/qwen3-coder-30b-a3b-q8-cpu-2026-07-11.md) | Strict CPU-only `bench-real` validation for one Qwen3-Coder 30B-A3B Q8_0 checkpoint, with generated tokens/s and cache-capacity caveats. |
 | [`docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md`](docs/benchmarks/mixtral-8x7b-rayon-autotune-2026-07.md) | July 2026 observed VM validation for Rayon/autotune, including fast/slow compute-regime caveats. |
 | [`docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md`](docs/benchmarks/mixtral-8x7b-cpu-cache-scaling-2026-06-27.md) | Historical full cache-scaling suite for Mixtral Q4_0 on GCP local NVMe. |
@@ -1975,6 +1976,76 @@ device memory. `--external-gpu-memory-artifact <STRING>` stores an opaque
 reference to separately collected PR6 evidence; this command does not invoke
 NVML or `nvidia-smi`.
 
+#### Strict Hybrid Q4_0 numerical parity
+
+`qualify-hybrid-q4-parity` is a separate fail-closed numerical qualification.
+It first compares deterministic, literal `ggml-standard-v1` Q4_0 blocks against
+the existing `matmul_q4_0.wgsl` pipeline, then fetches one complete converted
+checkpoint expert and compares MER's authoritative CPU Q4_0 forward result with
+the existing production routed-expert GPU path. `--expert-id` is a required
+global expert ID in `0..num_layers*num_experts_per_layer`; the report also
+records its derived layer and layer-local ID. It is never wrapped or
+reinterpreted. The current raw matrix contains eight cases, including a direct
+two-row dispatch with distinct row blocks and a nonzero, byte-unaligned Q4_0
+block offset.
+
+The authoritative hardened NVIDIA L4 run at commit
+`08c05ff1079b7676623642d354d13c15994af1ea` passed all eight raw cases, all
+three complete-expert vectors, and all 18 fail-closed checks. Its typed report
+is `pr6-q4-parity-08c05ff.json`, SHA-256
+`f50e0915288de6eb0847ea77a0f3685e91966aa54d178c8d8d6ebb63b9326beb`.
+See the [PR6 Q4_0 numerical-parity evidence](docs/benchmarks/qwen3-coder-30b-a3b-pr6-q4-parity-2026-08-11.md)
+for the exact device, execution-plan, residency, and validation record. This is
+numerical-correctness evidence, not a model-quality or performance claim.
+
+```bash
+./target/release/micro-expert-router qualify-hybrid-q4-parity \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expert-id 257 \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out q4-parity.json
+```
+
+The raw comparison uses fixed absolute `1e-5` and relative `1e-4` tolerances.
+The complete-expert comparison uses fixed absolute `2e-3` and relative `5e-3`
+tolerances and compares `f16(CPU f32)` against the returned GPU f16 value. Both
+apply `abs_error <= absolute + relative * abs(reference)`; any nonfinite result
+fails immediately. The report preserves the original CPU f32, rounded CPU f16,
+GPU f16, per-element errors, allowed errors, and worst index.
+
+In schema `mer.strict-hybrid-q4-parity.v1`, a relative error whose reference is
+zero and absolute error is nonzero is encoded as finite `f32::MAX`; it means
+“relative error undefined because reference is zero.” PASS does not compare
+that sentinel to the relative threshold. It continues to use the documented
+combined allowance, which reduces to the absolute tolerance at a zero
+reference.
+
+PASS additionally requires a clean-provenance release build, strict Hybrid
+component planes, canonical metadata, exact checkpoint payload size, an exact
+hardware adapter-name match, and strict fail-closed GPU policy. Per-vector
+before/after evidence must show one initial physical install, stable generation
+and physical reuse thereafter, no repeated expert-weight upload, complete GPU
+I/O/readback, a valid PR4 capacity ledger, and no eviction, stale retirement,
+CPU execution, fallback, degraded substitution, or dispatch failure. Raw WGSL
+buffers are ephemeral and must leave production expert residency and I/O state
+unchanged. This is numerical correctness evidence, not a batching or throughput
+claim.
+
+The complete-expert section distinguishes canonical, unpadded Q4_0 weight bytes
+from the header-stripped, block-aligned checkpoint payload slot. PASS requires
+the slot to have exactly the converter-defined aligned size and every alignment
+byte to be zero. It reports hashes and lengths for both forms; physical
+residency and upload evidence uses the kernel's separately checked 4-byte-padded
+VRAM length.
+
+This strict command also requires a positive
+`performance.progress_timeout_secs` (or `--progress-timeout-secs`). That value
+bounds raw qualification readback with nonblocking WGPU polling and a deadline.
+The complete-expert half intentionally calls the unchanged production
+routed-expert path; its synchronous production readback is not made
+preemptible by this qualification-only deadline. A separately scoped serving
+change would be required to bound that shared production wait safely.
+
 Increase log verbosity:
 
 ```bash
@@ -2377,6 +2448,13 @@ micro-expert-router qualify-hybrid-q4
   --report-out <PATH>        Write typed JSON there (default: stdout).
   --external-gpu-memory-artifact <STRING>
                               Opaque reference to separate external evidence.
+
+micro-expert-router qualify-hybrid-q4-parity
+  --config <PATH>            Strict Hybrid native-Q4_0 TOML config.
+  --expert-id <ID>           Required global expert ID (never layer-local).
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Write typed JSON there (default: stdout).
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance

@@ -1892,6 +1892,175 @@ impl Engine {
         self.core.execution_context.gpu_expert_io_snapshot()
     }
 
+    fn q4_parity_dispatch_snapshot(
+        &self,
+        expert_id: u32,
+    ) -> Result<crate::q4_parity::CompleteDispatchSnapshot, String> {
+        let backend = self.routed_expert_backend();
+        let logical_generation = self
+            .execution_context()
+            .gpu_expert_cache()
+            .current_admission(expert_id)
+            .map(|admission| admission.generation());
+        let memory = self
+            .gpu_expert_memory_snapshot()
+            .ok_or_else(|| "authoritative GPU backend has no physical-memory snapshot".to_string())?;
+        let gpu_io = self
+            .gpu_expert_io_snapshot()
+            .ok_or_else(|| "authoritative GPU backend has no routed-expert I/O snapshot".to_string())?;
+        Ok(crate::q4_parity::CompleteDispatchSnapshot {
+            logical_generation,
+            physical: backend.gpu_physical_expert_residency(expert_id),
+            memory,
+            gpu_io,
+            routed: self.routed_expert_execution_snapshot(),
+        })
+    }
+
+    /// Qualification-only complete Q4_0 expert execution. It fetches the
+    /// selected global expert through production storage, computes the
+    /// fail-loud authoritative CPU reference from that exact stripped payload,
+    /// and sends each vector through the normal strict routed-expert boundary.
+    /// Normal serving never calls this method.
+    pub(crate) async fn qualify_q4_0_complete_expert(
+        self: &Arc<Self>,
+        global_expert_id: u32,
+        layer_index: u32,
+        inputs: &[Vec<f32>],
+    ) -> Result<crate::q4_parity::CompleteExpertExecution, String> {
+        use sha2::{Digest, Sha256};
+
+        if self.core.options.dtype != WeightDtype::Q4_0 {
+            return Err(format!(
+                "complete-expert parity requires Q4_0, got {}",
+                self.core.options.dtype.as_str()
+            ));
+        }
+        if self.execution_context().plan().routed_experts()
+            != crate::backend::ExecutionPlane::Gpu
+            || self.routed_expert_gpu_failure_policy()
+                != RoutedExpertGpuFailurePolicy::StrictFailClosed
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "complete-expert parity requires a strict fail-closed GPU routed-expert plan"
+                    .to_string(),
+            );
+        }
+        if inputs.len() < 2 {
+            return Err("complete-expert parity requires at least two input vectors".to_string());
+        }
+        if inputs.iter().any(|input| {
+            input.len() != self.core.shape.d_model
+                || input.iter().any(|value| {
+                    !value.is_finite() || half::f16::from_f32(*value).to_f32() != *value
+                })
+        }) {
+            return Err(format!(
+                "complete-expert inputs must contain exactly {} finite f16-exact values",
+                self.core.shape.d_model
+            ));
+        }
+
+        let block_align = self.core.storage.config().block_align;
+        crate::q4_parity::validate_checkpoint_block_align(block_align)?;
+
+        self.core
+            .storage
+            .validate_expert_file_layout(std::iter::once(global_expert_id))
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} does not have the exact configured checkpoint file size: {error}"
+                )
+            })?;
+
+        let expected_payload = crate::inference::expert_weight_bytes_for(
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            WeightDtype::Q4_0,
+        );
+        let checkpoint_payload_bytes =
+            crate::q4_parity::aligned_checkpoint_payload_bytes(expected_payload, block_align)?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
+        if resident.data().len() != checkpoint_payload_bytes {
+            return Err(format!(
+                "global expert {global_expert_id} checkpoint payload has {} bytes, expected exactly {checkpoint_payload_bytes} ({expected_payload} canonical Q4_0 bytes plus alignment padding)",
+                resident.data().len(),
+            ));
+        }
+        let (canonical_payload, alignment_padding) = resident.data().split_at(expected_payload);
+        let alignment_padding_bytes = alignment_padding.len();
+        if alignment_padding.iter().any(|byte| *byte != 0) {
+            return Err(format!(
+                "global expert {global_expert_id} has non-zero bytes in its {}-byte checkpoint alignment pad",
+                alignment_padding.len()
+            ));
+        }
+        let payload_sha256 = format!("{:x}", Sha256::digest(canonical_payload));
+        let checkpoint_payload_sha256 = format!("{:x}", Sha256::digest(resident.data()));
+
+        // Compute every CPU oracle before the first GPU snapshot. This keeps
+        // each recorded before/after pair immediately adjacent to exactly one
+        // production GPU dispatch.
+        let cpu_outputs: Result<Vec<Vec<f32>>, String> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                crate::inference::q4_0_cpu_reference_forward(
+                    canonical_payload,
+                    input,
+                    self.core.shape.d_model,
+                    self.core.shape.d_ff,
+                )
+                .map_err(|error| format!("CPU reference vector {index} failed: {error}"))
+            })
+            .collect();
+        let cpu_outputs = cpu_outputs?;
+
+        let mut dispatches = Vec::with_capacity(inputs.len());
+        for (input, cpu_f32) in inputs.iter().cloned().zip(cpu_outputs) {
+            // Mirror the authoritative production routing probe exactly once.
+            // This owns logical admission hit/miss telemetry and LRU recency;
+            // the backend remains non-mutating with respect to logical LRU.
+            let _ = self
+                .execution_context()
+                .gpu_expert_cache()
+                .get(global_expert_id);
+            let before = self.q4_parity_dispatch_snapshot(global_expert_id)?;
+            let gpu_f16 = run_compute_donated(|| {
+                self.forward_moe_resident(0, layer_index, resident.as_ref(), &input, None)
+            })
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} layer {layer_index} GPU dispatch failed: {error}"
+                )
+            })?;
+            let after = self.q4_parity_dispatch_snapshot(global_expert_id)?;
+            dispatches.push(crate::q4_parity::CompleteDispatchExecution {
+                input,
+                cpu_f32,
+                gpu_f16,
+                before,
+                after,
+            });
+        }
+
+        Ok(crate::q4_parity::CompleteExpertExecution {
+            d_model: self.core.shape.d_model,
+            d_ff: self.core.shape.d_ff,
+            checkpoint_block_align: block_align,
+            payload_bytes: expected_payload,
+            checkpoint_payload_bytes,
+            alignment_padding_bytes,
+            payload_sha256,
+            checkpoint_payload_sha256,
+            dispatches,
+        })
+    }
+
     /// Snapshot the qualification-only real routed-expert execution counters.
     pub fn routed_expert_execution_snapshot(&self) -> RoutedExpertExecutionSnapshot {
         RoutedExpertExecutionSnapshot {

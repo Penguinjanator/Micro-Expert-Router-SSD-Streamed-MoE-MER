@@ -2232,6 +2232,10 @@ mod tests {
     // test; reuse `std::env::temp_dir()` with a unique subpath.
     mod tempdir {
         use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         pub struct TempDir {
             path: PathBuf,
         }
@@ -2242,8 +2246,9 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
+                let sequence = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
                 path.push(format!(
-                    "mer-server-test-{tag}-{}-{nanos}",
+                    "mer-server-test-{tag}-{}-{nanos}-{sequence}",
                     std::process::id()
                 ));
                 std::fs::create_dir_all(&path)?;
