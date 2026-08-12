@@ -484,6 +484,14 @@ impl DenseWeight {
         }
     }
 
+    /// Diagnostic-only full view of the exact per-row logits consumed by
+    /// [`Self::greedy_argmax`]. Calling the general matvec path here would be
+    /// incorrect because its selected backend may accumulate differently.
+    pub(crate) fn diagnostic_greedy_logits(&self, x: &[f32]) -> Vec<f32> {
+        assert_eq!(x.len(), self.cols(), "dense logit input length mismatch");
+        (0..self.rows()).map(|row| self.row_dot(row, x)).collect()
+    }
+
     pub fn top_k_logits(&self, x: &[f32], k: usize) -> Vec<(usize, f32)> {
         assert_eq!(x.len(), self.cols(), "dense top-k input length mismatch");
         if k == 0 || self.rows() == 0 {

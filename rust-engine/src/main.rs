@@ -161,6 +161,7 @@ mod prefetch_governor;
 mod pregate;
 mod qualification;
 mod greedy_parity;
+mod numerical_diagnostics;
 mod q4_parity;
 mod rayon_autotune;
 mod residency;
@@ -910,10 +911,31 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Collect reproducibility and complete first-token CPU/Hybrid logit
+    /// evidence for the fixed json-transformation case.
+    DiagnoseHybridQ4GreedyDivergence {
+        /// Path to the strict Hybrid native-Q4_0 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for Hybrid diagnostic workers.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required typed diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Private same-binary worker for one strict-Hybrid greedy-parity plane.
     #[command(name = "greedy-parity-hybrid-worker-internal", hide = true)]
     GreedyParityHybridWorkerInternal {
         /// The same strict Hybrid config parsed by the parent orchestrator.
+        #[arg(long)]
+        config: PathBuf,
+    },
+
+    /// Private same-binary CPU/Hybrid first-token logit worker.
+    #[command(name = "greedy-parity-logit-worker-internal", hide = true)]
+    GreedyParityLogitWorkerInternal {
         #[arg(long)]
         config: PathBuf,
     },
@@ -1569,6 +1591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_protocol_stdout = matches!(
         cli.cmd,
         Cmd::GreedyParityHybridWorkerInternal { .. }
+            | Cmd::GreedyParityLogitWorkerInternal { .. }
     );
     init_logging(&cli.log, worker_protocol_stdout);
 
@@ -1582,7 +1605,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
-        | Cmd::GreedyParityHybridWorkerInternal { config } => {
+        | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
+        | Cmd::GreedyParityHybridWorkerInternal { config }
+        | Cmd::GreedyParityLogitWorkerInternal { config } => {
             Some(crate::config::Config::from_file(config)?)
         }
         _ => None,
@@ -1706,7 +1731,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Cmd::QualifyHybridQ4 { .. }
             | Cmd::QualifyHybridQ4Parity { .. }
             | Cmd::QualifyHybridQ4GreedyParity { .. }
+            | Cmd::DiagnoseHybridQ4GreedyDivergence { .. }
             | Cmd::GreedyParityHybridWorkerInternal { .. }
+            | Cmd::GreedyParityLogitWorkerInternal { .. }
     ) && !run_gpu_requested
     {
         crate::backend::install_default();
@@ -2001,6 +2028,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::DiagnoseHybridQ4GreedyDivergence {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_diagnose_hybrid_q4_greedy_divergence(
+                DiagnoseHybridQ4GreedyDivergenceArgs {
+                    config,
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("logit diagnostic startup config was not parsed")?,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
         Cmd::GreedyParityHybridWorkerInternal { config: _ } => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -2010,6 +2057,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parsed_config: startup_config
                         .take()
                         .ok_or("greedy parity worker startup config was not parsed")?,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::GreedyParityLogitWorkerInternal { config: _ } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_greedy_parity_logit_worker_internal(
+                GreedyParityHybridWorkerArgs {
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("logit diagnostic worker startup config was not parsed")?,
                     progress_watchdog,
                 },
             ))
@@ -2253,6 +2313,14 @@ struct QualifyHybridQ4GreedyParityArgs {
 
 struct GreedyParityHybridWorkerArgs {
     parsed_config: crate::config::Config,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct DiagnoseHybridQ4GreedyDivergenceArgs {
+    config: PathBuf,
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    report_out: PathBuf,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
@@ -3643,6 +3711,62 @@ async fn execute_greedy_parity_plane(
     watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
     case_name: &str,
 ) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        mode,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_plane_with_logits(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+    first_token_logit_bits: &mut Vec<u32>,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        mode,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        Some(first_token_logit_bits),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_plane_internal(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+    first_token_logit_bits: Option<&mut Vec<u32>>,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
     use crate::qualification::{gpu_io_delta, routed_execution_delta, validate_memory};
 
     let runtime = build_isolated_greedy_runtime(spec, mode, tokenizer).await?;
@@ -3735,12 +3859,13 @@ async fn execute_greedy_parity_plane(
         let measured = with_progress_timeout(
             format!("greedy parity {case_name} {plane} inference"),
             watchdog,
-            run_real_once_from_token_ids(
+            run_real_once_from_token_ids_internal(
                 &runtime,
                 prompt_token_ids,
                 crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
                 crate::sampling::SamplingParams::greedy(),
                 0,
+                first_token_logit_bits,
             ),
         )
         .await?;
@@ -3891,9 +4016,26 @@ fn child_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// dedicated threads so verbose diagnostics cannot deadlock the child. A
 /// timeout always kills and then waits for the exact child before returning.
 async fn run_greedy_parity_worker_process(
+    command: std::process::Command,
+    request_json: Vec<u8>,
+    timeout: Duration,
+) -> Result<GreedyParityWorkerCapture, String> {
+    run_greedy_parity_worker_process_with_limits(
+        command,
+        request_json,
+        timeout,
+        crate::greedy_parity::MAX_WORKER_STDOUT_BYTES,
+        crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+    )
+    .await
+}
+
+async fn run_greedy_parity_worker_process_with_limits(
     mut command: std::process::Command,
     request_json: Vec<u8>,
     timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
 ) -> Result<GreedyParityWorkerCapture, String> {
     use std::io::Write as _;
     use std::process::Stdio;
@@ -3922,12 +4064,10 @@ async fn run_greedy_parity_worker_process(
             return Err("spawned Hybrid worker has no stderr pipe".to_string());
         }
     };
-    let stdout_thread = std::thread::spawn(move || {
-        read_child_output_bounded(stdout, crate::greedy_parity::MAX_WORKER_STDOUT_BYTES)
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        read_child_output_bounded(stderr, crate::greedy_parity::MAX_WORKER_STDERR_BYTES)
-    });
+    let stdout_thread =
+        std::thread::spawn(move || read_child_output_bounded(stdout, stdout_limit));
+    let stderr_thread =
+        std::thread::spawn(move || read_child_output_bounded(stderr, stderr_limit));
 
     let mut transport_error = None;
     match child.stdin.take() {
@@ -4090,6 +4230,158 @@ async fn cmd_greedy_parity_hybrid_worker_internal(
                 Some(detail.clone()),
             );
             emit_hybrid_worker_response(&response)?;
+            Err(detail.into())
+        }
+    }
+}
+
+fn emit_logit_worker_response(
+    response: &crate::numerical_diagnostics::DiagnosticWorkerResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, response)?;
+    locked.write_all(b"\n")?;
+    locked.flush()?;
+    Ok(())
+}
+
+/// Hidden same-binary worker. The request embeds the existing greedy-parity
+/// identity contract; the only new controls are plane and repeated-run index.
+async fn cmd_greedy_parity_logit_worker_internal(
+    args: GreedyParityHybridWorkerArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take((crate::greedy_parity::MAX_WORKER_STDOUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > crate::greedy_parity::MAX_WORKER_STDOUT_BYTES {
+        return Err("logit worker request exceeds the private protocol limit".into());
+    }
+    let request = crate::numerical_diagnostics::parse_worker_request_exact(&input)?;
+    request.validate_static()?;
+    let spec = resolve_real_cli_spec_from_config(
+        args.parsed_config,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let observed_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (_, observed_executable_sha256) = current_executable_identity()?;
+    let provenance = crate::qualification::BuildProvenance::embedded();
+    let identity = crate::greedy_parity::validate_hybrid_worker_request(
+        &request.base,
+        &observed_config_sha256,
+        &observed_executable_sha256,
+        provenance.git_sha.as_deref(),
+    );
+    if !identity.all_verified() {
+        let detail = "logit worker request identity validation failed".to_string();
+        let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+            protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION.to_string(),
+            plane: request.plane,
+            run_index: request.run_index,
+            base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request.base,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                None,
+                Some(detail.clone()),
+            ),
+            chosen_token_id: None,
+            first_token_logit_bits: None,
+            first_token_logit_bits_sha256: None,
+            failure: Some(detail.clone()),
+        };
+        emit_logit_worker_response(&response)?;
+        return Err(detail.into());
+    }
+    let mode = match request.plane {
+        crate::numerical_diagnostics::DiagnosticPlane::Cpu => {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu
+        }
+        crate::numerical_diagnostics::DiagnosticPlane::Hybrid => {
+            RealCliRuntimeMode::IsolatedGreedyParityHybrid
+        }
+    };
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let mut logit_bits = Vec::new();
+    let attempt = execute_greedy_parity_plane_with_logits(
+        &spec,
+        mode,
+        tokenizer,
+        &request.base.prompt_token_ids,
+        &request.base.prompt_token_ids_sha256,
+        &request.base.resolved_config_sha256,
+        &request.base.expected_adapter_name,
+        args.progress_watchdog,
+        &request.base.case_name,
+        &mut logit_bits,
+    )
+    .await;
+    match attempt {
+        Ok(plane) => {
+            if logit_bits.is_empty()
+                || logit_bits.len() > crate::numerical_diagnostics::MAX_VOCAB_SIZE
+            {
+                return Err("logit worker captured an invalid vocabulary vector".into());
+            }
+            let chosen_token_id = plane
+                .generation
+                .generated_token_ids
+                .first()
+                .copied()
+                .ok_or("logit worker generated no first token")?;
+            let logit_sha256 = crate::numerical_diagnostics::f32_bits_sha256(&logit_bits);
+            let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+                protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+                    .to_string(),
+                plane: request.plane,
+                run_index: request.run_index,
+                base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                    &request.base,
+                    &observed_config_sha256,
+                    &observed_executable_sha256,
+                    provenance.git_sha.as_deref(),
+                    identity,
+                    Some(plane),
+                    None,
+                ),
+                chosen_token_id: Some(chosen_token_id),
+                first_token_logit_bits: Some(logit_bits),
+                first_token_logit_bits_sha256: Some(logit_sha256),
+                failure: None,
+            };
+            emit_logit_worker_response(&response)
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+                protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+                    .to_string(),
+                plane: request.plane,
+                run_index: request.run_index,
+                base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                    &request.base,
+                    &observed_config_sha256,
+                    &observed_executable_sha256,
+                    provenance.git_sha.as_deref(),
+                    identity,
+                    None,
+                    Some(detail.clone()),
+                ),
+                chosen_token_id: None,
+                first_token_logit_bits: None,
+                first_token_logit_bits_sha256: None,
+                failure: Some(detail.clone()),
+            };
+            emit_logit_worker_response(&response)?;
             Err(detail.into())
         }
     }
@@ -4272,6 +4564,450 @@ async fn execute_greedy_parity_hybrid_worker(
             stderr_truncated: capture.stderr.truncated,
         },
     })
+}
+
+struct CompletedLogitWorker {
+    run: crate::numerical_diagnostics::RepeatedRunEvidence,
+    first_token_logit_bits: Vec<u32>,
+    chosen_token_id: u32,
+}
+
+async fn execute_logit_diagnostic_worker(
+    executable: &Path,
+    config: &Path,
+    request: &crate::numerical_diagnostics::DiagnosticWorkerRequest,
+    timeout: Duration,
+) -> Result<
+    CompletedLogitWorker,
+    crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence,
+> {
+    let empty_process = || crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.base.worker_id.clone(),
+        executable_sha256: request.base.executable_sha256.clone(),
+        build_git_sha: request.base.build_git_sha.clone(),
+        ..Default::default()
+    };
+    let request_json = serde_json::to_vec(request).map_err(|error| {
+        crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+            worker_id: request.base.worker_id.clone(),
+            plane: request.plane,
+            run_index: request.run_index,
+            detail: format!("failed to serialize logit worker request: {error}"),
+            process: empty_process(),
+            stderr: String::new(),
+            stderr_truncated: false,
+        }
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--progress-timeout-secs")
+        .arg(timeout.as_secs().to_string())
+        .arg("greedy-parity-logit-worker-internal")
+        .arg("--config")
+        .arg(config);
+    let capture = run_greedy_parity_worker_process_with_limits(
+        command,
+        request_json,
+        timeout,
+        crate::numerical_diagnostics::MAX_WORKER_STDOUT_BYTES,
+        crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+    )
+    .await
+    .map_err(|detail| crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+        worker_id: request.base.worker_id.clone(),
+        plane: request.plane,
+        run_index: request.run_index,
+        detail,
+        process: empty_process(),
+        stderr: String::new(),
+        stderr_truncated: false,
+    })?;
+    let stderr = String::from_utf8_lossy(&capture.stderr.bytes).into_owned();
+    let response_result = if capture.stdout.truncated {
+        Err(format!(
+            "logit worker stdout exceeded {} bytes",
+            crate::numerical_diagnostics::MAX_WORKER_STDOUT_BYTES
+        ))
+    } else {
+        crate::numerical_diagnostics::parse_worker_response_exact(&capture.stdout.bytes)
+    };
+    let parse_detail = response_result.as_ref().err().cloned();
+    let response = response_result.as_ref().ok();
+    let validation = response.map(|response| {
+        crate::greedy_parity::validate_hybrid_worker_response(&request.base, &response.base)
+    });
+    let response_identity_exact = response.is_some_and(|response| {
+        response.protocol_version == crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+            && response.plane == request.plane
+            && response.run_index == request.run_index
+            && response.base.worker_id == request.base.worker_id
+    });
+    let identity_attested = response_identity_exact
+        && validation.is_some_and(|value| value.all_verified())
+        && response.is_some_and(|response| {
+            response.failure.is_none()
+                && response.base.failure.is_none()
+                && response.base.plane.is_some()
+                && response.chosen_token_id.is_some()
+                && response.first_token_logit_bits.is_some()
+                && response.first_token_logit_bits_sha256.is_some()
+        });
+    let exit_code = capture.status.code();
+    let signal = child_exit_signal(&capture.status);
+    let normal_zero_exit = capture.status.success()
+        && exit_code == Some(0)
+        && signal.is_none()
+        && !capture.timed_out
+        && capture.transport_error.is_none();
+    let process = crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.base.worker_id.clone(),
+        child_process_spawned: true,
+        process_id: Some(capture.process_id),
+        executable_sha256: request.base.executable_sha256.clone(),
+        build_git_sha: request.base.build_git_sha.clone(),
+        executable_identity_verified: identity_attested,
+        build_sha_identity_verified: identity_attested,
+        case_identity_verified: identity_attested,
+        config_identity_verified: identity_attested,
+        expected_adapter_identity_verified: identity_attested,
+        prompt_token_identity_verified: identity_attested,
+        output_token_limit_verified: identity_attested,
+        greedy_sampling_identity_verified: identity_attested,
+        normal_zero_exit,
+        exit_code,
+        signal,
+        process_reaped: capture.reaped,
+        timed_out: capture.timed_out,
+        evidence_emitted: response.is_some(),
+    };
+    let completed = (|| -> Result<CompletedLogitWorker, String> {
+        if !normal_zero_exit || !capture.reaped || !identity_attested {
+            return Err("logit worker did not exit/reap with exact identity".to_string());
+        }
+        let response = response.ok_or("logit worker emitted no response")?;
+        let logit_bits = response
+            .first_token_logit_bits
+            .clone()
+            .ok_or("logit worker omitted complete logits")?;
+        let logit_sha256 = response
+            .first_token_logit_bits_sha256
+            .clone()
+            .ok_or("logit worker omitted logit hash")?;
+        if logit_bits.is_empty()
+            || logit_bits.len() > crate::numerical_diagnostics::MAX_VOCAB_SIZE
+            || crate::numerical_diagnostics::f32_bits_sha256(&logit_bits) != logit_sha256
+        {
+            return Err("logit worker vector is malformed or hash-mismatched".to_string());
+        }
+        let chosen_token_id = response
+            .chosen_token_id
+            .ok_or("logit worker omitted chosen token")?;
+        let logits: Vec<f32> = logit_bits.iter().copied().map(f32::from_bits).collect();
+        if crate::numerical_diagnostics::top_logits(&logits, 1)
+            .first()
+            .map(|item| item.token_id)
+            != Some(chosen_token_id)
+        {
+            return Err("complete logits disagree with production greedy token".to_string());
+        }
+        let mut plane = response
+            .base
+            .plane
+            .clone()
+            .ok_or("logit worker omitted plane evidence")?;
+        if plane.worker_process.is_some()
+            || plane.generation.generated_token_ids.first().copied() != Some(chosen_token_id)
+        {
+            return Err("logit worker plane evidence is malformed".to_string());
+        }
+        plane.worker_process = Some(process.clone());
+        let generated_token_ids = plane.generation.generated_token_ids.clone();
+        Ok(CompletedLogitWorker {
+            run: crate::numerical_diagnostics::RepeatedRunEvidence {
+                plane: request.plane,
+                run_index: request.run_index,
+                worker_id: request.base.worker_id.clone(),
+                generated_token_ids_sha256: crate::greedy_parity::token_ids_sha256(
+                    &generated_token_ids,
+                ),
+                generated_token_ids,
+                first_token_logit_bits_sha256: logit_sha256,
+                process: process.clone(),
+                plane_evidence: plane,
+            },
+            first_token_logit_bits: logit_bits,
+            chosen_token_id,
+        })
+    })();
+    completed.map_err(|detail| {
+        let response_failure = response.and_then(|response| {
+            response
+                .failure
+                .clone()
+                .or_else(|| response.base.failure.clone())
+        });
+        crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+            worker_id: request.base.worker_id.clone(),
+            plane: request.plane,
+            run_index: request.run_index,
+            detail: [
+                Some(detail),
+                capture.transport_error,
+                parse_detail,
+                response_failure,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; "),
+            process,
+            stderr,
+            stderr_truncated: capture.stderr.truncated,
+        }
+    })
+}
+
+fn emit_numerical_diagnostic_report(
+    report: &crate::numerical_diagnostics::DiagnosticReport,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = serde_json::to_vec_pretty(report)?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes)?;
+    eprintln!("logit diagnostic report written to {}", path.display());
+    Ok(())
+}
+
+fn fail_numerical_diagnostic(
+    mut report: crate::numerical_diagnostics::DiagnosticReport,
+    code: &str,
+    detail: impl Into<String>,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let detail = detail.into();
+    report.fail(code, detail.clone());
+    match emit_numerical_diagnostic_report(&report, path) {
+        Ok(()) => Err(format!("{code}: {detail}").into()),
+        Err(error) => Err(format!("{code}: {detail}; report emission failed: {error}").into()),
+    }
+}
+
+async fn cmd_diagnose_hybrid_q4_greedy_divergence(
+    args: DiagnoseHybridQ4GreedyDivergenceArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{
+        validate_preflight, BuildProvenance, PreflightEvidence, QualificationChecks,
+    };
+
+    let cfg = args.parsed_config;
+    let provenance = BuildProvenance::embedded();
+    let build_git_sha = provenance
+        .git_sha
+        .clone()
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("logit diagnostic requires embedded immutable build SHA")?;
+    if provenance.dirty != Some(false) {
+        return Err("logit diagnostic requires clean build provenance".into());
+    }
+    if args.expected_adapter_name.is_empty() {
+        return Err("--expected-adapter-name must be non-empty".into());
+    }
+    let worker_timeout = args
+        .progress_watchdog
+        .timeout
+        .ok_or("logit diagnostic requires a positive progress timeout")?;
+    let (_, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    if !artifact_errors.is_empty() {
+        return Err(format!(
+            "logit diagnostic artifact preflight failed: {}",
+            artifact_errors.join("; ")
+        )
+        .into());
+    }
+    let metadata = crate::qualification::read_expert_metadata(
+        &cfg.model.data_dir.join("metadata.json"),
+    )
+    .map_err(|error| format!("logit diagnostic metadata preflight failed: {error}"))?;
+    if !matches!(
+        cfg.real_transformer.resolve_weight_policy(),
+        Ok(crate::config::RealWeightPolicy::StrictReal)
+    ) {
+        return Err("logit diagnostic requires the strict real-weight policy".into());
+    }
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let preflight = PreflightEvidence {
+        provenance,
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        requested_mode: cfg.real_transformer.compute_offload,
+        routed_expert_dtype: cfg.model.dtype,
+        metadata,
+    };
+    validate_preflight(&preflight, &mut QualificationChecks::default())
+        .map_err(|failure| format!("{}: {}", failure.code, failure.detail))?;
+    let spec = resolve_real_cli_spec_from_config(
+        cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    if !greedy_parity_model_identity(&spec).is_qwen3_coder_30b_a3b_q4_0() {
+        return Err("logit diagnostic requires exact Qwen3-Coder 30B-A3B Q4_0 geometry".into());
+    }
+    let resolved_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (worker_executable, executable_sha256) = current_executable_identity()?;
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let fixed = crate::greedy_parity::fixed_case(
+        crate::numerical_diagnostics::TARGET_CASE,
+    )
+    .ok_or("json-transformation fixed corpus case is unavailable")?;
+    // Parent-only tokenization: every worker receives this identical vector.
+    let prompt_token_ids = tokenizer.encode(fixed.prompt)?;
+    if prompt_token_ids.is_empty() {
+        return Err("json-transformation prompt encoded to zero tokens".into());
+    }
+    let prompt_sha256 = crate::greedy_parity::sha256_hex(fixed.prompt.as_bytes());
+    let prompt_token_ids_sha256 = crate::greedy_parity::token_ids_sha256(&prompt_token_ids);
+    let mut report = crate::numerical_diagnostics::DiagnosticReport::new(
+        build_git_sha.clone(),
+        executable_sha256.clone(),
+        resolved_config_sha256.clone(),
+        args.expected_adapter_name.clone(),
+        prompt_sha256,
+        prompt_token_ids_sha256,
+        prompt_token_ids.len(),
+    );
+    let mut completed = Vec::with_capacity(4);
+    for plane in [
+        crate::numerical_diagnostics::DiagnosticPlane::Cpu,
+        crate::numerical_diagnostics::DiagnosticPlane::Hybrid,
+    ] {
+        for run_index in 0..crate::numerical_diagnostics::REPEATED_RUNS_PER_PLANE {
+            let worker_id = crate::numerical_diagnostics::diagnostic_worker_id(
+                &build_git_sha,
+                &executable_sha256,
+                plane,
+                run_index,
+            );
+            let base = crate::greedy_parity::HybridWorkerRequest::new(
+                worker_id,
+                fixed,
+                resolved_config_sha256.clone(),
+                args.expected_adapter_name.clone(),
+                prompt_token_ids.clone(),
+                executable_sha256.clone(),
+                build_git_sha.clone(),
+            );
+            let request = crate::numerical_diagnostics::DiagnosticWorkerRequest::new(
+                plane,
+                run_index,
+                base,
+            );
+            match execute_logit_diagnostic_worker(
+                &worker_executable,
+                &args.config,
+                &request,
+                worker_timeout,
+            )
+            .await
+            {
+                Ok(worker) => completed.push(worker),
+                Err(failure) => {
+                    let detail = failure.detail.clone();
+                    report.runs = completed.iter().map(|worker| worker.run.clone()).collect();
+                    report.reproducibility = Some(
+                        crate::numerical_diagnostics::validate_repeated_run_identity(&report.runs),
+                    );
+                    report.worker_failures.push(failure);
+                    return fail_numerical_diagnostic(
+                        report,
+                        "logit-diagnostic-worker-failed",
+                        detail,
+                        &args.report_out,
+                    );
+                }
+            }
+        }
+    }
+    report.runs = completed.iter().map(|worker| worker.run.clone()).collect();
+    let reproducibility =
+        crate::numerical_diagnostics::validate_repeated_run_identity(&report.runs);
+    report.reproducibility = Some(reproducibility.clone());
+    if !reproducibility.cpu_bitwise_reproducible
+        || !reproducibility.hybrid_bitwise_reproducible
+        || !reproducibility.all_worker_ids_unique
+        || !reproducibility.all_process_ids_unique
+        || !reproducibility.every_worker_exited_zero_and_reaped
+        || !reproducibility.no_retries
+    {
+        return fail_numerical_diagnostic(
+            report,
+            "logit-diagnostic-reproducibility-failed",
+            "fresh CPU/Hybrid runs were nondeterministic or process evidence was incomplete",
+            &args.report_out,
+        );
+    }
+    let cpu = completed
+        .iter()
+        .find(|worker| worker.run.plane == crate::numerical_diagnostics::DiagnosticPlane::Cpu)
+        .ok_or("missing CPU logit diagnostic run")?;
+    let hybrid = completed
+        .iter()
+        .find(|worker| worker.run.plane == crate::numerical_diagnostics::DiagnosticPlane::Hybrid)
+        .ok_or("missing Hybrid logit diagnostic run")?;
+    let cpu_logits: Vec<f32> = cpu
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let hybrid_logits: Vec<f32> = hybrid
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    report.first_token_logits = Some(match
+        crate::numerical_diagnostics::build_first_token_logit_evidence(
+            &cpu_logits,
+            &hybrid_logits,
+            cpu.chosen_token_id,
+            hybrid.chosen_token_id,
+        )
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "first-token-logit-comparison-failed",
+                error,
+                &args.report_out,
+            )
+        }
+    });
+    if let Err(error) = report.finish() {
+        return fail_numerical_diagnostic(
+            report,
+            "logit-diagnostic-evidence-incomplete",
+            error,
+            &args.report_out,
+        );
+    }
+    emit_numerical_diagnostic_report(&report, &args.report_out)
 }
 
 async fn cmd_qualify_hybrid_q4_greedy_parity(
@@ -6506,6 +7242,28 @@ async fn run_real_once_from_token_ids(
     params: crate::sampling::SamplingParams,
     run_index: usize,
 ) -> Result<PreTokenizedRealRun, Box<dyn std::error::Error>> {
+    run_real_once_from_token_ids_internal(
+        runtime,
+        prompt_ids,
+        output_tokens,
+        params,
+        run_index,
+        None,
+    )
+    .await
+}
+
+/// Sole pre-tokenized inference implementation. The private logit diagnostic
+/// may copy the exact first-token row-dot results immediately before the
+/// unchanged production greedy selector; all normal callers pass `None`.
+async fn run_real_once_from_token_ids_internal(
+    runtime: &BenchRealRuntime,
+    prompt_ids: &[u32],
+    output_tokens: usize,
+    params: crate::sampling::SamplingParams,
+    run_index: usize,
+    first_token_logit_bits: Option<&mut Vec<u32>>,
+) -> Result<PreTokenizedRealRun, Box<dyn std::error::Error>> {
     if prompt_ids.is_empty() {
         return Err("pre-tokenized real-model prompt contains zero tokens".into());
     }
@@ -6554,6 +7312,19 @@ async fn run_real_once_from_token_ids(
     let prompt_elapsed = prompt_started.elapsed();
     stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_elapsed);
     let prompt_seconds = prompt_elapsed.as_secs_f64();
+    if let Some(bits) = first_token_logit_bits {
+        if !bits.is_empty() {
+            return Err("first-token logit capture destination was not empty".into());
+        }
+        bits.extend(
+            runtime
+                .model
+                .lm_head
+                .diagnostic_greedy_logits(&final_hidden)
+                .into_iter()
+                .map(f32::to_bits),
+        );
+    }
     let first = runtime.model.sample_hidden_with_timing(
         &final_hidden,
         &params,
@@ -10368,6 +11139,42 @@ mod tests {
     }
 
     #[test]
+    fn logit_diagnostic_cli_requires_report_and_exact_adapter() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-hybrid-q4-greedy-divergence",
+            "--config",
+            "strict-hybrid.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "diagnostic.json",
+        ])
+        .unwrap();
+        let Cmd::DiagnoseHybridQ4GreedyDivergence {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = cli.cmd
+        else {
+            panic!("expected logit diagnostic command");
+        };
+        assert_eq!(config, PathBuf::from("strict-hybrid.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, PathBuf::from("diagnostic.json"));
+
+        let missing_report = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-hybrid-q4-greedy-divergence",
+            "--config",
+            "strict-hybrid.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+        ]);
+        assert!(missing_report.is_err());
+    }
+
+    #[test]
     fn greedy_parity_failure_report_is_written_and_returns_error() {
         let dir = tempdir_unique("greedy-parity-failure");
         std::fs::create_dir_all(&dir).unwrap();
@@ -10488,6 +11295,19 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(!help.contains("greedy-parity-hybrid-worker-internal"));
+        let diagnostic = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "greedy-parity-logit-worker-internal",
+            "--config",
+            "strict-hybrid.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            diagnostic.cmd,
+            Cmd::GreedyParityLogitWorkerInternal { config }
+                if config == Path::new("strict-hybrid.toml")
+        ));
+        assert!(!help.contains("greedy-parity-logit-worker-internal"));
     }
 
     #[test]

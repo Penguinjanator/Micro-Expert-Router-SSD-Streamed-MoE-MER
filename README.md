@@ -2116,6 +2116,48 @@ jq -e '
 ' greedy-parity.json
 ```
 
+##### First-token numerical diagnostic
+
+`diagnose-hybrid-q4-greedy-divergence` is a separate Phase-A diagnostic for
+the fixed `json-transformation` case. It leaves the exact-token qualification
+contract unchanged. The parent tokenizes once, then starts two fresh CPU and
+two fresh process-isolated Hybrid workers. Each worker returns the complete
+first-token logit vector as bounded exact f32 bits through a private typed
+protocol; the final JSON contains only hashes and comparison evidence.
+
+```bash
+./target/release/micro-expert-router diagnose-hybrid-q4-greedy-divergence \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out ./greedy-logit-diagnostic.json
+```
+
+The report schema is
+`mer.strict-hybrid-q4-greedy-logit-diagnostic.v1`. It records repeated-run
+bitwise reproducibility, chosen tokens, top-16 logits and bits, the union of
+both top-16 sets, complete-vector error metrics, and the CPU/Hybrid change in
+the token-715-versus-token-5212 margin. `qualification_pass` is always false;
+`diagnostic_complete` means only that all identity, process, strict-plane, and
+logit evidence was collected and reconciled.
+
+```bash
+jq -e '
+  .schema_version == "mer.strict-hybrid-q4-greedy-logit-diagnostic.v1" and
+  .qualification_pass == false and
+  .diagnostic_complete == true and
+  .failure == null and
+  (.runs | length) == 4 and
+  .reproducibility.cpu_bitwise_reproducible == true and
+  .reproducibility.hybrid_bitwise_reproducible == true and
+  .reproducibility.all_worker_ids_unique == true and
+  .reproducibility.all_process_ids_unique == true and
+  .reproducibility.every_worker_exited_zero_and_reaped == true and
+  .reproducibility.no_retries == true and
+  (.first_token_logits.cpu_top_16 | length) == 16 and
+  (.first_token_logits.hybrid_top_16 | length) == 16
+' ./greedy-logit-diagnostic.json
+```
+
 Increase log verbosity:
 
 ```bash
@@ -2531,6 +2573,12 @@ micro-expert-router qualify-hybrid-q4-greedy-parity
   --expected-adapter-name <NAME>
                               Required exact authoritative wgpu adapter name.
   --report-out <PATH>        Write typed JSON there (default: stdout).
+
+micro-expert-router diagnose-hybrid-q4-greedy-divergence
+  --config <PATH>            One strict Hybrid native-Q4_0 TOML config.
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Required typed diagnostic JSON destination.
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance
