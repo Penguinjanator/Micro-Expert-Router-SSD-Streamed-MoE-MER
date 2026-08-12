@@ -2046,6 +2046,68 @@ routed-expert path; its synchronous production readback is not made
 preemptible by this qualification-only deadline. A separately scoped serving
 change would be required to bound that shared production wait safely.
 
+#### Strict Hybrid fixed-corpus greedy-token parity
+
+`qualify-hybrid-q4-greedy-parity` is a separate fail-closed diagnostic for
+Qwen3-Coder 30B-A3B Q4_0. It parses and reconciles one supplied strict Hybrid
+configuration, freezes that resolved model/runtime specification, then derives
+an all-CPU control and strict Hybrid execution exclusively from that frozen
+specification. A second CPU config is neither accepted nor inferred. Each
+plane and each corpus case receives a fresh engine, KV state, RAM/logical GPU
+cache, physical registry, counters, predictors, background state, and storage
+runtime. Controlled shutdown must release every resource family before the
+next isolated runtime is constructed.
+
+The versioned corpus `qwen3-coder-30b-a3b-greedy-v1` contains four cases:
+Rust function generation, Rust code correction, compact JSON transformation,
+and a short Spanish instruction. Each prompt is tokenized exactly once, the
+same token-ID slice is passed to both planes, and each plane produces exactly
+16 completion tokens with `SamplingParams::greedy()` (`temperature=0`,
+`top_p=1`, `top_k=0`, `seed=0`). This is deliberately small correctness
+coverage, not a throughput benchmark.
+
+```bash
+./target/release/micro-expert-router qualify-hybrid-q4-greedy-parity \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out greedy-parity.json
+```
+
+Schema `mer.strict-hybrid-q4-greedy-parity.v1` passes only when the clean build,
+real checkpoint, canonical `ggml-standard-v1` metadata, exact Qwen3-Coder
+geometry, fixed corpus, and fixed sampling identity all validate. Per case,
+the CPU plan must resolve every component to CPU and account every selected
+routed expert as a CPU dispatch with zero GPU counters. Hybrid must resolve
+embeddings, LM head, dense projections, attention, KV, and router to CPU while
+routing native Q4_0 experts to the exact named non-software GPU under
+`StrictFailClosed`. Every selected Hybrid expert must be attempted and succeed
+on GPU; hidden uploads, queue submissions, map requests, completed readbacks,
+and readback bytes must all be nonzero; CPU expert execution, fallback,
+degraded substitution, and GPU failures must remain zero.
+
+PASS additionally requires exact generated token-ID equality at every position,
+identical generated count and termination reason, and identical decoded-text
+SHA-256. A failure report preserves the first differing position, nullable CPU
+and Hybrid token IDs for length divergence, both termination reasons, lengths,
+counters, and decoded prefixes bounded to 512 UTF-8 bytes. The report contains
+no timing or TPS fields and does not change EOS, serving, batching, scheduling,
+quantization, shader math, or numerical-parity tolerances.
+
+```bash
+jq -e '
+  . as $report |
+  $report.schema_version == "mer.strict-hybrid-q4-greedy-parity.v1" and
+  $report.status == "pass" and
+  $report.failure == null and
+  ($report.checks | all(.[]; . == true)) and
+  $report.source_preflight.requested_mode == "hybrid" and
+  all($report.cases[];
+    .hybrid.device.name == $report.expected_adapter_name and
+    .hybrid.device.software_adapter == false and
+    .comparison.exact_token_ids == true)
+' greedy-parity.json
+```
+
 Increase log verbosity:
 
 ```bash
@@ -2452,6 +2514,12 @@ micro-expert-router qualify-hybrid-q4
 micro-expert-router qualify-hybrid-q4-parity
   --config <PATH>            Strict Hybrid native-Q4_0 TOML config.
   --expert-id <ID>           Required global expert ID (never layer-local).
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Write typed JSON there (default: stdout).
+
+micro-expert-router qualify-hybrid-q4-greedy-parity
+  --config <PATH>            One strict Hybrid native-Q4_0 TOML config.
   --expected-adapter-name <NAME>
                               Required exact authoritative wgpu adapter name.
   --report-out <PATH>        Write typed JSON there (default: stdout).
