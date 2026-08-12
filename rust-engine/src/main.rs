@@ -3722,6 +3722,7 @@ async fn execute_greedy_parity_plane(
         watchdog,
         case_name,
         None,
+        None,
     )
     .await
 }
@@ -3738,6 +3739,7 @@ async fn execute_greedy_parity_plane_with_logits(
     watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
     case_name: &str,
     first_token_logit_bits: &mut Vec<u32>,
+    route_capture: &mut Option<crate::engine::RoutedFfnDiagnosticCapture>,
 ) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
     execute_greedy_parity_plane_internal(
         spec,
@@ -3750,6 +3752,7 @@ async fn execute_greedy_parity_plane_with_logits(
         watchdog,
         case_name,
         Some(first_token_logit_bits),
+        Some(route_capture),
     )
     .await
 }
@@ -3766,6 +3769,7 @@ async fn execute_greedy_parity_plane_internal(
     watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
     case_name: &str,
     first_token_logit_bits: Option<&mut Vec<u32>>,
+    route_capture: Option<&mut Option<crate::engine::RoutedFfnDiagnosticCapture>>,
 ) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
     use crate::qualification::{gpu_io_delta, routed_execution_delta, validate_memory};
 
@@ -3856,6 +3860,17 @@ async fn execute_greedy_parity_plane_internal(
         if let Some(snapshot) = memory_before {
             validate_memory(snapshot).map_err(|failure| failure.detail)?;
         }
+        if route_capture.is_some() {
+            let target_token_idx = prompt_token_ids
+                .len()
+                .checked_sub(1)
+                .and_then(|position| position.checked_mul(runtime.model.config.num_layers))
+                .and_then(|token_idx| u64::try_from(token_idx).ok())
+                .ok_or("layer-0 route capture token index overflowed")?;
+            runtime
+                .engine
+                .arm_layer0_route_capture(target_token_idx)?;
+        }
         let measured = with_progress_timeout(
             format!("greedy parity {case_name} {plane} inference"),
             watchdog,
@@ -3869,6 +3884,14 @@ async fn execute_greedy_parity_plane_internal(
             ),
         )
         .await?;
+        if let Some(destination) = route_capture {
+            *destination = Some(
+                runtime
+                    .engine
+                    .take_layer0_route_capture()
+                    .ok_or("final-prompt layer-0 routed-FFN input was not captured")?,
+            );
+        }
         let routed_after = runtime.engine.routed_expert_execution_snapshot();
         let io_after_option = runtime.engine.gpu_expert_io_snapshot();
         let io_after = io_after_option.unwrap_or_default();
@@ -4294,6 +4317,7 @@ async fn cmd_greedy_parity_logit_worker_internal(
             chosen_token_id: None,
             first_token_logit_bits: None,
             first_token_logit_bits_sha256: None,
+            route_capture: None,
             failure: Some(detail.clone()),
         };
         emit_logit_worker_response(&response)?;
@@ -4312,6 +4336,7 @@ async fn cmd_greedy_parity_logit_worker_internal(
         RealCliRuntimeMode::IsolatedGreedyParityHybrid,
     )?;
     let mut logit_bits = Vec::new();
+    let mut route_capture = None;
     let attempt = execute_greedy_parity_plane_with_logits(
         &spec,
         mode,
@@ -4323,6 +4348,7 @@ async fn cmd_greedy_parity_logit_worker_internal(
         args.progress_watchdog,
         &request.base.case_name,
         &mut logit_bits,
+        &mut route_capture,
     )
     .await;
     match attempt {
@@ -4356,6 +4382,7 @@ async fn cmd_greedy_parity_logit_worker_internal(
                 chosen_token_id: Some(chosen_token_id),
                 first_token_logit_bits: Some(logit_bits),
                 first_token_logit_bits_sha256: Some(logit_sha256),
+                route_capture,
                 failure: None,
             };
             emit_logit_worker_response(&response)
@@ -4379,6 +4406,7 @@ async fn cmd_greedy_parity_logit_worker_internal(
                 chosen_token_id: None,
                 first_token_logit_bits: None,
                 first_token_logit_bits_sha256: None,
+                route_capture: None,
                 failure: Some(detail.clone()),
             };
             emit_logit_worker_response(&response)?;
@@ -4570,6 +4598,7 @@ struct CompletedLogitWorker {
     run: crate::numerical_diagnostics::RepeatedRunEvidence,
     first_token_logit_bits: Vec<u32>,
     chosen_token_id: u32,
+    route_capture: crate::engine::RoutedFfnDiagnosticCapture,
 }
 
 async fn execute_logit_diagnostic_worker(
@@ -4651,6 +4680,7 @@ async fn execute_logit_diagnostic_worker(
                 && response.chosen_token_id.is_some()
                 && response.first_token_logit_bits.is_some()
                 && response.first_token_logit_bits_sha256.is_some()
+                && response.route_capture.is_some()
         });
     let exit_code = capture.status.code();
     let signal = child_exit_signal(&capture.status);
@@ -4702,6 +4732,10 @@ async fn execute_logit_diagnostic_worker(
         let chosen_token_id = response
             .chosen_token_id
             .ok_or("logit worker omitted chosen token")?;
+        let route_capture = response
+            .route_capture
+            .clone()
+            .ok_or("logit worker omitted layer-0 route capture")?;
         let logits: Vec<f32> = logit_bits.iter().copied().map(f32::from_bits).collect();
         if crate::numerical_diagnostics::top_logits(&logits, 1)
             .first()
@@ -4737,6 +4771,7 @@ async fn execute_logit_diagnostic_worker(
             },
             first_token_logit_bits: logit_bits,
             chosen_token_id,
+            route_capture,
         })
     })();
     completed.map_err(|detail| {
@@ -4792,6 +4827,78 @@ fn fail_numerical_diagnostic(
     }
 }
 
+async fn execute_actual_input_q4_shadow(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    expected_adapter_name: &str,
+    capture: &crate::engine::RoutedFfnDiagnosticCapture,
+) -> Result<crate::numerical_diagnostics::ActualInputQ4ShadowEvidence, String> {
+    let runtime = build_isolated_greedy_runtime(
+        spec,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        tokenizer,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let attempt = async {
+        let plan: crate::qualification::ExecutionPlanEvidence =
+            runtime.engine.execution_context().plan().into();
+        if !crate::greedy_parity::hybrid_plan_exact(&plan)
+            || runtime.engine.routed_expert_gpu_failure_policy()
+                != crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed
+        {
+            return Err("Q4 shadow runtime did not retain the exact strict Hybrid plan".to_string());
+        }
+        let device = runtime
+            .engine
+            .gpu_device_identity()
+            .ok_or("Q4 shadow runtime has no authoritative GPU identity")?;
+        if device.software_adapter
+            || device.device_type.eq_ignore_ascii_case("cpu")
+            || device.name != expected_adapter_name
+        {
+            return Err(format!(
+                "Q4 shadow selected adapter {:?}, expected exact hardware adapter {:?}",
+                device.name, expected_adapter_name
+            ));
+        }
+        let input: Vec<f32> = capture
+            .input_bits
+            .iter()
+            .map(|bits| half::f16::from_f32(f32::from_bits(*bits)).to_f32())
+            .collect();
+        let inputs = vec![input.clone(), input];
+        let mut outputs = Vec::with_capacity(capture.expert_ids.len());
+        for &global_expert_id in &capture.expert_ids {
+            let execution = runtime
+                .engine
+                .qualify_q4_0_complete_expert(global_expert_id, 0, &inputs)
+                .await?;
+            let dispatch = execution
+                .dispatches
+                .into_iter()
+                .next()
+                .ok_or("Q4 shadow expert returned no production dispatch")?;
+            outputs.push(crate::numerical_diagnostics::Q4ShadowExpertOutput {
+                global_expert_id,
+                cpu_f32: dispatch.cpu_f32,
+                gpu_f16: dispatch.gpu_f16,
+            });
+        }
+        crate::numerical_diagnostics::build_actual_input_q4_shadow(capture, outputs)
+    }
+    .await;
+    let shutdown = runtime.shutdown_isolated().await.map_err(|error| error.to_string());
+    match (attempt, shutdown) {
+        (Ok(evidence), Ok(_)) => Ok(evidence),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; isolated shutdown also failed: {shutdown_error}"))
+        }
+    }
+}
+
 async fn cmd_diagnose_hybrid_q4_greedy_divergence(
     args: DiagnoseHybridQ4GreedyDivergenceArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4841,7 +4948,7 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         .and_then(|bytes| u64::try_from(bytes).ok())
         .unwrap_or(0);
     let preflight = PreflightEvidence {
-        provenance,
+        provenance: provenance.clone(),
         real_transformer_enabled: cfg.real_transformer.enabled,
         weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
         strict_weights: cfg.real_transformer.strict_weights,
@@ -4883,6 +4990,7 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
     let prompt_sha256 = crate::greedy_parity::sha256_hex(fixed.prompt.as_bytes());
     let prompt_token_ids_sha256 = crate::greedy_parity::token_ids_sha256(&prompt_token_ids);
     let mut report = crate::numerical_diagnostics::DiagnosticReport::new(
+        provenance,
         build_git_sha.clone(),
         executable_sha256.clone(),
         resolved_config_sha256.clone(),
@@ -4999,6 +5107,61 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
             )
         }
     });
+    let route_captures: Vec<_> = completed
+        .iter()
+        .map(|worker| (worker.run.plane, worker.route_capture.clone()))
+        .collect();
+    let expected_token_idx = prompt_token_ids
+        .len()
+        .checked_sub(1)
+        .and_then(|position| position.checked_mul(spec.cfg.model.num_layers))
+        .and_then(|token_idx| u64::try_from(token_idx).ok())
+        .ok_or("layer-0 route capture token index overflowed")?;
+    let route_evidence = match crate::numerical_diagnostics::reconcile_route_captures(
+        &route_captures,
+        expected_token_idx,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "layer0-route-capture-invalid",
+                error,
+                &args.report_out,
+            )
+        }
+    };
+    let route_matches = route_evidence.exact_capture_match;
+    report.route_capture = Some(route_evidence);
+    if !route_matches {
+        return fail_numerical_diagnostic(
+            report,
+            "cpu-hybrid-layer0-route-mismatch",
+            "CPU/Hybrid layer-0 input, selected experts, or routing-weight bits differ; Q4 shadow dispatch was not performed",
+            &args.report_out,
+        );
+    }
+    let shadow_capture = &route_captures[0].1;
+    report.actual_input_q4_shadow = Some(
+        match execute_actual_input_q4_shadow(
+            &spec,
+            tokenizer,
+            &args.expected_adapter_name,
+            shadow_capture,
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return fail_numerical_diagnostic(
+                    report,
+                    "actual-input-q4-shadow-failed",
+                    error,
+                    &args.report_out,
+                )
+            }
+        },
+    );
     if let Err(error) = report.finish() {
         return fail_numerical_diagnostic(
             report,

@@ -1523,6 +1523,22 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
+    diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RoutedFfnDiagnosticCapture {
+    pub token_idx: u64,
+    pub layer: u32,
+    pub input_bits: Vec<u32>,
+    pub expert_ids: Vec<u32>,
+    pub routing_weight_bits: Vec<u32>,
+}
+
+struct DiagnosticRouteCaptureArm {
+    target_token_idx: u64,
+    captured: Option<RoutedFfnDiagnosticCapture>,
 }
 
 /// Run a CPU/GPU-blocking expert compute closure while *donating* the
@@ -1831,6 +1847,65 @@ impl Engine {
             ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
+            diagnostic_route_capture: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Arm a one-shot, diagnostic-only capture at the routed-FFN boundary.
+    /// Normal serving never arms this slot, so its hot path performs only one
+    /// relaxed atomic load and never locks or clones activations.
+    pub(crate) fn arm_layer0_route_capture(&self, target_token_idx: u64) -> Result<(), String> {
+        let mut slot = self.diagnostic_route_capture.lock();
+        if slot.is_some() {
+            return Err("routed-FFN diagnostic capture is already armed".to_string());
+        }
+        *slot = Some(DiagnosticRouteCaptureArm {
+            target_token_idx,
+            captured: None,
+        });
+        self.diagnostic_route_capture_armed
+            .store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn take_layer0_route_capture(
+        &self,
+    ) -> Option<RoutedFfnDiagnosticCapture> {
+        self.diagnostic_route_capture_armed
+            .store(false, Ordering::Relaxed);
+        self.diagnostic_route_capture
+            .lock()
+            .take()
+            .and_then(|arm| arm.captured)
+    }
+
+    fn capture_layer0_route_if_armed(
+        &self,
+        token_idx: u64,
+        layer: u32,
+        x: &[f32],
+        experts: &[u32],
+        weights: &[f32],
+    ) {
+        if !self
+            .diagnostic_route_capture_armed
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut slot = self.diagnostic_route_capture.lock();
+        let Some(arm) = slot.as_mut() else {
+            return;
+        };
+        if layer == 0 && token_idx == arm.target_token_idx && arm.captured.is_none() {
+            arm.captured = Some(RoutedFfnDiagnosticCapture {
+                token_idx,
+                layer,
+                input_bits: x.iter().copied().map(f32::to_bits).collect(),
+                expert_ids: experts.to_vec(),
+                routing_weight_bits: weights.iter().copied().map(f32::to_bits).collect(),
+            });
         }
     }
 
@@ -4460,6 +4535,7 @@ impl Engine {
             weights.len(),
             "moe_step_weighted_into_with_timing: experts and weights must align"
         );
+        self.capture_layer0_route_if_armed(token_idx, layer, x, experts, weights);
         match self
             .moe_step_inner(
                 token_idx,

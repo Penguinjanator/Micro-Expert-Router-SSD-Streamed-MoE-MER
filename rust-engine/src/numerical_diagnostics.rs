@@ -21,6 +21,8 @@ pub const WORKER_PROTOCOL_VERSION: &str =
 pub const TARGET_CASE: &str = "json-transformation";
 pub const REPEATED_RUNS_PER_PLANE: usize = 2;
 pub const TOP_LOGIT_COUNT: usize = 16;
+pub const SHADOW_EXPERT_COUNT: usize = 8;
+pub const SHADOW_D_MODEL: usize = 2048;
 pub const MAX_VOCAB_SIZE: usize = 262_144;
 pub const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -88,6 +90,7 @@ pub struct DiagnosticWorkerResponse {
     pub chosen_token_id: Option<u32>,
     pub first_token_logit_bits: Option<Vec<u32>>,
     pub first_token_logit_bits_sha256: Option<String>,
+    pub route_capture: Option<crate::engine::RoutedFfnDiagnosticCapture>,
     pub failure: Option<String>,
 }
 
@@ -141,6 +144,225 @@ pub fn f32_bits_sha256(bits: &[u32]) -> String {
         hasher.update(value.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RouteCaptureEvidence {
+    pub token_idx: u64,
+    pub layer: u32,
+    pub cpu_input_sha256: String,
+    pub hybrid_input_sha256: String,
+    pub input_hashes_match: bool,
+    pub cpu_expert_ids: Vec<u32>,
+    pub hybrid_expert_ids: Vec<u32>,
+    pub expert_ids_match: bool,
+    pub cpu_routing_weight_bits: Vec<u32>,
+    pub hybrid_routing_weight_bits: Vec<u32>,
+    pub routing_weight_bits_match: bool,
+    pub all_repeated_captures_match: bool,
+    pub exact_capture_match: bool,
+}
+
+pub fn reconcile_route_captures(
+    captures: &[(DiagnosticPlane, crate::engine::RoutedFfnDiagnosticCapture)],
+    expected_token_idx: u64,
+) -> Result<RouteCaptureEvidence, String> {
+    if captures.len() != REPEATED_RUNS_PER_PLANE * 2 {
+        return Err("route capture count is incomplete".to_string());
+    }
+    for (_, capture) in captures {
+        if capture.token_idx != expected_token_idx
+            || capture.layer != 0
+            || capture.input_bits.len() != SHADOW_D_MODEL
+            || capture.expert_ids.len() != SHADOW_EXPERT_COUNT
+            || capture.routing_weight_bits.len() != SHADOW_EXPERT_COUNT
+            || capture.expert_ids.iter().any(|expert| *expert >= 128)
+            || capture.expert_ids.iter().copied().collect::<HashSet<_>>().len()
+                != SHADOW_EXPERT_COUNT
+            || capture
+                .input_bits
+                .iter()
+                .chain(&capture.routing_weight_bits)
+                .any(|bits| !f32::from_bits(*bits).is_finite())
+        {
+            return Err("layer-0 route capture is malformed".to_string());
+        }
+    }
+    let cpu: Vec<_> = captures
+        .iter()
+        .filter(|(plane, _)| *plane == DiagnosticPlane::Cpu)
+        .map(|(_, capture)| capture)
+        .collect();
+    let hybrid: Vec<_> = captures
+        .iter()
+        .filter(|(plane, _)| *plane == DiagnosticPlane::Hybrid)
+        .map(|(_, capture)| capture)
+        .collect();
+    if cpu.len() != REPEATED_RUNS_PER_PLANE || hybrid.len() != REPEATED_RUNS_PER_PLANE {
+        return Err("route captures do not cover both repeated planes".to_string());
+    }
+    let cpu_input_sha256 = f32_bits_sha256(&cpu[0].input_bits);
+    let hybrid_input_sha256 = f32_bits_sha256(&hybrid[0].input_bits);
+    let input_hashes_match = cpu_input_sha256 == hybrid_input_sha256;
+    let expert_ids_match = cpu[0].expert_ids == hybrid[0].expert_ids;
+    let routing_weight_bits_match =
+        cpu[0].routing_weight_bits == hybrid[0].routing_weight_bits;
+    let all_repeated_captures_match = captures
+        .iter()
+        .all(|(_, capture)| capture == &captures[0].1);
+    Ok(RouteCaptureEvidence {
+        token_idx: expected_token_idx,
+        layer: 0,
+        cpu_input_sha256,
+        hybrid_input_sha256,
+        input_hashes_match,
+        cpu_expert_ids: cpu[0].expert_ids.clone(),
+        hybrid_expert_ids: hybrid[0].expert_ids.clone(),
+        expert_ids_match,
+        cpu_routing_weight_bits: cpu[0].routing_weight_bits.clone(),
+        hybrid_routing_weight_bits: hybrid[0].routing_weight_bits.clone(),
+        routing_weight_bits_match,
+        all_repeated_captures_match,
+        exact_capture_match: input_hashes_match
+            && expert_ids_match
+            && routing_weight_bits_match
+            && all_repeated_captures_match,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Q4ShadowOutputComparison {
+    pub cpu_f32_sha256: String,
+    pub cpu_f16_sha256: String,
+    pub gpu_f16_sha256: String,
+    pub max_absolute_error: f32,
+    pub rms_error: f64,
+    pub tolerance_pass: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Q4ShadowExpertEvidence {
+    pub global_expert_id: u32,
+    pub routing_weight: FloatEvidence,
+    pub output: Q4ShadowOutputComparison,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ActualInputQ4ShadowEvidence {
+    pub captured_input_sha256: String,
+    pub effective_f16_input_sha256: String,
+    pub tolerance: crate::q4_parity::ErrorTolerance,
+    pub experts: Vec<Q4ShadowExpertEvidence>,
+    pub weighted_aggregate: Q4ShadowOutputComparison,
+    pub all_experts_within_tolerance: bool,
+    pub weighted_aggregate_within_tolerance: bool,
+}
+
+pub struct Q4ShadowExpertOutput {
+    pub global_expert_id: u32,
+    pub cpu_f32: Vec<f32>,
+    pub gpu_f16: Vec<f32>,
+}
+
+fn hash_f32(values: &[f32]) -> String {
+    f32_bits_sha256(&values.iter().copied().map(f32::to_bits).collect::<Vec<_>>())
+}
+
+fn compare_q4_shadow_output(
+    cpu_f32: &[f32],
+    cpu_f16: &[f32],
+    gpu_f16: &[f32],
+) -> Result<Q4ShadowOutputComparison, String> {
+    if cpu_f32.len() != cpu_f16.len()
+        || cpu_f32.len() != gpu_f16.len()
+        || cpu_f32.is_empty()
+    {
+        return Err("Q4 shadow output lengths differ or are empty".to_string());
+    }
+    if cpu_f32
+        .iter()
+        .chain(cpu_f16.iter())
+        .chain(gpu_f16)
+        .any(|value| !value.is_finite())
+    {
+        return Err("Q4 shadow output contains a nonfinite value".to_string());
+    }
+    let tolerance = crate::q4_parity::COMPLETE_TOLERANCE;
+    let mut max_absolute_error = 0.0f32;
+    let mut squared_error = 0.0f64;
+    let mut tolerance_pass = true;
+    for (&cpu, &gpu) in cpu_f16.iter().zip(gpu_f16) {
+        let absolute = (gpu - cpu).abs();
+        max_absolute_error = max_absolute_error.max(absolute);
+        squared_error += f64::from(absolute) * f64::from(absolute);
+        tolerance_pass &= absolute <= tolerance.absolute + tolerance.relative * cpu.abs();
+    }
+    Ok(Q4ShadowOutputComparison {
+        cpu_f32_sha256: hash_f32(cpu_f32),
+        cpu_f16_sha256: hash_f32(cpu_f16),
+        gpu_f16_sha256: hash_f32(gpu_f16),
+        max_absolute_error,
+        rms_error: (squared_error / cpu_f16.len() as f64).sqrt(),
+        tolerance_pass,
+    })
+}
+
+pub fn build_actual_input_q4_shadow(
+    capture: &crate::engine::RoutedFfnDiagnosticCapture,
+    outputs: Vec<Q4ShadowExpertOutput>,
+) -> Result<ActualInputQ4ShadowEvidence, String> {
+    if outputs.len() != SHADOW_EXPERT_COUNT
+        || capture.expert_ids.len() != outputs.len()
+        || capture.routing_weight_bits.len() != outputs.len()
+    {
+        return Err("Q4 shadow expert output count is invalid".to_string());
+    }
+    let effective_input: Vec<f32> = capture
+        .input_bits
+        .iter()
+        .map(|bits| half::f16::from_f32(f32::from_bits(*bits)).to_f32())
+        .collect();
+    let mut cpu_aggregate = vec![0.0f32; SHADOW_D_MODEL];
+    let mut cpu_f16_aggregate = vec![0.0f32; SHADOW_D_MODEL];
+    let mut gpu_aggregate = vec![0.0f32; SHADOW_D_MODEL];
+    let mut experts = Vec::with_capacity(outputs.len());
+    for (slot, output) in outputs.into_iter().enumerate() {
+        if output.global_expert_id != capture.expert_ids[slot]
+            || output.cpu_f32.len() != SHADOW_D_MODEL
+            || output.gpu_f16.len() != SHADOW_D_MODEL
+        {
+            return Err("Q4 shadow expert identity or geometry is invalid".to_string());
+        }
+        let weight = f32::from_bits(capture.routing_weight_bits[slot]);
+        let cpu_f16: Vec<f32> = output
+            .cpu_f32
+            .iter()
+            .map(|value| half::f16::from_f32(*value).to_f32())
+            .collect();
+        for index in 0..SHADOW_D_MODEL {
+            cpu_aggregate[index] += weight * output.cpu_f32[index];
+            cpu_f16_aggregate[index] += weight * cpu_f16[index];
+            gpu_aggregate[index] += weight * output.gpu_f16[index];
+        }
+        experts.push(Q4ShadowExpertEvidence {
+            global_expert_id: output.global_expert_id,
+            routing_weight: FloatEvidence::new(weight),
+            output: compare_q4_shadow_output(&output.cpu_f32, &cpu_f16, &output.gpu_f16)?,
+        });
+    }
+    let weighted_aggregate =
+        compare_q4_shadow_output(&cpu_aggregate, &cpu_f16_aggregate, &gpu_aggregate)?;
+    Ok(ActualInputQ4ShadowEvidence {
+        captured_input_sha256: f32_bits_sha256(&capture.input_bits),
+        effective_f16_input_sha256: hash_f32(&effective_input),
+        tolerance: crate::q4_parity::COMPLETE_TOLERANCE,
+        all_experts_within_tolerance: experts
+            .iter()
+            .all(|expert| expert.output.tolerance_pass),
+        weighted_aggregate_within_tolerance: weighted_aggregate.tolerance_pass,
+        experts,
+        weighted_aggregate,
+    })
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -440,6 +662,7 @@ pub fn build_first_token_logit_evidence(
 #[derive(Clone, Debug, Serialize)]
 pub struct RepeatedRunEvidence {
     pub plane: DiagnosticPlane,
+    #[serde(rename = "repeat_index")]
     pub run_index: usize,
     pub worker_id: String,
     pub generated_token_ids: Vec<u32>,
@@ -537,6 +760,7 @@ pub struct DiagnosticReport {
     pub qualification_pass: bool,
     pub diagnostic_complete: bool,
     pub failure: Option<DiagnosticFailure>,
+    pub provenance: crate::qualification::BuildProvenance,
     pub build_git_sha: String,
     pub executable_sha256: String,
     pub resolved_config_sha256: String,
@@ -549,11 +773,14 @@ pub struct DiagnosticReport {
     pub worker_failures: Vec<DiagnosticWorkerFailureEvidence>,
     pub reproducibility: Option<ReproducibilityEvidence>,
     pub first_token_logits: Option<FirstTokenLogitEvidence>,
+    pub route_capture: Option<RouteCaptureEvidence>,
+    pub actual_input_q4_shadow: Option<ActualInputQ4ShadowEvidence>,
 }
 
 impl DiagnosticReport {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        provenance: crate::qualification::BuildProvenance,
         build_git_sha: String,
         executable_sha256: String,
         resolved_config_sha256: String,
@@ -568,6 +795,7 @@ impl DiagnosticReport {
             qualification_pass: false,
             diagnostic_complete: false,
             failure: None,
+            provenance,
             build_git_sha,
             executable_sha256,
             resolved_config_sha256,
@@ -580,6 +808,8 @@ impl DiagnosticReport {
             worker_failures: Vec::new(),
             reproducibility: None,
             first_token_logits: None,
+            route_capture: None,
+            actual_input_q4_shadow: None,
         }
     }
 
@@ -609,6 +839,15 @@ impl DiagnosticReport {
             || !reproducibility.no_retries
             || !self.worker_failures.is_empty()
             || self.first_token_logits.is_none()
+            || !self
+                .route_capture
+                .as_ref()
+                .is_some_and(|capture| capture.exact_capture_match)
+            || !self.actual_input_q4_shadow.as_ref().is_some_and(|shadow| {
+                shadow.experts.len() == SHADOW_EXPERT_COUNT
+                    && is_sha256_hex(&shadow.captured_input_sha256)
+                    && is_sha256_hex(&shadow.effective_f16_input_sha256)
+            })
             || !self.first_token_evidence_exact()
             || !self.runs.iter().all(|run| self.run_evidence_exact(run))
         {
@@ -844,6 +1083,11 @@ mod tests {
     #[test]
     fn diagnostic_report_can_never_claim_qualification_pass() {
         let mut report = DiagnosticReport::new(
+            crate::qualification::BuildProvenance {
+                git_sha: Some("a".repeat(40)),
+                dirty: Some(false),
+                package_version: "test".to_string(),
+            },
             "a".repeat(40),
             "b".repeat(64),
             "c".repeat(64),
@@ -858,5 +1102,57 @@ mod tests {
         report.fail("test", "failure");
         assert!(!report.qualification_pass);
         assert!(!report.diagnostic_complete);
+    }
+
+    fn route_capture(input_bits: Vec<u32>) -> crate::engine::RoutedFfnDiagnosticCapture {
+        crate::engine::RoutedFfnDiagnosticCapture {
+            token_idx: 96,
+            layer: 0,
+            input_bits,
+            expert_ids: (0..SHADOW_EXPERT_COUNT as u32).collect(),
+            routing_weight_bits: vec![(0.125f32).to_bits(); SHADOW_EXPERT_COUNT],
+        }
+    }
+
+    #[test]
+    fn route_capture_requires_exact_cpu_hybrid_inputs_experts_and_weights() {
+        let exact = route_capture(vec![(0.5f32).to_bits(); SHADOW_D_MODEL]);
+        let captures = vec![
+            (DiagnosticPlane::Cpu, exact.clone()),
+            (DiagnosticPlane::Cpu, exact.clone()),
+            (DiagnosticPlane::Hybrid, exact.clone()),
+            (DiagnosticPlane::Hybrid, exact.clone()),
+        ];
+        let evidence = reconcile_route_captures(&captures, 96).unwrap();
+        assert!(evidence.exact_capture_match);
+        assert!(evidence.all_repeated_captures_match);
+
+        let mut mismatched = captures;
+        mismatched[2].1.input_bits[17] = (0.25f32).to_bits();
+        let evidence = reconcile_route_captures(&mismatched, 96).unwrap();
+        assert!(!evidence.input_hashes_match);
+        assert!(!evidence.exact_capture_match);
+    }
+
+    #[test]
+    fn actual_input_shadow_uses_complete_q4_tolerance_without_serializing_vectors() {
+        let capture = route_capture(vec![(0.5f32).to_bits(); SHADOW_D_MODEL]);
+        let outputs = capture
+            .expert_ids
+            .iter()
+            .map(|&global_expert_id| Q4ShadowExpertOutput {
+                global_expert_id,
+                cpu_f32: vec![1.0; SHADOW_D_MODEL],
+                gpu_f16: vec![1.001; SHADOW_D_MODEL],
+            })
+            .collect();
+        let evidence = build_actual_input_q4_shadow(&capture, outputs).unwrap();
+        assert_eq!(evidence.tolerance, crate::q4_parity::COMPLETE_TOLERANCE);
+        assert!(evidence.all_experts_within_tolerance);
+        assert!(evidence.weighted_aggregate_within_tolerance);
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(!json.contains("input_bits"));
+        assert!(!json.contains("cpu_f32\""));
+        assert!(!json.contains("gpu_f16\""));
     }
 }
