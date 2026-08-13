@@ -1099,18 +1099,36 @@ impl GreedyParityReport {
                     && boundary.initial_state.context_id == boundary.execution_plan.context_id
                     && hybrid.initial_state.context_id == hybrid.execution_plan.context_id
             });
-        let context_ids: HashSet<&str> = collected
+        // CPU and boundary-reference contexts are created in this parent
+        // process, so their process-local IDs must be unique as bare IDs.
+        let parent_context_ids: HashSet<&str> = collected
             .iter()
-            .flat_map(|(_, cpu, boundary, hybrid, _, _)| {
+            .flat_map(|(_, cpu, boundary, _, _, _)| {
                 [
                     cpu.execution_plan.context_id.as_str(),
                     boundary.execution_plan.context_id.as_str(),
-                    hybrid.execution_plan.context_id.as_str(),
                 ]
             })
             .collect();
-        let unique_execution_context_every_run =
-            exact_run_count && context_ids.len() == CORPUS_CASE_COUNT * 3;
+        // Hybrid context IDs are process-local. Qualify them with the worker
+        // PID so a fresh worker may validly allocate context "1", while reuse
+        // of the same process/context identity remains a collision.
+        let hybrid_process_context_ids: HashSet<(u32, &str)> = collected
+            .iter()
+            .filter_map(|(_, _, _, hybrid, _, _)| {
+                let process_id = hybrid.worker_process.as_ref()?.process_id?;
+                Some((process_id, hybrid.execution_plan.context_id.as_str()))
+            })
+            .collect();
+        let unique_execution_context_every_run = exact_run_count
+            && parent_context_ids.len() == CORPUS_CASE_COUNT * 2
+            && parent_context_ids
+                .iter()
+                .all(|context_id| !context_id.is_empty())
+            && hybrid_process_context_ids.len() == CORPUS_CASE_COUNT
+            && hybrid_process_context_ids
+                .iter()
+                .all(|(_, context_id)| !context_id.is_empty());
         let controlled_background_shutdown_every_run = exact_run_count
             && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 cpu.background_shutdown.controlled_shutdown_requested
@@ -2045,6 +2063,73 @@ mod tests {
             .context_id = reused;
         assert!(context_reuse.finish().is_err());
         assert!(!context_reuse.checks.unique_execution_context_every_run);
+    }
+
+    #[test]
+    fn greedy_parity_worker_context_identity_is_process_aware_and_fail_closed() {
+        let mut process_local_ids = passing_report();
+        for case in &mut process_local_ids.cases {
+            let hybrid = case.hybrid.as_mut().unwrap();
+            hybrid.execution_plan.context_id = "1".to_string();
+            hybrid.initial_state.context_id = "1".to_string();
+        }
+        assert!(process_local_ids.finish().is_ok());
+        assert!(process_local_ids.checks.unique_execution_context_every_run);
+        assert!(process_local_ids.checks.unique_hybrid_process_identity);
+
+        let mut reused_process_context = passing_report();
+        for case in &mut reused_process_context.cases {
+            let hybrid = case.hybrid.as_mut().unwrap();
+            hybrid.execution_plan.context_id = "1".to_string();
+            hybrid.initial_state.context_id = "1".to_string();
+        }
+        let reused_process_id = reused_process_context.cases[0]
+            .hybrid
+            .as_ref()
+            .unwrap()
+            .worker_process
+            .as_ref()
+            .unwrap()
+            .process_id;
+        reused_process_context.cases[1]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .worker_process
+            .as_mut()
+            .unwrap()
+            .process_id = reused_process_id;
+        assert!(reused_process_context.finish().is_err());
+        assert!(!reused_process_context
+            .checks
+            .unique_execution_context_every_run);
+        assert!(!reused_process_context
+            .checks
+            .unique_hybrid_process_identity);
+
+        let mut missing_process = passing_report();
+        missing_process.cases[2]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .worker_process
+            .as_mut()
+            .unwrap()
+            .process_id = None;
+        assert!(missing_process.finish().is_err());
+        assert!(!missing_process
+            .checks
+            .unique_execution_context_every_run);
+        assert!(!missing_process.checks.hybrid_worker_processes_exact);
+
+        let mut missing_context = passing_report();
+        let hybrid = missing_context.cases[3].hybrid.as_mut().unwrap();
+        hybrid.execution_plan.context_id.clear();
+        hybrid.initial_state.context_id.clear();
+        assert!(missing_context.finish().is_err());
+        assert!(!missing_context
+            .checks
+            .unique_execution_context_every_run);
     }
 
     #[test]
