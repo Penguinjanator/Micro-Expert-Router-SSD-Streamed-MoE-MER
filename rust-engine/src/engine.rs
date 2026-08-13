@@ -1523,6 +1523,7 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
     diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
 }
@@ -1847,9 +1848,29 @@ impl Engine {
             ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Enable CPU-only emulation of the production routed-expert f16 input
+    /// and output boundaries. Only isolated numerical-diagnostic workers call
+    /// this; ordinary CPU serving retains its existing Q4 execution path.
+    pub(crate) fn enable_cpu_q4_boundary_emulation(&self) -> Result<(), String> {
+        if self.execution_context().plan().routed_experts()
+            != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.dtype != WeightDtype::Q4_0
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "Q4 boundary emulation requires a strict CPU Q4_0 routed-expert plan"
+                    .to_string(),
+            );
+        }
+        self.diagnostic_cpu_q4_boundary_emulation
+            .store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Arm a one-shot, diagnostic-only capture at the routed-FFN boundary.
@@ -4475,6 +4496,51 @@ impl Engine {
             .counters
             .cpu_expert_forward_calls
             .fetch_add(1, Ordering::Relaxed);
+
+        if self
+            .diagnostic_cpu_q4_boundary_emulation
+            .load(Ordering::Relaxed)
+        {
+            let expected = crate::inference::expert_weight_bytes_for(
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+                WeightDtype::Q4_0,
+            );
+            if r.data().len() < expected || r.data()[expected..].iter().any(|byte| *byte != 0) {
+                return Err(MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source: ExpertWeightsError::InvalidLayout(format!(
+                        "diagnostic Q4 payload has {} bytes; expected {expected} canonical bytes followed only by zero alignment padding",
+                        r.data().len()
+                    )),
+                });
+            }
+            let effective_input = crate::numerical_diagnostics::round_trip_f16_values(x)
+                .map_err(|source| MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source,
+                })?;
+            let cpu = crate::inference::q4_0_cpu_reference_forward(
+                &r.data()[..expected],
+                &effective_input,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+            )
+            .map_err(|source| MoeStepError::ExpertCompute {
+                layer,
+                expert: r.id,
+                source,
+            })?;
+            return crate::numerical_diagnostics::round_trip_f16_values(&cpu).map_err(|source| {
+                MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source,
+                }
+            });
+        }
 
         dispatch_expert_forward(
             self.core.options.dtype,

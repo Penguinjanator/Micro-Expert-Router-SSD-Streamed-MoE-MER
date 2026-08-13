@@ -30,6 +30,7 @@ pub const MAX_WORKER_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticPlane {
     Cpu,
+    CpuBoundaryEmulation,
     Hybrid,
 }
 
@@ -37,6 +38,7 @@ impl DiagnosticPlane {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
+            Self::CpuBoundaryEmulation => "cpu-boundary-emulation",
             Self::Hybrid => "hybrid",
         }
     }
@@ -144,6 +146,21 @@ pub fn f32_bits_sha256(bits: &[u32]) -> String {
         hasher.update(value.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn round_trip_f16_values(
+    values: &[f32],
+) -> Result<Vec<f32>, crate::inference::ExpertWeightsError> {
+    let rounded: Vec<f32> = values
+        .iter()
+        .map(|value| half::f16::from_f32(*value).to_f32())
+        .collect();
+    if rounded.iter().any(|value| !value.is_finite()) {
+        return Err(crate::inference::ExpertWeightsError::InvalidLayout(
+            "diagnostic f16 precision boundary produced a nonfinite value".to_string(),
+        ));
+    }
+    Ok(rounded)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -602,6 +619,67 @@ pub struct FirstTokenLogitEvidence {
     pub token_5212_hybrid: RankedLogitEvidence,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BoundaryPlaneEvidence {
+    pub chosen_token_id: u32,
+    pub generated_token_ids_sha256: String,
+    pub first_token_logit_bits_sha256: String,
+    pub top_16: Vec<RankedLogitEvidence>,
+    pub token_715: RankedLogitEvidence,
+    pub token_5212: RankedLogitEvidence,
+    pub token_715_minus_5212_margin: FloatEvidence,
+    pub versus_cpu: VectorComparisonEvidence,
+    pub versus_hybrid: VectorComparisonEvidence,
+    pub matches_cpu_chosen_token: bool,
+    pub matches_hybrid_chosen_token: bool,
+    pub matches_cpu_complete_logit_hash: bool,
+    pub matches_hybrid_complete_logit_hash: bool,
+}
+
+pub fn build_boundary_plane_evidence(
+    cpu: &[f32],
+    hybrid: &[f32],
+    boundary: &[f32],
+    cpu_chosen: u32,
+    hybrid_chosen: u32,
+    boundary_chosen: u32,
+    generated_token_ids_sha256: String,
+) -> Result<BoundaryPlaneEvidence, String> {
+    if cpu.len() != hybrid.len() || cpu.len() != boundary.len() || boundary.len() <= 5212 {
+        return Err(
+            "boundary-emulation logit vectors differ in length or are incomplete".to_string(),
+        );
+    }
+    let top_16 = top_logits(boundary, TOP_LOGIT_COUNT);
+    if top_16.first().map(|entry| entry.token_id) != Some(boundary_chosen) {
+        return Err(
+            "boundary-emulation logits disagree with production greedy selection".to_string(),
+        );
+    }
+    let cpu_hash = f32_bits_sha256(&cpu.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+    let hybrid_hash =
+        f32_bits_sha256(&hybrid.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+    let boundary_hash =
+        f32_bits_sha256(&boundary.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+    Ok(BoundaryPlaneEvidence {
+        chosen_token_id: boundary_chosen,
+        generated_token_ids_sha256,
+        first_token_logit_bits_sha256: boundary_hash.clone(),
+        token_715: ranked_logit_for(boundary, 715)
+            .ok_or("boundary-emulation token 715 is unavailable")?,
+        token_5212: ranked_logit_for(boundary, 5212)
+            .ok_or("boundary-emulation token 5212 is unavailable")?,
+        token_715_minus_5212_margin: FloatEvidence::new(boundary[715] - boundary[5212]),
+        versus_cpu: compare_vectors(cpu, boundary)?,
+        versus_hybrid: compare_vectors(hybrid, boundary)?,
+        matches_cpu_chosen_token: boundary_chosen == cpu_chosen,
+        matches_hybrid_chosen_token: boundary_chosen == hybrid_chosen,
+        matches_cpu_complete_logit_hash: boundary_hash == cpu_hash,
+        matches_hybrid_complete_logit_hash: boundary_hash == hybrid_hash,
+        top_16,
+    })
+}
+
 fn top_margin(top: &[RankedLogitEvidence]) -> Result<f32, String> {
     let first = top
         .first()
@@ -675,6 +753,7 @@ pub struct RepeatedRunEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ReproducibilityEvidence {
     pub cpu_bitwise_reproducible: bool,
+    pub cpu_boundary_emulation_bitwise_reproducible: bool,
     pub hybrid_bitwise_reproducible: bool,
     pub all_worker_ids_unique: bool,
     pub all_process_ids_unique: bool,
@@ -688,6 +767,10 @@ pub fn validate_repeated_run_identity(runs: &[RepeatedRunEvidence]) -> Reproduci
         .iter()
         .filter(|run| run.plane == DiagnosticPlane::Hybrid)
         .collect();
+    let boundary: Vec<_> = runs
+        .iter()
+        .filter(|run| run.plane == DiagnosticPlane::CpuBoundaryEmulation)
+        .collect();
     let worker_ids: HashSet<_> = runs.iter().map(|run| run.worker_id.as_str()).collect();
     let process_ids: Vec<_> = runs.iter().filter_map(|run| run.process.process_id).collect();
     let unique_process_ids: HashSet<_> = process_ids.iter().copied().collect();
@@ -700,6 +783,7 @@ pub fn validate_repeated_run_identity(runs: &[RepeatedRunEvidence]) -> Reproduci
     };
     ReproducibilityEvidence {
         cpu_bitwise_reproducible: reproducible(&cpu),
+        cpu_boundary_emulation_bitwise_reproducible: reproducible(&boundary),
         hybrid_bitwise_reproducible: reproducible(&hybrid),
         all_worker_ids_unique: worker_ids.len() == runs.len(),
         all_process_ids_unique: process_ids.len() == runs.len()
@@ -725,8 +809,13 @@ pub fn validate_repeated_run_identity(runs: &[RepeatedRunEvidence]) -> Reproduci
                 && run.process.process_reaped
                 && run.process.evidence_emitted
         }),
-        no_retries: runs.len() == REPEATED_RUNS_PER_PLANE * 2
+        no_retries: runs.len() == REPEATED_RUNS_PER_PLANE * 3
             && cpu.iter().map(|run| run.run_index).collect::<BTreeSet<_>>()
+                == BTreeSet::from([0, 1])
+            && boundary
+                .iter()
+                .map(|run| run.run_index)
+                .collect::<BTreeSet<_>>()
                 == BTreeSet::from([0, 1])
             && hybrid
                 .iter()
@@ -773,6 +862,7 @@ pub struct DiagnosticReport {
     pub worker_failures: Vec<DiagnosticWorkerFailureEvidence>,
     pub reproducibility: Option<ReproducibilityEvidence>,
     pub first_token_logits: Option<FirstTokenLogitEvidence>,
+    pub cpu_boundary_emulation: Option<BoundaryPlaneEvidence>,
     pub route_capture: Option<RouteCaptureEvidence>,
     pub actual_input_q4_shadow: Option<ActualInputQ4ShadowEvidence>,
 }
@@ -808,6 +898,7 @@ impl DiagnosticReport {
             worker_failures: Vec::new(),
             reproducibility: None,
             first_token_logits: None,
+            cpu_boundary_emulation: None,
             route_capture: None,
             actual_input_q4_shadow: None,
         }
@@ -829,9 +920,10 @@ impl DiagnosticReport {
             .reproducibility
             .as_ref()
             .ok_or("diagnostic has no reproducibility evidence")?;
-        if self.runs.len() != REPEATED_RUNS_PER_PLANE * 2
+        if self.runs.len() != REPEATED_RUNS_PER_PLANE * 3
             || reproducibility != &validate_repeated_run_identity(&self.runs)
             || !reproducibility.cpu_bitwise_reproducible
+            || !reproducibility.cpu_boundary_emulation_bitwise_reproducible
             || !reproducibility.hybrid_bitwise_reproducible
             || !reproducibility.all_worker_ids_unique
             || !reproducibility.all_process_ids_unique
@@ -839,6 +931,7 @@ impl DiagnosticReport {
             || !reproducibility.no_retries
             || !self.worker_failures.is_empty()
             || self.first_token_logits.is_none()
+            || self.cpu_boundary_emulation.is_none()
             || !self
                 .route_capture
                 .as_ref()
@@ -849,6 +942,7 @@ impl DiagnosticReport {
                     && is_sha256_hex(&shadow.effective_f16_input_sha256)
             })
             || !self.first_token_evidence_exact()
+            || !self.boundary_evidence_exact()
             || !self.runs.iter().all(|run| self.run_evidence_exact(run))
         {
             return Err("logit diagnostic evidence is partial or mismatched".to_string());
@@ -899,6 +993,41 @@ impl DiagnosticReport {
             && evidence.token_5212_hybrid.token_id == 5212
     }
 
+    fn boundary_evidence_exact(&self) -> bool {
+        let Some(evidence) = self.cpu_boundary_emulation.as_ref() else {
+            return false;
+        };
+        let find = |plane| self.runs.iter().find(|run| run.plane == plane);
+        let (Some(cpu), Some(boundary), Some(hybrid)) = (
+            find(DiagnosticPlane::Cpu),
+            find(DiagnosticPlane::CpuBoundaryEmulation),
+            find(DiagnosticPlane::Hybrid),
+        ) else {
+            return false;
+        };
+        let cpu_chosen = cpu.generated_token_ids.first().copied();
+        let boundary_chosen = boundary.generated_token_ids.first().copied();
+        let hybrid_chosen = hybrid.generated_token_ids.first().copied();
+        evidence.chosen_token_id == boundary_chosen.unwrap_or(u32::MAX)
+            && evidence.generated_token_ids_sha256 == boundary.generated_token_ids_sha256
+            && evidence.first_token_logit_bits_sha256
+                == boundary.first_token_logit_bits_sha256
+            && evidence.top_16.len() == TOP_LOGIT_COUNT
+            && evidence.top_16.first().map(|entry| entry.token_id) == boundary_chosen
+            && evidence.token_715.token_id == 715
+            && evidence.token_5212.token_id == 5212
+            && evidence.versus_cpu.length == evidence.versus_hybrid.length
+            && evidence.versus_cpu.length > 5212
+            && evidence.matches_cpu_chosen_token == (boundary_chosen == cpu_chosen)
+            && evidence.matches_hybrid_chosen_token == (boundary_chosen == hybrid_chosen)
+            && evidence.matches_cpu_complete_logit_hash
+                == (boundary.first_token_logit_bits_sha256
+                    == cpu.first_token_logit_bits_sha256)
+            && evidence.matches_hybrid_complete_logit_hash
+                == (boundary.first_token_logit_bits_sha256
+                    == hybrid.first_token_logit_bits_sha256)
+    }
+
     fn run_evidence_exact(&self, run: &RepeatedRunEvidence) -> bool {
         let plane = &run.plane_evidence;
         let routed = plane.routed_execution_delta;
@@ -939,7 +1068,7 @@ impl DiagnosticReport {
             return false;
         }
         match run.plane {
-            DiagnosticPlane::Cpu => {
+            DiagnosticPlane::Cpu | DiagnosticPlane::CpuBoundaryEmulation => {
                 plane.plane == "cpu"
                     && crate::greedy_parity::cpu_plan_exact(&plane.execution_plan)
                     && plane.device.is_none()
@@ -985,6 +1114,127 @@ impl DiagnosticReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repeated_run(
+        plane: DiagnosticPlane,
+        run_index: usize,
+        generated_token: u32,
+        logit_hash: char,
+        process_id: u32,
+    ) -> RepeatedRunEvidence {
+        let worker_id = format!("{}-{run_index}", plane.as_str());
+        let generated_token_ids = vec![generated_token];
+        let generated_token_ids_sha256 = token_ids_sha256(&generated_token_ids);
+        let process = HybridWorkerProcessEvidence {
+            worker_id: worker_id.clone(),
+            child_process_spawned: true,
+            process_id: Some(process_id),
+            executable_sha256: "e".repeat(64),
+            build_git_sha: "a".repeat(40),
+            executable_identity_verified: true,
+            build_sha_identity_verified: true,
+            case_identity_verified: true,
+            config_identity_verified: true,
+            expected_adapter_identity_verified: true,
+            prompt_token_identity_verified: true,
+            output_token_limit_verified: true,
+            greedy_sampling_identity_verified: true,
+            normal_zero_exit: true,
+            exit_code: Some(0),
+            signal: None,
+            process_reaped: true,
+            timed_out: false,
+            evidence_emitted: true,
+        };
+        let context_id = format!("context-{worker_id}");
+        let plane_evidence = PlaneRunEvidence {
+            plane: "cpu".to_string(),
+            model_load: crate::greedy_parity::ModelLoadEvidence {
+                strict: true,
+                loader: "safetensors".to_string(),
+                loaded_tensors: 1,
+                required_tensors: 1,
+                optional_probed: 0,
+                optional_loaded: 0,
+                seeded_fallback_remained: false,
+            },
+            execution_plan: crate::qualification::ExecutionPlanEvidence {
+                context_id: context_id.clone(),
+                requested: "cpu".to_string(),
+                resolved: "cpu".to_string(),
+                embeddings: "cpu".to_string(),
+                lm_head: "cpu".to_string(),
+                dense_projections: "cpu".to_string(),
+                attention: "cpu".to_string(),
+                kv: "cpu".to_string(),
+                router: "cpu".to_string(),
+                routed_experts: "cpu".to_string(),
+                routed_expert_dtype: "q4_0".to_string(),
+                fallback_occurred: false,
+                reason: None,
+            },
+            routed_expert_gpu_failure_policy: "serving-cpu-fallback".to_string(),
+            device: None,
+            initial_state: crate::greedy_parity::InitialStateEvidence {
+                context_id,
+                resolved_config_sha256: "c".repeat(64),
+                kv_cache_count: 1,
+                kv_sequence_lengths: vec![0],
+                all_kv_empty: true,
+                cache: crate::greedy_parity::RuntimeCacheSnapshot::default(),
+                routed: crate::engine::RoutedExpertExecutionSnapshot::default(),
+                gpu_io_available: false,
+                gpu_io: GpuExpertIoSnapshot::default(),
+            },
+            generation: crate::greedy_parity::GenerationEvidence {
+                prompt_token_ids_sha256: "p".repeat(64),
+                generated_token_ids: generated_token_ids.clone(),
+                generated_token_ids_sha256: generated_token_ids_sha256.clone(),
+                generated_text_sha256: "t".repeat(64),
+                generated_token_count: 1,
+                termination_reason: crate::greedy_parity::TerminationReason::LengthLimit,
+            },
+            routed_execution_delta: crate::engine::RoutedExpertExecutionSnapshot {
+                selected_routed_experts: 1,
+                cpu_routed_expert_dispatches: 1,
+                ..Default::default()
+            },
+            gpu_io_delta: GpuExpertIoSnapshot::default(),
+            attention_softmax_nonfinite_fallbacks: 0,
+            gpu_memory_before: None,
+            gpu_memory_after: None,
+            background_shutdown: crate::greedy_parity::BackgroundShutdownEvidence {
+                controlled_shutdown_requested: true,
+                all_runtime_resources_released: true,
+                poll_iterations: 1,
+            },
+            worker_process: Some(process.clone()),
+        };
+        RepeatedRunEvidence {
+            plane,
+            run_index,
+            worker_id,
+            generated_token_ids,
+            generated_token_ids_sha256,
+            first_token_logit_bits_sha256: logit_hash.to_string().repeat(64),
+            process,
+            plane_evidence,
+        }
+    }
+
+    #[test]
+    fn boundary_conversion_matches_production_f16_round_trip_and_fails_nonfinite() {
+        let values = [1.0003, -0.0, 65504.0];
+        let rounded = round_trip_f16_values(&values).unwrap();
+        assert_eq!(
+            rounded[0].to_bits(),
+            half::f16::from_f32(values[0]).to_f32().to_bits()
+        );
+        assert_eq!(rounded[1].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(rounded[2], 65504.0);
+        assert!(round_trip_f16_values(&[70000.0]).is_err());
+        assert!(round_trip_f16_values(&[f32::NAN]).is_err());
+    }
 
     #[test]
     fn top_logits_use_total_order_and_lower_token_id_for_ties() {
@@ -1059,6 +1309,65 @@ mod tests {
     }
 
     #[test]
+    fn boundary_report_compares_complete_logits_and_chosen_token() {
+        let mut cpu = vec![-10.0; 6000];
+        cpu[715] = 4.0;
+        cpu[5212] = 3.75;
+        let mut hybrid = cpu.clone();
+        hybrid[715] = 3.8;
+        hybrid[5212] = 4.0;
+        let boundary = hybrid.clone();
+        let generated_hash = token_ids_sha256(&[5212]);
+        let evidence = build_boundary_plane_evidence(
+            &cpu,
+            &hybrid,
+            &boundary,
+            715,
+            5212,
+            5212,
+            generated_hash.clone(),
+        )
+        .unwrap();
+        assert_eq!(evidence.generated_token_ids_sha256, generated_hash);
+        assert_eq!(evidence.top_16[0].token_id, 5212);
+        assert_eq!(evidence.token_715.rank, 2);
+        assert_eq!(evidence.token_5212.rank, 1);
+        assert!(evidence.versus_hybrid.exact_f32_bits);
+        assert!(!evidence.versus_cpu.exact_f32_bits);
+        assert!(!evidence.matches_cpu_chosen_token);
+        assert!(evidence.matches_hybrid_chosen_token);
+        assert!(!evidence.matches_cpu_complete_logit_hash);
+        assert!(evidence.matches_hybrid_complete_logit_hash);
+    }
+
+    #[test]
+    fn reproducibility_requires_two_exact_unique_runs_for_all_three_planes() {
+        let mut runs = Vec::new();
+        for (plane, token, hash, pid) in [
+            (DiagnosticPlane::Cpu, 715, 'a', 10),
+            (DiagnosticPlane::CpuBoundaryEmulation, 5212, 'b', 20),
+            (DiagnosticPlane::Hybrid, 5212, 'c', 30),
+        ] {
+            runs.push(repeated_run(plane, 0, token, hash, pid));
+            runs.push(repeated_run(plane, 1, token, hash, pid + 1));
+        }
+        let exact = validate_repeated_run_identity(&runs);
+        assert!(exact.cpu_bitwise_reproducible);
+        assert!(exact.cpu_boundary_emulation_bitwise_reproducible);
+        assert!(exact.hybrid_bitwise_reproducible);
+        assert!(exact.all_worker_ids_unique);
+        assert!(exact.all_process_ids_unique);
+        assert!(exact.every_worker_exited_zero_and_reaped);
+        assert!(exact.no_retries);
+
+        runs[3].first_token_logit_bits_sha256 = "d".repeat(64);
+        let mismatch = validate_repeated_run_identity(&runs);
+        assert!(mismatch.cpu_bitwise_reproducible);
+        assert!(!mismatch.cpu_boundary_emulation_bitwise_reproducible);
+        assert!(mismatch.hybrid_bitwise_reproducible);
+    }
+
+    #[test]
     fn worker_protocol_rejects_unknown_and_trailing_documents() {
         let base = HybridWorkerRequest::new(
             "worker".to_string(),
@@ -1072,6 +1381,16 @@ mod tests {
         let request = DiagnosticWorkerRequest::new(DiagnosticPlane::Cpu, 0, base);
         let encoded = serde_json::to_vec(&request).unwrap();
         assert_eq!(parse_worker_request_exact(&encoded).unwrap(), request);
+        let mut boundary: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        boundary["plane"] = serde_json::json!("cpu_boundary_emulation");
+        assert_eq!(
+            parse_worker_request_exact(&serde_json::to_vec(&boundary).unwrap())
+                .unwrap()
+                .plane,
+            DiagnosticPlane::CpuBoundaryEmulation
+        );
+        boundary["plane"] = serde_json::json!("unrecognized_plane");
+        assert!(parse_worker_request_exact(&serde_json::to_vec(&boundary).unwrap()).is_err());
         let mut unknown: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         unknown["unknown"] = serde_json::json!(true);
         assert!(parse_worker_request_exact(&serde_json::to_vec(&unknown).unwrap()).is_err());

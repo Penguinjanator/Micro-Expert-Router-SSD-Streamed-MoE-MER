@@ -3723,6 +3723,7 @@ async fn execute_greedy_parity_plane(
         case_name,
         None,
         None,
+        false,
     )
     .await
 }
@@ -3740,6 +3741,7 @@ async fn execute_greedy_parity_plane_with_logits(
     case_name: &str,
     first_token_logit_bits: &mut Vec<u32>,
     route_capture: &mut Option<crate::engine::RoutedFfnDiagnosticCapture>,
+    cpu_q4_boundary_emulation: bool,
 ) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
     execute_greedy_parity_plane_internal(
         spec,
@@ -3753,6 +3755,7 @@ async fn execute_greedy_parity_plane_with_logits(
         case_name,
         Some(first_token_logit_bits),
         Some(route_capture),
+        cpu_q4_boundary_emulation,
     )
     .await
 }
@@ -3770,11 +3773,15 @@ async fn execute_greedy_parity_plane_internal(
     case_name: &str,
     first_token_logit_bits: Option<&mut Vec<u32>>,
     route_capture: Option<&mut Option<crate::engine::RoutedFfnDiagnosticCapture>>,
+    cpu_q4_boundary_emulation: bool,
 ) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
     use crate::qualification::{gpu_io_delta, routed_execution_delta, validate_memory};
 
     let runtime = build_isolated_greedy_runtime(spec, mode, tokenizer).await?;
     let attempt = async {
+        if cpu_q4_boundary_emulation {
+            runtime.engine.enable_cpu_q4_boundary_emulation()?;
+        }
         let context = runtime.engine.execution_context();
         let execution_plan: crate::qualification::ExecutionPlanEvidence = context.plan().into();
         let plane = match mode {
@@ -4327,6 +4334,9 @@ async fn cmd_greedy_parity_logit_worker_internal(
         crate::numerical_diagnostics::DiagnosticPlane::Cpu => {
             RealCliRuntimeMode::IsolatedGreedyParityCpu
         }
+        crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation => {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu
+        }
         crate::numerical_diagnostics::DiagnosticPlane::Hybrid => {
             RealCliRuntimeMode::IsolatedGreedyParityHybrid
         }
@@ -4349,6 +4359,8 @@ async fn cmd_greedy_parity_logit_worker_internal(
         &request.base.case_name,
         &mut logit_bits,
         &mut route_capture,
+        request.plane
+            == crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation,
     )
     .await;
     match attempt {
@@ -4999,9 +5011,10 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         prompt_token_ids_sha256,
         prompt_token_ids.len(),
     );
-    let mut completed = Vec::with_capacity(4);
+    let mut completed = Vec::with_capacity(6);
     for plane in [
         crate::numerical_diagnostics::DiagnosticPlane::Cpu,
+        crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation,
         crate::numerical_diagnostics::DiagnosticPlane::Hybrid,
     ] {
         for run_index in 0..crate::numerical_diagnostics::REPEATED_RUNS_PER_PLANE {
@@ -5056,6 +5069,7 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         crate::numerical_diagnostics::validate_repeated_run_identity(&report.runs);
     report.reproducibility = Some(reproducibility.clone());
     if !reproducibility.cpu_bitwise_reproducible
+        || !reproducibility.cpu_boundary_emulation_bitwise_reproducible
         || !reproducibility.hybrid_bitwise_reproducible
         || !reproducibility.all_worker_ids_unique
         || !reproducibility.all_process_ids_unique
@@ -5065,7 +5079,7 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         return fail_numerical_diagnostic(
             report,
             "logit-diagnostic-reproducibility-failed",
-            "fresh CPU/Hybrid runs were nondeterministic or process evidence was incomplete",
+            "fresh CPU/boundary-emulation/Hybrid runs were nondeterministic or process evidence was incomplete",
             &args.report_out,
         );
     }
@@ -5077,6 +5091,13 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         .iter()
         .find(|worker| worker.run.plane == crate::numerical_diagnostics::DiagnosticPlane::Hybrid)
         .ok_or("missing Hybrid logit diagnostic run")?;
+    let boundary = completed
+        .iter()
+        .find(|worker| {
+            worker.run.plane
+                == crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation
+        })
+        .ok_or("missing CPU boundary-emulation logit diagnostic run")?;
     let cpu_logits: Vec<f32> = cpu
         .first_token_logit_bits
         .iter()
@@ -5084,6 +5105,12 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
         .map(f32::from_bits)
         .collect();
     let hybrid_logits: Vec<f32> = hybrid
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let boundary_logits: Vec<f32> = boundary
         .first_token_logit_bits
         .iter()
         .copied()
@@ -5107,8 +5134,36 @@ async fn cmd_diagnose_hybrid_q4_greedy_divergence(
             )
         }
     });
+    report.cpu_boundary_emulation = Some(match
+        crate::numerical_diagnostics::build_boundary_plane_evidence(
+            &cpu_logits,
+            &hybrid_logits,
+            &boundary_logits,
+            cpu.chosen_token_id,
+            hybrid.chosen_token_id,
+            boundary.chosen_token_id,
+            boundary.run.generated_token_ids_sha256.clone(),
+        )
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "cpu-boundary-emulation-comparison-failed",
+                error,
+                &args.report_out,
+            )
+        }
+    });
     let route_captures: Vec<_> = completed
         .iter()
+        .filter(|worker| {
+            matches!(
+                worker.run.plane,
+                crate::numerical_diagnostics::DiagnosticPlane::Cpu
+                    | crate::numerical_diagnostics::DiagnosticPlane::Hybrid
+            )
+        })
         .map(|worker| (worker.run.plane, worker.route_capture.clone()))
         .collect();
     let expected_token_idx = prompt_token_ids
