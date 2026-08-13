@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const SCHEMA_VERSION: &str = "mer.strict-hybrid-q4-greedy-parity.v1";
+#[cfg(test)]
+pub const LEGACY_SCHEMA_VERSION: &str = "mer.strict-hybrid-q4-greedy-parity.v1";
+pub const SCHEMA_VERSION: &str = "mer.strict-hybrid-q4-greedy-parity.v2";
 pub const MODE: &str = "strict-hybrid-q4-greedy-parity";
 pub const CORPUS_ID: &str = "qwen3-coder-30b-a3b-greedy-v1";
 pub const CORPUS_VERSION: u32 = 1;
@@ -738,6 +740,57 @@ where
     })
 }
 
+fn comparison_matches_generations(
+    reference: &GenerationEvidence,
+    hybrid: &GenerationEvidence,
+    comparison: &CaseComparisonEvidence,
+) -> bool {
+    let exact_token_ids = reference.generated_token_ids == hybrid.generated_token_ids;
+    let equal_generated_count =
+        reference.generated_token_count == hybrid.generated_token_count;
+    let equal_termination_reason =
+        reference.termination_reason == hybrid.termination_reason;
+    let equal_generated_text_hash =
+        reference.generated_text_sha256 == hybrid.generated_text_sha256;
+    if comparison.exact_token_ids != exact_token_ids
+        || comparison.equal_generated_count != equal_generated_count
+        || comparison.equal_termination_reason != equal_termination_reason
+        || comparison.equal_generated_text_hash != equal_generated_text_hash
+    {
+        return false;
+    }
+    let diverged = !exact_token_ids
+        || !equal_generated_count
+        || !equal_termination_reason
+        || !equal_generated_text_hash;
+    match (&comparison.first_divergence, diverged) {
+        (None, false) => true,
+        (Some(divergence), true) => {
+            let common = reference
+                .generated_token_ids
+                .len()
+                .min(hybrid.generated_token_ids.len());
+            let position = (0..common)
+                .find(|&index| {
+                    reference.generated_token_ids[index] != hybrid.generated_token_ids[index]
+                })
+                .unwrap_or(common);
+            divergence.position == position
+                && divergence.cpu_token_id
+                    == reference.generated_token_ids.get(position).copied()
+                && divergence.hybrid_token_id
+                    == hybrid.generated_token_ids.get(position).copied()
+                && divergence.cpu_generated_length == reference.generated_token_ids.len()
+                && divergence.hybrid_generated_length == hybrid.generated_token_ids.len()
+                && divergence.cpu_termination_reason == reference.termination_reason
+                && divergence.hybrid_termination_reason == hybrid.termination_reason
+                && divergence.cpu_decoded_prefix.len() <= MAX_DECODED_PREFIX_BYTES
+                && divergence.hybrid_decoded_prefix.len() <= MAX_DECODED_PREFIX_BYTES
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CaseReport {
     pub name: &'static str,
@@ -749,8 +802,10 @@ pub struct CaseReport {
     pub tokenization_calls: u32,
     pub output_token_limit: usize,
     pub cpu: Option<PlaneRunEvidence>,
+    pub boundary_reference: Option<PlaneRunEvidence>,
     pub hybrid: Option<PlaneRunEvidence>,
-    pub comparison: Option<CaseComparisonEvidence>,
+    pub ordinary_cpu_vs_hybrid: Option<CaseComparisonEvidence>,
+    pub boundary_reference_vs_hybrid: Option<CaseComparisonEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_failure: Option<HybridWorkerFailureEvidence>,
     pub failure: Option<QualificationFailure>,
@@ -769,8 +824,10 @@ impl CaseReport {
             tokenization_calls: 1,
             output_token_limit: OUTPUT_TOKEN_LIMIT,
             cpu: None,
+            boundary_reference: None,
             hybrid: None,
-            comparison: None,
+            ordinary_cpu_vs_hybrid: None,
+            boundary_reference_vs_hybrid: None,
             worker_failure: None,
             failure: None,
         }
@@ -849,6 +906,7 @@ pub struct GreedyParityChecks {
     pub controlled_background_shutdown_every_run: bool,
     pub hybrid_worker_processes_exact: bool,
     pub unique_hybrid_worker_identity: bool,
+    pub unique_hybrid_process_identity: bool,
     pub cpu_plans_exact: bool,
     pub cpu_counter_invariants: bool,
     pub cpu_gpu_io_zero: bool,
@@ -860,10 +918,11 @@ pub struct GreedyParityChecks {
     pub hybrid_gpu_io_observed: bool,
     pub hybrid_memory_ledger_valid: bool,
     pub zero_gpu_failures_fallbacks_or_degraded: bool,
-    pub exact_generated_token_ids: bool,
-    pub identical_generated_token_count: bool,
-    pub identical_termination_reason: bool,
-    pub identical_generated_text_hash: bool,
+    pub ordinary_cpu_comparison_recorded: bool,
+    pub boundary_reference_exact_generated_token_ids: bool,
+    pub boundary_reference_identical_generated_token_count: bool,
+    pub boundary_reference_identical_termination_reason: bool,
+    pub boundary_reference_identical_generated_text_hash: bool,
 }
 
 impl GreedyParityChecks {
@@ -881,6 +940,7 @@ impl GreedyParityChecks {
             && self.controlled_background_shutdown_every_run
             && self.hybrid_worker_processes_exact
             && self.unique_hybrid_worker_identity
+            && self.unique_hybrid_process_identity
             && self.cpu_plans_exact
             && self.cpu_counter_invariants
             && self.cpu_gpu_io_zero
@@ -892,10 +952,11 @@ impl GreedyParityChecks {
             && self.hybrid_gpu_io_observed
             && self.hybrid_memory_ledger_valid
             && self.zero_gpu_failures_fallbacks_or_degraded
-            && self.exact_generated_token_ids
-            && self.identical_generated_token_count
-            && self.identical_termination_reason
-            && self.identical_generated_text_hash
+            && self.ordinary_cpu_comparison_recorded
+            && self.boundary_reference_exact_generated_token_ids
+            && self.boundary_reference_identical_generated_token_count
+            && self.boundary_reference_identical_termination_reason
+            && self.boundary_reference_identical_generated_text_hash
     }
 }
 
@@ -962,15 +1023,19 @@ impl GreedyParityReport {
                     && report.worker_failure.is_none()
                     && report.failure.is_none()
                     && report.cpu.is_some()
+                    && report.boundary_reference.is_some()
                     && report.hybrid.is_some()
-                    && report.comparison.is_some()
+                    && report.ordinary_cpu_vs_hybrid.is_some()
+                    && report.boundary_reference_vs_hybrid.is_some()
             });
         let runs = self.cases.iter().filter_map(|case| {
             Some((
                 case,
                 case.cpu.as_ref()?,
+                case.boundary_reference.as_ref()?,
                 case.hybrid.as_ref()?,
-                case.comparison.as_ref()?,
+                case.ordinary_cpu_vs_hybrid.as_ref()?,
+                case.boundary_reference_vs_hybrid.as_ref()?,
             ))
         });
         let collected: Vec<_> = runs.collect();
@@ -982,59 +1047,76 @@ impl GreedyParityReport {
                 .source_preflight
                 .as_ref()
                 .is_some_and(StrictHybridPreflightEvidence::is_exact)
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
-                cpu.model_load.is_strict_complete() && hybrid.model_load.is_strict_complete()
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
+                cpu.model_load.is_strict_complete()
+                    && boundary.model_load.is_strict_complete()
+                    && hybrid.model_load.is_strict_complete()
             });
         let resolved_config_identity = exact_run_count
             && config_hash.is_some_and(is_sha256_hex)
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 Some(cpu.initial_state.resolved_config_sha256.as_str()) == config_hash
+                    && Some(boundary.initial_state.resolved_config_sha256.as_str()) == config_hash
                     && Some(hybrid.initial_state.resolved_config_sha256.as_str()) == config_hash
             });
         let tokenized_once_and_shared = exact_run_count
-            && collected.iter().all(|(case, cpu, hybrid, _)| {
+            && collected.iter().all(|(case, cpu, boundary, hybrid, _, _)| {
                 !case.prompt_token_ids.is_empty()
                     && case.tokenization_calls == 1
                     && case.prompt_token_ids_sha256 == token_ids_sha256(&case.prompt_token_ids)
                     && cpu.generation.prompt_token_ids_sha256 == case.prompt_token_ids_sha256
+                    && boundary.generation.prompt_token_ids_sha256
+                        == case.prompt_token_ids_sha256
                     && hybrid.generation.prompt_token_ids_sha256 == case.prompt_token_ids_sha256
                     && cpu.generation.generated_token_count == OUTPUT_TOKEN_LIMIT
+                    && boundary.generation.generated_token_count == OUTPUT_TOKEN_LIMIT
                     && hybrid.generation.generated_token_count == OUTPUT_TOKEN_LIMIT
                     && cpu.generation.generated_token_count
                         == cpu.generation.generated_token_ids.len()
+                    && boundary.generation.generated_token_count
+                        == boundary.generation.generated_token_ids.len()
                     && hybrid.generation.generated_token_count
                         == hybrid.generation.generated_token_ids.len()
                     && cpu.generation.generated_token_ids_sha256
                         == token_ids_sha256(&cpu.generation.generated_token_ids)
+                    && boundary.generation.generated_token_ids_sha256
+                        == token_ids_sha256(&boundary.generation.generated_token_ids)
                     && hybrid.generation.generated_token_ids_sha256
                         == token_ids_sha256(&hybrid.generation.generated_token_ids)
                     && is_sha256_hex(&cpu.generation.generated_text_sha256)
+                    && is_sha256_hex(&boundary.generation.generated_text_sha256)
                     && is_sha256_hex(&hybrid.generation.generated_text_sha256)
                     && cpu.generation.termination_reason == TerminationReason::LengthLimit
+                    && boundary.generation.termination_reason == TerminationReason::LengthLimit
                     && hybrid.generation.termination_reason == TerminationReason::LengthLimit
             });
         let fresh_state_every_run = exact_run_count
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 cpu.initial_state.is_clean()
+                    && boundary.initial_state.is_clean()
                     && hybrid.initial_state.is_clean()
                     && cpu.initial_state.context_id == cpu.execution_plan.context_id
+                    && boundary.initial_state.context_id == boundary.execution_plan.context_id
                     && hybrid.initial_state.context_id == hybrid.execution_plan.context_id
             });
         let context_ids: HashSet<&str> = collected
             .iter()
-            .flat_map(|(_, cpu, hybrid, _)| {
+            .flat_map(|(_, cpu, boundary, hybrid, _, _)| {
                 [
                     cpu.execution_plan.context_id.as_str(),
+                    boundary.execution_plan.context_id.as_str(),
                     hybrid.execution_plan.context_id.as_str(),
                 ]
             })
             .collect();
         let unique_execution_context_every_run =
-            exact_run_count && context_ids.len() == CORPUS_CASE_COUNT * 2;
+            exact_run_count && context_ids.len() == CORPUS_CASE_COUNT * 3;
         let controlled_background_shutdown_every_run = exact_run_count
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 cpu.background_shutdown.controlled_shutdown_requested
                     && cpu.background_shutdown.all_runtime_resources_released
+                    && boundary.background_shutdown.controlled_shutdown_requested
+                    && boundary.background_shutdown.all_runtime_resources_released
                     && hybrid.background_shutdown.controlled_shutdown_requested
                     && hybrid.background_shutdown.all_runtime_resources_released
             });
@@ -1043,8 +1125,9 @@ impl GreedyParityReport {
                 .orchestrator_executable_sha256
                 .as_deref()
                 .is_some_and(is_sha256_hex)
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 cpu.worker_process.is_none()
+                    && boundary.worker_process.is_none()
                     && hybrid.worker_process.as_ref().is_some_and(|process| {
                         process.is_exact()
                             && Some(process.executable_sha256.as_str())
@@ -1055,7 +1138,7 @@ impl GreedyParityReport {
             });
         let worker_ids: HashSet<&str> = collected
             .iter()
-            .filter_map(|(_, _, hybrid, _)| {
+            .filter_map(|(_, _, _, hybrid, _, _)| {
                 hybrid
                     .worker_process
                     .as_ref()
@@ -1064,37 +1147,58 @@ impl GreedyParityReport {
             .collect();
         let unique_hybrid_worker_identity =
             hybrid_worker_processes_exact && worker_ids.len() == CORPUS_CASE_COUNT;
+        let process_ids: HashSet<u32> = collected
+            .iter()
+            .filter_map(|(_, _, _, hybrid, _, _)| {
+                hybrid
+                    .worker_process
+                    .as_ref()
+                    .and_then(|process| process.process_id)
+            })
+            .collect();
+        let unique_hybrid_process_identity =
+            hybrid_worker_processes_exact && process_ids.len() == CORPUS_CASE_COUNT;
         let cpu_plans_exact = exact_run_count
-            && collected
-                .iter()
-                .all(|(_, cpu, _, _)| cpu.plane == "cpu" && cpu_plan_exact(&cpu.execution_plan));
+            && collected.iter().all(|(_, cpu, boundary, _, _, _)| {
+                cpu.plane == "cpu"
+                    && boundary.plane == "cpu"
+                    && cpu_plan_exact(&cpu.execution_plan)
+                    && cpu_plan_exact(&boundary.execution_plan)
+            });
         let cpu_counter_invariants = exact_run_count
-            && collected
-                .iter()
-                .all(|(_, cpu, _, _)| cpu_counters_exact(cpu.routed_execution_delta));
+            && collected.iter().all(|(_, cpu, boundary, _, _, _)| {
+                cpu_counters_exact(cpu.routed_execution_delta)
+                    && cpu_counters_exact(boundary.routed_execution_delta)
+            });
         let cpu_gpu_io_zero = exact_run_count
-            && collected.iter().all(|(_, cpu, _, _)| {
+            && collected.iter().all(|(_, cpu, boundary, _, _, _)| {
                 cpu.device.is_none()
                     && !cpu.initial_state.gpu_io_available
                     && cpu.initial_state.gpu_io == GpuExpertIoSnapshot::default()
                     && cpu.gpu_io_delta == GpuExpertIoSnapshot::default()
                     && cpu.gpu_memory_before.is_none()
                     && cpu.gpu_memory_after.is_none()
+                    && boundary.device.is_none()
+                    && !boundary.initial_state.gpu_io_available
+                    && boundary.initial_state.gpu_io == GpuExpertIoSnapshot::default()
+                    && boundary.gpu_io_delta == GpuExpertIoSnapshot::default()
+                    && boundary.gpu_memory_before.is_none()
+                    && boundary.gpu_memory_after.is_none()
             });
         let hybrid_plans_exact = exact_run_count
-            && collected.iter().all(|(_, _, hybrid, _)| {
+            && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid.plane == "hybrid" && hybrid_plan_exact(&hybrid.execution_plan)
             });
         let hardware_adapter_exact_match = exact_run_count
             && !self.expected_adapter_name.is_empty()
-            && collected.iter().all(|(_, _, hybrid, _)| {
+            && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid.device.as_ref().is_some_and(|device| {
                     device.name == self.expected_adapter_name
                         && !device.device_type.eq_ignore_ascii_case("cpu")
                 })
             });
         let software_adapter_false = exact_run_count
-            && collected.iter().all(|(_, _, hybrid, _)| {
+            && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid
                     .device
                     .as_ref()
@@ -1103,13 +1207,13 @@ impl GreedyParityReport {
         let hybrid_counter_invariants = exact_run_count
             && collected
                 .iter()
-                .all(|(_, _, hybrid, _)| hybrid_counters_exact(hybrid.routed_execution_delta));
+                .all(|(_, _, _, hybrid, _, _)| hybrid_counters_exact(hybrid.routed_execution_delta));
         let hybrid_gpu_io_observed = exact_run_count
-            && collected.iter().all(|(_, _, hybrid, _)| {
+            && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid.initial_state.gpu_io_available && gpu_io_observed(hybrid.gpu_io_delta)
             });
         let hybrid_memory_ledger_valid = exact_run_count
-            && collected.iter().all(|(_, _, hybrid, _)| {
+            && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid
                     .gpu_memory_before
                     .is_some_and(|snapshot| crate::qualification::validate_memory(snapshot).is_ok())
@@ -1118,11 +1222,15 @@ impl GreedyParityReport {
                     })
             });
         let zero_gpu_failures_fallbacks_or_degraded = exact_run_count
-            && collected.iter().all(|(_, cpu, hybrid, _)| {
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
                 cpu.routed_execution_delta.gpu_dispatch_failures == 0
                     && cpu.routed_execution_delta.gpu_cpu_fallbacks == 0
                     && cpu.routed_execution_delta.degraded_expert_substitutions == 0
                     && cpu.attention_softmax_nonfinite_fallbacks == 0
+                    && boundary.routed_execution_delta.gpu_dispatch_failures == 0
+                    && boundary.routed_execution_delta.gpu_cpu_fallbacks == 0
+                    && boundary.routed_execution_delta.degraded_expert_substitutions == 0
+                    && boundary.attention_softmax_nonfinite_fallbacks == 0
                     && hybrid.routed_execution_delta.gpu_dispatch_failures == 0
                     && hybrid.routed_execution_delta.cpu_routed_expert_dispatches == 0
                     && hybrid.routed_execution_delta.gpu_cpu_fallbacks == 0
@@ -1153,6 +1261,7 @@ impl GreedyParityReport {
             controlled_background_shutdown_every_run,
             hybrid_worker_processes_exact,
             unique_hybrid_worker_identity,
+            unique_hybrid_process_identity,
             cpu_plans_exact,
             cpu_counter_invariants,
             cpu_gpu_io_zero,
@@ -1160,35 +1269,49 @@ impl GreedyParityReport {
             hardware_adapter_exact_match,
             software_adapter_false,
             strict_gpu_failure_policy: exact_run_count
-                && collected.iter().all(|(_, _, hybrid, _)| {
+                && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                     hybrid.routed_expert_gpu_failure_policy == "strict-fail-closed"
                 }),
             hybrid_counter_invariants,
             hybrid_gpu_io_observed,
             hybrid_memory_ledger_valid,
             zero_gpu_failures_fallbacks_or_degraded,
-            exact_generated_token_ids: exact_run_count
-                && collected.iter().all(|(_, cpu, hybrid, comparison)| {
+            ordinary_cpu_comparison_recorded: exact_run_count
+                && collected.iter().all(|(_, cpu, _, hybrid, comparison, _)| {
+                    comparison_matches_generations(
+                        &cpu.generation,
+                        &hybrid.generation,
+                        comparison,
+                    )
+                }),
+            boundary_reference_exact_generated_token_ids: exact_run_count
+                && collected.iter().all(|(_, _, boundary, hybrid, _, comparison)| {
                     comparison.exact_token_ids
                         && comparison.first_divergence.is_none()
-                        && cpu.generation.generated_token_ids
+                        && boundary.generation.generated_token_ids
                             == hybrid.generation.generated_token_ids
+                        && comparison_matches_generations(
+                            &boundary.generation,
+                            &hybrid.generation,
+                            comparison,
+                        )
                 }),
-            identical_generated_token_count: exact_run_count
-                && collected.iter().all(|(_, cpu, hybrid, comparison)| {
+            boundary_reference_identical_generated_token_count: exact_run_count
+                && collected.iter().all(|(_, _, boundary, hybrid, _, comparison)| {
                     comparison.equal_generated_count
-                        && cpu.generation.generated_token_count
+                        && boundary.generation.generated_token_count
                             == hybrid.generation.generated_token_count
                 }),
-            identical_termination_reason: exact_run_count
-                && collected.iter().all(|(_, cpu, hybrid, comparison)| {
+            boundary_reference_identical_termination_reason: exact_run_count
+                && collected.iter().all(|(_, _, boundary, hybrid, _, comparison)| {
                     comparison.equal_termination_reason
-                        && cpu.generation.termination_reason == hybrid.generation.termination_reason
+                        && boundary.generation.termination_reason
+                            == hybrid.generation.termination_reason
                 }),
-            identical_generated_text_hash: exact_run_count
-                && collected.iter().all(|(_, cpu, hybrid, comparison)| {
+            boundary_reference_identical_generated_text_hash: exact_run_count
+                && collected.iter().all(|(_, _, boundary, hybrid, _, comparison)| {
                     comparison.equal_generated_text_hash
-                        && cpu.generation.generated_text_sha256
+                        && boundary.generation.generated_text_sha256
                             == hybrid.generation.generated_text_sha256
                 }),
         }
@@ -1409,6 +1532,10 @@ mod tests {
             let mut case = CaseReport::new(fixed, prompt_ids);
             let prompt_hash = case.prompt_token_ids_sha256.clone();
             let mut cpu = plane_evidence(index, false, &ids);
+            let mut boundary = plane_evidence(index, false, &ids);
+            let boundary_context_id = format!("boundary-{index}");
+            boundary.execution_plan.context_id = boundary_context_id.clone();
+            boundary.initial_state.context_id = boundary_context_id;
             let mut hybrid = plane_evidence(index, true, &ids);
             hybrid.worker_process = Some(HybridWorkerProcessEvidence {
                 worker_id: hybrid_worker_id(
@@ -1443,14 +1570,22 @@ mod tests {
                 evidence_emitted: true,
             });
             cpu.generation.prompt_token_ids_sha256 = prompt_hash.clone();
+            boundary.generation.prompt_token_ids_sha256 = prompt_hash.clone();
             hybrid.generation.prompt_token_ids_sha256 = prompt_hash;
-            case.comparison = Some(
+            case.ordinary_cpu_vs_hybrid = Some(
                 compare_generations(&cpu.generation, &hybrid.generation, |_| {
                     Ok("same".to_string())
                 })
                 .unwrap(),
             );
+            case.boundary_reference_vs_hybrid = Some(
+                compare_generations(&boundary.generation, &hybrid.generation, |_| {
+                    Ok("same".to_string())
+                })
+                .unwrap(),
+            );
             case.cpu = Some(cpu);
+            case.boundary_reference = Some(boundary);
             case.hybrid = Some(hybrid);
             report.cases.push(case);
         }
@@ -1470,6 +1605,9 @@ mod tests {
 
     #[test]
     fn greedy_parity_fixed_corpus_contract_is_versioned_and_nontrivial() {
+        assert_eq!(SCHEMA_VERSION, "mer.strict-hybrid-q4-greedy-parity.v2");
+        assert_eq!(LEGACY_SCHEMA_VERSION, "mer.strict-hybrid-q4-greedy-parity.v1");
+        assert_ne!(SCHEMA_VERSION, LEGACY_SCHEMA_VERSION);
         assert_eq!(FIXED_CORPUS.len(), 4);
         assert_eq!(OUTPUT_TOKEN_LIMIT, 16);
         assert_eq!(FIXED_CORPUS[0].name, "rust-generation");
@@ -1768,10 +1906,100 @@ mod tests {
         assert_eq!(report.status, QualificationStatus::Pass);
         assert!(report.checks.passes());
         let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+        assert_ne!(json["schema_version"], LEGACY_SCHEMA_VERSION);
         assert_eq!(
             json["cases"][0]["hybrid"]["device"]["software_adapter"],
             false
         );
+    }
+
+    #[test]
+    fn greedy_parity_ordinary_cpu_divergence_is_informational() {
+        let mut report = passing_report();
+        let case = &mut report.cases[0];
+        let cpu = case.cpu.as_mut().unwrap();
+        cpu.generation.generated_token_ids[0] ^= 1;
+        cpu.generation.generated_token_ids_sha256 =
+            token_ids_sha256(&cpu.generation.generated_token_ids);
+        cpu.generation.generated_text_sha256 = sha256_hex(b"ordinary-cpu-diverged");
+        case.ordinary_cpu_vs_hybrid = Some(
+            compare_generations(
+                &cpu.generation,
+                &case.hybrid.as_ref().unwrap().generation,
+                |ids| Ok(format!("{ids:?}")),
+            )
+            .unwrap(),
+        );
+
+        report.finish().unwrap();
+        assert_eq!(report.status, QualificationStatus::Pass);
+        assert!(report.checks.ordinary_cpu_comparison_recorded);
+        assert!(!report.cases[0]
+            .ordinary_cpu_vs_hybrid
+            .as_ref()
+            .unwrap()
+            .exact_token_ids);
+        assert!(report.cases[0]
+            .boundary_reference_vs_hybrid
+            .as_ref()
+            .unwrap()
+            .exact_token_ids);
+    }
+
+    #[test]
+    fn greedy_parity_boundary_reference_divergence_fails() {
+        let mut report = passing_report();
+        let case = &mut report.cases[1];
+        let boundary = case.boundary_reference.as_mut().unwrap();
+        boundary.generation.generated_token_ids[3] ^= 1;
+        boundary.generation.generated_token_ids_sha256 =
+            token_ids_sha256(&boundary.generation.generated_token_ids);
+        boundary.generation.generated_text_sha256 = sha256_hex(b"boundary-diverged");
+        case.boundary_reference_vs_hybrid = Some(
+            compare_generations(
+                &boundary.generation,
+                &case.hybrid.as_ref().unwrap().generation,
+                |ids| Ok(format!("{ids:?}")),
+            )
+            .unwrap(),
+        );
+
+        assert!(report.finish().is_err());
+        assert!(!report
+            .checks
+            .boundary_reference_exact_generated_token_ids);
+    }
+
+    #[test]
+    fn greedy_parity_partial_boundary_or_process_evidence_fails() {
+        let mut missing_boundary = passing_report();
+        missing_boundary.cases[0].boundary_reference = None;
+        assert!(missing_boundary.finish().is_err());
+
+        let mut partial_corpus = passing_report();
+        partial_corpus.cases.pop();
+        assert!(partial_corpus.finish().is_err());
+
+        let mut reused_process = passing_report();
+        let process_id = reused_process.cases[0]
+            .hybrid
+            .as_ref()
+            .unwrap()
+            .worker_process
+            .as_ref()
+            .unwrap()
+            .process_id;
+        reused_process.cases[1]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .worker_process
+            .as_mut()
+            .unwrap()
+            .process_id = process_id;
+        assert!(reused_process.finish().is_err());
+        assert!(!reused_process.checks.unique_hybrid_process_identity);
     }
 
     #[test]
@@ -1915,7 +2143,9 @@ mod tests {
         // Leave the stored comparison flags untouched to simulate copied or
         // stale intended evidence. PASS must still be impossible.
         assert!(report.finish().is_err());
-        assert!(!report.checks.exact_generated_token_ids);
+        assert!(!report
+            .checks
+            .boundary_reference_exact_generated_token_ids);
 
         let mut bad_hash = passing_report();
         bad_hash.cases[0]
@@ -2157,8 +2387,8 @@ mod tests {
         ));
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["cases"].as_array().unwrap().len(), 3);
-        assert!(json["cases"][0]["comparison"].is_object());
-        assert!(json["cases"][1]["comparison"].is_object());
+        assert!(json["cases"][0]["boundary_reference_vs_hybrid"].is_object());
+        assert!(json["cases"][1]["ordinary_cpu_vs_hybrid"].is_object());
         assert_eq!(json["cases"][2]["worker_failure"]["signal"], 15);
     }
 }

@@ -2051,11 +2051,12 @@ change would be required to bound that shared production wait safely.
 `qualify-hybrid-q4-greedy-parity` is a separate fail-closed diagnostic for
 Qwen3-Coder 30B-A3B Q4_0. It parses and reconciles one supplied strict Hybrid
 configuration, freezes that resolved model/runtime specification, then derives
-an all-CPU control and strict Hybrid execution exclusively from that frozen
-specification. A second CPU config is neither accepted nor inferred. Each
-plane and each corpus case receives a fresh engine, KV state, RAM/logical GPU
-cache, physical registry, counters, predictors, background state, and storage
-runtime. CPU controls remain fresh in-process runtimes. Every Hybrid plane runs
+an ordinary all-CPU control, an all-CPU Hybrid-boundary reference, and strict
+Hybrid execution exclusively from that frozen specification. A second CPU
+config is neither accepted nor inferred. Each run and each corpus case receives
+a fresh engine, KV state, RAM/logical GPU cache, physical registry, counters,
+predictors, background state, and storage runtime. Both CPU runs remain fresh
+in-process runtimes. Every Hybrid case runs
 in a separate short-lived child of the same immutable executable; the parent
 passes already-tokenized IDs through a typed stdin protocol, waits for a normal
 zero exit, and reaps the child before starting the next case. Controlled Rust
@@ -2065,7 +2066,7 @@ NVIDIA client/device teardown boundary.
 The versioned corpus `qwen3-coder-30b-a3b-greedy-v1` contains four cases:
 Rust function generation, Rust code correction, compact JSON transformation,
 and a short Spanish instruction. Each prompt is tokenized exactly once, the
-same token-ID slice is passed to both planes, and each plane produces exactly
+same token-ID slice is passed to all three runs, and each run produces exactly
 16 completion tokens with `SamplingParams::greedy()` (`temperature=0`,
 `top_p=1`, `top_k=0`, `seed=0`). This is deliberately small correctness
 coverage, not a throughput benchmark.
@@ -2077,34 +2078,43 @@ coverage, not a throughput benchmark.
   --report-out greedy-parity.json
 ```
 
-Schema `mer.strict-hybrid-q4-greedy-parity.v1` passes only when the clean build,
+Schema `mer.strict-hybrid-q4-greedy-parity.v2` passes only when the clean build,
 real checkpoint, canonical `ggml-standard-v1` metadata, exact Qwen3-Coder
 geometry, fixed corpus, and fixed sampling identity all validate. Per case,
-the CPU plan must resolve every component to CPU and account every selected
-routed expert as a CPU dispatch with zero GPU counters. Hybrid must resolve
+both the ordinary informational CPU plane and the authoritative CPU
+Hybrid-boundary reference must resolve every component to CPU and account
+every selected routed expert as a CPU dispatch with zero GPU counters. The
+boundary reference applies the documented production Hybrid f16 conversion at
+every routed-expert input and output while retaining the original f32 routing
+weights and aggregation semantics. Hybrid must resolve
 embeddings, LM head, dense projections, attention, KV, and router to CPU while
 routing native Q4_0 experts to the exact named non-software GPU under
 `StrictFailClosed`. Every selected Hybrid expert must be attempted and succeed
 on GPU; hidden uploads, queue submissions, map requests, completed readbacks,
 and readback bytes must all be nonzero; CPU expert execution, fallback,
 degraded substitution, and GPU failures must remain zero.
-Each Hybrid case must also prove its unique worker identity, matching executable
-and build SHA, case/config/token identities, normal zero exit, successful reap,
-and absence of timeout or signal termination. Missing worker-process evidence
-fails closed. Worker stderr is diagnostic-only and bounded in failure reports.
+Each Hybrid case must also prove unique worker and process identities, matching
+executable and build SHA, case/config/token identities, normal zero exit,
+successful reap, and absence of timeout or signal termination. Missing
+worker-process evidence fails closed. Worker stderr is diagnostic-only and
+bounded in failure reports.
 
-PASS additionally requires exact generated token-ID equality at every position,
-identical generated count and termination reason, and identical decoded-text
-SHA-256. A failure report preserves the first differing position, nullable CPU
-and Hybrid token IDs for length divergence, both termination reasons, lengths,
-counters, and decoded prefixes bounded to 512 UTF-8 bytes. The report contains
-no timing or TPS fields and does not change EOS, serving, batching, scheduling,
-quantization, shader math, or numerical-parity tolerances.
+PASS additionally requires the CPU Hybrid-boundary reference and Hybrid to have
+exact generated token-ID equality at every position, identical generated count
+and termination reason, and identical decoded-text SHA-256. Ordinary CPU output
+and its comparison with Hybrid remain informational evidence; their divergence
+does not fail the boundary-aware v2 contract. Both comparisons preserve the
+first differing position, nullable reference and Hybrid token IDs for length
+divergence, termination reasons, lengths, counters, and decoded prefixes
+bounded to 512 UTF-8 bytes. The report contains no timing or TPS fields and does
+not change EOS, serving, batching, scheduling, quantization, shader math, or
+numerical-parity tolerances. The earlier v1 schema retains its original raw-CPU
+parity meaning and is not accepted as v2 evidence.
 
 ```bash
 jq -e '
   . as $report |
-  $report.schema_version == "mer.strict-hybrid-q4-greedy-parity.v1" and
+  $report.schema_version == "mer.strict-hybrid-q4-greedy-parity.v2" and
   $report.status == "pass" and
   $report.failure == null and
   ($report.checks | all(.[]; . == true)) and
@@ -2112,7 +2122,10 @@ jq -e '
   all($report.cases[];
     .hybrid.device.name == $report.expected_adapter_name and
     .hybrid.device.software_adapter == false and
-    .comparison.exact_token_ids == true)
+    .boundary_reference_vs_hybrid.exact_token_ids == true and
+    .boundary_reference_vs_hybrid.equal_generated_count == true and
+    .boundary_reference_vs_hybrid.equal_termination_reason == true and
+    .boundary_reference_vs_hybrid.equal_generated_text_hash == true)
 ' greedy-parity.json
 ```
 

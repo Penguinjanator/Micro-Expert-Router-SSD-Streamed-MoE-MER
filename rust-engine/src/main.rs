@@ -3729,6 +3729,34 @@ async fn execute_greedy_parity_plane(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_boundary_reference_plane(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        None,
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_greedy_parity_plane_with_logits(
     spec: &ResolvedRealCliSpec,
     mode: RealCliRuntimeMode,
@@ -5508,6 +5536,32 @@ async fn cmd_qualify_hybrid_q4_greedy_parity(
         };
         case.cpu = Some(cpu);
 
+        let boundary_reference = execute_greedy_parity_boundary_reference_plane(
+            &spec,
+            tokenizer.clone(),
+            &case.prompt_token_ids,
+            &case.prompt_token_ids_sha256,
+            &resolved_config_sha256,
+            &args.expected_adapter_name,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await;
+        let boundary_reference = match boundary_reference {
+            Ok(reference) => reference,
+            Err(error) => {
+                let mut failure = qualification_inference_failure(error.as_ref());
+                failure.detail = format!(
+                    "fixed case {} CPU Hybrid-boundary reference: {error}",
+                    fixed.name
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        case.boundary_reference = Some(boundary_reference);
+
         let worker_request = crate::greedy_parity::HybridWorkerRequest::new(
             crate::greedy_parity::hybrid_worker_id(
                 &build_git_sha,
@@ -5550,52 +5604,83 @@ async fn cmd_qualify_hybrid_q4_greedy_parity(
             }
         };
         case.hybrid = Some(hybrid);
-        let (cpu_generation, hybrid_generation) = match (&case.cpu, &case.hybrid) {
-            (Some(cpu), Some(hybrid)) => (&cpu.generation, &hybrid.generation),
+        let (cpu_generation, boundary_generation, hybrid_generation) =
+            match (&case.cpu, &case.boundary_reference, &case.hybrid) {
+            (Some(cpu), Some(boundary), Some(hybrid)) => (
+                &cpu.generation,
+                &boundary.generation,
+                &hybrid.generation,
+            ),
             _ => {
                 let failure = QualificationFailure::new(
                     FailureStage::Postcondition,
                     "plane-evidence-incomplete",
-                    format!("fixed case {} lost successful plane evidence", fixed.name),
+                    format!(
+                        "fixed case {} lost successful CPU, boundary-reference, or Hybrid evidence",
+                        fixed.name
+                    ),
                 );
                 case.failure = Some(failure.clone());
                 report.cases.push(case);
                 return fail_greedy_parity(report, failure, args.report_out.as_deref());
             }
         };
-        let comparison = crate::greedy_parity::compare_generations(
+        let ordinary_comparison = crate::greedy_parity::compare_generations(
             cpu_generation,
             hybrid_generation,
             |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
         );
-        let comparison = match comparison {
+        let ordinary_comparison = match ordinary_comparison {
             Ok(comparison) => comparison,
             Err(error) => {
                 let failure = QualificationFailure::new(
                     FailureStage::Postcondition,
                     "divergence-evidence-decode-failed",
-                    format!("fixed case {}: {error}", fixed.name),
+                    format!("fixed case {} ordinary CPU comparison: {error}", fixed.name),
                 );
                 case.failure = Some(failure.clone());
                 report.cases.push(case);
                 return fail_greedy_parity(report, failure, args.report_out.as_deref());
             }
         };
-        let diverged = !comparison.exact_token_ids
-            || !comparison.equal_generated_count
-            || !comparison.equal_termination_reason
-            || !comparison.equal_generated_text_hash;
-        let divergence_position = comparison
+        case.ordinary_cpu_vs_hybrid = Some(ordinary_comparison);
+
+        let boundary_comparison = crate::greedy_parity::compare_generations(
+            boundary_generation,
+            hybrid_generation,
+            |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+        );
+        let boundary_comparison = match boundary_comparison {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                let failure = QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "divergence-evidence-decode-failed",
+                    format!(
+                        "fixed case {} CPU Hybrid-boundary comparison: {error}",
+                        fixed.name
+                    ),
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        let diverged = !boundary_comparison.exact_token_ids
+            || !boundary_comparison.equal_generated_count
+            || !boundary_comparison.equal_termination_reason
+            || !boundary_comparison.equal_generated_text_hash;
+        let divergence_position = boundary_comparison
             .first_divergence
             .as_ref()
             .map(|evidence| evidence.position);
-        case.comparison = Some(comparison);
+        case.boundary_reference_vs_hybrid = Some(boundary_comparison);
         if diverged {
             let failure = QualificationFailure::new(
                 FailureStage::Postcondition,
-                "greedy-token-divergence",
+                "boundary-reference-greedy-token-divergence",
                 format!(
-                    "fixed case {} diverged at position {:?}",
+                    "fixed case {} Hybrid diverged from the CPU Hybrid-boundary reference at position {:?}",
                     fixed.name, divergence_position
                 ),
             );
