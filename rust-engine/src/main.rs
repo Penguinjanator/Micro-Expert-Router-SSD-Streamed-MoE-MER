@@ -3810,6 +3810,16 @@ async fn execute_greedy_parity_plane_internal(
         if cpu_q4_boundary_emulation {
             runtime.engine.enable_cpu_q4_boundary_emulation()?;
         }
+        let boundary_emulation_before =
+            runtime.engine.cpu_q4_boundary_emulation_snapshot();
+        if boundary_emulation_before.enabled != cpu_q4_boundary_emulation
+            || boundary_emulation_before.routed_expert_dispatches != 0
+        {
+            return Err(format!(
+                "{case_name} runtime Q4 boundary-emulation state did not start clean or match the requested execution mode"
+            )
+            .into());
+        }
         let context = runtime.engine.execution_context();
         let execution_plan: crate::qualification::ExecutionPlanEvidence = context.plan().into();
         let plane = match mode {
@@ -3928,6 +3938,8 @@ async fn execute_greedy_parity_plane_internal(
             );
         }
         let routed_after = runtime.engine.routed_expert_execution_snapshot();
+        let cpu_q4_boundary_emulation =
+            runtime.engine.cpu_q4_boundary_emulation_snapshot();
         let io_after_option = runtime.engine.gpu_expert_io_snapshot();
         let io_after = io_after_option.unwrap_or_default();
         let memory_after = runtime.engine.gpu_expert_memory_snapshot();
@@ -3989,6 +4001,7 @@ async fn execute_greedy_parity_plane_internal(
                 runtime.engine.routed_expert_gpu_failure_policy(),
             )
             .to_string(),
+            cpu_q4_boundary_emulation,
             device,
             initial_state,
             generation,

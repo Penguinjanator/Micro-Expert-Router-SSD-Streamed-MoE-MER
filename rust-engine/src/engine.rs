@@ -1524,8 +1524,16 @@ pub struct Engine {
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
     diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool,
+    diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
     diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuQ4BoundaryEmulationSnapshot {
+    pub enabled: bool,
+    pub routed_expert_dispatches: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1849,6 +1857,7 @@ impl Engine {
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
             diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool::new(false),
+            diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture: parking_lot::Mutex::new(None),
         }
@@ -1869,8 +1878,21 @@ impl Engine {
             );
         }
         self.diagnostic_cpu_q4_boundary_emulation
-            .store(true, Ordering::Relaxed);
+            .store(true, Ordering::Release);
         Ok(())
+    }
+
+    pub(crate) fn cpu_q4_boundary_emulation_snapshot(
+        &self,
+    ) -> CpuQ4BoundaryEmulationSnapshot {
+        CpuQ4BoundaryEmulationSnapshot {
+            enabled: self
+                .diagnostic_cpu_q4_boundary_emulation
+                .load(Ordering::Acquire),
+            routed_expert_dispatches: self
+                .diagnostic_cpu_q4_boundary_emulated_dispatches
+                .load(Ordering::Acquire),
+        }
     }
 
     /// Arm a one-shot, diagnostic-only capture at the routed-FFN boundary.
@@ -4499,7 +4521,7 @@ impl Engine {
 
         if self
             .diagnostic_cpu_q4_boundary_emulation
-            .load(Ordering::Relaxed)
+            .load(Ordering::Acquire)
         {
             let expected = crate::inference::expert_weight_bytes_for(
                 self.core.shape.d_model,
@@ -4533,13 +4555,16 @@ impl Engine {
                 expert: r.id,
                 source,
             })?;
-            return crate::numerical_diagnostics::round_trip_f16_values(&cpu).map_err(|source| {
-                MoeStepError::ExpertCompute {
+            let output = crate::numerical_diagnostics::round_trip_f16_values(&cpu).map_err(
+                |source| MoeStepError::ExpertCompute {
                     layer,
                     expert: r.id,
                     source,
-                }
-            });
+                },
+            )?;
+            self.diagnostic_cpu_q4_boundary_emulated_dispatches
+                .fetch_add(1, Ordering::Release);
+            return Ok(output);
         }
 
         dispatch_expert_forward(

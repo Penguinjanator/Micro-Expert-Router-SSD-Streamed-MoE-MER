@@ -1068,9 +1068,28 @@ impl DiagnosticReport {
             return false;
         }
         match run.plane {
-            DiagnosticPlane::Cpu | DiagnosticPlane::CpuBoundaryEmulation => {
+            DiagnosticPlane::Cpu => {
                 plane.plane == "cpu"
                     && crate::greedy_parity::cpu_plan_exact(&plane.execution_plan)
+                    && plane.cpu_q4_boundary_emulation
+                        == crate::engine::CpuQ4BoundaryEmulationSnapshot::default()
+                    && plane.device.is_none()
+                    && !initial.gpu_io_available
+                    && routed.selected_routed_experts > 0
+                    && routed.cpu_routed_expert_dispatches == routed.selected_routed_experts
+                    && routed.gpu_dispatch_attempts == 0
+                    && io == GpuExpertIoSnapshot::default()
+                    && plane.gpu_memory_before.is_none()
+                    && plane.gpu_memory_after.is_none()
+            }
+            DiagnosticPlane::CpuBoundaryEmulation => {
+                plane.plane == "cpu"
+                    && crate::greedy_parity::cpu_plan_exact(&plane.execution_plan)
+                    && plane.cpu_q4_boundary_emulation.enabled
+                    && plane
+                        .cpu_q4_boundary_emulation
+                        .routed_expert_dispatches
+                        == routed.cpu_routed_expert_dispatches
                     && plane.device.is_none()
                     && !initial.gpu_io_available
                     && routed.selected_routed_experts > 0
@@ -1083,6 +1102,8 @@ impl DiagnosticReport {
             DiagnosticPlane::Hybrid => {
                 plane.plane == "hybrid"
                     && crate::greedy_parity::hybrid_plan_exact(&plane.execution_plan)
+                    && plane.cpu_q4_boundary_emulation
+                        == crate::engine::CpuQ4BoundaryEmulationSnapshot::default()
                     && plane.device.as_ref().is_some_and(|device| {
                         !device.software_adapter
                             && !device.device_type.eq_ignore_ascii_case("cpu")
@@ -1123,7 +1144,8 @@ mod tests {
         process_id: u32,
     ) -> RepeatedRunEvidence {
         let worker_id = format!("{}-{run_index}", plane.as_str());
-        let generated_token_ids = vec![generated_token];
+        let mut generated_token_ids = vec![generated_token];
+        generated_token_ids.resize(crate::greedy_parity::OUTPUT_TOKEN_LIMIT, generated_token);
         let generated_token_ids_sha256 = token_ids_sha256(&generated_token_ids);
         let process = HybridWorkerProcessEvidence {
             worker_id: worker_id.clone(),
@@ -1174,6 +1196,8 @@ mod tests {
                 reason: None,
             },
             routed_expert_gpu_failure_policy: "serving-cpu-fallback".to_string(),
+            cpu_q4_boundary_emulation:
+                crate::engine::CpuQ4BoundaryEmulationSnapshot::default(),
             device: None,
             initial_state: crate::greedy_parity::InitialStateEvidence {
                 context_id,
@@ -1191,7 +1215,7 @@ mod tests {
                 generated_token_ids: generated_token_ids.clone(),
                 generated_token_ids_sha256: generated_token_ids_sha256.clone(),
                 generated_text_sha256: "t".repeat(64),
-                generated_token_count: 1,
+                generated_token_count: crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
                 termination_reason: crate::greedy_parity::TerminationReason::LengthLimit,
             },
             routed_execution_delta: crate::engine::RoutedExpertExecutionSnapshot {
@@ -1365,6 +1389,45 @@ mod tests {
         assert!(mismatch.cpu_bitwise_reproducible);
         assert!(!mismatch.cpu_boundary_emulation_bitwise_reproducible);
         assert!(mismatch.hybrid_bitwise_reproducible);
+    }
+
+    #[test]
+    fn diagnostic_boundary_role_requires_runtime_observed_emulation() {
+        let report = DiagnosticReport::new(
+            crate::qualification::BuildProvenance {
+                git_sha: Some("a".repeat(40)),
+                dirty: Some(false),
+                package_version: "test".to_string(),
+            },
+            "a".repeat(40),
+            "e".repeat(64),
+            "c".repeat(64),
+            "NVIDIA L4".to_string(),
+            "d".repeat(64),
+            "p".repeat(64),
+            2,
+        );
+        let ordinary_cpu_substitute =
+            repeated_run(DiagnosticPlane::CpuBoundaryEmulation, 0, 5212, 'b', 20);
+        assert!(!report.run_evidence_exact(&ordinary_cpu_substitute));
+
+        let mut observed_boundary = ordinary_cpu_substitute;
+        observed_boundary
+            .plane_evidence
+            .cpu_q4_boundary_emulation = crate::engine::CpuQ4BoundaryEmulationSnapshot {
+            enabled: true,
+            routed_expert_dispatches: 1,
+        };
+        assert!(report.run_evidence_exact(&observed_boundary));
+
+        let mut ordinary_cpu = repeated_run(DiagnosticPlane::Cpu, 0, 715, 'a', 10);
+        assert!(report.run_evidence_exact(&ordinary_cpu));
+        ordinary_cpu.plane_evidence.cpu_q4_boundary_emulation =
+            crate::engine::CpuQ4BoundaryEmulationSnapshot {
+                enabled: true,
+                routed_expert_dispatches: 1,
+            };
+        assert!(!report.run_evidence_exact(&ordinary_cpu));
     }
 
     #[test]

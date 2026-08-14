@@ -426,6 +426,7 @@ pub struct PlaneRunEvidence {
     pub model_load: ModelLoadEvidence,
     pub execution_plan: ExecutionPlanEvidence,
     pub routed_expert_gpu_failure_policy: String,
+    pub cpu_q4_boundary_emulation: crate::engine::CpuQ4BoundaryEmulationSnapshot,
     pub device: Option<GpuDeviceIdentity>,
     pub initial_state: InitialStateEvidence,
     pub generation: GenerationEvidence,
@@ -914,6 +915,7 @@ pub struct GreedyParityChecks {
     pub hardware_adapter_exact_match: bool,
     pub software_adapter_false: bool,
     pub strict_gpu_failure_policy: bool,
+    pub q4_boundary_emulation_exact: bool,
     pub hybrid_counter_invariants: bool,
     pub hybrid_gpu_io_observed: bool,
     pub hybrid_memory_ledger_valid: bool,
@@ -948,6 +950,7 @@ impl GreedyParityChecks {
             && self.hardware_adapter_exact_match
             && self.software_adapter_false
             && self.strict_gpu_failure_policy
+            && self.q4_boundary_emulation_exact
             && self.hybrid_counter_invariants
             && self.hybrid_gpu_io_observed
             && self.hybrid_memory_ledger_valid
@@ -1226,6 +1229,20 @@ impl GreedyParityReport {
             && collected
                 .iter()
                 .all(|(_, _, _, hybrid, _, _)| hybrid_counters_exact(hybrid.routed_execution_delta));
+        let q4_boundary_emulation_exact = exact_run_count
+            && collected.iter().all(|(_, cpu, boundary, hybrid, _, _)| {
+                cpu.cpu_q4_boundary_emulation
+                    == crate::engine::CpuQ4BoundaryEmulationSnapshot::default()
+                    && boundary.cpu_q4_boundary_emulation.enabled
+                    && boundary
+                        .cpu_q4_boundary_emulation
+                        .routed_expert_dispatches
+                        == boundary
+                            .routed_execution_delta
+                            .cpu_routed_expert_dispatches
+                    && hybrid.cpu_q4_boundary_emulation
+                        == crate::engine::CpuQ4BoundaryEmulationSnapshot::default()
+            });
         let hybrid_gpu_io_observed = exact_run_count
             && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                 hybrid.initial_state.gpu_io_available && gpu_io_observed(hybrid.gpu_io_delta)
@@ -1290,6 +1307,7 @@ impl GreedyParityReport {
                 && collected.iter().all(|(_, _, _, hybrid, _, _)| {
                     hybrid.routed_expert_gpu_failure_policy == "strict-fail-closed"
                 }),
+            q4_boundary_emulation_exact,
             hybrid_counter_invariants,
             hybrid_gpu_io_observed,
             hybrid_memory_ledger_valid,
@@ -1439,6 +1457,8 @@ mod tests {
                 "serving-cpu-fallback"
             }
             .to_string(),
+            cpu_q4_boundary_emulation:
+                crate::engine::CpuQ4BoundaryEmulationSnapshot::default(),
             device: hybrid.then(|| GpuDeviceIdentity {
                 name: "NVIDIA L4".to_string(),
                 vendor_id: 0x10de,
@@ -1551,6 +1571,11 @@ mod tests {
             let prompt_hash = case.prompt_token_ids_sha256.clone();
             let mut cpu = plane_evidence(index, false, &ids);
             let mut boundary = plane_evidence(index, false, &ids);
+            boundary.cpu_q4_boundary_emulation =
+                crate::engine::CpuQ4BoundaryEmulationSnapshot {
+                    enabled: true,
+                    routed_expert_dispatches: 8,
+                };
             let boundary_context_id = format!("boundary-{index}");
             boundary.execution_plan.context_id = boundary_context_id.clone();
             boundary.initial_state.context_id = boundary_context_id;
@@ -1930,6 +1955,49 @@ mod tests {
             json["cases"][0]["hybrid"]["device"]["software_adapter"],
             false
         );
+    }
+
+    #[test]
+    fn greedy_parity_requires_runtime_observed_boundary_emulation_by_role() {
+        let mut substituted = passing_report();
+        let case = &mut substituted.cases[0];
+        let boundary_context = case
+            .boundary_reference
+            .as_ref()
+            .unwrap()
+            .execution_plan
+            .context_id
+            .clone();
+        let mut ordinary_cpu = case.cpu.as_ref().unwrap().clone();
+        ordinary_cpu.execution_plan.context_id = boundary_context.clone();
+        ordinary_cpu.initial_state.context_id = boundary_context;
+        case.boundary_reference = Some(ordinary_cpu);
+        assert!(substituted.finish().is_err());
+        assert!(!substituted.checks.q4_boundary_emulation_exact);
+
+        let mut mislabeled_cpu = passing_report();
+        mislabeled_cpu.cases[0]
+            .cpu
+            .as_mut()
+            .unwrap()
+            .cpu_q4_boundary_emulation = crate::engine::CpuQ4BoundaryEmulationSnapshot {
+            enabled: true,
+            routed_expert_dispatches: 8,
+        };
+        assert!(mislabeled_cpu.finish().is_err());
+        assert!(!mislabeled_cpu.checks.q4_boundary_emulation_exact);
+
+        let mut mislabeled_hybrid = passing_report();
+        mislabeled_hybrid.cases[0]
+            .hybrid
+            .as_mut()
+            .unwrap()
+            .cpu_q4_boundary_emulation = crate::engine::CpuQ4BoundaryEmulationSnapshot {
+            enabled: true,
+            routed_expert_dispatches: 8,
+        };
+        assert!(mislabeled_hybrid.finish().is_err());
+        assert!(!mislabeled_hybrid.checks.q4_boundary_emulation_exact);
     }
 
     #[test]

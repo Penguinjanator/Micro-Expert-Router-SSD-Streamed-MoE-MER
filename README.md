@@ -2086,7 +2086,10 @@ Hybrid-boundary reference must resolve every component to CPU and account
 every selected routed expert as a CPU dispatch with zero GPU counters. The
 boundary reference applies the documented production Hybrid f16 conversion at
 every routed-expert input and output while retaining the original f32 routing
-weights and aggregation semantics. Hybrid must resolve
+weights and aggregation semantics. Typed runtime evidence must show boundary
+emulation disabled with zero emulated dispatches for ordinary CPU and Hybrid,
+and enabled with every CPU routed-expert dispatch observed through the emulation
+path for the boundary reference. Hybrid must resolve
 embeddings, LM head, dense projections, attention, KV, and router to CPU while
 routing native Q4_0 experts to the exact named non-software GPU under
 `StrictFailClosed`. Every selected Hybrid expert must be attempted and succeed
@@ -2122,6 +2125,11 @@ jq -e '
   all($report.cases[];
     .hybrid.device.name == $report.expected_adapter_name and
     .hybrid.device.software_adapter == false and
+    .cpu.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0} and
+    .boundary_reference.cpu_q4_boundary_emulation.enabled == true and
+    (.boundary_reference.cpu_q4_boundary_emulation.routed_expert_dispatches ==
+      .boundary_reference.routed_execution_delta.cpu_routed_expert_dispatches) and
+    .hybrid.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0} and
     .boundary_reference_vs_hybrid.exact_token_ids == true and
     .boundary_reference_vs_hybrid.equal_generated_count == true and
     .boundary_reference_vs_hybrid.equal_termination_reason == true and
@@ -2133,10 +2141,12 @@ jq -e '
 
 `diagnose-hybrid-q4-greedy-divergence` is a separate Phase-A diagnostic for
 the fixed `json-transformation` case. It leaves the exact-token qualification
-contract unchanged. The parent tokenizes once, then starts two fresh CPU and
-two fresh process-isolated Hybrid workers. Each worker returns the complete
-first-token logit vector as bounded exact f32 bits through a private typed
-protocol; the final JSON contains only hashes and comparison evidence.
+contract unchanged. The parent tokenizes once, then starts two fresh
+process-isolated ordinary CPU workers, two fresh process-isolated CPU
+Hybrid-boundary-emulation workers, and two fresh process-isolated Hybrid
+workers: six runs total. Each worker returns the complete first-token logit
+vector as bounded exact f32 bits through a private typed protocol; the final
+JSON contains only hashes and comparison evidence.
 
 ```bash
 ./target/release/micro-expert-router diagnose-hybrid-q4-greedy-divergence \
@@ -2159,13 +2169,24 @@ jq -e '
   .qualification_pass == false and
   .diagnostic_complete == true and
   .failure == null and
-  (.runs | length) == 4 and
+  (.runs | length) == 6 and
   .reproducibility.cpu_bitwise_reproducible == true and
+  .reproducibility.cpu_boundary_emulation_bitwise_reproducible == true and
   .reproducibility.hybrid_bitwise_reproducible == true and
   .reproducibility.all_worker_ids_unique == true and
   .reproducibility.all_process_ids_unique == true and
   .reproducibility.every_worker_exited_zero_and_reaped == true and
   .reproducibility.no_retries == true and
+  all(.runs[];
+    if .plane == "cpu" then
+      .plane_evidence.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0}
+    elif .plane == "cpu_boundary_emulation" then
+      (.plane_evidence.cpu_q4_boundary_emulation.enabled == true and
+       (.plane_evidence.cpu_q4_boundary_emulation.routed_expert_dispatches ==
+        .plane_evidence.routed_execution_delta.cpu_routed_expert_dispatches))
+    else
+      .plane_evidence.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0}
+    end) and
   (.first_token_logits.cpu_top_16 | length) == 16 and
   (.first_token_logits.hybrid_top_16 | length) == 16
 ' ./greedy-logit-diagnostic.json
