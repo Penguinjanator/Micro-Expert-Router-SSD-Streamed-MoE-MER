@@ -2170,6 +2170,9 @@ jq -e '
   .diagnostic_complete == true and
   .failure == null and
   (.runs | length) == 6 and
+  ([.runs[] | select(.plane == "cpu")] | length) == 2 and
+  ([.runs[] | select(.plane == "cpu_boundary_emulation")] | length) == 2 and
+  ([.runs[] | select(.plane == "hybrid")] | length) == 2 and
   .reproducibility.cpu_bitwise_reproducible == true and
   .reproducibility.cpu_boundary_emulation_bitwise_reproducible == true and
   .reproducibility.hybrid_bitwise_reproducible == true and
@@ -2184,8 +2187,9 @@ jq -e '
       (.plane_evidence.cpu_q4_boundary_emulation.enabled == true and
        (.plane_evidence.cpu_q4_boundary_emulation.routed_expert_dispatches ==
         .plane_evidence.routed_execution_delta.cpu_routed_expert_dispatches))
-    else
+    elif .plane == "hybrid" then
       .plane_evidence.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0}
+    else false
     end) and
   (.first_token_logits.cpu_top_16 | length) == 16 and
   (.first_token_logits.hybrid_top_16 | length) == 16
