@@ -1,5 +1,7 @@
 //! Math-backend module connecting GPU execution via wgpu and providing a CPU fallback.
 
+pub(crate) mod gpu_native;
+
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
@@ -5170,6 +5172,24 @@ impl ExecutionContext {
         self.gpu_backend
             .as_ref()
             .and_then(|backend| backend.gpu_expert_io_snapshot())
+    }
+
+    /// Construct the isolated GPU-native bootstrap from this context's exact
+    /// production GPU backend. No resolved execution plan selects this path;
+    /// callers must opt in through this crate-private seam.
+    #[allow(dead_code)]
+    pub(crate) fn create_gpu_native_executor_context(
+        &self,
+        d_model: usize,
+    ) -> std::result::Result<
+        gpu_native::GpuNativeExecutorContext,
+        gpu_native::GpuNativeBootstrapError,
+    > {
+        let backend = self
+            .gpu_backend
+            .as_ref()
+            .ok_or(gpu_native::GpuNativeBootstrapError::GpuBackendUnavailable)?;
+        gpu_native::GpuNativeExecutorContext::try_new(backend.clone(), d_model)
     }
 
     pub fn primary_backend(&self) -> &Arc<BackendBox> {
