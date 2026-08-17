@@ -1,8 +1,9 @@
 //! Isolated foundations for a future GPU-native token loop.
 //!
 //! This module is not reachable from current operator-facing execution modes.
-//! It owns request-local device state, persistent dense model weights, and
-//! encoder-only embedding/GEMV primitives on the authoritative WGPU device.
+//! It owns request-local device state, persistent dense/RMSNorm model weights,
+//! and encoder-only embedding, GEMV, RMSNorm, and residual primitives on the
+//! authoritative WGPU device.
 //! Later slices can compose those pieces without inheriting legacy host-shaped
 //! upload/readback APIs.
 
@@ -22,6 +23,7 @@ use std::sync::Arc;
 const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
+const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 
 /// Typed, fail-closed construction failure for the GPU-native bootstrap.
@@ -83,6 +85,31 @@ pub(crate) enum GpuNativeBootstrapError {
         actual_rows: usize,
         actual_cols: usize,
     },
+    InvalidRmsNormWeightWidth {
+        width: usize,
+    },
+    ForeignRmsNormHandle,
+    StaleRmsNormHandle {
+        key: String,
+    },
+    RmsNormWeightWidth {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidRmsNormGroups {
+        groups: usize,
+    },
+    InvalidRmsNormGroupWidth {
+        group_width: usize,
+    },
+    RmsNormGeometryOverflow {
+        groups: usize,
+        group_width: usize,
+    },
+    RmsNormScratchGeometry {
+        expected: usize,
+        actual: usize,
+    },
     InvalidScratchElements,
     ScratchSizeOverflow {
         elements: usize,
@@ -103,6 +130,10 @@ pub(crate) enum GpuNativeBootstrapError {
         vocab_size: usize,
     },
     EmbeddingWidth {
+        expected: usize,
+        actual: usize,
+    },
+    ResidualContributionWidth {
         expected: usize,
         actual: usize,
     },
@@ -196,6 +227,40 @@ impl fmt::Display for GpuNativeBootstrapError {
                 f,
                 "GPU-native dense weight {key:?} has shape [{actual_rows}, {actual_cols}], expected [{expected_rows}, {expected_cols}]"
             ),
+            Self::InvalidRmsNormWeightWidth { width } => write!(
+                f,
+                "GPU-native RMSNorm weight width must be non-zero, got {width}"
+            ),
+            Self::ForeignRmsNormHandle => write!(
+                f,
+                "GPU-native RMSNorm handle belongs to a different executor context"
+            ),
+            Self::StaleRmsNormHandle { key } => {
+                write!(f, "GPU-native RMSNorm handle for {key:?} is stale")
+            }
+            Self::RmsNormWeightWidth { expected, actual } => write!(
+                f,
+                "GPU-native RMSNorm weight width is {actual}, expected {expected}"
+            ),
+            Self::InvalidRmsNormGroups { groups } => write!(
+                f,
+                "GPU-native RMSNorm group count must be non-zero, got {groups}"
+            ),
+            Self::InvalidRmsNormGroupWidth { group_width } => write!(
+                f,
+                "GPU-native RMSNorm group width must be non-zero, got {group_width}"
+            ),
+            Self::RmsNormGeometryOverflow {
+                groups,
+                group_width,
+            } => write!(
+                f,
+                "GPU-native RMSNorm geometry {groups} x {group_width} overflows"
+            ),
+            Self::RmsNormScratchGeometry { expected, actual } => write!(
+                f,
+                "GPU-native RMSNorm scratch has {actual} elements, expected {expected}"
+            ),
             Self::InvalidScratchElements => {
                 write!(f, "GPU-native scratch length must be non-zero")
             }
@@ -232,6 +297,10 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::EmbeddingWidth { expected, actual } => write!(
                 f,
                 "GPU-native embedding width is {actual}, expected token-state width {expected}"
+            ),
+            Self::ResidualContributionWidth { expected, actual } => write!(
+                f,
+                "GPU-native residual contribution has {actual} elements, expected {expected}"
             ),
             Self::DispatchGeometryUnsupported {
                 workgroups,
@@ -581,6 +650,74 @@ impl GpuNativeDenseWeightPlan {
     }
 }
 
+/// Checked logical grouping for one RMSNorm dispatch. The shader launches one
+/// workgroup per group and reuses one `group_width`-element F32 gain vector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuNativeRmsNormGeometry {
+    groups: usize,
+    group_width: usize,
+    elements: usize,
+}
+
+impl GpuNativeRmsNormGeometry {
+    fn try_new(
+        groups: usize,
+        group_width: usize,
+        actual_elements: usize,
+        weight_width: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if groups == 0 {
+            return Err(GpuNativeBootstrapError::InvalidRmsNormGroups { groups });
+        }
+        if group_width == 0 {
+            return Err(GpuNativeBootstrapError::InvalidRmsNormGroupWidth { group_width });
+        }
+        let elements = groups.checked_mul(group_width).ok_or(
+            GpuNativeBootstrapError::RmsNormGeometryOverflow {
+                groups,
+                group_width,
+            },
+        )?;
+        if u32::try_from(groups).is_err()
+            || u32::try_from(group_width).is_err()
+            || u32::try_from(elements).is_err()
+        {
+            return Err(GpuNativeBootstrapError::RmsNormGeometryOverflow {
+                groups,
+                group_width,
+            });
+        }
+        if actual_elements != elements {
+            return Err(GpuNativeBootstrapError::RmsNormScratchGeometry {
+                expected: elements,
+                actual: actual_elements,
+            });
+        }
+        if weight_width != group_width {
+            return Err(GpuNativeBootstrapError::RmsNormWeightWidth {
+                expected: group_width,
+                actual: weight_width,
+            });
+        }
+        Ok(Self {
+            groups,
+            group_width,
+            elements,
+        })
+    }
+
+    fn checked_workgroups(self, limits: &wgpu::Limits) -> Result<u32, GpuNativeBootstrapError> {
+        let workgroups = self.groups as u64;
+        if workgroups > limits.max_compute_workgroups_per_dimension as u64 {
+            return Err(GpuNativeBootstrapError::DispatchGeometryUnsupported {
+                workgroups,
+                maximum: limits.max_compute_workgroups_per_dimension,
+            });
+        }
+        Ok(self.groups as u32)
+    }
+}
+
 /// Stable model-scoped key used to retrieve a registered dense tensor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct GpuNativeDenseWeightKey(Arc<str>);
@@ -615,6 +752,28 @@ impl GpuNativeDenseWeightHandle {
 
     pub(crate) const fn layout(&self) -> GpuNativeDenseWeightLayout {
         self.layout
+    }
+}
+
+/// Narrow semantic wrapper for a persistent F32 `[1, width]` gain vector.
+/// The underlying registry identity remains model-scoped and context-bound,
+/// while callers cannot accidentally use this handle as a matrix operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeRmsNormHandle {
+    dense: GpuNativeDenseWeightHandle,
+    width: usize,
+}
+
+impl GpuNativeRmsNormHandle {
+    fn from_dense(dense: GpuNativeDenseWeightHandle) -> Self {
+        Self {
+            width: dense.layout.cols,
+            dense,
+        }
+    }
+
+    pub(crate) const fn width(&self) -> usize {
+        self.width
     }
 }
 
@@ -719,6 +878,37 @@ impl<B> GpuNativeDenseWeightRegistry<B> {
             });
         }
         Ok(weight.handle(self.context_id))
+    }
+
+    fn resolve_rms_norm(
+        &self,
+        handle: &GpuNativeRmsNormHandle,
+    ) -> Result<Arc<GpuNativeDenseWeight<B>>, GpuNativeBootstrapError> {
+        if handle.dense.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignRmsNormHandle);
+        }
+        let weight = self.weights.get(&handle.dense.key).ok_or_else(|| {
+            GpuNativeBootstrapError::MissingDenseWeight {
+                key: handle.dense.key.as_str().to_string(),
+            }
+        })?;
+        if weight.weight_id != handle.dense.weight_id
+            || weight.layout != handle.dense.layout
+            || handle.width != handle.dense.layout.cols
+        {
+            return Err(GpuNativeBootstrapError::StaleRmsNormHandle {
+                key: handle.dense.key.as_str().to_string(),
+            });
+        }
+        if weight.layout.kind != GpuNativeDenseWeightKind::F32
+            || weight.layout.rows != 1
+            || weight.layout.cols != handle.width
+        {
+            return Err(GpuNativeBootstrapError::StaleRmsNormHandle {
+                key: handle.dense.key.as_str().to_string(),
+            });
+        }
+        Ok(weight.clone())
     }
 }
 
@@ -946,6 +1136,43 @@ impl<B> fmt::Debug for GpuNativeTokenState<B> {
     }
 }
 
+fn validate_token_state_owner(
+    context_id: u64,
+    state_context_id: u64,
+) -> Result<(), GpuNativeBootstrapError> {
+    if state_context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignTokenState);
+    }
+    Ok(())
+}
+
+fn validate_scratch_owner(
+    context_id: u64,
+    scratch_context_id: u64,
+) -> Result<(), GpuNativeBootstrapError> {
+    if scratch_context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignScratch);
+    }
+    Ok(())
+}
+
+fn validate_residual_contribution_width(
+    expected: usize,
+    actual: usize,
+) -> Result<(), GpuNativeBootstrapError> {
+    if actual != expected {
+        return Err(GpuNativeBootstrapError::ResidualContributionWidth { expected, actual });
+    }
+    Ok(())
+}
+
+fn validate_rms_norm_weight_width(width: usize) -> Result<(), GpuNativeBootstrapError> {
+    if width == 0 {
+        return Err(GpuNativeBootstrapError::InvalidRmsNormWeightWidth { width });
+    }
+    Ok(())
+}
+
 /// Immutable, serializable evidence for GPU-native execution boundaries.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeExecutionSnapshot {
@@ -957,6 +1184,11 @@ pub(crate) struct GpuNativeExecutionSnapshot {
     pub(crate) dense_gemv_dispatches: u64,
     pub(crate) dense_gemv_chunk_dispatches: u64,
     pub(crate) embedding_dispatches: u64,
+    pub(crate) rms_norm_dispatches: u64,
+    pub(crate) rms_norm_groups: u64,
+    pub(crate) rms_norm_state_dispatches: u64,
+    pub(crate) rms_norm_scratch_dispatches: u64,
+    pub(crate) residual_add_dispatches: u64,
     pub(crate) tokens_submitted: u64,
     pub(crate) tokens_completed: u64,
     pub(crate) layers_encoded: u64,
@@ -985,6 +1217,11 @@ struct GpuNativeExecutionCounters {
     dense_gemv_dispatches: AtomicU64,
     dense_gemv_chunk_dispatches: AtomicU64,
     embedding_dispatches: AtomicU64,
+    rms_norm_dispatches: AtomicU64,
+    rms_norm_groups: AtomicU64,
+    rms_norm_state_dispatches: AtomicU64,
+    rms_norm_scratch_dispatches: AtomicU64,
+    residual_add_dispatches: AtomicU64,
     tokens_submitted: AtomicU64,
     tokens_completed: AtomicU64,
     layers_encoded: AtomicU64,
@@ -1014,6 +1251,11 @@ impl GpuNativeExecutionCounters {
             dense_gemv_dispatches: self.dense_gemv_dispatches.load(Ordering::Relaxed),
             dense_gemv_chunk_dispatches: self.dense_gemv_chunk_dispatches.load(Ordering::Relaxed),
             embedding_dispatches: self.embedding_dispatches.load(Ordering::Relaxed),
+            rms_norm_dispatches: self.rms_norm_dispatches.load(Ordering::Relaxed),
+            rms_norm_groups: self.rms_norm_groups.load(Ordering::Relaxed),
+            rms_norm_state_dispatches: self.rms_norm_state_dispatches.load(Ordering::Relaxed),
+            rms_norm_scratch_dispatches: self.rms_norm_scratch_dispatches.load(Ordering::Relaxed),
+            residual_add_dispatches: self.residual_add_dispatches.load(Ordering::Relaxed),
             tokens_submitted: self.tokens_submitted.load(Ordering::Relaxed),
             tokens_completed: self.tokens_completed.load(Ordering::Relaxed),
             layers_encoded: self.layers_encoded.load(Ordering::Relaxed),
@@ -1056,6 +1298,24 @@ impl GpuNativeExecutionCounters {
         self.embedding_dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_rms_norm_state_dispatch(&self, groups: u64) {
+        self.rms_norm_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.rms_norm_groups.fetch_add(groups, Ordering::Relaxed);
+        self.rms_norm_state_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rms_norm_scratch_dispatch(&self, groups: u64) {
+        self.rms_norm_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.rms_norm_groups.fetch_add(groups, Ordering::Relaxed);
+        self.rms_norm_scratch_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_residual_add_dispatch(&self) {
+        self.residual_add_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     fn record_token_boundary_readback(&self) {
         self.token_boundary_readbacks
@@ -1084,6 +1344,15 @@ struct GpuNativeEmbeddingPushConstants {
     global_row: u32,
     cols: u32,
     q8_first_block: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeRmsNormPushConstants {
+    groups: u32,
+    group_width: u32,
+    epsilon_bits: u32,
+    _reserved: u32,
 }
 
 struct GpuNativeDensePipelines {
@@ -1221,6 +1490,125 @@ impl GpuNativeDensePipelines {
     }
 }
 
+struct GpuNativeStatePipelines {
+    rms_capture_bind_group_layout: wgpu::BindGroupLayout,
+    rms_in_place_bind_group_layout: wgpu::BindGroupLayout,
+    rms_capture: wgpu::ComputePipeline,
+    rms_in_place: wgpu::ComputePipeline,
+    residual_add: wgpu::ComputePipeline,
+}
+
+impl GpuNativeStatePipelines {
+    fn new(device: &wgpu::Device) -> Self {
+        let read_only_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let read_write_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let rms_capture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_rms_capture_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_only_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                ],
+            });
+        let rms_in_place_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_rms_in_place_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_only_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                ],
+            });
+        let pipeline_layout = |label, bind_group_layout: &wgpu::BindGroupLayout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[bind_group_layout],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..16,
+                }],
+            })
+        };
+        let capture_pipeline_layout = pipeline_layout(
+            "gpu_native_rms_capture_pipeline_layout",
+            &rms_capture_bind_group_layout,
+        );
+        let in_place_pipeline_layout = pipeline_layout(
+            "gpu_native_rms_in_place_pipeline_layout",
+            &rms_in_place_bind_group_layout,
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_rmsnorm_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_RMSNORM_SHADER.into()),
+        });
+        let pipeline =
+            |label: &'static str, layout: &wgpu::PipelineLayout, entry_point: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(layout),
+                    module: &module,
+                    entry_point,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                })
+            };
+        let rms_capture = pipeline(
+            "gpu_native_rms_capture_pipeline",
+            &capture_pipeline_layout,
+            "rms_norm_capture_main",
+        );
+        let rms_in_place = pipeline(
+            "gpu_native_rms_in_place_pipeline",
+            &in_place_pipeline_layout,
+            "rms_norm_in_place_main",
+        );
+        let residual_add = pipeline(
+            "gpu_native_residual_add_pipeline",
+            &capture_pipeline_layout,
+            "residual_add_main",
+        );
+        Self {
+            rms_capture_bind_group_layout,
+            rms_in_place_bind_group_layout,
+            rms_capture,
+            rms_in_place,
+            residual_add,
+        }
+    }
+}
+
 /// Internal bootstrap for future GPU-owned token execution.
 ///
 /// Retaining the exact `Arc<BackendBox>` keeps the authoritative non-cloneable
@@ -1233,6 +1621,7 @@ pub(crate) struct GpuNativeExecutorContext {
     layout: GpuNativeTokenStateLayout,
     dense_weights: ParkingMutex<GpuNativeDenseWeightRegistry>,
     dense_pipelines: GpuNativeDensePipelines,
+    state_pipelines: GpuNativeStatePipelines,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -1258,6 +1647,7 @@ impl GpuNativeExecutorContext {
         let device_identity = gpu.gpu_device_identity();
         let context_id = next_nonzero_id(&NEXT_GPU_NATIVE_CONTEXT_ID, "context");
         let dense_pipelines = GpuNativeDensePipelines::new(&gpu.device);
+        let state_pipelines = GpuNativeStatePipelines::new(&gpu.device);
 
         Ok(Self {
             context_id,
@@ -1266,6 +1656,7 @@ impl GpuNativeExecutorContext {
             layout,
             dense_weights: ParkingMutex::new(GpuNativeDenseWeightRegistry::new(context_id)),
             dense_pipelines,
+            state_pipelines,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -1400,6 +1791,20 @@ impl GpuNativeExecutorContext {
         Ok(handle)
     }
 
+    /// Register one immutable RMSNorm gain vector in the existing persistent
+    /// F32 dense-weight registry. The typed handle deliberately exposes no
+    /// matrix interface.
+    pub(crate) fn register_rms_norm(
+        &self,
+        key: GpuNativeDenseWeightKey,
+        weight: &[f32],
+    ) -> Result<GpuNativeRmsNormHandle, GpuNativeBootstrapError> {
+        validate_rms_norm_weight_width(weight.len())?;
+        let dense = DenseWeight::from_f32(weight.to_vec(), 1, weight.len());
+        self.register_dense_weight(key, &dense)
+            .map(GpuNativeRmsNormHandle::from_dense)
+    }
+
     pub(crate) fn dense_weight_handle(
         &self,
         key: &GpuNativeDenseWeightKey,
@@ -1410,6 +1815,18 @@ impl GpuNativeExecutorContext {
         self.dense_weights
             .lock()
             .handle_for(key, expected_kind, expected_rows, expected_cols)
+    }
+
+    pub(crate) fn rms_norm_handle(
+        &self,
+        key: &GpuNativeDenseWeightKey,
+        expected_width: usize,
+    ) -> Result<GpuNativeRmsNormHandle, GpuNativeBootstrapError> {
+        validate_rms_norm_weight_width(expected_width)?;
+        self.dense_weights
+            .lock()
+            .handle_for(key, GpuNativeDenseWeightKind::F32, 1, expected_width)
+            .map(GpuNativeRmsNormHandle::from_dense)
     }
 
     pub(crate) fn create_scratch(
@@ -1646,6 +2063,229 @@ impl GpuNativeExecutorContext {
         Ok(())
     }
 
+    /// Preserve the current residual stream and RMS-normalise hidden in one
+    /// dispatch: `residual = old hidden`, `hidden = rms_norm(old hidden)`.
+    pub(crate) fn encode_rms_norm_state_in_place(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &GpuNativeRmsNormHandle,
+        epsilon: f32,
+        state: &GpuNativeTokenState,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        self.encode_rms_norm_buffers(
+            encoder,
+            handle,
+            epsilon,
+            &state.hidden,
+            state.layout.d_model,
+            Some(&state.residual),
+            1,
+            state.layout.d_model,
+            false,
+        )
+    }
+
+    /// Apply final-model RMSNorm to hidden without changing the saved residual.
+    pub(crate) fn encode_rms_norm_hidden_in_place(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &GpuNativeRmsNormHandle,
+        epsilon: f32,
+        state: &GpuNativeTokenState,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        self.encode_rms_norm_buffers(
+            encoder,
+            handle,
+            epsilon,
+            &state.hidden,
+            state.layout.d_model,
+            None,
+            1,
+            state.layout.d_model,
+            false,
+        )
+    }
+
+    /// RMS-normalise each logical scratch group independently using a shared
+    /// `group_width`-element gain vector.
+    pub(crate) fn encode_rms_norm_scratch_in_place(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &GpuNativeRmsNormHandle,
+        epsilon: f32,
+        scratch: &GpuNativeScratch,
+        groups: usize,
+        group_width: usize,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_scratch_owner(self.context_id, scratch.context_id)?;
+        self.encode_rms_norm_buffers(
+            encoder,
+            handle,
+            epsilon,
+            &scratch.buffer,
+            scratch.layout.elements,
+            None,
+            groups,
+            group_width,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rms_norm_buffers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &GpuNativeRmsNormHandle,
+        epsilon: f32,
+        target: &wgpu::Buffer,
+        target_elements: usize,
+        residual: Option<&wgpu::Buffer>,
+        groups: usize,
+        group_width: usize,
+        scratch_dispatch: bool,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let weight = self.dense_weights.lock().resolve_rms_norm(handle)?;
+        let geometry = GpuNativeRmsNormGeometry::try_new(
+            groups,
+            group_width,
+            target_elements,
+            weight.layout.cols,
+        )?;
+        let workgroups = geometry.checked_workgroups(&gpu.device.limits())?;
+        let chunk = match weight.chunks.as_slice() {
+            [chunk] => chunk,
+            _ => {
+                return Err(GpuNativeBootstrapError::StaleRmsNormHandle {
+                    key: handle.dense.key.as_str().to_string(),
+                });
+            }
+        };
+        let push_constants = GpuNativeRmsNormPushConstants {
+            groups: geometry.groups as u32,
+            group_width: geometry.group_width as u32,
+            epsilon_bits: epsilon.to_bits(),
+            _reserved: 0,
+        };
+
+        match residual {
+            Some(residual) => {
+                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gpu_native_rms_capture_bind_group"),
+                    layout: &self.state_pipelines.rms_capture_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: chunk.buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: target.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: residual.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_rms_capture_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.state_pipelines.rms_capture);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&push_constants));
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            None => {
+                let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gpu_native_rms_in_place_bind_group"),
+                    layout: &self.state_pipelines.rms_in_place_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: chunk.buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: target.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_rms_in_place_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.state_pipelines.rms_in_place);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&push_constants));
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+        }
+        if scratch_dispatch {
+            self.counters
+                .record_rms_norm_scratch_dispatch(geometry.groups as u64);
+        } else {
+            self.counters
+                .record_rms_norm_state_dispatch(geometry.groups as u64);
+        }
+        Ok(())
+    }
+
+    /// Complete a prepared sub-block entirely on device:
+    /// `hidden = residual + contribution`.
+    pub(crate) fn encode_residual_add_scratch_to_hidden(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        state: &GpuNativeTokenState,
+        contribution: &GpuNativeScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        validate_scratch_owner(self.context_id, contribution.context_id)?;
+        validate_residual_contribution_width(state.layout.d_model, contribution.layout.elements)?;
+        let gpu = self.authoritative_gpu()?;
+        let workgroups = self.checked_workgroups(state.layout.d_model, &gpu.device.limits())?;
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_residual_add_bind_group"),
+            layout: &self.state_pipelines.rms_capture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: contribution.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: state.hidden.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state.residual.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_residual_add_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.state_pipelines.residual_add);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_push_constants(
+            0,
+            bytemuck::bytes_of(&GpuNativeRmsNormPushConstants {
+                groups: 1,
+                group_width: state.layout.d_model as u32,
+                epsilon_bits: 0,
+                _reserved: 0,
+            }),
+        );
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        drop(pass);
+        self.counters.record_residual_add_dispatch();
+        Ok(())
+    }
+
     fn authoritative_gpu(&self) -> Result<&super::GpuBackend, GpuNativeBootstrapError> {
         let gpu = match self.authoritative_backend.as_ref() {
             BackendBox::Gpu(gpu) => gpu,
@@ -1763,6 +2403,53 @@ mod tests {
                 "index {index}: actual={actual}, expected={expected}, tolerance={tolerance}"
             );
         }
+    }
+
+    fn rms_norm_mirror(
+        values: &[f32],
+        weight: &[f32],
+        epsilon: f32,
+        groups: usize,
+        group_width: usize,
+    ) -> Vec<f32> {
+        assert_eq!(values.len(), groups * group_width);
+        assert_eq!(weight.len(), group_width);
+        let mut result = values.to_vec();
+        for group in result.chunks_exact_mut(group_width) {
+            let mut squared_sum = 0.0f32;
+            for &value in group.iter() {
+                squared_sum += value * value;
+            }
+            let mean_square = squared_sum / group_width as f32;
+            let inverse_rms = 1.0 / (mean_square + epsilon).sqrt();
+            for (value, gain) in group.iter_mut().zip(weight) {
+                *value = *value * inverse_rms * *gain;
+            }
+        }
+        result
+    }
+
+    fn residual_add_mirror(residual: &[f32], contribution: &[f32]) -> Vec<f32> {
+        residual
+            .iter()
+            .zip(contribution)
+            .map(|(&residual, &contribution)| residual + contribution)
+            .collect()
+    }
+
+    fn rms_norm_capture_mirror(
+        hidden: &mut Vec<f32>,
+        residual: &mut Vec<f32>,
+        weight: &[f32],
+        epsilon: f32,
+    ) {
+        residual.clone_from(hidden);
+        let width = hidden.len();
+        *hidden = rms_norm_mirror(hidden, weight, epsilon, 1, width);
+    }
+
+    fn residual_complete_mirror(hidden: &mut Vec<f32>, residual: &[f32], contribution: &[f32]) {
+        *hidden = residual_add_mirror(residual, contribution);
     }
 
     fn test_weight<B>(
@@ -2059,6 +2746,274 @@ mod tests {
     }
 
     #[test]
+    fn rms_norm_mirror_is_exactly_the_cpu_reference_for_required_widths() {
+        for width in [1usize, 7, 65, 2_048] {
+            let values = (0..width)
+                .map(|index| ((index * 17 % 41) as f32 - 20.0) / 9.0)
+                .collect::<Vec<_>>();
+            let weight = (0..width)
+                .map(|index| 0.75 + (index * 11 % 13) as f32 / 20.0)
+                .collect::<Vec<_>>();
+            let epsilon = 1e-6;
+            let expected =
+                crate::transformer::RmsNorm::new(weight.clone(), epsilon).forward(&values);
+            assert_eq!(
+                rms_norm_mirror(&values, &weight, epsilon, 1, width),
+                expected,
+                "width={width} must preserve the scalar f32 accumulation contract"
+            );
+        }
+
+        let zero = vec![0.0; 7];
+        assert_eq!(rms_norm_mirror(&zero, &[1.0; 7], 1e-6, 1, 7), zero);
+    }
+
+    #[test]
+    fn grouped_rms_norm_matches_per_head_cpu_reference_and_isolates_boundaries() {
+        let groups = 4;
+        let group_width = 7;
+        let epsilon = 1e-5;
+        let weight = (0..group_width)
+            .map(|index| 0.5 + index as f32 / 7.0)
+            .collect::<Vec<_>>();
+        let values = (0..groups * group_width)
+            .map(|index| ((index * 19 % 37) as f32 - 18.0) / 5.0)
+            .collect::<Vec<_>>();
+        let actual = rms_norm_mirror(&values, &weight, epsilon, groups, group_width);
+        let norm = crate::transformer::RmsNorm::new(weight.clone(), epsilon);
+        let expected = values
+            .chunks_exact(group_width)
+            .flat_map(|group| norm.forward(group))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let mut changed_last_group = values.clone();
+        changed_last_group[3 * group_width..].fill(10_000.0);
+        let changed = rms_norm_mirror(&changed_last_group, &weight, epsilon, groups, group_width);
+        assert_eq!(
+            &actual[..3 * group_width],
+            &changed[..3 * group_width],
+            "one Q/K head must not affect another head's RMS reduction"
+        );
+    }
+
+    #[test]
+    fn rms_norm_geometry_fails_closed_for_every_invalid_shape() {
+        assert_eq!(
+            validate_rms_norm_weight_width(0),
+            Err(GpuNativeBootstrapError::InvalidRmsNormWeightWidth { width: 0 })
+        );
+        assert_eq!(validate_rms_norm_weight_width(2_048), Ok(()));
+        assert_eq!(
+            GpuNativeRmsNormGeometry::try_new(0, 7, 0, 7),
+            Err(GpuNativeBootstrapError::InvalidRmsNormGroups { groups: 0 })
+        );
+        assert_eq!(
+            GpuNativeRmsNormGeometry::try_new(3, 0, 0, 0),
+            Err(GpuNativeBootstrapError::InvalidRmsNormGroupWidth { group_width: 0 })
+        );
+        assert_eq!(
+            GpuNativeRmsNormGeometry::try_new(usize::MAX, 2, 0, 2),
+            Err(GpuNativeBootstrapError::RmsNormGeometryOverflow {
+                groups: usize::MAX,
+                group_width: 2,
+            })
+        );
+        if usize::BITS > u32::BITS {
+            let groups = u32::MAX as usize + 1;
+            assert_eq!(
+                GpuNativeRmsNormGeometry::try_new(groups, 1, groups, 1),
+                Err(GpuNativeBootstrapError::RmsNormGeometryOverflow {
+                    groups,
+                    group_width: 1,
+                })
+            );
+        }
+        assert_eq!(
+            GpuNativeRmsNormGeometry::try_new(3, 7, 20, 7),
+            Err(GpuNativeBootstrapError::RmsNormScratchGeometry {
+                expected: 21,
+                actual: 20,
+            })
+        );
+        assert_eq!(
+            GpuNativeRmsNormGeometry::try_new(3, 7, 21, 8),
+            Err(GpuNativeBootstrapError::RmsNormWeightWidth {
+                expected: 7,
+                actual: 8,
+            })
+        );
+        let geometry = GpuNativeRmsNormGeometry::try_new(4, 7, 28, 7).unwrap();
+        let limits = wgpu::Limits {
+            max_compute_workgroups_per_dimension: 3,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            geometry.checked_workgroups(&limits),
+            Err(GpuNativeBootstrapError::DispatchGeometryUnsupported {
+                workgroups: 4,
+                maximum: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn typed_rms_norm_handles_reuse_persistent_f32_registry_and_fail_closed() {
+        let layout =
+            GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 1, 7, 28).unwrap();
+        let mut registry = GpuNativeDenseWeightRegistry::new(41);
+        let dense = registry
+            .insert(test_weight(7, "layer.0.rms_attn", layout, ()))
+            .unwrap();
+        let handle = GpuNativeRmsNormHandle::from_dense(dense.clone());
+        assert_eq!(handle.width(), 7);
+        let first = registry.resolve_rms_norm(&handle).unwrap();
+        let second = registry.resolve_rms_norm(&handle).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(registry.weights.len(), 1);
+
+        let foreign_registry = GpuNativeDenseWeightRegistry::<()>::new(42);
+        assert!(matches!(
+            foreign_registry.resolve_rms_norm(&handle),
+            Err(GpuNativeBootstrapError::ForeignRmsNormHandle)
+        ));
+
+        let mut stale = handle.clone();
+        stale.dense.weight_id += 1;
+        assert!(matches!(
+            registry.resolve_rms_norm(&stale),
+            Err(GpuNativeBootstrapError::StaleRmsNormHandle { .. })
+        ));
+
+        let mut wrong_width = handle.clone();
+        wrong_width.width = 6;
+        assert!(matches!(
+            registry.resolve_rms_norm(&wrong_width),
+            Err(GpuNativeBootstrapError::StaleRmsNormHandle { .. })
+        ));
+        assert_eq!(
+            registry.handle_for(dense.key(), GpuNativeDenseWeightKind::F32, 1, 6,),
+            Err(GpuNativeBootstrapError::DenseWeightShapeMismatch {
+                key: "layer.0.rms_attn".to_string(),
+                expected_rows: 1,
+                expected_cols: 6,
+                actual_rows: 1,
+                actual_cols: 7,
+            })
+        );
+
+        let q8_layout = GpuNativeDenseWeightLayout::try_new(
+            GpuNativeDenseWeightKind::Q8_0,
+            1,
+            32,
+            Q8_0_BLOCK_BYTES,
+        )
+        .unwrap();
+        let q8_dense = registry
+            .insert(test_weight(8, "invalid.q8_norm", q8_layout, ()))
+            .unwrap();
+        let q8_handle = GpuNativeRmsNormHandle::from_dense(q8_dense);
+        assert!(matches!(
+            registry.resolve_rms_norm(&q8_handle),
+            Err(GpuNativeBootstrapError::StaleRmsNormHandle { .. })
+        ));
+    }
+
+    #[test]
+    fn new_state_operations_reject_foreign_request_ownership() {
+        assert_eq!(validate_token_state_owner(7, 7), Ok(()));
+        assert_eq!(validate_scratch_owner(7, 7), Ok(()));
+        assert_eq!(
+            validate_token_state_owner(7, 8),
+            Err(GpuNativeBootstrapError::ForeignTokenState)
+        );
+        assert_eq!(
+            validate_scratch_owner(7, 8),
+            Err(GpuNativeBootstrapError::ForeignScratch)
+        );
+        assert_eq!(validate_residual_contribution_width(2_048, 2_048), Ok(()));
+        assert_eq!(
+            validate_residual_contribution_width(2_048, 1_024),
+            Err(GpuNativeBootstrapError::ResidualContributionWidth {
+                expected: 2_048,
+                actual: 1_024,
+            })
+        );
+    }
+
+    #[test]
+    fn hardware_independent_residual_chain_preserves_every_state_transition() {
+        const WIDTH: usize = 7;
+        let embedding = DenseWeight::from_f32(
+            (0..3 * WIDTH)
+                .map(|index| ((index * 13 % 29) as f32 - 14.0) / 6.0)
+                .collect(),
+            3,
+            WIDTH,
+        );
+        let first_dense = DenseWeight::from_f32(
+            (0..WIDTH * WIDTH)
+                .map(|index| ((index * 17 % 31) as f32 - 15.0) / 23.0)
+                .collect(),
+            WIDTH,
+            WIDTH,
+        );
+        let second_dense = DenseWeight::from_f32(
+            (0..WIDTH * WIDTH)
+                .map(|index| ((index * 19 % 37) as f32 - 18.0) / 29.0)
+                .collect(),
+            WIDTH,
+            WIDTH,
+        );
+        let first_gain = (0..WIDTH)
+            .map(|index| 0.7 + index as f32 / 20.0)
+            .collect::<Vec<_>>();
+        let second_gain = (0..WIDTH)
+            .map(|index| 0.9 - index as f32 / 30.0)
+            .collect::<Vec<_>>();
+        let final_gain = (0..WIDTH)
+            .map(|index| 1.1 + index as f32 / 40.0)
+            .collect::<Vec<_>>();
+        let epsilon = 1e-6;
+
+        let mut hidden = Vec::new();
+        embedding.row_dequant_into(1, &mut hidden);
+
+        let original_hidden = hidden.clone();
+        let mut residual = vec![f32::NAN; WIDTH];
+        rms_norm_capture_mirror(&mut hidden, &mut residual, &first_gain, epsilon);
+        assert_eq!(residual, original_hidden);
+        assert_eq!(
+            hidden,
+            rms_norm_mirror(&original_hidden, &first_gain, epsilon, 1, WIDTH)
+        );
+        let first_contribution = first_dense.matvec(&hidden);
+        residual_complete_mirror(&mut hidden, &residual, &first_contribution);
+        assert_eq!(
+            hidden,
+            original_hidden
+                .iter()
+                .zip(&first_contribution)
+                .map(|(&residual, &contribution)| residual + contribution)
+                .collect::<Vec<_>>()
+        );
+
+        let before_second_norm = hidden.clone();
+        rms_norm_capture_mirror(&mut hidden, &mut residual, &second_gain, epsilon);
+        assert_eq!(residual, before_second_norm);
+        let second_contribution = second_dense.matvec(&hidden);
+        residual_complete_mirror(&mut hidden, &residual, &second_contribution);
+        let before_final_norm = hidden.clone();
+        let residual_before_final_norm = residual.clone();
+        hidden = rms_norm_mirror(&hidden, &final_gain, epsilon, 1, WIDTH);
+
+        assert_eq!(residual, residual_before_final_norm);
+        assert_eq!(before_final_norm.len(), WIDTH);
+        assert_eq!(hidden.len(), WIDTH);
+        assert!(hidden.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn registry_missing_duplicate_kind_shape_and_context_checks_fail_closed() {
         let f32_layout =
             GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 3, 5, 60).unwrap();
@@ -2203,12 +3158,22 @@ mod tests {
         counters.record_dense_gemv_dispatch(3);
         counters.record_dense_gemv_dispatch(2);
         counters.record_embedding_dispatch();
+        counters.record_rms_norm_state_dispatch(1);
+        counters.record_rms_norm_state_dispatch(1);
+        counters.record_rms_norm_scratch_dispatch(4);
+        counters.record_residual_add_dispatch();
+        counters.record_residual_add_dispatch();
         let after_dispatch = counters.snapshot();
         assert_eq!(after_dispatch.dense_weight_uploads, 3);
         assert_eq!(after_dispatch.dense_weight_upload_bytes, 108);
         assert_eq!(after_dispatch.dense_gemv_dispatches, 2);
         assert_eq!(after_dispatch.dense_gemv_chunk_dispatches, 5);
         assert_eq!(after_dispatch.embedding_dispatches, 1);
+        assert_eq!(after_dispatch.rms_norm_dispatches, 3);
+        assert_eq!(after_dispatch.rms_norm_groups, 6);
+        assert_eq!(after_dispatch.rms_norm_state_dispatches, 2);
+        assert_eq!(after_dispatch.rms_norm_scratch_dispatches, 1);
+        assert_eq!(after_dispatch.residual_add_dispatches, 2);
     }
 
     #[test]
@@ -2221,6 +3186,14 @@ mod tests {
             (
                 GPU_NATIVE_EMBEDDING_SHADER,
                 &["f32_embedding_main", "q8_0_embedding_main"][..],
+            ),
+            (
+                GPU_NATIVE_RMSNORM_SHADER,
+                &[
+                    "rms_norm_capture_main",
+                    "rms_norm_in_place_main",
+                    "residual_add_main",
+                ][..],
             ),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
@@ -2661,6 +3634,316 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(
             completed.dense_weight_upload_bytes,
             registered.dense_weight_upload_bytes
+        );
+        assert_eq!(completed.intermediate_maps, 0);
+        assert_eq!(completed.intermediate_readbacks, 0);
+    }
+
+    /// Requires an actual NVIDIA L4 WGPU adapter. All production operations
+    /// share one caller-owned encoder; validation maps only a four-byte status.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_rmsnorm_residual_chain() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::inference::WeightDtype;
+
+        const WIDTH: usize = 65;
+        const GROUPS: usize = 3;
+        const GROUP_WIDTH: usize = 67;
+        const EPSILON: f32 = 1e-6;
+
+        let expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024 * 1024,
+            0.5,
+            16,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 8,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 8,
+                v_head_dim: 8,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: 32,
+                d_ff: 64,
+            },
+            expert_cache,
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = execution
+            .create_gpu_native_executor_context(WIDTH)
+            .expect("GPU-native executor must retain the authoritative backend");
+        let gpu = executor.authoritative_gpu().unwrap();
+
+        let first_gain = (0..WIDTH)
+            .map(|index| 0.75 + (index * 7 % 17) as f32 / 40.0)
+            .collect::<Vec<_>>();
+        let second_gain = (0..WIDTH)
+            .map(|index| 0.9 + (index * 11 % 19) as f32 / 50.0)
+            .collect::<Vec<_>>();
+        let final_gain = (0..WIDTH)
+            .map(|index| 1.05 - (index * 5 % 13) as f32 / 60.0)
+            .collect::<Vec<_>>();
+        let grouped_gain = (0..GROUP_WIDTH)
+            .map(|index| 0.8 + (index * 13 % 23) as f32 / 55.0)
+            .collect::<Vec<_>>();
+
+        let first_norm = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.norm.first").unwrap(),
+                &first_gain,
+            )
+            .unwrap();
+        let second_norm = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.norm.second").unwrap(),
+                &second_gain,
+            )
+            .unwrap();
+        let final_norm = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.norm.final").unwrap(),
+                &final_gain,
+            )
+            .unwrap();
+        let grouped_norm = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.norm.grouped").unwrap(),
+                &grouped_gain,
+            )
+            .unwrap();
+        let norm_registered = executor.execution_snapshot();
+        assert_eq!(norm_registered.dense_weights_registered, 4);
+        assert_eq!(norm_registered.dense_weight_uploads, 4);
+
+        let embedding = DenseWeight::from_f32(
+            (0..3 * WIDTH)
+                .map(|index| ((index * 13 % 43) as f32 - 21.0) / 8.0)
+                .collect(),
+            3,
+            WIDTH,
+        );
+        let first_dense = DenseWeight::from_f32(
+            (0..WIDTH * WIDTH)
+                .map(|index| ((index * 17 % 47) as f32 - 23.0) / 97.0)
+                .collect(),
+            WIDTH,
+            WIDTH,
+        );
+        let second_dense_values = (0..WIDTH * WIDTH)
+            .map(|index| ((index * 19 % 53) as f32 - 26.0) / 89.0)
+            .collect::<Vec<_>>();
+        let second_dense =
+            DenseWeight::from_q8_0_bytes(q8_bytes(&second_dense_values), WIDTH, WIDTH).unwrap();
+        let embedding_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.chain.embedding").unwrap(),
+                &embedding,
+            )
+            .unwrap();
+        let first_dense_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.chain.first_dense").unwrap(),
+                &first_dense,
+            )
+            .unwrap();
+        let second_dense_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.chain.second_dense").unwrap(),
+                &second_dense,
+            )
+            .unwrap();
+        let registered = executor.execution_snapshot();
+        assert_eq!(registered.dense_weights_registered, 7);
+        assert_eq!(registered.dense_weight_uploads, 7);
+
+        let mut expected_hidden = Vec::new();
+        embedding.row_dequant_into(1, &mut expected_hidden);
+        let first_residual = expected_hidden.clone();
+        expected_hidden =
+            crate::transformer::RmsNorm::new(first_gain, EPSILON).forward(&expected_hidden);
+        let first_contribution = first_dense.matvec(&expected_hidden);
+        expected_hidden = residual_add_mirror(&first_residual, &first_contribution);
+        let expected_residual = expected_hidden.clone();
+        expected_hidden =
+            crate::transformer::RmsNorm::new(second_gain, EPSILON).forward(&expected_hidden);
+        let second_contribution = second_dense.matvec(&expected_hidden);
+        expected_hidden = residual_add_mirror(&expected_residual, &second_contribution);
+        expected_hidden =
+            crate::transformer::RmsNorm::new(final_gain, EPSILON).forward(&expected_hidden);
+
+        let grouped_input = (0..GROUPS * GROUP_WIDTH)
+            .map(|index| ((index * 23 % 59) as f32 - 29.0) / 11.0)
+            .collect::<Vec<_>>();
+        let grouped_expected = grouped_input
+            .chunks_exact(GROUP_WIDTH)
+            .flat_map(|group| {
+                crate::transformer::RmsNorm::new(grouped_gain.clone(), EPSILON).forward(group)
+            })
+            .collect::<Vec<_>>();
+
+        let state = executor.create_token_state().unwrap();
+        let contribution = executor.create_scratch(WIDTH).unwrap();
+        let grouped = executor.create_scratch(GROUPS * GROUP_WIDTH).unwrap();
+        gpu.queue
+            .write_buffer(&grouped.buffer, 0, bytemuck::cast_slice(&grouped_input));
+        let expected_hidden_buffer = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_rms_chain_expected_hidden",
+            &expected_hidden,
+        );
+        let expected_residual_buffer = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_rms_chain_expected_residual",
+            &expected_residual,
+        );
+        let grouped_expected_buffer = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_grouped_rms_expected",
+            &grouped_expected,
+        );
+        let status = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_rms_chain_validation_status"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(&status, 0, &[0; 4]);
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_rms_chain_validation_staging"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_rms_chain_live_l4_encoder"),
+            });
+
+        executor
+            .encode_embedding_lookup(&mut encoder, &embedding_handle, 1, &state)
+            .unwrap();
+        executor
+            .encode_rms_norm_state_in_place(&mut encoder, &first_norm, EPSILON, &state)
+            .unwrap();
+        executor
+            .encode_dense_gemv_hidden_to_scratch(
+                &mut encoder,
+                &first_dense_handle,
+                &state,
+                &contribution,
+            )
+            .unwrap();
+        executor
+            .encode_residual_add_scratch_to_hidden(&mut encoder, &state, &contribution)
+            .unwrap();
+        executor
+            .encode_rms_norm_state_in_place(&mut encoder, &second_norm, EPSILON, &state)
+            .unwrap();
+        executor
+            .encode_dense_gemv_hidden_to_scratch(
+                &mut encoder,
+                &second_dense_handle,
+                &state,
+                &contribution,
+            )
+            .unwrap();
+        executor
+            .encode_residual_add_scratch_to_hidden(&mut encoder, &state, &contribution)
+            .unwrap();
+        executor
+            .encode_rms_norm_hidden_in_place(&mut encoder, &final_norm, EPSILON, &state)
+            .unwrap();
+        executor
+            .encode_rms_norm_scratch_in_place(
+                &mut encoder,
+                &grouped_norm,
+                EPSILON,
+                &grouped,
+                GROUPS,
+                GROUP_WIDTH,
+            )
+            .unwrap();
+
+        for (actual, expected, elements) in [
+            (&state.hidden, &expected_hidden_buffer, WIDTH),
+            (&state.residual, &expected_residual_buffer, WIDTH),
+            (
+                &grouped.buffer,
+                &grouped_expected_buffer,
+                GROUPS * GROUP_WIDTH,
+            ),
+        ] {
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                actual,
+                expected,
+                &status,
+                elements,
+                2e-3,
+            );
+        }
+
+        let encoded = executor.execution_snapshot();
+        assert_eq!(
+            encoded.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(
+            encoded.dense_weight_upload_bytes,
+            registered.dense_weight_upload_bytes
+        );
+        assert_eq!(encoded.embedding_dispatches, 1);
+        assert_eq!(encoded.dense_gemv_dispatches, 2);
+        assert_eq!(encoded.rms_norm_dispatches, 4);
+        assert_eq!(encoded.rms_norm_groups, 6);
+        assert_eq!(encoded.rms_norm_state_dispatches, 3);
+        assert_eq!(encoded.rms_norm_scratch_dispatches, 1);
+        assert_eq!(encoded.residual_add_dispatches, 2);
+        assert_eq!(encoded.queue_submissions, 0);
+        assert_eq!(encoded.intermediate_maps, 0);
+        assert_eq!(encoded.intermediate_readbacks, 0);
+
+        encoder.copy_buffer_to_buffer(&status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("validation map callback must be drained")
+            .expect("validation status must map");
+        let mapped = slice.get_mapped_range();
+        let status_value = u32::from_le_bytes(mapped[..4].try_into().unwrap());
+        drop(mapped);
+        staging.unmap();
+        assert_eq!(status_value, 0, "on-device RMS/residual comparison failed");
+
+        let completed = executor.execution_snapshot();
+        assert_eq!(
+            completed.dense_weight_uploads,
+            registered.dense_weight_uploads
         );
         assert_eq!(completed.intermediate_maps, 0);
         assert_eq!(completed.intermediate_readbacks, 0);
