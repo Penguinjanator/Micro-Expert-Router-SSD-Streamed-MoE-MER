@@ -160,6 +160,8 @@ mod parallel;
 mod prefetch_governor;
 mod pregate;
 mod qualification;
+mod greedy_parity;
+mod numerical_diagnostics;
 mod q4_parity;
 mod rayon_autotune;
 mod residency;
@@ -895,6 +897,49 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Compare fixed-corpus greedy token IDs between isolated strict CPU and
+    /// strict Hybrid Q4_0 real-checkpoint execution.
+    QualifyHybridQ4GreedyParity {
+        /// Path to the strict Hybrid native-Q4_0 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for every Hybrid corpus case.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the typed JSON report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+    },
+
+    /// Collect reproducibility and complete first-token CPU/Hybrid logit
+    /// evidence for the fixed json-transformation case.
+    DiagnoseHybridQ4GreedyDivergence {
+        /// Path to the strict Hybrid native-Q4_0 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for Hybrid diagnostic workers.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required typed diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Private same-binary worker for one strict-Hybrid greedy-parity plane.
+    #[command(name = "greedy-parity-hybrid-worker-internal", hide = true)]
+    GreedyParityHybridWorkerInternal {
+        /// The same strict Hybrid config parsed by the parent orchestrator.
+        #[arg(long)]
+        config: PathBuf,
+    },
+
+    /// Private same-binary CPU/Hybrid first-token logit worker.
+    #[command(name = "greedy-parity-logit-worker-internal", hide = true)]
+    GreedyParityLogitWorkerInternal {
+        #[arg(long)]
+        config: PathBuf,
+    },
+
     /// Benchmark dense matvec backends on the target Qwen3-Coder CPU shapes.
     ///
     /// This is intentionally separate from `bench-real`: it isolates Q/K/V/O,
@@ -1048,13 +1093,25 @@ fn parse_positive_f64_value(s: &str) -> Result<f64, String> {
     }
 }
 
-fn init_logging(filter: &str) {
+fn init_logging(filter: &str, worker_protocol_stdout: bool) {
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .with_level(true)
-        .try_init();
+    if worker_protocol_stdout {
+        // The private worker reserves stdout for exactly one typed JSON value.
+        // All inherited diagnostics must stay on stderr or the parent rejects
+        // the protocol as corrupted.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_level(true)
+            .with_writer(std::io::stderr)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_level(true)
+            .try_init();
+    }
 }
 
 fn rayon_env_override_present() -> bool {
@@ -1531,17 +1588,26 @@ fn parse_autotune_probe_output(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
-    init_logging(&cli.log);
+    let worker_protocol_stdout = matches!(
+        cli.cmd,
+        Cmd::GreedyParityHybridWorkerInternal { .. }
+            | Cmd::GreedyParityLogitWorkerInternal { .. }
+    );
+    init_logging(&cli.log, worker_protocol_stdout);
 
     // Load only enough startup configuration to resolve process-level
     // runtime controls before CPU placement / Rayon exist. The command
     // handlers still own their normal config reconciliation and runtime
     // construction below.
-    let startup_config = match &cli.cmd {
+    let mut startup_config = match &cli.cmd {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
-        | Cmd::QualifyHybridQ4Parity { config, .. } => {
+        | Cmd::QualifyHybridQ4Parity { config, .. }
+        | Cmd::QualifyHybridQ4GreedyParity { config, .. }
+        | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
+        | Cmd::GreedyParityHybridWorkerInternal { config }
+        | Cmd::GreedyParityLogitWorkerInternal { config } => {
             Some(crate::config::Config::from_file(config)?)
         }
         _ => None,
@@ -1664,6 +1730,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Serve { .. }
             | Cmd::QualifyHybridQ4 { .. }
             | Cmd::QualifyHybridQ4Parity { .. }
+            | Cmd::QualifyHybridQ4GreedyParity { .. }
+            | Cmd::DiagnoseHybridQ4GreedyDivergence { .. }
+            | Cmd::GreedyParityHybridWorkerInternal { .. }
+            | Cmd::GreedyParityLogitWorkerInternal { .. }
     ) && !run_gpu_requested
     {
         crate::backend::install_default();
@@ -1938,6 +2008,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::QualifyHybridQ4GreedyParity {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_qualify_hybrid_q4_greedy_parity(
+                QualifyHybridQ4GreedyParityArgs {
+                    config,
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("greedy parity startup config was not parsed")?,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::DiagnoseHybridQ4GreedyDivergence {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_diagnose_hybrid_q4_greedy_divergence(
+                DiagnoseHybridQ4GreedyDivergenceArgs {
+                    config,
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("logit diagnostic startup config was not parsed")?,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::GreedyParityHybridWorkerInternal { config: _ } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_greedy_parity_hybrid_worker_internal(
+                GreedyParityHybridWorkerArgs {
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("greedy parity worker startup config was not parsed")?,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::GreedyParityLogitWorkerInternal { config: _ } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_greedy_parity_logit_worker_internal(
+                GreedyParityHybridWorkerArgs {
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("logit diagnostic worker startup config was not parsed")?,
+                    progress_watchdog,
+                },
+            ))
+        }
         Cmd::MatvecMicrobench {
             backend,
             warmup_runs,
@@ -2167,6 +2303,27 @@ struct QualifyHybridQ4ParityArgs {
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
+struct QualifyHybridQ4GreedyParityArgs {
+    config: PathBuf,
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    report_out: Option<PathBuf>,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct GreedyParityHybridWorkerArgs {
+    parsed_config: crate::config::Config,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct DiagnoseHybridQ4GreedyDivergenceArgs {
+    config: PathBuf,
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    report_out: PathBuf,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
 struct MatvecMicrobenchArgs {
     backends: Vec<crate::parallel::DenseMatvecBackend>,
     warmup_runs: usize,
@@ -2284,6 +2441,104 @@ struct BenchRealRuntime {
     engine: Arc<Engine>,
     model: Arc<crate::model::RealModel>,
     tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    isolated_cache: Option<Arc<MultiLayerExpertCache>>,
+    isolated_shutdown: Option<IsolatedRuntimeShutdownWitness>,
+}
+
+/// Type-specific weak references to every mutable resource family that an
+/// isolated qualification runtime can hand to background work. Controlled
+/// shutdown consumes the runtime, closes its producer channels, and waits for
+/// these references to become un-upgradeable before the next plane is built.
+struct IsolatedRuntimeShutdownWitness {
+    engine: std::sync::Weak<Engine>,
+    model: std::sync::Weak<crate::model::RealModel>,
+    cache: std::sync::Weak<MultiLayerExpertCache>,
+    storage: std::sync::Weak<NvmeStorage>,
+    predictor: std::sync::Weak<PredictiveLoader>,
+    execution_context: std::sync::Weak<crate::backend::ExecutionContext>,
+    gpu_cache: std::sync::Weak<crate::expert_cache::GpuExpertCache>,
+    speculator: Option<std::sync::Weak<NeuralSpeculator>>,
+    affinity: Option<std::sync::Weak<LayeredExpertAffinity>>,
+}
+
+impl IsolatedRuntimeShutdownWitness {
+    fn all_released(&self) -> bool {
+        self.engine.upgrade().is_none()
+            && self.model.upgrade().is_none()
+            && self.cache.upgrade().is_none()
+            && self.storage.upgrade().is_none()
+            && self.predictor.upgrade().is_none()
+            && self.execution_context.upgrade().is_none()
+            && self.gpu_cache.upgrade().is_none()
+            && self
+                .speculator
+                .as_ref()
+                .map_or(true, |weak| weak.upgrade().is_none())
+            && self
+                .affinity
+                .as_ref()
+                .map_or(true, |weak| weak.upgrade().is_none())
+    }
+
+    async fn wait_for_release(
+        self,
+    ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        wait_for_isolated_release(
+            || self.all_released(),
+            POLL_INTERVAL,
+            SHUTDOWN_TIMEOUT,
+        )
+        .await
+    }
+}
+
+async fn wait_for_isolated_release<F>(
+    mut all_released: F,
+    poll_interval: std::time::Duration,
+    shutdown_timeout: std::time::Duration,
+) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String>
+where
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    let mut poll_iterations = 0u32;
+    loop {
+        poll_iterations = poll_iterations.saturating_add(1);
+        if all_released() {
+            return Ok(crate::greedy_parity::BackgroundShutdownEvidence {
+                controlled_shutdown_requested: true,
+                all_runtime_resources_released: true,
+                poll_iterations,
+            });
+        }
+        if started.elapsed() >= shutdown_timeout {
+            return Err(format!(
+                "isolated runtime background resources remained live after {}s",
+                shutdown_timeout.as_secs_f64()
+            ));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+impl BenchRealRuntime {
+    async fn shutdown_isolated(
+        mut self,
+    ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String> {
+        let witness = self
+            .isolated_shutdown
+            .take()
+            .ok_or_else(|| "runtime was not constructed by the isolated qualification factory".to_string())?;
+        // Dropping the Engine closes the GPU-promotion and neural-speculator
+        // producer channels. Affinity's owned handle joins its worker in Drop;
+        // outstanding prefetch work releases cache/storage/predictor Arcs when
+        // it completes. The weak witness below proves all of those resource
+        // families are gone before another case/plane is constructed.
+        drop(self);
+        witness.wait_for_release().await
+    }
 }
 
 #[derive(Serialize)]
@@ -3339,6 +3594,2121 @@ async fn cmd_qualify_hybrid_q4_parity(
     emit_q4_parity_report(&report, args.report_out.as_deref())
 }
 
+fn emit_greedy_parity_report(
+    report: &crate::greedy_parity::GreedyParityReport,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = serde_json::to_vec_pretty(report)?;
+    json.push(b'\n');
+    if let Some(path) = report_out {
+        std::fs::write(path, json)?;
+        eprintln!("greedy-token parity report written to {}", path.display());
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&json)?;
+    }
+    Ok(())
+}
+
+fn fail_greedy_parity(
+    mut report: crate::greedy_parity::GreedyParityReport,
+    failure: crate::qualification::QualificationFailure,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = format!("{}: {}", failure.code, failure.detail);
+    report.fail(failure);
+    match emit_greedy_parity_report(&report, report_out) {
+        Ok(()) => Err(summary.into()),
+        Err(emit_error) => Err(format!(
+            "{summary}; additionally failed to emit greedy-token parity report: {emit_error}"
+        )
+        .into()),
+    }
+}
+
+fn greedy_parity_model_identity(
+    spec: &ResolvedRealCliSpec,
+) -> crate::greedy_parity::ModelIdentityEvidence {
+    crate::greedy_parity::ModelIdentityEvidence {
+        architecture: spec.architecture.model_type().to_string(),
+        num_layers: spec.cfg.model.num_layers,
+        num_experts_per_layer: spec.cfg.model.num_experts,
+        total_experts: (spec.cfg.model.num_layers as u64)
+            .saturating_mul(spec.cfg.model.num_experts as u64),
+        top_k: spec.cfg.model.top_k,
+        d_model: spec.cfg.model.d_model,
+        d_ff: spec.cfg.model.d_ff,
+        routed_expert_dtype: spec.cfg.model.dtype.as_str().to_string(),
+    }
+}
+
+fn greedy_parity_model_load(
+    runtime: &BenchRealRuntime,
+) -> crate::greedy_parity::ModelLoadEvidence {
+    let load = &runtime.model.load_status;
+    crate::greedy_parity::ModelLoadEvidence {
+        strict: load.strict,
+        loader: load.loader.to_string(),
+        loaded_tensors: load.loaded_tensors,
+        required_tensors: load.required_tensors,
+        optional_probed: load.optional_probed,
+        optional_loaded: load.optional_loaded,
+        seeded_fallback_remained: load.seeded_fallback_remained,
+    }
+}
+
+fn greedy_parity_runtime_cache_snapshot(
+    runtime: &BenchRealRuntime,
+) -> crate::greedy_parity::RuntimeCacheSnapshot {
+    let report = runtime.engine.report();
+    let gpu_cache = runtime.engine.execution_context().gpu_expert_cache();
+    let memory = runtime.engine.gpu_expert_memory_snapshot();
+    crate::greedy_parity::RuntimeCacheSnapshot {
+        ram_entries: runtime
+            .isolated_cache
+            .as_ref()
+            .map_or(0, |cache| cache.len()),
+        ram_hits: report.hits,
+        ram_misses: report.misses,
+        bytes_read: report.bytes_read,
+        prefetch_completed: report.prefetch_completed,
+        predictor_observations: report.predictor_observations,
+        logical_gpu_hits: gpu_cache.hits(),
+        logical_gpu_misses: gpu_cache.misses(),
+        logical_gpu_promotions: gpu_cache.promotions(),
+        logical_admitted_bytes: gpu_cache.used_bytes(),
+        logical_anchor_entries: gpu_cache.anchor_len(),
+        logical_lru_entries: gpu_cache.lru_len(),
+        physical_entries: memory.map_or(0, |snapshot| snapshot.physical_entries),
+        physical_installs: memory.map_or(0, |snapshot| snapshot.physical_installs),
+        physical_evictions: memory.map_or(0, |snapshot| snapshot.physical_evictions),
+        stale_retirements: memory.map_or(0, |snapshot| snapshot.stale_retirements),
+    }
+}
+
+fn greedy_parity_failure_policy_name(
+    policy: crate::engine::RoutedExpertGpuFailurePolicy,
+) -> &'static str {
+    match policy {
+        crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed => "strict-fail-closed",
+        crate::engine::RoutedExpertGpuFailurePolicy::ServingCpuFallback => {
+            "serving-cpu-fallback"
+        }
+    }
+}
+
+// Qualification call sites deliberately name every frozen/shared input; this
+// makes configuration and token-ID drift reviewable at the boundary.
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_plane(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        mode,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_boundary_reference_plane(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        None,
+        None,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_plane_with_logits(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+    first_token_logit_bits: &mut Vec<u32>,
+    route_capture: &mut Option<crate::engine::RoutedFfnDiagnosticCapture>,
+    cpu_q4_boundary_emulation: bool,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    execute_greedy_parity_plane_internal(
+        spec,
+        mode,
+        tokenizer,
+        prompt_token_ids,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
+        watchdog,
+        case_name,
+        Some(first_token_logit_bits),
+        Some(route_capture),
+        cpu_q4_boundary_emulation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_plane_internal(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+    first_token_logit_bits: Option<&mut Vec<u32>>,
+    route_capture: Option<&mut Option<crate::engine::RoutedFfnDiagnosticCapture>>,
+    cpu_q4_boundary_emulation: bool,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, Box<dyn std::error::Error>> {
+    use crate::qualification::{gpu_io_delta, routed_execution_delta, validate_memory};
+
+    let runtime = build_isolated_greedy_runtime(spec, mode, tokenizer).await?;
+    let attempt = async {
+        if cpu_q4_boundary_emulation {
+            runtime.engine.enable_cpu_q4_boundary_emulation()?;
+        }
+        let boundary_emulation_before =
+            runtime.engine.cpu_q4_boundary_emulation_snapshot();
+        if boundary_emulation_before.enabled != cpu_q4_boundary_emulation
+            || boundary_emulation_before.routed_expert_dispatches != 0
+        {
+            return Err(format!(
+                "{case_name} runtime Q4 boundary-emulation state did not start clean or match the requested execution mode"
+            )
+            .into());
+        }
+        let context = runtime.engine.execution_context();
+        let execution_plan: crate::qualification::ExecutionPlanEvidence = context.plan().into();
+        let plane = match mode {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu => "cpu",
+            RealCliRuntimeMode::IsolatedGreedyParityHybrid => "hybrid",
+            _ => return Err("non-isolated mode reached greedy parity execution".into()),
+        };
+        let device = runtime.engine.gpu_device_identity();
+        match mode {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu => {
+                if !crate::greedy_parity::cpu_plan_exact(&execution_plan) {
+                    return Err(format!(
+                        "CPU control did not resolve every component to CPU: {execution_plan:?}"
+                    )
+                    .into());
+                }
+                if device.is_some() {
+                    return Err("CPU control unexpectedly exposes a GPU device identity".into());
+                }
+            }
+            RealCliRuntimeMode::IsolatedGreedyParityHybrid => {
+                if !crate::greedy_parity::hybrid_plan_exact(&execution_plan) {
+                    return Err(format!(
+                        "Hybrid run did not resolve the strict component plan: {execution_plan:?}"
+                    )
+                    .into());
+                }
+                let selected = device.as_ref().ok_or(
+                    "strict Hybrid run has no authoritative GPU device identity",
+                )?;
+                if selected.software_adapter
+                    || selected.device_type.eq_ignore_ascii_case("cpu")
+                {
+                    return Err(format!(
+                        "strict Hybrid selected software adapter {:?}",
+                        selected.name
+                    )
+                    .into());
+                }
+                if selected.name != expected_adapter_name {
+                    return Err(format!(
+                        "strict Hybrid selected adapter {:?}, expected exact name {:?}",
+                        selected.name, expected_adapter_name
+                    )
+                    .into());
+                }
+                if runtime.engine.routed_expert_gpu_failure_policy()
+                    != crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed
+                {
+                    return Err("strict Hybrid engine does not use StrictFailClosed".into());
+                }
+            }
+            _ => unreachable!("isolated modes checked above"),
+        }
+
+        let cache_before = greedy_parity_runtime_cache_snapshot(&runtime);
+        let observed_config_sha256 = resolved_real_runtime_identity_sha256(
+            &runtime.cfg,
+            runtime.model.config.architecture,
+            runtime.model.config.first_k_dense_replace,
+            &runtime.model.config.advanced,
+        )?;
+        if observed_config_sha256 != resolved_config_sha256 {
+            return Err(format!(
+                "{plane} runtime identity {observed_config_sha256} drifted from frozen specification {resolved_config_sha256}"
+            )
+            .into());
+        }
+        let routed_before = runtime.engine.routed_expert_execution_snapshot();
+        let io_before_option = runtime.engine.gpu_expert_io_snapshot();
+        let io_before = io_before_option.unwrap_or_default();
+        let memory_before = runtime.engine.gpu_expert_memory_snapshot();
+        let attention_softmax_before = crate::transformer::nonfinite_softmax_fallbacks();
+        if cache_before != crate::greedy_parity::RuntimeCacheSnapshot::default()
+            || routed_before != crate::engine::RoutedExpertExecutionSnapshot::default()
+            || io_before != crate::backend::GpuExpertIoSnapshot::default()
+        {
+            return Err(format!(
+                "{plane} isolated runtime did not start from clean cache/counter state"
+            )
+            .into());
+        }
+        if let Some(snapshot) = memory_before {
+            validate_memory(snapshot).map_err(|failure| failure.detail)?;
+        }
+        if route_capture.is_some() {
+            let target_token_idx = prompt_token_ids
+                .len()
+                .checked_sub(1)
+                .and_then(|position| position.checked_mul(runtime.model.config.num_layers))
+                .and_then(|token_idx| u64::try_from(token_idx).ok())
+                .ok_or("layer-0 route capture token index overflowed")?;
+            runtime
+                .engine
+                .arm_layer0_route_capture(target_token_idx)?;
+        }
+        let measured = with_progress_timeout(
+            format!("greedy parity {case_name} {plane} inference"),
+            watchdog,
+            run_real_once_from_token_ids_internal(
+                &runtime,
+                prompt_token_ids,
+                crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
+                crate::sampling::SamplingParams::greedy(),
+                0,
+                first_token_logit_bits,
+            ),
+        )
+        .await?;
+        if let Some(destination) = route_capture {
+            *destination = Some(
+                runtime
+                    .engine
+                    .take_layer0_route_capture()
+                    .ok_or("final-prompt layer-0 routed-FFN input was not captured")?,
+            );
+        }
+        let routed_after = runtime.engine.routed_expert_execution_snapshot();
+        let cpu_q4_boundary_emulation =
+            runtime.engine.cpu_q4_boundary_emulation_snapshot();
+        let io_after_option = runtime.engine.gpu_expert_io_snapshot();
+        let io_after = io_after_option.unwrap_or_default();
+        let memory_after = runtime.engine.gpu_expert_memory_snapshot();
+        let attention_softmax_nonfinite_fallbacks =
+            crate::transformer::nonfinite_softmax_fallbacks()
+                .saturating_sub(attention_softmax_before);
+        if let Some(snapshot) = memory_after {
+            validate_memory(snapshot).map_err(|failure| failure.detail)?;
+        }
+        if mode == RealCliRuntimeMode::IsolatedGreedyParityHybrid
+            && (io_before_option.is_none()
+                || io_after_option.is_none()
+                || memory_before.is_none()
+                || memory_after.is_none())
+        {
+            return Err("strict Hybrid GPU evidence disappeared during inference".into());
+        }
+        if mode == RealCliRuntimeMode::IsolatedGreedyParityCpu
+            && (io_before_option.is_some()
+                || io_after_option.is_some()
+                || memory_before.is_some()
+                || memory_after.is_some())
+        {
+            return Err("CPU control unexpectedly exposed GPU I/O or memory evidence".into());
+        }
+
+        let routed_delta = routed_execution_delta(routed_before, routed_after)
+            .map_err(|failure| failure.detail)?;
+        let gpu_io_delta = gpu_io_delta(io_before, io_after).map_err(|failure| failure.detail)?;
+        let generated_token_ids = measured.report.output_token_ids;
+        let generated_text = measured.report.output_text;
+        let generation = crate::greedy_parity::GenerationEvidence {
+            prompt_token_ids_sha256: prompt_token_ids_sha256.to_string(),
+            generated_token_ids_sha256: crate::greedy_parity::token_ids_sha256(
+                &generated_token_ids,
+            ),
+            generated_text_sha256: crate::greedy_parity::sha256_hex(generated_text.as_bytes()),
+            generated_token_count: generated_token_ids.len(),
+            generated_token_ids,
+            termination_reason: crate::greedy_parity::TerminationReason::LengthLimit,
+        };
+        let initial_kv_sequence_lengths = measured.initial_kv_sequence_lengths;
+        let initial_state = crate::greedy_parity::InitialStateEvidence {
+            context_id: execution_plan.context_id.clone(),
+            resolved_config_sha256: observed_config_sha256,
+            kv_cache_count: initial_kv_sequence_lengths.len(),
+            all_kv_empty: initial_kv_sequence_lengths.iter().all(|&length| length == 0),
+            kv_sequence_lengths: initial_kv_sequence_lengths,
+            cache: cache_before,
+            routed: routed_before,
+            gpu_io_available: io_before_option.is_some(),
+            gpu_io: io_before,
+        };
+        Ok(crate::greedy_parity::PlaneRunEvidence {
+            plane: plane.to_string(),
+            model_load: greedy_parity_model_load(&runtime),
+            execution_plan,
+            routed_expert_gpu_failure_policy: greedy_parity_failure_policy_name(
+                runtime.engine.routed_expert_gpu_failure_policy(),
+            )
+            .to_string(),
+            cpu_q4_boundary_emulation,
+            device,
+            initial_state,
+            generation,
+            routed_execution_delta: routed_delta,
+            gpu_io_delta,
+            attention_softmax_nonfinite_fallbacks,
+            gpu_memory_before: memory_before,
+            gpu_memory_after: memory_after,
+            background_shutdown: crate::greedy_parity::BackgroundShutdownEvidence::default(),
+            worker_process: None,
+        })
+    }
+    .await;
+
+    // Always consume and shut down a successfully constructed isolated runtime,
+    // including when inference or evidence validation failed.
+    let shutdown = runtime.shutdown_isolated().await;
+    match (attempt, shutdown) {
+        (Ok(mut evidence), Ok(shutdown)) => {
+            evidence.background_shutdown = shutdown;
+            Ok(evidence)
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; isolated shutdown also failed: {shutdown_error}").into())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BoundedChildOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct GreedyParityWorkerCapture {
+    process_id: u32,
+    status: std::process::ExitStatus,
+    timed_out: bool,
+    reaped: bool,
+    stdout: BoundedChildOutput,
+    stderr: BoundedChildOutput,
+    transport_error: Option<String>,
+}
+
+fn read_child_output_bounded(
+    mut reader: impl std::io::Read,
+    limit: usize,
+) -> std::io::Result<BoundedChildOutput> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep != read;
+    }
+    Ok(BoundedChildOutput {
+        bytes: retained,
+        truncated,
+    })
+}
+
+#[cfg(unix)]
+fn child_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn child_exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Spawn, feed, drain, bound, and reap one worker. Both pipes are drained on
+/// dedicated threads so verbose diagnostics cannot deadlock the child. A
+/// timeout always kills and then waits for the exact child before returning.
+async fn run_greedy_parity_worker_process(
+    command: std::process::Command,
+    request_json: Vec<u8>,
+    timeout: Duration,
+) -> Result<GreedyParityWorkerCapture, String> {
+    run_greedy_parity_worker_process_with_limits(
+        command,
+        request_json,
+        timeout,
+        crate::greedy_parity::MAX_WORKER_STDOUT_BYTES,
+        crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+    )
+    .await
+}
+
+async fn run_greedy_parity_worker_process_with_limits(
+    mut command: std::process::Command,
+    request_json: Vec<u8>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<GreedyParityWorkerCapture, String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn Hybrid worker: {error}"))?;
+    let process_id = child.id();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("spawned Hybrid worker has no stdout pipe".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("spawned Hybrid worker has no stderr pipe".to_string());
+        }
+    };
+    let stdout_thread =
+        std::thread::spawn(move || read_child_output_bounded(stdout, stdout_limit));
+    let stderr_thread =
+        std::thread::spawn(move || read_child_output_bounded(stderr, stderr_limit));
+
+    let mut transport_error = None;
+    match child.stdin.take() {
+        Some(mut stdin) => {
+            if let Err(error) = stdin.write_all(&request_json) {
+                transport_error = Some(format!("failed to write Hybrid worker request: {error}"));
+                let _ = child.kill();
+            }
+        }
+        None => {
+            transport_error = Some("spawned Hybrid worker has no stdin pipe".to_string());
+            let _ = child.kill();
+        }
+    }
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout && transport_error.is_none() => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(None) => {
+                timed_out = transport_error.is_none();
+                if let Err(error) = child.kill() {
+                    transport_error.get_or_insert_with(|| {
+                        format!("failed to kill Hybrid worker after timeout: {error}")
+                    });
+                }
+                break child
+                    .wait()
+                    .map_err(|error| format!("failed to reap Hybrid worker: {error}"))?;
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to query Hybrid worker status: {error}"));
+            }
+        }
+    };
+
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "Hybrid worker stdout reader thread panicked".to_string())?
+        .map_err(|error| format!("failed to read Hybrid worker stdout: {error}"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "Hybrid worker stderr reader thread panicked".to_string())?
+        .map_err(|error| format!("failed to read Hybrid worker stderr: {error}"))?;
+    Ok(GreedyParityWorkerCapture {
+        process_id,
+        status,
+        timed_out,
+        reaped: true,
+        stdout,
+        stderr,
+        transport_error,
+    })
+}
+
+fn current_executable_identity() -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+    let executable = std::env::current_exe()?;
+    let digest = crate::qualification::hash_small_file(&executable)?;
+    Ok((executable, digest.sha256))
+}
+
+fn emit_hybrid_worker_response(
+    response: &crate::greedy_parity::HybridWorkerResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, response)?;
+    locked.write_all(b"\n")?;
+    locked.flush()?;
+    Ok(())
+}
+
+/// Hidden same-binary entry point. It never tokenizes: the only prompt input
+/// accepted is the parent's typed token-ID vector on stdin.
+async fn cmd_greedy_parity_hybrid_worker_internal(
+    args: GreedyParityHybridWorkerArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take((crate::greedy_parity::MAX_WORKER_STDOUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > crate::greedy_parity::MAX_WORKER_STDOUT_BYTES {
+        return Err("Hybrid worker request exceeds the private protocol limit".into());
+    }
+    let request = crate::greedy_parity::parse_hybrid_worker_request_exact(&input)?;
+    let spec = resolve_real_cli_spec_from_config(
+        args.parsed_config,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let observed_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (_, observed_executable_sha256) = current_executable_identity()?;
+    let provenance = crate::qualification::BuildProvenance::embedded();
+    let identity = crate::greedy_parity::validate_hybrid_worker_request(
+        &request,
+        &observed_config_sha256,
+        &observed_executable_sha256,
+        provenance.git_sha.as_deref(),
+    );
+    if !identity.all_verified() {
+        let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+            &request,
+            &observed_config_sha256,
+            &observed_executable_sha256,
+            provenance.git_sha.as_deref(),
+            identity,
+            None,
+            Some("Hybrid worker request identity validation failed".to_string()),
+        );
+        emit_hybrid_worker_response(&response)?;
+        return Err("Hybrid worker request identity validation failed".into());
+    }
+
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let attempt = execute_greedy_parity_plane(
+        &spec,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        tokenizer,
+        &request.prompt_token_ids,
+        &request.prompt_token_ids_sha256,
+        &request.resolved_config_sha256,
+        &request.expected_adapter_name,
+        args.progress_watchdog,
+        &request.case_name,
+    )
+    .await;
+    match attempt {
+        Ok(plane) => {
+            let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                Some(plane),
+                None,
+            );
+            emit_hybrid_worker_response(&response)
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let response = crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                None,
+                Some(detail.clone()),
+            );
+            emit_hybrid_worker_response(&response)?;
+            Err(detail.into())
+        }
+    }
+}
+
+fn emit_logit_worker_response(
+    response: &crate::numerical_diagnostics::DiagnosticWorkerResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut locked = stdout.lock();
+    serde_json::to_writer(&mut locked, response)?;
+    locked.write_all(b"\n")?;
+    locked.flush()?;
+    Ok(())
+}
+
+/// Hidden same-binary worker. The request embeds the existing greedy-parity
+/// identity contract; the only new controls are plane and repeated-run index.
+async fn cmd_greedy_parity_logit_worker_internal(
+    args: GreedyParityHybridWorkerArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take((crate::greedy_parity::MAX_WORKER_STDOUT_BYTES + 1) as u64)
+        .read_to_end(&mut input)?;
+    if input.len() > crate::greedy_parity::MAX_WORKER_STDOUT_BYTES {
+        return Err("logit worker request exceeds the private protocol limit".into());
+    }
+    let request = crate::numerical_diagnostics::parse_worker_request_exact(&input)?;
+    request.validate_static()?;
+    let spec = resolve_real_cli_spec_from_config(
+        args.parsed_config,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let observed_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (_, observed_executable_sha256) = current_executable_identity()?;
+    let provenance = crate::qualification::BuildProvenance::embedded();
+    let identity = crate::greedy_parity::validate_hybrid_worker_request(
+        &request.base,
+        &observed_config_sha256,
+        &observed_executable_sha256,
+        provenance.git_sha.as_deref(),
+    );
+    if !identity.all_verified() {
+        let detail = "logit worker request identity validation failed".to_string();
+        let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+            protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION.to_string(),
+            plane: request.plane,
+            run_index: request.run_index,
+            base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                &request.base,
+                &observed_config_sha256,
+                &observed_executable_sha256,
+                provenance.git_sha.as_deref(),
+                identity,
+                None,
+                Some(detail.clone()),
+            ),
+            chosen_token_id: None,
+            first_token_logit_bits: None,
+            first_token_logit_bits_sha256: None,
+            route_capture: None,
+            failure: Some(detail.clone()),
+        };
+        emit_logit_worker_response(&response)?;
+        return Err(detail.into());
+    }
+    let mode = match request.plane {
+        crate::numerical_diagnostics::DiagnosticPlane::Cpu => {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu
+        }
+        crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation => {
+            RealCliRuntimeMode::IsolatedGreedyParityCpu
+        }
+        crate::numerical_diagnostics::DiagnosticPlane::Hybrid => {
+            RealCliRuntimeMode::IsolatedGreedyParityHybrid
+        }
+    };
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let mut logit_bits = Vec::new();
+    let mut route_capture = None;
+    let attempt = execute_greedy_parity_plane_with_logits(
+        &spec,
+        mode,
+        tokenizer,
+        &request.base.prompt_token_ids,
+        &request.base.prompt_token_ids_sha256,
+        &request.base.resolved_config_sha256,
+        &request.base.expected_adapter_name,
+        args.progress_watchdog,
+        &request.base.case_name,
+        &mut logit_bits,
+        &mut route_capture,
+        request.plane
+            == crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation,
+    )
+    .await;
+    match attempt {
+        Ok(plane) => {
+            if logit_bits.is_empty()
+                || logit_bits.len() > crate::numerical_diagnostics::MAX_VOCAB_SIZE
+            {
+                return Err("logit worker captured an invalid vocabulary vector".into());
+            }
+            let chosen_token_id = plane
+                .generation
+                .generated_token_ids
+                .first()
+                .copied()
+                .ok_or("logit worker generated no first token")?;
+            let logit_sha256 = crate::numerical_diagnostics::f32_bits_sha256(&logit_bits);
+            let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+                protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+                    .to_string(),
+                plane: request.plane,
+                run_index: request.run_index,
+                base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                    &request.base,
+                    &observed_config_sha256,
+                    &observed_executable_sha256,
+                    provenance.git_sha.as_deref(),
+                    identity,
+                    Some(plane),
+                    None,
+                ),
+                chosen_token_id: Some(chosen_token_id),
+                first_token_logit_bits: Some(logit_bits),
+                first_token_logit_bits_sha256: Some(logit_sha256),
+                route_capture,
+                failure: None,
+            };
+            emit_logit_worker_response(&response)
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let response = crate::numerical_diagnostics::DiagnosticWorkerResponse {
+                protocol_version: crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+                    .to_string(),
+                plane: request.plane,
+                run_index: request.run_index,
+                base: crate::greedy_parity::HybridWorkerResponse::from_request(
+                    &request.base,
+                    &observed_config_sha256,
+                    &observed_executable_sha256,
+                    provenance.git_sha.as_deref(),
+                    identity,
+                    None,
+                    Some(detail.clone()),
+                ),
+                chosen_token_id: None,
+                first_token_logit_bits: None,
+                first_token_logit_bits_sha256: None,
+                route_capture: None,
+                failure: Some(detail.clone()),
+            };
+            emit_logit_worker_response(&response)?;
+            Err(detail.into())
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GreedyParityWorkerCaseFailure {
+    detail: String,
+    evidence: crate::greedy_parity::HybridWorkerFailureEvidence,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_greedy_parity_hybrid_worker(
+    executable: &Path,
+    config: &Path,
+    request: &crate::greedy_parity::HybridWorkerRequest,
+    timeout: Duration,
+) -> Result<crate::greedy_parity::PlaneRunEvidence, GreedyParityWorkerCaseFailure> {
+    let request_json = serde_json::to_vec(request).map_err(|error| {
+        GreedyParityWorkerCaseFailure {
+            detail: format!("failed to serialize Hybrid worker request: {error}"),
+            evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+                worker_id: request.worker_id.clone(),
+                case_name: request.case_name.clone(),
+                child_process_spawned: false,
+                process_id: None,
+                exit_code: None,
+                signal: None,
+                timed_out: false,
+                process_reaped: false,
+                evidence_emitted: false,
+                identity_validation_succeeded: false,
+                identity_validation: None,
+                stderr: String::new(),
+                stderr_truncated: false,
+            },
+        }
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--progress-timeout-secs")
+        .arg(timeout.as_secs().to_string())
+        .arg("greedy-parity-hybrid-worker-internal")
+        .arg("--config")
+        .arg(config);
+    let capture = run_greedy_parity_worker_process(command, request_json, timeout)
+        .await
+        .map_err(|detail| GreedyParityWorkerCaseFailure {
+            detail,
+            evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+                worker_id: request.worker_id.clone(),
+                case_name: request.case_name.clone(),
+                child_process_spawned: false,
+                process_id: None,
+                exit_code: None,
+                signal: None,
+                timed_out: false,
+                process_reaped: false,
+                evidence_emitted: false,
+                identity_validation_succeeded: false,
+                identity_validation: None,
+                stderr: String::new(),
+                stderr_truncated: false,
+            },
+        })?;
+
+    let stderr = String::from_utf8_lossy(&capture.stderr.bytes).into_owned();
+    if !stderr.is_empty() {
+        eprintln!(
+            "greedy parity Hybrid worker {} stderr{}:\n{}",
+            request.case_name,
+            if capture.stderr.truncated {
+                " (bounded/truncated)"
+            } else {
+                ""
+            },
+            stderr
+        );
+    }
+    let response_result = if capture.stdout.truncated {
+        Err(format!(
+            "Hybrid worker stdout exceeded {} bytes",
+            crate::greedy_parity::MAX_WORKER_STDOUT_BYTES
+        ))
+    } else {
+        crate::greedy_parity::parse_hybrid_worker_response_exact(&capture.stdout.bytes)
+    };
+    let response = response_result.as_ref().ok();
+    let validation = response.map(|response| {
+        crate::greedy_parity::validate_hybrid_worker_response(request, response)
+    });
+    let exit_code = capture.status.code();
+    let signal = child_exit_signal(&capture.status);
+    let normal_zero_exit = capture.status.success()
+        && exit_code == Some(0)
+        && signal.is_none()
+        && !capture.timed_out
+        && capture.transport_error.is_none();
+    let process = crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.worker_id.clone(),
+        child_process_spawned: true,
+        process_id: Some(capture.process_id),
+        executable_sha256: request.executable_sha256.clone(),
+        build_git_sha: request.build_git_sha.clone(),
+        executable_identity_verified: validation
+            .is_some_and(|value| value.executable_identity_verified),
+        build_sha_identity_verified: validation
+            .is_some_and(|value| value.build_sha_identity_verified),
+        case_identity_verified: validation.is_some_and(|value| value.case_identity_verified),
+        config_identity_verified: validation
+            .is_some_and(|value| value.config_identity_verified),
+        expected_adapter_identity_verified: validation
+            .is_some_and(|value| value.expected_adapter_identity_verified),
+        prompt_token_identity_verified: validation
+            .is_some_and(|value| value.prompt_token_identity_verified),
+        output_token_limit_verified: validation
+            .is_some_and(|value| value.output_token_limit_verified),
+        greedy_sampling_identity_verified: validation
+            .is_some_and(|value| value.greedy_sampling_identity_verified),
+        normal_zero_exit,
+        exit_code,
+        signal,
+        process_reaped: capture.reaped,
+        timed_out: capture.timed_out,
+        evidence_emitted: response.is_some(),
+    };
+    let response_failure = response.and_then(|response| response.failure.as_deref());
+    let success = process.normal_zero_exit
+        && process.process_reaped
+        && validation.is_some_and(|value| value.all_verified())
+        && response.is_some_and(|response| {
+            response.failure.is_none()
+                && response.plane.is_some()
+                && response
+                    .plane
+                    .as_ref()
+                    .is_some_and(|plane| plane.worker_process.is_none())
+        });
+    if success {
+        let mut plane = response.unwrap().plane.clone().unwrap();
+        plane.worker_process = Some(process);
+        return Ok(plane);
+    }
+
+    let parse_detail = response_result.as_ref().err().cloned();
+    let detail = [
+        capture.transport_error.as_deref(),
+        parse_detail.as_deref(),
+        response_failure,
+        (!normal_zero_exit).then_some("Hybrid worker did not exit normally with status zero"),
+        (!capture.reaped).then_some("Hybrid worker was not reaped"),
+        validation
+            .is_some_and(|value| !value.all_verified())
+            .then_some("Hybrid worker response identity validation failed"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ");
+    Err(GreedyParityWorkerCaseFailure {
+        detail: if detail.is_empty() {
+            "Hybrid worker emitted no successful plane evidence".to_string()
+        } else {
+            detail
+        },
+        evidence: crate::greedy_parity::HybridWorkerFailureEvidence {
+            worker_id: request.worker_id.clone(),
+            case_name: request.case_name.clone(),
+            child_process_spawned: true,
+            process_id: Some(capture.process_id),
+            exit_code,
+            signal,
+            timed_out: capture.timed_out,
+            process_reaped: capture.reaped,
+            evidence_emitted: response.is_some(),
+            identity_validation_succeeded: validation
+                .is_some_and(|value| value.all_verified()),
+            identity_validation: validation,
+            stderr,
+            stderr_truncated: capture.stderr.truncated,
+        },
+    })
+}
+
+struct CompletedLogitWorker {
+    run: crate::numerical_diagnostics::RepeatedRunEvidence,
+    first_token_logit_bits: Vec<u32>,
+    chosen_token_id: u32,
+    route_capture: crate::engine::RoutedFfnDiagnosticCapture,
+}
+
+async fn execute_logit_diagnostic_worker(
+    executable: &Path,
+    config: &Path,
+    request: &crate::numerical_diagnostics::DiagnosticWorkerRequest,
+    timeout: Duration,
+) -> Result<
+    CompletedLogitWorker,
+    crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence,
+> {
+    let empty_process = || crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.base.worker_id.clone(),
+        executable_sha256: request.base.executable_sha256.clone(),
+        build_git_sha: request.base.build_git_sha.clone(),
+        ..Default::default()
+    };
+    let request_json = serde_json::to_vec(request).map_err(|error| {
+        crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+            worker_id: request.base.worker_id.clone(),
+            plane: request.plane,
+            run_index: request.run_index,
+            detail: format!("failed to serialize logit worker request: {error}"),
+            process: empty_process(),
+            stderr: String::new(),
+            stderr_truncated: false,
+        }
+    })?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--progress-timeout-secs")
+        .arg(timeout.as_secs().to_string())
+        .arg("greedy-parity-logit-worker-internal")
+        .arg("--config")
+        .arg(config);
+    let capture = run_greedy_parity_worker_process_with_limits(
+        command,
+        request_json,
+        timeout,
+        crate::numerical_diagnostics::MAX_WORKER_STDOUT_BYTES,
+        crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+    )
+    .await
+    .map_err(|detail| crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+        worker_id: request.base.worker_id.clone(),
+        plane: request.plane,
+        run_index: request.run_index,
+        detail,
+        process: empty_process(),
+        stderr: String::new(),
+        stderr_truncated: false,
+    })?;
+    let stderr = String::from_utf8_lossy(&capture.stderr.bytes).into_owned();
+    let response_result = if capture.stdout.truncated {
+        Err(format!(
+            "logit worker stdout exceeded {} bytes",
+            crate::numerical_diagnostics::MAX_WORKER_STDOUT_BYTES
+        ))
+    } else {
+        crate::numerical_diagnostics::parse_worker_response_exact(&capture.stdout.bytes)
+    };
+    let parse_detail = response_result.as_ref().err().cloned();
+    let response = response_result.as_ref().ok();
+    let validation = response.map(|response| {
+        crate::greedy_parity::validate_hybrid_worker_response(&request.base, &response.base)
+    });
+    let response_identity_exact = response.is_some_and(|response| {
+        response.protocol_version == crate::numerical_diagnostics::WORKER_PROTOCOL_VERSION
+            && response.plane == request.plane
+            && response.run_index == request.run_index
+            && response.base.worker_id == request.base.worker_id
+    });
+    let identity_attested = response_identity_exact
+        && validation.is_some_and(|value| value.all_verified())
+        && response.is_some_and(|response| {
+            response.failure.is_none()
+                && response.base.failure.is_none()
+                && response.base.plane.is_some()
+                && response.chosen_token_id.is_some()
+                && response.first_token_logit_bits.is_some()
+                && response.first_token_logit_bits_sha256.is_some()
+                && response.route_capture.is_some()
+        });
+    let exit_code = capture.status.code();
+    let signal = child_exit_signal(&capture.status);
+    let normal_zero_exit = capture.status.success()
+        && exit_code == Some(0)
+        && signal.is_none()
+        && !capture.timed_out
+        && capture.transport_error.is_none();
+    let process = crate::greedy_parity::HybridWorkerProcessEvidence {
+        worker_id: request.base.worker_id.clone(),
+        child_process_spawned: true,
+        process_id: Some(capture.process_id),
+        executable_sha256: request.base.executable_sha256.clone(),
+        build_git_sha: request.base.build_git_sha.clone(),
+        executable_identity_verified: identity_attested,
+        build_sha_identity_verified: identity_attested,
+        case_identity_verified: identity_attested,
+        config_identity_verified: identity_attested,
+        expected_adapter_identity_verified: identity_attested,
+        prompt_token_identity_verified: identity_attested,
+        output_token_limit_verified: identity_attested,
+        greedy_sampling_identity_verified: identity_attested,
+        normal_zero_exit,
+        exit_code,
+        signal,
+        process_reaped: capture.reaped,
+        timed_out: capture.timed_out,
+        evidence_emitted: response.is_some(),
+    };
+    let completed = (|| -> Result<CompletedLogitWorker, String> {
+        if !normal_zero_exit || !capture.reaped || !identity_attested {
+            return Err("logit worker did not exit/reap with exact identity".to_string());
+        }
+        let response = response.ok_or("logit worker emitted no response")?;
+        let logit_bits = response
+            .first_token_logit_bits
+            .clone()
+            .ok_or("logit worker omitted complete logits")?;
+        let logit_sha256 = response
+            .first_token_logit_bits_sha256
+            .clone()
+            .ok_or("logit worker omitted logit hash")?;
+        if logit_bits.is_empty()
+            || logit_bits.len() > crate::numerical_diagnostics::MAX_VOCAB_SIZE
+            || crate::numerical_diagnostics::f32_bits_sha256(&logit_bits) != logit_sha256
+        {
+            return Err("logit worker vector is malformed or hash-mismatched".to_string());
+        }
+        let chosen_token_id = response
+            .chosen_token_id
+            .ok_or("logit worker omitted chosen token")?;
+        let route_capture = response
+            .route_capture
+            .clone()
+            .ok_or("logit worker omitted layer-0 route capture")?;
+        let logits: Vec<f32> = logit_bits.iter().copied().map(f32::from_bits).collect();
+        if crate::numerical_diagnostics::top_logits(&logits, 1)
+            .first()
+            .map(|item| item.token_id)
+            != Some(chosen_token_id)
+        {
+            return Err("complete logits disagree with production greedy token".to_string());
+        }
+        let mut plane = response
+            .base
+            .plane
+            .clone()
+            .ok_or("logit worker omitted plane evidence")?;
+        if plane.worker_process.is_some()
+            || plane.generation.generated_token_ids.first().copied() != Some(chosen_token_id)
+        {
+            return Err("logit worker plane evidence is malformed".to_string());
+        }
+        plane.worker_process = Some(process.clone());
+        let generated_token_ids = plane.generation.generated_token_ids.clone();
+        Ok(CompletedLogitWorker {
+            run: crate::numerical_diagnostics::RepeatedRunEvidence {
+                plane: request.plane,
+                run_index: request.run_index,
+                worker_id: request.base.worker_id.clone(),
+                generated_token_ids_sha256: crate::greedy_parity::token_ids_sha256(
+                    &generated_token_ids,
+                ),
+                generated_token_ids,
+                first_token_logit_bits_sha256: logit_sha256,
+                process: process.clone(),
+                plane_evidence: plane,
+            },
+            first_token_logit_bits: logit_bits,
+            chosen_token_id,
+            route_capture,
+        })
+    })();
+    completed.map_err(|detail| {
+        let response_failure = response.and_then(|response| {
+            response
+                .failure
+                .clone()
+                .or_else(|| response.base.failure.clone())
+        });
+        crate::numerical_diagnostics::DiagnosticWorkerFailureEvidence {
+            worker_id: request.base.worker_id.clone(),
+            plane: request.plane,
+            run_index: request.run_index,
+            detail: [
+                Some(detail),
+                capture.transport_error,
+                parse_detail,
+                response_failure,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; "),
+            process,
+            stderr,
+            stderr_truncated: capture.stderr.truncated,
+        }
+    })
+}
+
+fn emit_numerical_diagnostic_report(
+    report: &crate::numerical_diagnostics::DiagnosticReport,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = serde_json::to_vec_pretty(report)?;
+    bytes.push(b'\n');
+    std::fs::write(path, bytes)?;
+    eprintln!("logit diagnostic report written to {}", path.display());
+    Ok(())
+}
+
+fn fail_numerical_diagnostic(
+    mut report: crate::numerical_diagnostics::DiagnosticReport,
+    code: &str,
+    detail: impl Into<String>,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let detail = detail.into();
+    report.fail(code, detail.clone());
+    match emit_numerical_diagnostic_report(&report, path) {
+        Ok(()) => Err(format!("{code}: {detail}").into()),
+        Err(error) => Err(format!("{code}: {detail}; report emission failed: {error}").into()),
+    }
+}
+
+async fn execute_actual_input_q4_shadow(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    expected_adapter_name: &str,
+    capture: &crate::engine::RoutedFfnDiagnosticCapture,
+) -> Result<crate::numerical_diagnostics::ActualInputQ4ShadowEvidence, String> {
+    let runtime = build_isolated_greedy_runtime(
+        spec,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        tokenizer,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let attempt = async {
+        let plan: crate::qualification::ExecutionPlanEvidence =
+            runtime.engine.execution_context().plan().into();
+        if !crate::greedy_parity::hybrid_plan_exact(&plan)
+            || runtime.engine.routed_expert_gpu_failure_policy()
+                != crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed
+        {
+            return Err("Q4 shadow runtime did not retain the exact strict Hybrid plan".to_string());
+        }
+        let device = runtime
+            .engine
+            .gpu_device_identity()
+            .ok_or("Q4 shadow runtime has no authoritative GPU identity")?;
+        if device.software_adapter
+            || device.device_type.eq_ignore_ascii_case("cpu")
+            || device.name != expected_adapter_name
+        {
+            return Err(format!(
+                "Q4 shadow selected adapter {:?}, expected exact hardware adapter {:?}",
+                device.name, expected_adapter_name
+            ));
+        }
+        let input: Vec<f32> = capture
+            .input_bits
+            .iter()
+            .map(|bits| half::f16::from_f32(f32::from_bits(*bits)).to_f32())
+            .collect();
+        let inputs = vec![input.clone(), input];
+        let mut outputs = Vec::with_capacity(capture.expert_ids.len());
+        for &global_expert_id in &capture.expert_ids {
+            let execution = runtime
+                .engine
+                .qualify_q4_0_complete_expert(global_expert_id, 0, &inputs)
+                .await?;
+            let dispatch = execution
+                .dispatches
+                .into_iter()
+                .next()
+                .ok_or("Q4 shadow expert returned no production dispatch")?;
+            outputs.push(crate::numerical_diagnostics::Q4ShadowExpertOutput {
+                global_expert_id,
+                cpu_f32: dispatch.cpu_f32,
+                gpu_f16: dispatch.gpu_f16,
+            });
+        }
+        crate::numerical_diagnostics::build_actual_input_q4_shadow(capture, outputs)
+    }
+    .await;
+    let shutdown = runtime.shutdown_isolated().await.map_err(|error| error.to_string());
+    match (attempt, shutdown) {
+        (Ok(evidence), Ok(_)) => Ok(evidence),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; isolated shutdown also failed: {shutdown_error}"))
+        }
+    }
+}
+
+async fn cmd_diagnose_hybrid_q4_greedy_divergence(
+    args: DiagnoseHybridQ4GreedyDivergenceArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{
+        validate_preflight, BuildProvenance, PreflightEvidence, QualificationChecks,
+    };
+
+    let cfg = args.parsed_config;
+    let provenance = BuildProvenance::embedded();
+    let build_git_sha = provenance
+        .git_sha
+        .clone()
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("logit diagnostic requires embedded immutable build SHA")?;
+    if provenance.dirty != Some(false) {
+        return Err("logit diagnostic requires clean build provenance".into());
+    }
+    if args.expected_adapter_name.is_empty() {
+        return Err("--expected-adapter-name must be non-empty".into());
+    }
+    let worker_timeout = args
+        .progress_watchdog
+        .timeout
+        .ok_or("logit diagnostic requires a positive progress timeout")?;
+    let (_, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    if !artifact_errors.is_empty() {
+        return Err(format!(
+            "logit diagnostic artifact preflight failed: {}",
+            artifact_errors.join("; ")
+        )
+        .into());
+    }
+    let metadata = crate::qualification::read_expert_metadata(
+        &cfg.model.data_dir.join("metadata.json"),
+    )
+    .map_err(|error| format!("logit diagnostic metadata preflight failed: {error}"))?;
+    if !matches!(
+        cfg.real_transformer.resolve_weight_policy(),
+        Ok(crate::config::RealWeightPolicy::StrictReal)
+    ) {
+        return Err("logit diagnostic requires the strict real-weight policy".into());
+    }
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let preflight = PreflightEvidence {
+        provenance: provenance.clone(),
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        requested_mode: cfg.real_transformer.compute_offload,
+        routed_expert_dtype: cfg.model.dtype,
+        metadata,
+    };
+    validate_preflight(&preflight, &mut QualificationChecks::default())
+        .map_err(|failure| format!("{}: {}", failure.code, failure.detail))?;
+    let spec = resolve_real_cli_spec_from_config(
+        cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    if !greedy_parity_model_identity(&spec).is_qwen3_coder_30b_a3b_q4_0() {
+        return Err("logit diagnostic requires exact Qwen3-Coder 30B-A3B Q4_0 geometry".into());
+    }
+    let resolved_config_sha256 = resolved_real_cli_spec_sha256(&spec)?;
+    let (worker_executable, executable_sha256) = current_executable_identity()?;
+    let tokenizer = load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    )?;
+    let fixed = crate::greedy_parity::fixed_case(
+        crate::numerical_diagnostics::TARGET_CASE,
+    )
+    .ok_or("json-transformation fixed corpus case is unavailable")?;
+    // Parent-only tokenization: every worker receives this identical vector.
+    let prompt_token_ids = tokenizer.encode(fixed.prompt)?;
+    if prompt_token_ids.is_empty() {
+        return Err("json-transformation prompt encoded to zero tokens".into());
+    }
+    let prompt_sha256 = crate::greedy_parity::sha256_hex(fixed.prompt.as_bytes());
+    let prompt_token_ids_sha256 = crate::greedy_parity::token_ids_sha256(&prompt_token_ids);
+    let mut report = crate::numerical_diagnostics::DiagnosticReport::new(
+        provenance,
+        build_git_sha.clone(),
+        executable_sha256.clone(),
+        resolved_config_sha256.clone(),
+        args.expected_adapter_name.clone(),
+        prompt_sha256,
+        prompt_token_ids_sha256,
+        prompt_token_ids.len(),
+    );
+    let mut completed = Vec::with_capacity(6);
+    for plane in [
+        crate::numerical_diagnostics::DiagnosticPlane::Cpu,
+        crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation,
+        crate::numerical_diagnostics::DiagnosticPlane::Hybrid,
+    ] {
+        for run_index in 0..crate::numerical_diagnostics::REPEATED_RUNS_PER_PLANE {
+            let worker_id = crate::numerical_diagnostics::diagnostic_worker_id(
+                &build_git_sha,
+                &executable_sha256,
+                plane,
+                run_index,
+            );
+            let base = crate::greedy_parity::HybridWorkerRequest::new(
+                worker_id,
+                fixed,
+                resolved_config_sha256.clone(),
+                args.expected_adapter_name.clone(),
+                prompt_token_ids.clone(),
+                executable_sha256.clone(),
+                build_git_sha.clone(),
+            );
+            let request = crate::numerical_diagnostics::DiagnosticWorkerRequest::new(
+                plane,
+                run_index,
+                base,
+            );
+            match execute_logit_diagnostic_worker(
+                &worker_executable,
+                &args.config,
+                &request,
+                worker_timeout,
+            )
+            .await
+            {
+                Ok(worker) => completed.push(worker),
+                Err(failure) => {
+                    let detail = failure.detail.clone();
+                    report.runs = completed.iter().map(|worker| worker.run.clone()).collect();
+                    report.reproducibility = Some(
+                        crate::numerical_diagnostics::validate_repeated_run_identity(&report.runs),
+                    );
+                    report.worker_failures.push(failure);
+                    return fail_numerical_diagnostic(
+                        report,
+                        "logit-diagnostic-worker-failed",
+                        detail,
+                        &args.report_out,
+                    );
+                }
+            }
+        }
+    }
+    report.runs = completed.iter().map(|worker| worker.run.clone()).collect();
+    let reproducibility =
+        crate::numerical_diagnostics::validate_repeated_run_identity(&report.runs);
+    report.reproducibility = Some(reproducibility.clone());
+    if !reproducibility.cpu_bitwise_reproducible
+        || !reproducibility.cpu_boundary_emulation_bitwise_reproducible
+        || !reproducibility.hybrid_bitwise_reproducible
+        || !reproducibility.all_worker_ids_unique
+        || !reproducibility.all_process_ids_unique
+        || !reproducibility.every_worker_exited_zero_and_reaped
+        || !reproducibility.no_retries
+    {
+        return fail_numerical_diagnostic(
+            report,
+            "logit-diagnostic-reproducibility-failed",
+            "fresh CPU/boundary-emulation/Hybrid runs were nondeterministic or process evidence was incomplete",
+            &args.report_out,
+        );
+    }
+    let cpu = completed
+        .iter()
+        .find(|worker| worker.run.plane == crate::numerical_diagnostics::DiagnosticPlane::Cpu)
+        .ok_or("missing CPU logit diagnostic run")?;
+    let hybrid = completed
+        .iter()
+        .find(|worker| worker.run.plane == crate::numerical_diagnostics::DiagnosticPlane::Hybrid)
+        .ok_or("missing Hybrid logit diagnostic run")?;
+    let boundary = completed
+        .iter()
+        .find(|worker| {
+            worker.run.plane
+                == crate::numerical_diagnostics::DiagnosticPlane::CpuBoundaryEmulation
+        })
+        .ok_or("missing CPU boundary-emulation logit diagnostic run")?;
+    let cpu_logits: Vec<f32> = cpu
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let hybrid_logits: Vec<f32> = hybrid
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let boundary_logits: Vec<f32> = boundary
+        .first_token_logit_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    report.first_token_logits = Some(match
+        crate::numerical_diagnostics::build_first_token_logit_evidence(
+            &cpu_logits,
+            &hybrid_logits,
+            cpu.chosen_token_id,
+            hybrid.chosen_token_id,
+        )
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "first-token-logit-comparison-failed",
+                error,
+                &args.report_out,
+            )
+        }
+    });
+    report.cpu_boundary_emulation = Some(match
+        crate::numerical_diagnostics::build_boundary_plane_evidence(
+            &cpu_logits,
+            &hybrid_logits,
+            &boundary_logits,
+            cpu.chosen_token_id,
+            hybrid.chosen_token_id,
+            boundary.chosen_token_id,
+            boundary.run.generated_token_ids_sha256.clone(),
+        )
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "cpu-boundary-emulation-comparison-failed",
+                error,
+                &args.report_out,
+            )
+        }
+    });
+    let route_captures: Vec<_> = completed
+        .iter()
+        .filter(|worker| {
+            matches!(
+                worker.run.plane,
+                crate::numerical_diagnostics::DiagnosticPlane::Cpu
+                    | crate::numerical_diagnostics::DiagnosticPlane::Hybrid
+            )
+        })
+        .map(|worker| (worker.run.plane, worker.route_capture.clone()))
+        .collect();
+    let expected_token_idx = prompt_token_ids
+        .len()
+        .checked_sub(1)
+        .and_then(|position| position.checked_mul(spec.cfg.model.num_layers))
+        .and_then(|token_idx| u64::try_from(token_idx).ok())
+        .ok_or("layer-0 route capture token index overflowed")?;
+    let route_evidence = match crate::numerical_diagnostics::reconcile_route_captures(
+        &route_captures,
+        expected_token_idx,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return fail_numerical_diagnostic(
+                report,
+                "layer0-route-capture-invalid",
+                error,
+                &args.report_out,
+            )
+        }
+    };
+    let route_matches = route_evidence.exact_capture_match;
+    report.route_capture = Some(route_evidence);
+    if !route_matches {
+        return fail_numerical_diagnostic(
+            report,
+            "cpu-hybrid-layer0-route-mismatch",
+            "CPU/Hybrid layer-0 input, selected experts, or routing-weight bits differ; Q4 shadow dispatch was not performed",
+            &args.report_out,
+        );
+    }
+    let shadow_capture = &route_captures[0].1;
+    report.actual_input_q4_shadow = Some(
+        match execute_actual_input_q4_shadow(
+            &spec,
+            tokenizer,
+            &args.expected_adapter_name,
+            shadow_capture,
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return fail_numerical_diagnostic(
+                    report,
+                    "actual-input-q4-shadow-failed",
+                    error,
+                    &args.report_out,
+                )
+            }
+        },
+    );
+    if let Err(error) = report.finish() {
+        return fail_numerical_diagnostic(
+            report,
+            "logit-diagnostic-evidence-incomplete",
+            error,
+            &args.report_out,
+        );
+    }
+    emit_numerical_diagnostic_report(&report, &args.report_out)
+}
+
+async fn cmd_qualify_hybrid_q4_greedy_parity(
+    args: QualifyHybridQ4GreedyParityArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{
+        validate_preflight, BuildProvenance, FailureStage, PreflightEvidence,
+        QualificationChecks, QualificationFailure,
+    };
+
+    // The supplied Hybrid config is parsed exactly once. Reconciliation below
+    // produces one frozen spec from which both isolated planes are derived.
+    let cfg = args.parsed_config;
+    let provenance = BuildProvenance::embedded();
+    let (artifacts, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let metadata_result = crate::qualification::read_expert_metadata(&metadata_path);
+    let metadata = metadata_result.clone().ok();
+    let mut report = crate::greedy_parity::GreedyParityReport::new(
+        provenance.clone(),
+        artifacts,
+        metadata.clone(),
+        args.expected_adapter_name.clone(),
+    );
+
+    if args.expected_adapter_name.is_empty() {
+        return fail_greedy_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "expected-adapter-name-empty",
+                "--expected-adapter-name must be a non-empty exact adapter name",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    if args.progress_watchdog.timeout.is_none() {
+        return fail_greedy_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "progress-watchdog-required",
+                "greedy parity requires a positive performance.progress_timeout_secs or --progress-timeout-secs",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    if !artifact_errors.is_empty() {
+        return fail_greedy_parity(
+            report,
+            qualification_artifact_failure(&artifact_errors),
+            args.report_out.as_deref(),
+        );
+    }
+    let metadata = match metadata_result {
+        Ok(metadata) => metadata,
+        Err(detail) => {
+            return fail_greedy_parity(
+                report,
+                qualification_metadata_failure(detail),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let weight_policy = cfg.real_transformer.resolve_weight_policy();
+    if !matches!(weight_policy, Ok(crate::config::RealWeightPolicy::StrictReal)) {
+        return fail_greedy_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "non-strict-weight-policy",
+                weight_policy
+                    .err()
+                    .unwrap_or_else(|| "resolved weight policy is SeededDev".to_string()),
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let preflight = PreflightEvidence {
+        provenance,
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        requested_mode: cfg.real_transformer.compute_offload,
+        routed_expert_dtype: cfg.model.dtype,
+        metadata,
+    };
+    report.source_preflight = Some(crate::greedy_parity::StrictHybridPreflightEvidence {
+        real_transformer_enabled: preflight.real_transformer_enabled,
+        weights_dir_configured: preflight.weights_dir_configured,
+        strict_weights: preflight.strict_weights,
+        allow_seeded_fallback: preflight.allow_seeded_fallback,
+        allow_degraded_experts: preflight.allow_degraded_experts,
+        allow_attention_fallback: preflight.allow_attention_fallback,
+        allow_truncated_expert_payloads: preflight.allow_truncated_expert_payloads,
+        distributed_enabled: preflight.distributed_enabled,
+        gpu_cache_enabled: preflight.gpu_cache_enabled,
+        gpu_expert_capacity_bytes: preflight.gpu_expert_capacity_bytes,
+        requested_mode: match preflight.requested_mode {
+            crate::backend::ComputeOffload::Cpu => "cpu",
+            crate::backend::ComputeOffload::Gpu => "gpu",
+            crate::backend::ComputeOffload::Auto => "auto",
+            crate::backend::ComputeOffload::Hybrid => "hybrid",
+        }
+        .to_string(),
+        routed_expert_dtype: preflight.routed_expert_dtype.as_str().to_string(),
+    });
+    let mut base_checks = QualificationChecks::default();
+    if let Err(failure) = validate_preflight(&preflight, &mut base_checks) {
+        return fail_greedy_parity(report, failure, args.report_out.as_deref());
+    }
+    let spec = match resolve_real_cli_spec_from_config(
+        cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "configuration-reconciliation-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let identity = greedy_parity_model_identity(&spec);
+    if !identity.is_qwen3_coder_30b_a3b_q4_0() {
+        report.model_identity = Some(identity);
+        return fail_greedy_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "unexpected-model-identity",
+                "fixed corpus is qualified only for Qwen3-Coder 30B-A3B Q4_0 geometry",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    report.model_identity = Some(identity);
+    let resolved_config_sha256 = match resolved_real_cli_spec_sha256(&spec) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "resolved-config-hash-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.resolved_config_sha256 = Some(resolved_config_sha256.clone());
+    let worker_timeout = args
+        .progress_watchdog
+        .timeout
+        .expect("positive progress timeout checked above");
+    let (worker_executable, executable_sha256) = match current_executable_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "worker-executable-identity-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.orchestrator_executable_sha256 = Some(executable_sha256.clone());
+    let build_git_sha = match report.provenance.git_sha.clone() {
+        Some(sha)
+            if sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            sha
+        }
+        _ => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "worker-build-identity-unavailable",
+                    "same-binary worker isolation requires an embedded immutable build git SHA",
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    let tokenizer = match load_real_cli_tokenizer(
+        &spec.cfg,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+    ) {
+        Ok(tokenizer) => tokenizer,
+        Err(error) => {
+            return fail_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "tokenizer-load-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
+    for (case_index, fixed) in crate::greedy_parity::FIXED_CORPUS
+        .into_iter()
+        .enumerate()
+    {
+        // The sole encode call for this case happens here. The CPU runtime
+        // receives this immutable ID slice directly; the same IDs and frozen
+        // tokenizer artifact identity cross the typed worker protocol.
+        let prompt_token_ids = match tokenizer.encode(fixed.prompt) {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => {
+                return fail_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "prompt-tokenization-empty",
+                        format!("fixed case {} encoded to zero tokens", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+            Err(error) => {
+                return fail_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "prompt-tokenization-failed",
+                        format!("fixed case {}: {error}", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        let mut case = crate::greedy_parity::CaseReport::new(fixed, prompt_token_ids);
+        let cpu = execute_greedy_parity_plane(
+            &spec,
+            RealCliRuntimeMode::IsolatedGreedyParityCpu,
+            tokenizer.clone(),
+            &case.prompt_token_ids,
+            &case.prompt_token_ids_sha256,
+            &resolved_config_sha256,
+            &args.expected_adapter_name,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await;
+        let cpu = match cpu {
+            Ok(cpu) => cpu,
+            Err(error) => {
+                let mut failure = qualification_inference_failure(error.as_ref());
+                failure.detail = format!("fixed case {} CPU control: {error}", fixed.name);
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        case.cpu = Some(cpu);
+
+        let boundary_reference = execute_greedy_parity_boundary_reference_plane(
+            &spec,
+            tokenizer.clone(),
+            &case.prompt_token_ids,
+            &case.prompt_token_ids_sha256,
+            &resolved_config_sha256,
+            &args.expected_adapter_name,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await;
+        let boundary_reference = match boundary_reference {
+            Ok(reference) => reference,
+            Err(error) => {
+                let mut failure = qualification_inference_failure(error.as_ref());
+                failure.detail = format!(
+                    "fixed case {} CPU Hybrid-boundary reference: {error}",
+                    fixed.name
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        case.boundary_reference = Some(boundary_reference);
+
+        let worker_request = crate::greedy_parity::HybridWorkerRequest::new(
+            crate::greedy_parity::hybrid_worker_id(
+                &build_git_sha,
+                &executable_sha256,
+                case_index,
+                fixed.name,
+            ),
+            fixed,
+            resolved_config_sha256.clone(),
+            args.expected_adapter_name.clone(),
+            case.prompt_token_ids.clone(),
+            executable_sha256.clone(),
+            build_git_sha.clone(),
+        );
+        let hybrid = execute_greedy_parity_hybrid_worker(
+            &worker_executable,
+            &args.config,
+            &worker_request,
+            worker_timeout,
+        )
+        .await;
+        let hybrid = match hybrid {
+            Ok(hybrid) => hybrid,
+            Err(worker_error) => {
+                let mut failure = QualificationFailure::new(
+                    FailureStage::Inference,
+                    "hybrid-worker-failed",
+                    format!(
+                        "fixed case {} strict Hybrid worker: {}",
+                        fixed.name, worker_error.detail
+                    ),
+                );
+                if worker_error.evidence.timed_out {
+                    failure.code = "hybrid-worker-timeout".to_string();
+                }
+                case.worker_failure = Some(worker_error.evidence);
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        case.hybrid = Some(hybrid);
+        let (cpu_generation, boundary_generation, hybrid_generation) =
+            match (&case.cpu, &case.boundary_reference, &case.hybrid) {
+            (Some(cpu), Some(boundary), Some(hybrid)) => (
+                &cpu.generation,
+                &boundary.generation,
+                &hybrid.generation,
+            ),
+            _ => {
+                let failure = QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "plane-evidence-incomplete",
+                    format!(
+                        "fixed case {} lost successful CPU, boundary-reference, or Hybrid evidence",
+                        fixed.name
+                    ),
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        let ordinary_comparison = crate::greedy_parity::compare_generations(
+            cpu_generation,
+            hybrid_generation,
+            |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+        );
+        let ordinary_comparison = match ordinary_comparison {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                let failure = QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "divergence-evidence-decode-failed",
+                    format!("fixed case {} ordinary CPU comparison: {error}", fixed.name),
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        case.ordinary_cpu_vs_hybrid = Some(ordinary_comparison);
+
+        let boundary_comparison = crate::greedy_parity::compare_generations(
+            boundary_generation,
+            hybrid_generation,
+            |ids| tokenizer.decode(ids).map_err(|error| error.to_string()),
+        );
+        let boundary_comparison = match boundary_comparison {
+            Ok(comparison) => comparison,
+            Err(error) => {
+                let failure = QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "divergence-evidence-decode-failed",
+                    format!(
+                        "fixed case {} CPU Hybrid-boundary comparison: {error}",
+                        fixed.name
+                    ),
+                );
+                case.failure = Some(failure.clone());
+                report.cases.push(case);
+                return fail_greedy_parity(report, failure, args.report_out.as_deref());
+            }
+        };
+        let diverged = !boundary_comparison.exact_token_ids
+            || !boundary_comparison.equal_generated_count
+            || !boundary_comparison.equal_termination_reason
+            || !boundary_comparison.equal_generated_text_hash;
+        let divergence_position = boundary_comparison
+            .first_divergence
+            .as_ref()
+            .map(|evidence| evidence.position);
+        case.boundary_reference_vs_hybrid = Some(boundary_comparison);
+        if diverged {
+            let failure = QualificationFailure::new(
+                FailureStage::Postcondition,
+                "boundary-reference-greedy-token-divergence",
+                format!(
+                    "fixed case {} Hybrid diverged from the CPU Hybrid-boundary reference at position {:?}",
+                    fixed.name, divergence_position
+                ),
+            );
+            case.failure = Some(failure.clone());
+            report.cases.push(case);
+            return fail_greedy_parity(report, failure, args.report_out.as_deref());
+        }
+        report.cases.push(case);
+    }
+    if let Err(failure) = report.finish() {
+        return fail_greedy_parity(report, failure, args.report_out.as_deref());
+    }
+    emit_greedy_parity_report(&report, args.report_out.as_deref())
+}
+
 async fn with_progress_timeout<T, F>(
     label: String,
     watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
@@ -4319,6 +6689,42 @@ fn validate_bench_real_policies(cfg: &crate::config::Config) -> Result<(), Strin
 enum RealCliRuntimeMode {
     BenchReal,
     StrictHybridQualification,
+    IsolatedGreedyParityCpu,
+    IsolatedGreedyParityHybrid,
+}
+
+impl RealCliRuntimeMode {
+    fn is_isolated(self) -> bool {
+        matches!(
+            self,
+            Self::IsolatedGreedyParityCpu | Self::IsolatedGreedyParityHybrid
+        )
+    }
+
+    fn installs_logical_gpu_cache(self) -> bool {
+        matches!(
+            self,
+            Self::StrictHybridQualification | Self::IsolatedGreedyParityHybrid
+        )
+    }
+
+    fn tokenizer_command(self) -> &'static str {
+        match self {
+            Self::BenchReal => "bench-real",
+            Self::StrictHybridQualification => "qualify-hybrid-q4",
+            Self::IsolatedGreedyParityCpu | Self::IsolatedGreedyParityHybrid => {
+                "qualify-hybrid-q4-greedy-parity"
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedRealCliSpec {
+    cfg: crate::config::Config,
+    architecture: crate::architecture::Architecture,
+    first_k_dense_replace: usize,
+    advanced: crate::model::AdvancedConfig,
 }
 
 fn strict_hybrid_gpu_geometry(
@@ -4358,10 +6764,42 @@ async fn build_real_cli_runtime(
     mode: RealCliRuntimeMode,
 ) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
     use crate::config::Config;
-    use crate::metrics::Metrics;
-    use crate::tokenizer::Tokenizer;
 
-    let mut cfg = Config::from_file(config_path)?;
+    let cfg = Config::from_file(config_path)?;
+    let spec = resolve_real_cli_spec_from_config(cfg, mode)?;
+    let execution_context = match mode {
+        RealCliRuntimeMode::BenchReal => {
+            crate::backend::install_default();
+            let context = crate::backend::current_execution_context();
+            let b = crate::backend::current();
+            info!(
+                backend = b.device_name(),
+                compute_plane = b.compute_plane(),
+                "bench-real math backend installed"
+            );
+            context
+        }
+        RealCliRuntimeMode::StrictHybridQualification => {
+            let context = resolve_isolated_real_cli_context(
+                &spec,
+                spec.cfg.real_transformer.compute_offload,
+            )?;
+            crate::backend::set_execution_context(context.clone())
+                .map_err(|e| format!("failed to install qualification execution context: {e}"))?;
+            context
+        }
+        RealCliRuntimeMode::IsolatedGreedyParityCpu
+        | RealCliRuntimeMode::IsolatedGreedyParityHybrid => {
+            return Err("isolated qualification runtimes must use the private isolated factory".into());
+        }
+    };
+    build_real_cli_runtime_from_spec(&spec, mode, execution_context, None).await
+}
+
+fn resolve_real_cli_spec_from_config(
+    mut cfg: crate::config::Config,
+    mode: RealCliRuntimeMode,
+) -> Result<ResolvedRealCliSpec, Box<dyn std::error::Error>> {
     crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
     if mode == RealCliRuntimeMode::BenchReal {
         validate_bench_real_policies(&cfg)?;
@@ -4377,46 +6815,126 @@ async fn build_real_cli_runtime(
         resolved_first_k_dense_replace,
         &resolved_advanced,
     )?;
+    Ok(ResolvedRealCliSpec {
+        cfg,
+        architecture: resolved_architecture,
+        first_k_dense_replace: resolved_first_k_dense_replace,
+        advanced: resolved_advanced,
+    })
+}
 
-    let execution_context = match mode {
-        RealCliRuntimeMode::BenchReal => {
-            crate::backend::install_default();
-            let context = crate::backend::current_execution_context();
-            let b = crate::backend::current();
-            info!(
-                backend = b.device_name(),
-                compute_plane = b.compute_plane(),
-                "bench-real math backend installed"
-            );
-            context
-        }
-        RealCliRuntimeMode::StrictHybridQualification => {
-            let capacity_bytes = cfg
-                .gpu_cache
-                .vram_capacity_mb
-                .checked_mul(1024 * 1024)
-                .ok_or("gpu_cache.vram_capacity_mb overflows usize")?;
-            let gpu_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
-                capacity_bytes,
-                cfg.gpu_cache.vram_anchor_ratio,
-                cfg.gpu_cache.promote_after_hits,
-            ));
-            let context = crate::backend::resolve_execution_context(
-                cfg.real_transformer.compute_offload,
-                true,
-                strict_hybrid_gpu_geometry(&cfg, &resolved_advanced),
-                crate::backend::RoutedExpertGpuSpec {
-                    dtype: cfg.model.dtype,
-                    d_model: cfg.model.d_model,
-                    d_ff: cfg.model.d_ff,
-                },
-                gpu_cache,
-            )?;
-            crate::backend::set_execution_context(context.clone())
-                .map_err(|e| format!("failed to install qualification execution context: {e}"))?;
-            context
-        }
+fn resolve_isolated_real_cli_context(
+    spec: &ResolvedRealCliSpec,
+    requested: crate::backend::ComputeOffload,
+) -> Result<Arc<crate::backend::ExecutionContext>, Box<dyn std::error::Error>> {
+    let cfg = &spec.cfg;
+    let capacity_bytes = if requested == crate::backend::ComputeOffload::Hybrid {
+        cfg.gpu_cache
+            .vram_capacity_mb
+            .checked_mul(1024 * 1024)
+            .ok_or("gpu_cache.vram_capacity_mb overflows usize")?
+    } else {
+        0
     };
+    let gpu_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+        capacity_bytes,
+        cfg.gpu_cache.vram_anchor_ratio,
+        cfg.gpu_cache.promote_after_hits,
+    ));
+    Ok(crate::backend::resolve_execution_context(
+        requested,
+        true,
+        strict_hybrid_gpu_geometry(cfg, &spec.advanced),
+        crate::backend::RoutedExpertGpuSpec {
+            dtype: cfg.model.dtype,
+            d_model: cfg.model.d_model,
+            d_ff: cfg.model.d_ff,
+        },
+        gpu_cache,
+    )?)
+}
+
+fn resolved_real_cli_spec_sha256(
+    spec: &ResolvedRealCliSpec,
+) -> Result<String, Box<dyn std::error::Error>> {
+    resolved_real_runtime_identity_sha256(
+        &spec.cfg,
+        spec.architecture,
+        spec.first_k_dense_replace,
+        &spec.advanced,
+    )
+}
+
+fn resolved_real_runtime_identity_sha256(
+    cfg: &crate::config::Config,
+    architecture: crate::architecture::Architecture,
+    first_k_dense_replace: usize,
+    advanced: &crate::model::AdvancedConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut bytes = serde_json::to_vec(cfg)?;
+    bytes.extend_from_slice(architecture.model_type().as_bytes());
+    bytes.extend_from_slice(&(first_k_dense_replace as u64).to_le_bytes());
+    bytes.extend_from_slice(format!("{advanced:?}").as_bytes());
+    Ok(crate::greedy_parity::sha256_hex(&bytes))
+}
+
+/// Private qualification-only factory. It deliberately constructs an
+/// execution context without installing it in the process-global OnceLock.
+/// Every invocation builds a new storage/cache/predictor/model/engine family.
+async fn build_isolated_greedy_runtime(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    let requested = match mode {
+        RealCliRuntimeMode::IsolatedGreedyParityCpu => crate::backend::ComputeOffload::Cpu,
+        RealCliRuntimeMode::IsolatedGreedyParityHybrid => {
+            crate::backend::ComputeOffload::Hybrid
+        }
+        _ => return Err("non-isolated runtime mode passed to isolated factory".into()),
+    };
+    let context = resolve_isolated_real_cli_context(spec, requested)?;
+    build_real_cli_runtime_from_spec(spec, mode, context, Some(tokenizer)).await
+}
+
+fn load_real_cli_tokenizer(
+    cfg: &crate::config::Config,
+    mode: RealCliRuntimeMode,
+) -> Result<Arc<crate::tokenizer::Tokenizer>, Box<dyn std::error::Error>> {
+    let command = mode.tokenizer_command();
+    match cfg.tokenizer.path.as_ref() {
+        Some(path) => crate::tokenizer::Tokenizer::from_file(path)
+            .map(Arc::new)
+            .map_err(|error| {
+                format!(
+                    "{command} failed to load tokenizer {}: {error}",
+                    path.display()
+                )
+                .into()
+            }),
+        None if mode == RealCliRuntimeMode::BenchReal => Err(
+            "bench-real requires tokenizer.path; byte tokenizer fallback is not a production benchmark"
+                .into(),
+        ),
+        None => Err(format!(
+            "{command} requires tokenizer.path; byte tokenizer fallback is not permitted"
+        )
+        .into()),
+    }
+}
+
+async fn build_real_cli_runtime_from_spec(
+    spec: &ResolvedRealCliSpec,
+    mode: RealCliRuntimeMode,
+    execution_context: Arc<crate::backend::ExecutionContext>,
+    tokenizer_override: Option<Arc<crate::tokenizer::Tokenizer>>,
+) -> Result<BenchRealRuntime, Box<dyn std::error::Error>> {
+    use crate::metrics::Metrics;
+
+    let cfg = spec.cfg.clone();
+    let resolved_architecture = spec.architecture;
+    let resolved_first_k_dense_replace = spec.first_k_dense_replace;
+    let resolved_advanced = spec.advanced.clone();
 
     if !cfg.model.data_dir.is_dir() {
         return Err(format!(
@@ -4446,6 +6964,7 @@ async fn build_real_cli_runtime(
         cfg.model.expert_size,
     )?;
     let storage = Arc::new(storage);
+    let storage_shutdown = Arc::downgrade(&storage);
     let total_experts_for_files =
         (cfg.model.num_layers as u32).saturating_mul(cfg.model.num_experts);
     if !storage.is_packed() {
@@ -4488,6 +7007,7 @@ async fn build_real_cli_runtime(
             Arc::new(MultiLayerExpertCache::with_capacities(caps, per_layer))
         }
     };
+    let cache_shutdown = Arc::downgrade(&cache);
     let total_experts: u32 = (cfg.model.num_layers as u32)
         .saturating_mul(cfg.model.num_experts)
         .max(cfg.model.num_experts);
@@ -4497,6 +7017,7 @@ async fn build_real_cli_runtime(
         resolve_predict_min_prob(cfg.storage.predict_min_prob, total_experts),
         0xC0FFEE,
     ));
+    let predictor_shutdown = Arc::downgrade(&predictor);
 
     let rt = &cfg.real_transformer;
     let head_dim = if rt.head_dim == 0 {
@@ -4563,8 +7084,12 @@ async fn build_real_cli_runtime(
     );
     let router = crate::gating::Router::Linear(Arc::new(model.layers[0].gate.clone()));
     let metrics = Metrics::new();
+    let execution_context_shutdown = Arc::downgrade(&execution_context);
+    let gpu_cache_shutdown = Arc::downgrade(execution_context.gpu_expert_cache());
+    let mut speculator_shutdown = None;
+    let mut affinity_shutdown = None;
     let mut engine_builder = Engine::with_options_and_execution_context(
-        cache,
+        cache.clone(),
         pool,
         storage,
         router,
@@ -4615,6 +7140,7 @@ async fn build_real_cli_runtime(
             total_experts,
             0xC0FFEE,
         ));
+        speculator_shutdown = Some(Arc::downgrade(&spec));
         engine_builder = engine_builder.with_speculator(spec, top_k);
     }
     if cfg.predictive.affinity_enabled {
@@ -4622,6 +7148,7 @@ async fn build_real_cli_runtime(
             cfg.model.num_layers.max(1),
             cfg.model.num_experts,
         ));
+        affinity_shutdown = Some(Arc::downgrade(&affinity));
         engine_builder = engine_builder.with_affinity(
             affinity,
             cfg.predictive.affinity_neighbors_k,
@@ -4648,7 +7175,7 @@ async fn build_real_cli_runtime(
         ));
         engine_builder = engine_builder.with_pregate(pregate);
     }
-    if mode == RealCliRuntimeMode::StrictHybridQualification {
+    if mode.installs_logical_gpu_cache() {
         engine_builder.install_gpu_cache();
         engine_builder = engine_builder.with_routed_expert_gpu_failure_policy(
             crate::engine::RoutedExpertGpuFailurePolicy::StrictFailClosed,
@@ -4656,51 +7183,41 @@ async fn build_real_cli_runtime(
     }
     let engine = Arc::new(engine_builder.with_metrics(metrics));
 
-    let tokenizer = match cfg.tokenizer.path.as_ref() {
-        Some(p) => match Tokenizer::from_file(p) {
-            Ok(t) => Arc::new(t),
-            Err(e) => {
-                let detail = match mode {
-                    RealCliRuntimeMode::BenchReal => {
-                        format!("bench-real failed to load tokenizer {}: {e}", p.display())
-                    }
-                    RealCliRuntimeMode::StrictHybridQualification => format!(
-                        "qualify-hybrid-q4 failed to load tokenizer {}: {e}",
-                        p.display()
-                    ),
-                };
-                return Err(detail.into());
-            }
-        },
-        None => {
-            let detail = match mode {
-                RealCliRuntimeMode::BenchReal => "bench-real requires tokenizer.path; byte tokenizer fallback is not a production benchmark",
-                RealCliRuntimeMode::StrictHybridQualification => "qualify-hybrid-q4 requires tokenizer.path; byte tokenizer fallback is not permitted",
-            };
-            return Err(detail.into());
-        }
+    let tokenizer = match tokenizer_override {
+        Some(tokenizer) => tokenizer,
+        None => load_real_cli_tokenizer(&cfg, mode)?,
     };
     // The tokenizer must be addressable by the reconciled model vocabulary
     // (Finding 4): every emittable token id must be < model.vocab_size.
     tokenizer
         .validate_vocab_compat(model.config.vocab_size)
         .map_err(|e| -> Box<dyn std::error::Error> {
-            match mode {
-                RealCliRuntimeMode::BenchReal => {
-                    format!("bench-real tokenizer is incompatible with the model: {e}").into()
-                }
-                RealCliRuntimeMode::StrictHybridQualification => {
-                    format!("qualify-hybrid-q4 tokenizer is incompatible with the model: {e}")
-                        .into()
-                }
-            }
+            format!(
+                "{} tokenizer is incompatible with the model: {e}",
+                mode.tokenizer_command()
+            )
+            .into()
         })?;
+
+    let isolated_shutdown = mode.is_isolated().then(|| IsolatedRuntimeShutdownWitness {
+        engine: Arc::downgrade(&engine),
+        model: Arc::downgrade(&model),
+        cache: cache_shutdown,
+        storage: storage_shutdown,
+        predictor: predictor_shutdown,
+        execution_context: execution_context_shutdown,
+        gpu_cache: gpu_cache_shutdown,
+        speculator: speculator_shutdown,
+        affinity: affinity_shutdown,
+    });
 
     Ok(BenchRealRuntime {
         cfg,
         engine,
         model,
         tokenizer,
+        isolated_cache: mode.is_isolated().then_some(cache),
+        isolated_shutdown,
     })
 }
 
@@ -5019,8 +7536,56 @@ async fn run_bench_real_once(
     if prompt_ids.is_empty() {
         return Err("bench-real prompt encoded to zero tokens".into());
     }
+    Ok(
+        run_real_once_from_token_ids(runtime, &prompt_ids, output_tokens, params, run_index)
+            .await?
+            .report,
+    )
+}
+
+struct PreTokenizedRealRun {
+    report: BenchRealRunReport,
+    initial_kv_sequence_lengths: Vec<usize>,
+}
+
+/// Execute the existing production-authentic real-model path from caller-owned
+/// token IDs. The fixed-corpus qualifier uses this seam to prove both planes
+/// receive the exact same single tokenization result.
+async fn run_real_once_from_token_ids(
+    runtime: &BenchRealRuntime,
+    prompt_ids: &[u32],
+    output_tokens: usize,
+    params: crate::sampling::SamplingParams,
+    run_index: usize,
+) -> Result<PreTokenizedRealRun, Box<dyn std::error::Error>> {
+    run_real_once_from_token_ids_internal(
+        runtime,
+        prompt_ids,
+        output_tokens,
+        params,
+        run_index,
+        None,
+    )
+    .await
+}
+
+/// Sole pre-tokenized inference implementation. The private logit diagnostic
+/// may copy the exact first-token row-dot results immediately before the
+/// unchanged production greedy selector; all normal callers pass `None`.
+async fn run_real_once_from_token_ids_internal(
+    runtime: &BenchRealRuntime,
+    prompt_ids: &[u32],
+    output_tokens: usize,
+    params: crate::sampling::SamplingParams,
+    run_index: usize,
+    first_token_logit_bits: Option<&mut Vec<u32>>,
+) -> Result<PreTokenizedRealRun, Box<dyn std::error::Error>> {
+    if prompt_ids.is_empty() {
+        return Err("pre-tokenized real-model prompt contains zero tokens".into());
+    }
     let stage_timings = crate::stage_timing::StageTimings::default();
     let mut kv = runtime.model.fresh_kv_caches();
+    let initial_kv_sequence_lengths = kv.iter().map(|cache| cache.seq_len).collect();
     let pre = runtime.engine.report();
     let total_started = Instant::now();
     let prompt_started = Instant::now();
@@ -5063,6 +7628,19 @@ async fn run_bench_real_once(
     let prompt_elapsed = prompt_started.elapsed();
     stage_timings.record(crate::stage_timing::TOTAL_PROMPT, prompt_elapsed);
     let prompt_seconds = prompt_elapsed.as_secs_f64();
+    if let Some(bits) = first_token_logit_bits {
+        if !bits.is_empty() {
+            return Err("first-token logit capture destination was not empty".into());
+        }
+        bits.extend(
+            runtime
+                .model
+                .lm_head
+                .diagnostic_greedy_logits(&final_hidden)
+                .into_iter()
+                .map(f32::to_bits),
+        );
+    }
     let first = runtime.model.sample_hidden_with_timing(
         &final_hidden,
         &params,
@@ -5124,7 +7702,7 @@ async fn run_bench_real_once(
     let output_text = runtime.tokenizer.decode(&completion_ids)?;
     let stage_timings = stage_timings.snapshot();
 
-    Ok(BenchRealRunReport {
+    let report = BenchRealRunReport {
         run_index,
         prompt_tokens: prompt_ids.len(),
         completion_tokens: output_tokens,
@@ -5151,6 +7729,10 @@ async fn run_bench_real_once(
         output_token_ids: completion_ids,
         output_text,
         stage_timings,
+    };
+    Ok(PreTokenizedRealRun {
+        report,
+        initial_kv_sequence_lengths,
     })
 }
 
@@ -8831,6 +11413,310 @@ mod tests {
         assert_eq!(expert_id, 257);
         assert_eq!(expected_adapter_name, "NVIDIA L4");
         assert_eq!(report_out, None);
+    }
+
+    #[test]
+    fn greedy_parity_cli_requires_one_config_and_exact_adapter() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-hybrid-q4-greedy-parity",
+            "--config",
+            "strict-hybrid.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "report.json",
+        ])
+        .unwrap();
+        let Cmd::QualifyHybridQ4GreedyParity {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = cli.cmd
+        else {
+            panic!("expected qualify-hybrid-q4-greedy-parity command");
+        };
+        assert_eq!(config, PathBuf::from("strict-hybrid.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, Some(PathBuf::from("report.json")));
+
+        let error = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-hybrid-q4-greedy-parity",
+            "--config",
+            "strict-hybrid.toml",
+            "--cpu-config",
+            "cpu.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--cpu-config"));
+    }
+
+    #[test]
+    fn logit_diagnostic_cli_requires_report_and_exact_adapter() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-hybrid-q4-greedy-divergence",
+            "--config",
+            "strict-hybrid.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "diagnostic.json",
+        ])
+        .unwrap();
+        let Cmd::DiagnoseHybridQ4GreedyDivergence {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = cli.cmd
+        else {
+            panic!("expected logit diagnostic command");
+        };
+        assert_eq!(config, PathBuf::from("strict-hybrid.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, PathBuf::from("diagnostic.json"));
+
+        let missing_report = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-hybrid-q4-greedy-divergence",
+            "--config",
+            "strict-hybrid.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+        ]);
+        assert!(missing_report.is_err());
+    }
+
+    #[test]
+    fn greedy_parity_failure_report_is_written_and_returns_error() {
+        let dir = tempdir_unique("greedy-parity-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let report = crate::greedy_parity::GreedyParityReport::new(
+            crate::qualification::BuildProvenance {
+                git_sha: Some("0".repeat(40)),
+                dirty: Some(false),
+                package_version: "test".to_string(),
+            },
+            crate::qualification::QualificationArtifacts::default(),
+            None,
+            "NVIDIA L4".to_string(),
+        );
+        let failure = crate::qualification::QualificationFailure::new(
+            crate::qualification::FailureStage::Postcondition,
+            "test-failure",
+            "typed failure must produce a nonzero command result",
+        );
+        assert!(fail_greedy_parity(report, failure, Some(&path)).is_err());
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["status"], "fail");
+        assert_eq!(json["failure"]["code"], "test-failure");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn greedy_parity_isolated_contexts_are_distinct_and_cpu_exact() {
+        let global_before = crate::backend::current_execution_context();
+        let mut cfg = bench_real_ok_cfg();
+        cfg.model.d_model = 32;
+        cfg.model.d_ff = 32;
+        cfg.model.dtype = crate::inference::WeightDtype::Q4_0;
+        cfg.real_transformer.num_heads = 1;
+        cfg.real_transformer.num_kv_heads = 1;
+        cfg.real_transformer.head_dim = 32;
+        let spec = ResolvedRealCliSpec {
+            cfg,
+            architecture: crate::architecture::Architecture::Qwen3Moe,
+            first_k_dense_replace: 0,
+            advanced: crate::model::AdvancedConfig::default(),
+        };
+        let first = resolve_isolated_real_cli_context(
+            &spec,
+            crate::backend::ComputeOffload::Cpu,
+        )
+        .unwrap();
+        let second = resolve_isolated_real_cli_context(
+            &spec,
+            crate::backend::ComputeOffload::Cpu,
+        )
+        .unwrap();
+        assert_ne!(first.id(), second.id());
+        assert!(!Arc::ptr_eq(
+            first.gpu_expert_cache(),
+            second.gpu_expert_cache()
+        ));
+        assert!(crate::greedy_parity::cpu_plan_exact(&first.plan().into()));
+        assert!(crate::greedy_parity::cpu_plan_exact(&second.plan().into()));
+        let global_after = crate::backend::current_execution_context();
+        assert!(Arc::ptr_eq(&global_before, &global_after));
+        assert_ne!(first.id(), global_after.id());
+        assert_ne!(second.id(), global_after.id());
+        assert!(RealCliRuntimeMode::IsolatedGreedyParityCpu.is_isolated());
+        assert!(RealCliRuntimeMode::IsolatedGreedyParityHybrid.is_isolated());
+        assert!(!RealCliRuntimeMode::BenchReal.is_isolated());
+    }
+
+    #[tokio::test]
+    async fn greedy_parity_shutdown_waits_for_background_reference_release() {
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let background = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            drop(owner);
+        });
+        let evidence = wait_for_isolated_release(
+            || weak.upgrade().is_none(),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        background.await.unwrap();
+        assert!(evidence.controlled_shutdown_requested);
+        assert!(evidence.all_runtime_resources_released);
+        assert!(evidence.poll_iterations > 1);
+    }
+
+    #[tokio::test]
+    async fn greedy_parity_shutdown_timeout_fails_closed() {
+        let error = wait_for_isolated_release(
+            || false,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("background resources remained live"));
+    }
+
+    #[test]
+    fn greedy_parity_internal_worker_command_is_hidden_and_non_recursive() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "greedy-parity-hybrid-worker-internal",
+            "--config",
+            "strict-hybrid.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::GreedyParityHybridWorkerInternal { config }
+                if config == Path::new("strict-hybrid.toml")
+        ));
+        let help = <Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("greedy-parity-hybrid-worker-internal"));
+        let diagnostic = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "greedy-parity-logit-worker-internal",
+            "--config",
+            "strict-hybrid.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            diagnostic.cmd,
+            Cmd::GreedyParityLogitWorkerInternal { config }
+                if config == Path::new("strict-hybrid.toml")
+        ));
+        assert!(!help.contains("greedy-parity-logit-worker-internal"));
+    }
+
+    #[test]
+    fn greedy_parity_worker_stderr_is_bounded_while_input_is_fully_drained() {
+        let input = vec![b'x'; crate::greedy_parity::MAX_WORKER_STDERR_BYTES + 4096];
+        let bounded = read_child_output_bounded(
+            std::io::Cursor::new(input),
+            crate::greedy_parity::MAX_WORKER_STDERR_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            bounded.bytes.len(),
+            crate::greedy_parity::MAX_WORKER_STDERR_BYTES
+        );
+        assert!(bounded.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_observes_success_and_zero_exit() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; printf '{\"ok\":true}'; printf diagnostic >&2");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            br#"{"request":true}"#.to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), Some(0));
+        assert_eq!(child_exit_signal(&capture.status), None);
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+        assert_eq!(capture.stdout.bytes, br#"{"ok":true}"#);
+        assert_eq!(capture.stderr.bytes, b"diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_preserves_nonzero_exit() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("cat >/dev/null; exit 7");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), Some(7));
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_supervisor_preserves_signal_termination() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; kill -TERM $$");
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.status.code(), None);
+        assert_eq!(child_exit_signal(&capture.status), Some(15));
+        assert!(capture.reaped);
+        assert!(!capture.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn greedy_parity_worker_timeout_kills_and_reaps_exact_child() {
+        let mut command = Command::new("sleep");
+        command.arg("2");
+        let started = Instant::now();
+        let capture = run_greedy_parity_worker_process(
+            command,
+            b"request".to_vec(),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert!(capture.timed_out);
+        assert!(capture.reaped);
+        assert!(child_exit_signal(&capture.status).is_some());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

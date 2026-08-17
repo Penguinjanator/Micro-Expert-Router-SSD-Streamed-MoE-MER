@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex as ParkingMutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -140,7 +140,7 @@ struct AdapterMetadata {
 /// Immutable identity of the adapter selected by the authoritative GPU
 /// backend. This is evidence about the backend that executes work; it does not
 /// enumerate or rediscover a second adapter for reporting.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuDeviceIdentity {
     pub name: String,
     pub vendor_id: u32,
@@ -452,7 +452,7 @@ impl std::error::Error for GpuExpertDispatchError {}
 /// deliberately narrower than process/device memory: physical expert weight
 /// buffers plus the fixed routed-expert workspace buffers. Dense, attention,
 /// KV, driver, and allocator overhead remain outside this internal ledger.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)] // Public PR5 seam; PR4 validates it through backend-local tests.
 pub struct GpuExpertMemorySnapshot {
     /// Host payload bytes admitted by [`crate::expert_cache::GpuExpertCache`].
@@ -486,7 +486,7 @@ pub(crate) struct GpuPhysicalExpertResidency {
 
 /// Monotonic counters for only the routed-expert GPU path. Dense and
 /// attention operations are deliberately excluded.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuExpertIoSnapshot {
     /// Actual physical expert-buffer writes; registry hits do not increment it.
     pub expert_weight_uploads: u64,

@@ -188,7 +188,7 @@ pub fn read_expert_metadata(path: &Path) -> Result<ExpertMetadataEvidence, Strin
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionPlanEvidence {
     pub context_id: String,
     pub requested: String,

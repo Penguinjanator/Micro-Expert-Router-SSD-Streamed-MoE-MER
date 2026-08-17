@@ -36,7 +36,7 @@ use crate::router::{
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -871,7 +871,7 @@ pub(crate) struct Counters {
 /// These counters deliberately exclude the synthetic [`Engine::generate`]
 /// path. They are a qualification seam rather than a second Prometheus
 /// telemetry surface.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoutedExpertExecutionSnapshot {
     pub selected_routed_experts: u64,
     pub gpu_dispatch_attempts: u64,
@@ -1523,6 +1523,31 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool,
+    diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
+    diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
+    diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuQ4BoundaryEmulationSnapshot {
+    pub enabled: bool,
+    pub routed_expert_dispatches: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RoutedFfnDiagnosticCapture {
+    pub token_idx: u64,
+    pub layer: u32,
+    pub input_bits: Vec<u32>,
+    pub expert_ids: Vec<u32>,
+    pub routing_weight_bits: Vec<u32>,
+}
+
+struct DiagnosticRouteCaptureArm {
+    target_token_idx: u64,
+    captured: Option<RoutedFfnDiagnosticCapture>,
 }
 
 /// Run a CPU/GPU-blocking expert compute closure while *donating* the
@@ -1831,6 +1856,99 @@ impl Engine {
             ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool::new(false),
+            diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
+            diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
+            diagnostic_route_capture: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Enable CPU-only emulation of the production routed-expert f16 input
+    /// and output boundaries. Only isolated numerical-diagnostic workers call
+    /// this; ordinary CPU serving retains its existing Q4 execution path.
+    pub(crate) fn enable_cpu_q4_boundary_emulation(&self) -> Result<(), String> {
+        if self.execution_context().plan().routed_experts()
+            != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.dtype != WeightDtype::Q4_0
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "Q4 boundary emulation requires a strict CPU Q4_0 routed-expert plan"
+                    .to_string(),
+            );
+        }
+        self.diagnostic_cpu_q4_boundary_emulation
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn cpu_q4_boundary_emulation_snapshot(
+        &self,
+    ) -> CpuQ4BoundaryEmulationSnapshot {
+        CpuQ4BoundaryEmulationSnapshot {
+            enabled: self
+                .diagnostic_cpu_q4_boundary_emulation
+                .load(Ordering::Acquire),
+            routed_expert_dispatches: self
+                .diagnostic_cpu_q4_boundary_emulated_dispatches
+                .load(Ordering::Acquire),
+        }
+    }
+
+    /// Arm a one-shot, diagnostic-only capture at the routed-FFN boundary.
+    /// Normal serving never arms this slot, so its hot path performs only one
+    /// relaxed atomic load and never locks or clones activations.
+    pub(crate) fn arm_layer0_route_capture(&self, target_token_idx: u64) -> Result<(), String> {
+        let mut slot = self.diagnostic_route_capture.lock();
+        if slot.is_some() {
+            return Err("routed-FFN diagnostic capture is already armed".to_string());
+        }
+        *slot = Some(DiagnosticRouteCaptureArm {
+            target_token_idx,
+            captured: None,
+        });
+        self.diagnostic_route_capture_armed
+            .store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn take_layer0_route_capture(
+        &self,
+    ) -> Option<RoutedFfnDiagnosticCapture> {
+        self.diagnostic_route_capture_armed
+            .store(false, Ordering::Relaxed);
+        self.diagnostic_route_capture
+            .lock()
+            .take()
+            .and_then(|arm| arm.captured)
+    }
+
+    fn capture_layer0_route_if_armed(
+        &self,
+        token_idx: u64,
+        layer: u32,
+        x: &[f32],
+        experts: &[u32],
+        weights: &[f32],
+    ) {
+        if !self
+            .diagnostic_route_capture_armed
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut slot = self.diagnostic_route_capture.lock();
+        let Some(arm) = slot.as_mut() else {
+            return;
+        };
+        if layer == 0 && token_idx == arm.target_token_idx && arm.captured.is_none() {
+            arm.captured = Some(RoutedFfnDiagnosticCapture {
+                token_idx,
+                layer,
+                input_bits: x.iter().copied().map(f32::to_bits).collect(),
+                expert_ids: experts.to_vec(),
+                routing_weight_bits: weights.iter().copied().map(f32::to_bits).collect(),
+            });
         }
     }
 
@@ -4401,6 +4519,54 @@ impl Engine {
             .cpu_expert_forward_calls
             .fetch_add(1, Ordering::Relaxed);
 
+        if self
+            .diagnostic_cpu_q4_boundary_emulation
+            .load(Ordering::Acquire)
+        {
+            let expected = crate::inference::expert_weight_bytes_for(
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+                WeightDtype::Q4_0,
+            );
+            if r.data().len() < expected || r.data()[expected..].iter().any(|byte| *byte != 0) {
+                return Err(MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source: ExpertWeightsError::InvalidLayout(format!(
+                        "diagnostic Q4 payload has {} bytes; expected {expected} canonical bytes followed only by zero alignment padding",
+                        r.data().len()
+                    )),
+                });
+            }
+            let effective_input = crate::numerical_diagnostics::round_trip_f16_values(x)
+                .map_err(|source| MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source,
+                })?;
+            let cpu = crate::inference::q4_0_cpu_reference_forward(
+                &r.data()[..expected],
+                &effective_input,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+            )
+            .map_err(|source| MoeStepError::ExpertCompute {
+                layer,
+                expert: r.id,
+                source,
+            })?;
+            let output = crate::numerical_diagnostics::round_trip_f16_values(&cpu).map_err(
+                |source| MoeStepError::ExpertCompute {
+                    layer,
+                    expert: r.id,
+                    source,
+                },
+            )?;
+            self.diagnostic_cpu_q4_boundary_emulated_dispatches
+                .fetch_add(1, Ordering::Release);
+            return Ok(output);
+        }
+
         dispatch_expert_forward(
             self.core.options.dtype,
             self.core.options.use_qmm_for_q4,
@@ -4460,6 +4626,7 @@ impl Engine {
             weights.len(),
             "moe_step_weighted_into_with_timing: experts and weights must align"
         );
+        self.capture_layer0_route_if_armed(token_idx, layer, x, experts, weights);
         match self
             .moe_step_inner(
                 token_idx,

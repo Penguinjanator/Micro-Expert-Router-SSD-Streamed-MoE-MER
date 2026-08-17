@@ -2046,6 +2046,156 @@ routed-expert path; its synchronous production readback is not made
 preemptible by this qualification-only deadline. A separately scoped serving
 change would be required to bound that shared production wait safely.
 
+#### Strict Hybrid fixed-corpus greedy-token parity
+
+`qualify-hybrid-q4-greedy-parity` is a separate fail-closed diagnostic for
+Qwen3-Coder 30B-A3B Q4_0. It parses and reconciles one supplied strict Hybrid
+configuration, freezes that resolved model/runtime specification, then derives
+an ordinary all-CPU control, an all-CPU Hybrid-boundary reference, and strict
+Hybrid execution exclusively from that frozen specification. A second CPU
+config is neither accepted nor inferred. Each run and each corpus case receives
+a fresh engine, KV state, RAM/logical GPU cache, physical registry, counters,
+predictors, background state, and storage runtime. Both CPU runs remain fresh
+in-process runtimes. Every Hybrid case runs
+in a separate short-lived child of the same immutable executable; the parent
+passes already-tokenized IDs through a typed stdin protocol, waits for a normal
+zero exit, and reaps the child before starting the next case. Controlled Rust
+shutdown remains reported, while process termination is the authoritative
+NVIDIA client/device teardown boundary.
+
+The versioned corpus `qwen3-coder-30b-a3b-greedy-v1` contains four cases:
+Rust function generation, Rust code correction, compact JSON transformation,
+and a short Spanish instruction. Each prompt is tokenized exactly once, the
+same token-ID slice is passed to all three runs, and each run produces exactly
+16 completion tokens with `SamplingParams::greedy()` (`temperature=0`,
+`top_p=1`, `top_k=0`, `seed=0`). This is deliberately small correctness
+coverage, not a throughput benchmark.
+
+```bash
+./target/release/micro-expert-router qualify-hybrid-q4-greedy-parity \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out greedy-parity.json
+```
+
+Schema `mer.strict-hybrid-q4-greedy-parity.v2` passes only when the clean build,
+real checkpoint, canonical `ggml-standard-v1` metadata, exact Qwen3-Coder
+geometry, fixed corpus, and fixed sampling identity all validate. Per case,
+both the ordinary informational CPU plane and the authoritative CPU
+Hybrid-boundary reference must resolve every component to CPU and account
+every selected routed expert as a CPU dispatch with zero GPU counters. The
+boundary reference applies the documented production Hybrid f16 conversion at
+every routed-expert input and output while retaining the original f32 routing
+weights and aggregation semantics. Typed runtime evidence must show boundary
+emulation disabled with zero emulated dispatches for ordinary CPU and Hybrid,
+and enabled with every CPU routed-expert dispatch observed through the emulation
+path for the boundary reference. Hybrid must resolve
+embeddings, LM head, dense projections, attention, KV, and router to CPU while
+routing native Q4_0 experts to the exact named non-software GPU under
+`StrictFailClosed`. Every selected Hybrid expert must be attempted and succeed
+on GPU; hidden uploads, queue submissions, map requests, completed readbacks,
+and readback bytes must all be nonzero; CPU expert execution, fallback,
+degraded substitution, and GPU failures must remain zero.
+Each Hybrid case must also prove unique worker and process identities, matching
+executable and build SHA, case/config/token identities, normal zero exit,
+successful reap, and absence of timeout or signal termination. Missing
+worker-process evidence fails closed. Worker stderr is diagnostic-only and
+bounded in failure reports.
+
+PASS additionally requires the CPU Hybrid-boundary reference and Hybrid to have
+exact generated token-ID equality at every position, identical generated count
+and termination reason, and identical decoded-text SHA-256. Ordinary CPU output
+and its comparison with Hybrid remain informational evidence; their divergence
+does not fail the boundary-aware v2 contract. Both comparisons preserve the
+first differing position, nullable reference and Hybrid token IDs for length
+divergence, termination reasons, lengths, counters, and decoded prefixes
+bounded to 512 UTF-8 bytes. The report contains no timing or TPS fields and does
+not change EOS, serving, batching, scheduling, quantization, shader math, or
+numerical-parity tolerances. The earlier v1 schema retains its original raw-CPU
+parity meaning and is not accepted as v2 evidence.
+
+```bash
+jq -e '
+  . as $report |
+  $report.schema_version == "mer.strict-hybrid-q4-greedy-parity.v2" and
+  $report.status == "pass" and
+  $report.failure == null and
+  ($report.checks | all(.[]; . == true)) and
+  $report.source_preflight.requested_mode == "hybrid" and
+  all($report.cases[];
+    .hybrid.device.name == $report.expected_adapter_name and
+    .hybrid.device.software_adapter == false and
+    .cpu.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0} and
+    .boundary_reference.cpu_q4_boundary_emulation.enabled == true and
+    (.boundary_reference.cpu_q4_boundary_emulation.routed_expert_dispatches ==
+      .boundary_reference.routed_execution_delta.cpu_routed_expert_dispatches) and
+    .hybrid.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0} and
+    .boundary_reference_vs_hybrid.exact_token_ids == true and
+    .boundary_reference_vs_hybrid.equal_generated_count == true and
+    .boundary_reference_vs_hybrid.equal_termination_reason == true and
+    .boundary_reference_vs_hybrid.equal_generated_text_hash == true)
+' greedy-parity.json
+```
+
+##### First-token numerical diagnostic
+
+`diagnose-hybrid-q4-greedy-divergence` is a separate Phase-A diagnostic for
+the fixed `json-transformation` case. It leaves the exact-token qualification
+contract unchanged. The parent tokenizes once, then starts two fresh
+process-isolated ordinary CPU workers, two fresh process-isolated CPU
+Hybrid-boundary-emulation workers, and two fresh process-isolated Hybrid
+workers: six runs total. Each worker returns the complete first-token logit
+vector as bounded exact f32 bits through a private typed protocol; the final
+JSON contains only hashes and comparison evidence.
+
+```bash
+./target/release/micro-expert-router diagnose-hybrid-q4-greedy-divergence \
+  --config ./path/to/strict-hybrid-q4.toml \
+  --expected-adapter-name "NVIDIA L4" \
+  --report-out ./greedy-logit-diagnostic.json
+```
+
+The report schema is
+`mer.strict-hybrid-q4-greedy-logit-diagnostic.v1`. It records repeated-run
+bitwise reproducibility, chosen tokens, top-16 logits and bits, the union of
+both top-16 sets, complete-vector error metrics, and the CPU/Hybrid change in
+the token-715-versus-token-5212 margin. `qualification_pass` is always false;
+`diagnostic_complete` means only that all identity, process, strict-plane, and
+logit evidence was collected and reconciled.
+
+```bash
+jq -e '
+  .schema_version == "mer.strict-hybrid-q4-greedy-logit-diagnostic.v1" and
+  .qualification_pass == false and
+  .diagnostic_complete == true and
+  .failure == null and
+  (.runs | length) == 6 and
+  ([.runs[] | select(.plane == "cpu")] | length) == 2 and
+  ([.runs[] | select(.plane == "cpu_boundary_emulation")] | length) == 2 and
+  ([.runs[] | select(.plane == "hybrid")] | length) == 2 and
+  .reproducibility.cpu_bitwise_reproducible == true and
+  .reproducibility.cpu_boundary_emulation_bitwise_reproducible == true and
+  .reproducibility.hybrid_bitwise_reproducible == true and
+  .reproducibility.all_worker_ids_unique == true and
+  .reproducibility.all_process_ids_unique == true and
+  .reproducibility.every_worker_exited_zero_and_reaped == true and
+  .reproducibility.no_retries == true and
+  all(.runs[];
+    if .plane == "cpu" then
+      .plane_evidence.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0}
+    elif .plane == "cpu_boundary_emulation" then
+      (.plane_evidence.cpu_q4_boundary_emulation.enabled == true and
+       (.plane_evidence.cpu_q4_boundary_emulation.routed_expert_dispatches ==
+        .plane_evidence.routed_execution_delta.cpu_routed_expert_dispatches))
+    elif .plane == "hybrid" then
+      .plane_evidence.cpu_q4_boundary_emulation == {"enabled":false,"routed_expert_dispatches":0}
+    else false
+    end) and
+  (.first_token_logits.cpu_top_16 | length) == 16 and
+  (.first_token_logits.hybrid_top_16 | length) == 16
+' ./greedy-logit-diagnostic.json
+```
+
 Increase log verbosity:
 
 ```bash
@@ -2455,6 +2605,18 @@ micro-expert-router qualify-hybrid-q4-parity
   --expected-adapter-name <NAME>
                               Required exact authoritative wgpu adapter name.
   --report-out <PATH>        Write typed JSON there (default: stdout).
+
+micro-expert-router qualify-hybrid-q4-greedy-parity
+  --config <PATH>            One strict Hybrid native-Q4_0 TOML config.
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Write typed JSON there (default: stdout).
+
+micro-expert-router diagnose-hybrid-q4-greedy-divergence
+  --config <PATH>            One strict Hybrid native-Q4_0 TOML config.
+  --expected-adapter-name <NAME>
+                              Required exact authoritative wgpu adapter name.
+  --report-out <PATH>        Required typed diagnostic JSON destination.
 
 micro-expert-router monitor          # requires `--features tui` (on by default)
   --url <URL>                Base URL of a running `serve` instance

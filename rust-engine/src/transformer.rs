@@ -1876,6 +1876,13 @@ impl LMHead {
         self.weights.matvec(hidden)
     }
 
+    /// Diagnostic-only full-logit capture through the production greedy
+    /// selector's row kernel. Normal inference retains the allocation-free
+    /// fused argmax path.
+    pub(crate) fn diagnostic_greedy_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        self.weights.diagnostic_greedy_logits(hidden)
+    }
+
     /// One-shot: project `hidden` to logits and sample a next-token id
     /// using the given [`crate::sampling::SamplingParams`]. The
     /// `position` is folded into the sampler's per-step seed so a
