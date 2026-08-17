@@ -3,10 +3,10 @@
 // scalar; the weight and destination never cross the host boundary here.
 
 struct PushConstants {
-    token_id: u32,
-    rows: u32,
+    local_row: u32,
+    global_row: u32,
     cols: u32,
-    _pad: u32,
+    q8_first_block: u32,
 };
 var<push_constant> pc: PushConstants;
 
@@ -21,7 +21,7 @@ fn read_weight_byte(byte_offset: u32) -> u32 {
 }
 
 fn q8_0_value(flat_index: u32) -> f32 {
-    let block = flat_index / Q8_0_BLOCK_ELEMS;
+    let block = flat_index / Q8_0_BLOCK_ELEMS - pc.q8_first_block;
     let in_block = flat_index % Q8_0_BLOCK_ELEMS;
     let block_offset = block * Q8_0_BLOCK_BYTES;
     let scale_bits = read_weight_byte(block_offset)
@@ -38,7 +38,7 @@ fn f32_embedding_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (col >= pc.cols) {
         return;
     }
-    HIDDEN[col] = bitcast<f32>(W[pc.token_id * pc.cols + col]);
+    HIDDEN[col] = bitcast<f32>(W[pc.local_row * pc.cols + col]);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -47,5 +47,5 @@ fn q8_0_embedding_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (col >= pc.cols) {
         return;
     }
-    HIDDEN[col] = q8_0_value(pc.token_id * pc.cols + col);
+    HIDDEN[col] = q8_0_value(pc.global_row * pc.cols + col);
 }

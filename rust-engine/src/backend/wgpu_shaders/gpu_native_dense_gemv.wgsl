@@ -7,8 +7,8 @@
 struct PushConstants {
     rows: u32,
     cols: u32,
-    _pad0: u32,
-    _pad1: u32,
+    global_row_base: u32,
+    q8_first_block: u32,
 };
 var<push_constant> pc: PushConstants;
 
@@ -24,7 +24,7 @@ fn read_weight_byte(byte_offset: u32) -> u32 {
 }
 
 fn q8_0_value(flat_index: u32) -> f32 {
-    let block = flat_index / Q8_0_BLOCK_ELEMS;
+    let block = flat_index / Q8_0_BLOCK_ELEMS - pc.q8_first_block;
     let in_block = flat_index % Q8_0_BLOCK_ELEMS;
     let block_offset = block * Q8_0_BLOCK_BYTES;
     let scale_bits = read_weight_byte(block_offset)
@@ -37,28 +37,29 @@ fn q8_0_value(flat_index: u32) -> f32 {
 
 @compute @workgroup_size(64, 1, 1)
 fn f32_gemv_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= pc.rows) {
+    let local_row = gid.x;
+    if (local_row >= pc.rows) {
         return;
     }
-    let row_start = row * pc.cols;
+    let row_start = local_row * pc.cols;
     var sum = 0.0;
     for (var col = 0u; col < pc.cols; col = col + 1u) {
         sum = sum + bitcast<f32>(W[row_start + col]) * X[col];
     }
-    OUT[row] = sum;
+    OUT[pc.global_row_base + local_row] = sum;
 }
 
 @compute @workgroup_size(64, 1, 1)
 fn q8_0_gemv_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    if (row >= pc.rows) {
+    let local_row = gid.x;
+    if (local_row >= pc.rows) {
         return;
     }
-    let row_start = row * pc.cols;
+    let global_row = pc.global_row_base + local_row;
+    let row_start = global_row * pc.cols;
     var sum = 0.0;
     for (var col = 0u; col < pc.cols; col = col + 1u) {
         sum = sum + q8_0_value(row_start + col) * X[col];
     }
-    OUT[row] = sum;
+    OUT[global_row] = sum;
 }

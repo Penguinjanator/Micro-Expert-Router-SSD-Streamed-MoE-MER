@@ -48,6 +48,12 @@ pub(crate) enum GpuNativeBootstrapError {
         rows: usize,
         cols: usize,
     },
+    DenseWeightRowExceedsDeviceLimit {
+        kind: GpuNativeDenseWeightKind,
+        cols: usize,
+        required: u64,
+        maximum: u64,
+    },
     DenseWeightByteLength {
         kind: GpuNativeDenseWeightKind,
         rows: usize,
@@ -139,6 +145,15 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::DenseWeightDimensionTooLarge { rows, cols } => write!(
                 f,
                 "GPU-native dense weight shape [{rows}, {cols}] exceeds u32 shader geometry"
+            ),
+            Self::DenseWeightRowExceedsDeviceLimit {
+                kind,
+                cols,
+                required,
+                maximum,
+            } => write!(
+                f,
+                "GPU-native {kind:?} dense weight row with {cols} columns requires {required} bytes, exceeding the physical chunk limit {maximum}"
             ),
             Self::DenseWeightByteLength {
                 kind,
@@ -385,6 +400,187 @@ impl GpuNativeDenseWeightLayout {
     }
 }
 
+/// One independently bindable physical buffer covering complete logical rows.
+/// Q8_0 chunks retain the source tensor's global flat-block convention and can
+/// therefore duplicate the single boundary block shared by adjacent chunks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuNativeDenseWeightChunkPlan {
+    row_start: usize,
+    row_count: usize,
+    first_block: usize,
+    payload_offset_bytes: usize,
+    payload_bytes: u64,
+    allocation_bytes: u64,
+}
+
+impl GpuNativeDenseWeightChunkPlan {
+    fn row_end(self) -> usize {
+        self.row_start + self.row_count
+    }
+
+    fn contains_row(self, row: usize) -> bool {
+        self.row_start <= row && row < self.row_end()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuNativeDenseWeightPlan {
+    layout: GpuNativeDenseWeightLayout,
+    chunks: Vec<GpuNativeDenseWeightChunkPlan>,
+    physical_allocation_bytes: u64,
+}
+
+impl GpuNativeDenseWeightPlan {
+    fn try_new(
+        layout: GpuNativeDenseWeightLayout,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        let maximum = limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size));
+        let mut chunks = Vec::new();
+        let mut row_start = 0usize;
+        let mut physical_allocation_bytes = 0u64;
+
+        while row_start < layout.rows {
+            let remaining = layout.rows - row_start;
+            let row_count = match layout.kind {
+                GpuNativeDenseWeightKind::F32 => {
+                    let row_bytes = layout.cols.checked_mul(std::mem::size_of::<f32>()).ok_or(
+                        GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                            rows: layout.rows,
+                            cols: layout.cols,
+                        },
+                    )?;
+                    let row_bytes = u64::try_from(row_bytes).map_err(|_| {
+                        GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                            rows: layout.rows,
+                            cols: layout.cols,
+                        }
+                    })?;
+                    if row_bytes > maximum {
+                        return Err(GpuNativeBootstrapError::DenseWeightRowExceedsDeviceLimit {
+                            kind: layout.kind,
+                            cols: layout.cols,
+                            required: row_bytes,
+                            maximum,
+                        });
+                    }
+                    remaining.min(usize::try_from(maximum / row_bytes).unwrap_or(usize::MAX))
+                }
+                GpuNativeDenseWeightKind::Q8_0 => {
+                    let one_row = Self::q8_chunk(layout, row_start, 1)?;
+                    if one_row.allocation_bytes > maximum {
+                        return Err(GpuNativeBootstrapError::DenseWeightRowExceedsDeviceLimit {
+                            kind: layout.kind,
+                            cols: layout.cols,
+                            required: one_row.allocation_bytes,
+                            maximum,
+                        });
+                    }
+                    let mut low = 1usize;
+                    let mut high = remaining;
+                    while low < high {
+                        let middle = low + (high - low).div_ceil(2);
+                        if Self::q8_chunk(layout, row_start, middle)?.allocation_bytes <= maximum {
+                            low = middle;
+                        } else {
+                            high = middle - 1;
+                        }
+                    }
+                    low
+                }
+            };
+
+            let chunk = match layout.kind {
+                GpuNativeDenseWeightKind::F32 => {
+                    let row_bytes = layout.cols * std::mem::size_of::<f32>();
+                    let payload_offset_bytes = row_start * row_bytes;
+                    let payload_bytes = u64::try_from(row_count * row_bytes).map_err(|_| {
+                        GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                            rows: layout.rows,
+                            cols: layout.cols,
+                        }
+                    })?;
+                    GpuNativeDenseWeightChunkPlan {
+                        row_start,
+                        row_count,
+                        first_block: 0,
+                        payload_offset_bytes,
+                        payload_bytes,
+                        allocation_bytes: payload_bytes,
+                    }
+                }
+                GpuNativeDenseWeightKind::Q8_0 => Self::q8_chunk(layout, row_start, row_count)?,
+            };
+            physical_allocation_bytes = physical_allocation_bytes
+                .checked_add(chunk.allocation_bytes)
+                .ok_or(GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                    rows: layout.rows,
+                    cols: layout.cols,
+                })?;
+            chunks.push(chunk);
+            row_start += row_count;
+        }
+
+        Ok(Self {
+            layout,
+            chunks,
+            physical_allocation_bytes,
+        })
+    }
+
+    fn q8_chunk(
+        layout: GpuNativeDenseWeightLayout,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<GpuNativeDenseWeightChunkPlan, GpuNativeBootstrapError> {
+        let element_start = row_start.checked_mul(layout.cols).ok_or(
+            GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                rows: layout.rows,
+                cols: layout.cols,
+            },
+        )?;
+        let element_end = row_start
+            .checked_add(row_count)
+            .and_then(|row_end| row_end.checked_mul(layout.cols))
+            .ok_or(GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                rows: layout.rows,
+                cols: layout.cols,
+            })?;
+        let first_block = element_start / Q8_0_BLOCK_ELEMS;
+        let block_end = element_end.div_ceil(Q8_0_BLOCK_ELEMS);
+        let block_count = block_end - first_block;
+        let payload_offset_bytes = first_block.checked_mul(Q8_0_BLOCK_BYTES).ok_or(
+            GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                rows: layout.rows,
+                cols: layout.cols,
+            },
+        )?;
+        let payload_bytes_usize = block_count.checked_mul(Q8_0_BLOCK_BYTES).ok_or(
+            GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                rows: layout.rows,
+                cols: layout.cols,
+            },
+        )?;
+        let allocation_bytes_usize = payload_bytes_usize
+            .checked_add(3)
+            .map(|bytes| bytes & !3)
+            .ok_or(GpuNativeBootstrapError::DenseWeightShapeOverflow {
+                rows: layout.rows,
+                cols: layout.cols,
+            })?;
+        Ok(GpuNativeDenseWeightChunkPlan {
+            row_start,
+            row_count,
+            first_block,
+            payload_offset_bytes,
+            payload_bytes: payload_bytes_usize as u64,
+            allocation_bytes: allocation_bytes_usize as u64,
+        })
+    }
+}
+
 /// Stable model-scoped key used to retrieve a registered dense tensor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct GpuNativeDenseWeightKey(Arc<str>);
@@ -422,11 +618,16 @@ impl GpuNativeDenseWeightHandle {
     }
 }
 
+struct GpuNativeDenseWeightChunk<B = wgpu::Buffer> {
+    plan: GpuNativeDenseWeightChunkPlan,
+    buffer: B,
+}
+
 struct GpuNativeDenseWeight<B = wgpu::Buffer> {
     weight_id: u64,
     key: GpuNativeDenseWeightKey,
     layout: GpuNativeDenseWeightLayout,
-    buffer: B,
+    chunks: Vec<GpuNativeDenseWeightChunk<B>>,
 }
 
 impl<B> GpuNativeDenseWeight<B> {
@@ -749,10 +950,12 @@ impl<B> fmt::Debug for GpuNativeTokenState<B> {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeExecutionSnapshot {
     pub(crate) dense_weights_registered: u64,
+    pub(crate) dense_weight_chunks: u64,
     pub(crate) dense_weight_uploads: u64,
     pub(crate) dense_weight_upload_bytes: u64,
     pub(crate) dense_weight_resident_bytes: u64,
     pub(crate) dense_gemv_dispatches: u64,
+    pub(crate) dense_gemv_chunk_dispatches: u64,
     pub(crate) embedding_dispatches: u64,
     pub(crate) tokens_submitted: u64,
     pub(crate) tokens_completed: u64,
@@ -775,10 +978,12 @@ pub(crate) struct GpuNativeExecutionSnapshot {
 #[derive(Debug, Default)]
 struct GpuNativeExecutionCounters {
     dense_weights_registered: AtomicU64,
+    dense_weight_chunks: AtomicU64,
     dense_weight_uploads: AtomicU64,
     dense_weight_upload_bytes: AtomicU64,
     dense_weight_resident_bytes: AtomicU64,
     dense_gemv_dispatches: AtomicU64,
+    dense_gemv_chunk_dispatches: AtomicU64,
     embedding_dispatches: AtomicU64,
     tokens_submitted: AtomicU64,
     tokens_completed: AtomicU64,
@@ -802,10 +1007,12 @@ impl GpuNativeExecutionCounters {
     fn snapshot(&self) -> GpuNativeExecutionSnapshot {
         GpuNativeExecutionSnapshot {
             dense_weights_registered: self.dense_weights_registered.load(Ordering::Relaxed),
+            dense_weight_chunks: self.dense_weight_chunks.load(Ordering::Relaxed),
             dense_weight_uploads: self.dense_weight_uploads.load(Ordering::Relaxed),
             dense_weight_upload_bytes: self.dense_weight_upload_bytes.load(Ordering::Relaxed),
             dense_weight_resident_bytes: self.dense_weight_resident_bytes.load(Ordering::Relaxed),
             dense_gemv_dispatches: self.dense_gemv_dispatches.load(Ordering::Relaxed),
+            dense_gemv_chunk_dispatches: self.dense_gemv_chunk_dispatches.load(Ordering::Relaxed),
             embedding_dispatches: self.embedding_dispatches.load(Ordering::Relaxed),
             tokens_submitted: self.tokens_submitted.load(Ordering::Relaxed),
             tokens_completed: self.tokens_completed.load(Ordering::Relaxed),
@@ -826,18 +1033,23 @@ impl GpuNativeExecutionCounters {
         }
     }
 
-    fn record_dense_weight_registration(&self, allocation_bytes: u64) {
+    fn record_dense_weight_registration(&self, chunks: u64, allocation_bytes: u64) {
         self.dense_weights_registered
             .fetch_add(1, Ordering::Relaxed);
-        self.dense_weight_uploads.fetch_add(1, Ordering::Relaxed);
+        self.dense_weight_chunks
+            .fetch_add(chunks, Ordering::Relaxed);
+        self.dense_weight_uploads
+            .fetch_add(chunks, Ordering::Relaxed);
         self.dense_weight_upload_bytes
             .fetch_add(allocation_bytes, Ordering::Relaxed);
         self.dense_weight_resident_bytes
             .fetch_add(allocation_bytes, Ordering::Relaxed);
     }
 
-    fn record_dense_gemv_dispatch(&self) {
+    fn record_dense_gemv_dispatch(&self, chunks: u64) {
         self.dense_gemv_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.dense_gemv_chunk_dispatches
+            .fetch_add(chunks, Ordering::Relaxed);
     }
 
     fn record_embedding_dispatch(&self) {
@@ -861,17 +1073,17 @@ impl GpuNativeExecutionCounters {
 struct GpuNativeGemvPushConstants {
     rows: u32,
     cols: u32,
-    _pad0: u32,
-    _pad1: u32,
+    global_row_base: u32,
+    q8_first_block: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuNativeEmbeddingPushConstants {
-    token_id: u32,
-    rows: u32,
+    local_row: u32,
+    global_row: u32,
     cols: u32,
-    _pad: u32,
+    q8_first_block: u32,
 }
 
 struct GpuNativeDensePipelines {
@@ -1104,9 +1316,9 @@ impl GpuNativeExecutorContext {
     }
 
     /// Register one immutable model-scoped dense tensor and upload its payload
-    /// exactly once. This is the only dense-weight upload path in the
+    /// exactly once per physical chunk. This is the only dense-weight upload path in the
     /// GPU-native plane; encoded GEMV and embedding calls only bind this
-    /// persistent buffer.
+    /// persistent model-scoped storage.
     pub(crate) fn register_dense_weight(
         &self,
         key: GpuNativeDenseWeightKey,
@@ -1114,8 +1326,7 @@ impl GpuNativeExecutorContext {
     ) -> Result<GpuNativeDenseWeightHandle, GpuNativeBootstrapError> {
         let gpu = self.authoritative_gpu()?;
         let layout = GpuNativeDenseWeightLayout::from_weight(weight)?;
-        let label = format!("gpu_native_dense_weight_{}", key.as_str());
-        layout.validate_for_limits(&label, &gpu.device.limits())?;
+        let plan = GpuNativeDenseWeightPlan::try_new(layout, &gpu.device.limits())?;
 
         // Serialize the duplicate check through insertion so two startup
         // registrars cannot both upload the same stable key.
@@ -1125,36 +1336,67 @@ impl GpuNativeExecutorContext {
                 key: key.as_str().to_string(),
             });
         }
-        let buffer = create_startup_buffer(
-            &gpu.device,
-            &label,
-            layout.allocation_bytes,
-            GpuNativeDenseWeightLayout::usage(),
-        )?;
-        match weight {
-            DenseWeight::F32 { values, .. } => {
-                gpu.queue
-                    .write_buffer(&buffer, 0, bytemuck::cast_slice(values));
+        for (index, chunk) in plan.chunks.iter().enumerate() {
+            super::validate_startup_buffer(
+                &format!("gpu_native_dense_weight_{}_chunk_{index}", key.as_str()),
+                chunk.allocation_bytes,
+                GpuNativeDenseWeightLayout::usage(),
+                &gpu.device.limits(),
+            )?;
+        }
+
+        let mut chunks = Vec::with_capacity(plan.chunks.len());
+        for (index, chunk_plan) in plan.chunks.iter().copied().enumerate() {
+            let label = format!("gpu_native_dense_weight_{}_chunk_{index}", key.as_str());
+            let buffer = create_startup_buffer(
+                &gpu.device,
+                &label,
+                chunk_plan.allocation_bytes,
+                GpuNativeDenseWeightLayout::usage(),
+            )?;
+            match weight {
+                DenseWeight::F32 { values, .. } => {
+                    let value_start = chunk_plan.payload_offset_bytes / std::mem::size_of::<f32>();
+                    let value_count =
+                        chunk_plan.payload_bytes as usize / std::mem::size_of::<f32>();
+                    gpu.queue.write_buffer(
+                        &buffer,
+                        0,
+                        bytemuck::cast_slice(&values[value_start..value_start + value_count]),
+                    );
+                }
+                DenseWeight::Q8_0 { bytes, .. }
+                    if chunk_plan.payload_bytes == chunk_plan.allocation_bytes =>
+                {
+                    let start = chunk_plan.payload_offset_bytes;
+                    let end = start + chunk_plan.payload_bytes as usize;
+                    gpu.queue.write_buffer(&buffer, 0, &bytes[start..end]);
+                }
+                DenseWeight::Q8_0 { bytes, .. } => {
+                    let start = chunk_plan.payload_offset_bytes;
+                    let end = start + chunk_plan.payload_bytes as usize;
+                    let mut upload = Vec::with_capacity(chunk_plan.allocation_bytes as usize);
+                    upload.extend_from_slice(&bytes[start..end]);
+                    upload.resize(chunk_plan.allocation_bytes as usize, 0);
+                    gpu.queue.write_buffer(&buffer, 0, &upload);
+                }
             }
-            DenseWeight::Q8_0 { bytes, .. } if bytes.len() as u64 == layout.allocation_bytes => {
-                gpu.queue.write_buffer(&buffer, 0, bytes);
-            }
-            DenseWeight::Q8_0 { bytes, .. } => {
-                let mut upload = Vec::with_capacity(layout.allocation_bytes as usize);
-                upload.extend_from_slice(bytes);
-                upload.resize(layout.allocation_bytes as usize, 0);
-                gpu.queue.write_buffer(&buffer, 0, &upload);
-            }
+            chunks.push(GpuNativeDenseWeightChunk {
+                plan: chunk_plan,
+                buffer,
+            });
         }
         let registered = GpuNativeDenseWeight {
             weight_id: next_nonzero_id(&NEXT_GPU_NATIVE_WEIGHT_ID, "dense weight"),
             key,
             layout,
-            buffer,
+            chunks,
         };
         let handle = registry.insert(registered)?;
-        self.counters
-            .record_dense_weight_registration(layout.allocation_bytes);
+        self.counters.record_dense_weight_registration(
+            plan.chunks.len() as u64,
+            plan.physical_allocation_bytes,
+        );
         Ok(handle)
     }
 
@@ -1289,47 +1531,53 @@ impl GpuNativeExecutorContext {
                 actual: output_elements,
             });
         }
-        let workgroups = self.checked_workgroups(weight.layout.rows, &gpu.device.limits())?;
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gpu_native_dense_gemv_bind_group"),
-            layout: &self.dense_pipelines.gemv_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: weight.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output.as_entire_binding(),
-                },
-            ],
-        });
+        let workgroups = weight
+            .chunks
+            .iter()
+            .map(|chunk| self.checked_workgroups(chunk.plan.row_count, &gpu.device.limits()))
+            .collect::<Result<Vec<_>, _>>()?;
         let pipeline = match weight.layout.kind {
             GpuNativeDenseWeightKind::F32 => &self.dense_pipelines.f32_gemv,
             GpuNativeDenseWeightKind::Q8_0 => &self.dense_pipelines.q8_0_gemv,
         };
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("gpu_native_dense_gemv_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.set_push_constants(
-            0,
-            bytemuck::bytes_of(&GpuNativeGemvPushConstants {
-                rows: weight.layout.rows as u32,
-                cols: weight.layout.cols as u32,
-                _pad0: 0,
-                _pad1: 0,
-            }),
-        );
-        pass.dispatch_workgroups(workgroups, 1, 1);
-        drop(pass);
-        self.counters.record_dense_gemv_dispatch();
+        for (chunk, workgroups) in weight.chunks.iter().zip(workgroups) {
+            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gpu_native_dense_gemv_chunk_bind_group"),
+                layout: &self.dense_pipelines.gemv_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: chunk.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_native_dense_gemv_chunk_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_push_constants(
+                0,
+                bytemuck::bytes_of(&GpuNativeGemvPushConstants {
+                    rows: chunk.plan.row_count as u32,
+                    cols: weight.layout.cols as u32,
+                    global_row_base: chunk.plan.row_start as u32,
+                    q8_first_block: chunk.plan.first_block as u32,
+                }),
+            );
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        self.counters
+            .record_dense_gemv_dispatch(weight.chunks.len() as u64);
         Ok(())
     }
 
@@ -1354,13 +1602,18 @@ impl GpuNativeExecutorContext {
             });
         }
         let workgroups = self.checked_workgroups(weight.layout.cols, &gpu.device.limits())?;
+        let chunk = weight
+            .chunks
+            .iter()
+            .find(|chunk| chunk.plan.contains_row(token_id as usize))
+            .expect("validated embedding row must belong to exactly one chunk");
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gpu_native_embedding_bind_group"),
             layout: &self.dense_pipelines.embedding_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: weight.buffer.as_entire_binding(),
+                    resource: chunk.buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1381,10 +1634,10 @@ impl GpuNativeExecutorContext {
         pass.set_push_constants(
             0,
             bytemuck::bytes_of(&GpuNativeEmbeddingPushConstants {
-                token_id,
-                rows: weight.layout.rows as u32,
+                local_row: token_id - chunk.plan.row_start as u32,
+                global_row: token_id,
                 cols: weight.layout.cols as u32,
-                _pad: 0,
+                q8_first_block: chunk.plan.first_block as u32,
             }),
         );
         pass.dispatch_workgroups(workgroups, 1, 1);
@@ -1477,6 +1730,19 @@ mod tests {
         scale * (bytes[offset + 2 + in_block] as i8 as f32)
     }
 
+    fn read_q8_chunk_mirror(
+        bytes: &[u8],
+        plan: GpuNativeDenseWeightChunkPlan,
+        global_flat_index: usize,
+    ) -> f32 {
+        let global_block = global_flat_index / Q8_0_BLOCK_ELEMS;
+        let local_block = global_block - plan.first_block;
+        let in_block = global_flat_index % Q8_0_BLOCK_ELEMS;
+        let offset = local_block * Q8_0_BLOCK_BYTES;
+        let scale = half::f16::from_le_bytes([bytes[offset], bytes[offset + 1]]).to_f32();
+        scale * (bytes[offset + 2 + in_block] as i8 as f32)
+    }
+
     fn q8_gemv_mirror(bytes: &[u8], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
         (0..rows)
             .map(|row| {
@@ -1505,11 +1771,16 @@ mod tests {
         layout: GpuNativeDenseWeightLayout,
         buffer: B,
     ) -> GpuNativeDenseWeight<B> {
+        let plan = GpuNativeDenseWeightPlan::try_new(layout, &wgpu::Limits::default()).unwrap();
+        assert_eq!(plan.chunks.len(), 1);
         GpuNativeDenseWeight {
             weight_id,
             key: GpuNativeDenseWeightKey::try_new(key).unwrap(),
             layout,
-            buffer,
+            chunks: vec![GpuNativeDenseWeightChunk {
+                plan: plan.chunks[0],
+                buffer,
+            }],
         }
     }
 
@@ -1544,6 +1815,210 @@ mod tests {
         .unwrap();
         assert_eq!(one_block.payload_bytes(), 34);
         assert_eq!(one_block.allocation_bytes(), 36);
+    }
+
+    #[test]
+    fn qwen_dense_weight_plans_fit_physical_storage_limits_without_allocating_payloads() {
+        const ROWS: usize = 151_936;
+        const COLS: usize = 2_048;
+        const STORAGE_LIMIT: u64 = 128 * 1024 * 1024;
+        const BUFFER_LIMIT: u64 = 256 * 1024 * 1024;
+        let limits = wgpu::Limits {
+            max_buffer_size: BUFFER_LIMIT,
+            max_storage_buffer_binding_size: STORAGE_LIMIT as u32,
+            ..wgpu::Limits::default()
+        };
+
+        let elements = ROWS * COLS;
+        let f32_layout = GpuNativeDenseWeightLayout::try_new(
+            GpuNativeDenseWeightKind::F32,
+            ROWS,
+            COLS,
+            elements * std::mem::size_of::<f32>(),
+        )
+        .unwrap();
+        let f32_plan = GpuNativeDenseWeightPlan::try_new(f32_layout, &limits).unwrap();
+        assert_eq!(f32_plan.chunks.len(), 10);
+        assert_eq!(f32_plan.chunks[0].row_count, 16_384);
+        assert_eq!(f32_plan.chunks.last().unwrap().row_count, 4_480);
+        assert!(f32_plan
+            .chunks
+            .iter()
+            .all(|chunk| chunk.allocation_bytes <= STORAGE_LIMIT));
+        assert_eq!(
+            f32_plan
+                .chunks
+                .iter()
+                .map(|chunk| chunk.allocation_bytes)
+                .max(),
+            Some(STORAGE_LIMIT)
+        );
+        for (index, chunk) in f32_plan.chunks.iter().enumerate() {
+            super::super::validate_startup_buffer(
+                &format!("test_qwen_f32_chunk_{index}"),
+                chunk.allocation_bytes,
+                GpuNativeDenseWeightLayout::usage(),
+                &limits,
+            )
+            .unwrap();
+        }
+
+        let q8_bytes = elements.div_ceil(Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES;
+        let q8_layout = GpuNativeDenseWeightLayout::try_new(
+            GpuNativeDenseWeightKind::Q8_0,
+            ROWS,
+            COLS,
+            q8_bytes,
+        )
+        .unwrap();
+        let q8_plan = GpuNativeDenseWeightPlan::try_new(q8_layout, &limits).unwrap();
+        assert_eq!(q8_plan.chunks.len(), 3);
+        assert_eq!(q8_plan.chunks[0].row_count, 61_680);
+        assert_eq!(q8_plan.chunks.last().unwrap().row_count, 28_576);
+        assert!(q8_plan
+            .chunks
+            .iter()
+            .all(|chunk| chunk.allocation_bytes <= STORAGE_LIMIT));
+        assert_eq!(
+            q8_plan
+                .chunks
+                .iter()
+                .map(|chunk| chunk.allocation_bytes)
+                .max(),
+            Some(134_215_680)
+        );
+        for (index, chunk) in q8_plan.chunks.iter().enumerate() {
+            super::super::validate_startup_buffer(
+                &format!("test_qwen_q8_chunk_{index}"),
+                chunk.allocation_bytes,
+                GpuNativeDenseWeightLayout::usage(),
+                &limits,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn q8_row_crossing_chunks_preserve_metadata_blocks_gemv_and_embedding() {
+        let rows = 3;
+        let cols = 35;
+        let values = (0..rows * cols)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 7.0)
+            .collect::<Vec<_>>();
+        let source = q8_bytes(&values);
+        let weight = DenseWeight::from_q8_0_bytes(source.clone(), rows, cols).unwrap();
+        let layout = GpuNativeDenseWeightLayout::from_weight(&weight).unwrap();
+        let limits = wgpu::Limits {
+            max_buffer_size: 68,
+            max_storage_buffer_binding_size: 68,
+            ..wgpu::Limits::default()
+        };
+        let plan = GpuNativeDenseWeightPlan::try_new(layout, &limits).unwrap();
+        assert_eq!(plan.chunks.len(), 3);
+        assert_eq!(plan.physical_allocation_bytes, 204);
+        assert_eq!(
+            plan.chunks,
+            vec![
+                GpuNativeDenseWeightChunkPlan {
+                    row_start: 0,
+                    row_count: 1,
+                    first_block: 0,
+                    payload_offset_bytes: 0,
+                    payload_bytes: 68,
+                    allocation_bytes: 68,
+                },
+                GpuNativeDenseWeightChunkPlan {
+                    row_start: 1,
+                    row_count: 1,
+                    first_block: 1,
+                    payload_offset_bytes: 34,
+                    payload_bytes: 68,
+                    allocation_bytes: 68,
+                },
+                GpuNativeDenseWeightChunkPlan {
+                    row_start: 2,
+                    row_count: 1,
+                    first_block: 2,
+                    payload_offset_bytes: 68,
+                    payload_bytes: 68,
+                    allocation_bytes: 68,
+                },
+            ]
+        );
+
+        let chunk_bytes = plan
+            .chunks
+            .iter()
+            .map(|chunk| {
+                &source[chunk.payload_offset_bytes
+                    ..chunk.payload_offset_bytes + chunk.payload_bytes as usize]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&chunk_bytes[0][34..68], &chunk_bytes[1][0..34]);
+        assert_eq!(&chunk_bytes[1][34..68], &chunk_bytes[2][0..34]);
+
+        for (chunk, bytes) in plan.chunks.iter().copied().zip(&chunk_bytes) {
+            for row in chunk.row_start..chunk.row_end() {
+                for col in 0..cols {
+                    let flat = row * cols + col;
+                    assert_eq!(
+                        read_q8_chunk_mirror(bytes, chunk, flat),
+                        read_q8_mirror(&source, flat)
+                    );
+                }
+            }
+        }
+
+        let input = (0..cols)
+            .map(|i| ((i * 11 % 19) as f32 - 9.0) / 5.0)
+            .collect::<Vec<_>>();
+        let expected_gemv = weight.matvec(&input);
+        let mut chunked_gemv = vec![0.0; rows];
+        for (chunk, bytes) in plan.chunks.iter().copied().zip(&chunk_bytes) {
+            for row in chunk.row_start..chunk.row_end() {
+                for col in 0..cols {
+                    chunked_gemv[row] +=
+                        read_q8_chunk_mirror(bytes, chunk, row * cols + col) * input[col];
+                }
+            }
+        }
+        assert_close(&chunked_gemv, &expected_gemv, 1e-5);
+
+        for token in 0..rows {
+            let (chunk, bytes) = plan
+                .chunks
+                .iter()
+                .copied()
+                .zip(&chunk_bytes)
+                .find(|(chunk, _)| chunk.contains_row(token))
+                .unwrap();
+            let actual = (0..cols)
+                .map(|col| read_q8_chunk_mirror(bytes, chunk, token * cols + col))
+                .collect::<Vec<_>>();
+            let mut expected = Vec::new();
+            weight.row_dequant_into(token, &mut expected);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn dense_weight_planner_fails_when_one_complete_row_cannot_fit() {
+        let layout =
+            GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 2, 4, 32).unwrap();
+        let limits = wgpu::Limits {
+            max_buffer_size: 15,
+            max_storage_buffer_binding_size: 15,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            GpuNativeDenseWeightPlan::try_new(layout, &limits),
+            Err(GpuNativeBootstrapError::DenseWeightRowExceedsDeviceLimit {
+                kind: GpuNativeDenseWeightKind::F32,
+                cols: 4,
+                required: 16,
+                maximum: 15,
+            })
+        );
     }
 
     #[test]
@@ -1715,21 +2190,24 @@ mod tests {
     #[test]
     fn registration_and_dispatch_counters_keep_uploads_distinct() {
         let counters = GpuNativeExecutionCounters::default();
-        counters.record_dense_weight_registration(36);
+        counters.record_dense_weight_registration(3, 108);
         let after_registration = counters.snapshot();
         assert_eq!(after_registration.dense_weights_registered, 1);
-        assert_eq!(after_registration.dense_weight_uploads, 1);
-        assert_eq!(after_registration.dense_weight_upload_bytes, 36);
-        assert_eq!(after_registration.dense_weight_resident_bytes, 36);
+        assert_eq!(after_registration.dense_weight_chunks, 3);
+        assert_eq!(after_registration.dense_weight_uploads, 3);
+        assert_eq!(after_registration.dense_weight_upload_bytes, 108);
+        assert_eq!(after_registration.dense_weight_resident_bytes, 108);
         assert_eq!(after_registration.dense_gemv_dispatches, 0);
+        assert_eq!(after_registration.dense_gemv_chunk_dispatches, 0);
 
-        counters.record_dense_gemv_dispatch();
-        counters.record_dense_gemv_dispatch();
+        counters.record_dense_gemv_dispatch(3);
+        counters.record_dense_gemv_dispatch(2);
         counters.record_embedding_dispatch();
         let after_dispatch = counters.snapshot();
-        assert_eq!(after_dispatch.dense_weight_uploads, 1);
-        assert_eq!(after_dispatch.dense_weight_upload_bytes, 36);
+        assert_eq!(after_dispatch.dense_weight_uploads, 3);
+        assert_eq!(after_dispatch.dense_weight_upload_bytes, 108);
         assert_eq!(after_dispatch.dense_gemv_dispatches, 2);
+        assert_eq!(after_dispatch.dense_gemv_chunk_dispatches, 5);
         assert_eq!(after_dispatch.embedding_dispatches, 1);
     }
 
@@ -1744,6 +2222,7 @@ mod tests {
                 GPU_NATIVE_EMBEDDING_SHADER,
                 &["f32_embedding_main", "q8_0_embedding_main"][..],
             ),
+            (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("GPU-native WGSL must parse");
             naga::valid::Validator::new(
@@ -1759,6 +2238,432 @@ mod tests {
                     .any(|entry| entry.name == *entry_point));
             }
         }
+    }
+
+    const GPU_NATIVE_TEST_COMPARE_SHADER: &str = r#"
+struct PushConstants {
+    elements: u32,
+    tolerance_bits: u32,
+};
+var<push_constant> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read> ACTUAL: array<f32>;
+@group(0) @binding(1) var<storage, read> EXPECTED: array<f32>;
+@group(0) @binding(2) var<storage, read_write> STATUS: array<atomic<u32>>;
+
+@compute @workgroup_size(64, 1, 1)
+fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= pc.elements) {
+        return;
+    }
+    let difference = abs(ACTUAL[gid.x] - EXPECTED[gid.x]);
+    if (!(difference <= bitcast<f32>(pc.tolerance_bits))) {
+        atomicStore(&STATUS[0], 1u);
+    }
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    struct GpuNativeTestComparePushConstants {
+        elements: u32,
+        tolerance_bits: u32,
+    }
+
+    fn create_test_compare_pipeline(
+        device: &wgpu::Device,
+    ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_native_test_compare_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_native_test_compare_pipeline_layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..8,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_test_compare_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_TEST_COMPARE_SHADER.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_test_compare_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "compare_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        (layout, pipeline)
+    }
+
+    fn create_test_expected_buffer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        label: &str,
+        values: &[f32],
+    ) -> wgpu::Buffer {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (values.len() * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(values));
+        buffer
+    }
+
+    fn encode_test_compare(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layout: &wgpu::BindGroupLayout,
+        pipeline: &wgpu::ComputePipeline,
+        actual: &wgpu::Buffer,
+        expected: &wgpu::Buffer,
+        status: &wgpu::Buffer,
+        elements: usize,
+        tolerance: f32,
+    ) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_test_compare_bind_group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: actual.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: expected.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: status.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_test_compare_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_push_constants(
+            0,
+            bytemuck::bytes_of(&GpuNativeTestComparePushConstants {
+                elements: elements as u32,
+                tolerance_bits: tolerance.to_bits(),
+            }),
+        );
+        pass.dispatch_workgroups((elements as u32).div_ceil(GPU_NATIVE_WORKGROUP_SIZE), 1, 1);
+    }
+
+    /// Requires an actual hardware WGPU adapter. This intentionally uses the
+    /// production execution-context resolver and maps only its four-byte
+    /// aggregate validation status, never GPU-native hidden or scratch data.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_dense_gemv_embedding_persistence() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::inference::WeightDtype;
+
+        const COLS: usize = 35;
+        let expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024 * 1024,
+            0.5,
+            16,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 8,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 8,
+                v_head_dim: 8,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: 32,
+                d_ff: 64,
+            },
+            expert_cache,
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = execution
+            .create_gpu_native_executor_context(COLS)
+            .expect("GPU-native executor must retain the authoritative backend");
+        let gpu = executor.authoritative_gpu().unwrap();
+
+        let gemv_input_values = (0..COLS)
+            .map(|i| ((i * 11 % 19) as f32 - 9.0) / 5.0)
+            .collect::<Vec<_>>();
+        let f32_gemv_values = (0..3 * COLS)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 7.0)
+            .collect::<Vec<_>>();
+        let f32_gemv_weight = DenseWeight::from_f32(f32_gemv_values, 3, COLS);
+        let q8_gemv_values = (0..3 * COLS)
+            .map(|i| ((i * 23 % 47) as f32 - 23.0) / 9.0)
+            .collect::<Vec<_>>();
+        let q8_gemv_weight =
+            DenseWeight::from_q8_0_bytes(q8_bytes(&q8_gemv_values), 3, COLS).unwrap();
+        let f32_embedding_values = (0..5 * COLS)
+            .map(|i| ((i * 13 % 41) as f32 - 20.0) / 6.0)
+            .collect::<Vec<_>>();
+        let f32_embedding_weight = DenseWeight::from_f32(f32_embedding_values, 5, COLS);
+        let q8_embedding_values = (0..3 * COLS)
+            .map(|i| ((i * 29 % 53) as f32 - 26.0) / 8.0)
+            .collect::<Vec<_>>();
+        let q8_embedding_weight =
+            DenseWeight::from_q8_0_bytes(q8_bytes(&q8_embedding_values), 3, COLS).unwrap();
+
+        let f32_gemv_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.f32_gemv").unwrap(),
+                &f32_gemv_weight,
+            )
+            .unwrap();
+        let q8_gemv_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.q8_gemv").unwrap(),
+                &q8_gemv_weight,
+            )
+            .unwrap();
+        let f32_embedding_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.f32_embedding").unwrap(),
+                &f32_embedding_weight,
+            )
+            .unwrap();
+        let q8_embedding_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.q8_embedding").unwrap(),
+                &q8_embedding_weight,
+            )
+            .unwrap();
+        let registered = executor.execution_snapshot();
+        assert_eq!(registered.dense_weights_registered, 4);
+
+        let input = executor.create_scratch(COLS).unwrap();
+        let f32_output = executor.create_scratch(3).unwrap();
+        let q8_output = executor.create_scratch(3).unwrap();
+        let state = executor.create_token_state().unwrap();
+        gpu.queue
+            .write_buffer(&input.buffer, 0, bytemuck::cast_slice(&gemv_input_values));
+
+        let f32_gemv_expected = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_test_f32_gemv_expected",
+            &f32_gemv_weight.matvec(&gemv_input_values),
+        );
+        let q8_gemv_expected = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_test_q8_gemv_expected",
+            &q8_gemv_weight.matvec(&gemv_input_values),
+        );
+        let f32_embedding_expected = [0usize, 2, 4]
+            .into_iter()
+            .map(|row| {
+                let mut expected = Vec::new();
+                f32_embedding_weight.row_dequant_into(row, &mut expected);
+                create_test_expected_buffer(
+                    &gpu.device,
+                    &gpu.queue,
+                    "gpu_native_test_f32_embedding_expected",
+                    &expected,
+                )
+            })
+            .collect::<Vec<_>>();
+        let q8_embedding_expected = [0usize, 1, 2]
+            .into_iter()
+            .map(|row| {
+                let mut expected = Vec::new();
+                q8_embedding_weight.row_dequant_into(row, &mut expected);
+                create_test_expected_buffer(
+                    &gpu.device,
+                    &gpu.queue,
+                    "gpu_native_test_q8_embedding_expected",
+                    &expected,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let status = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_test_validation_status"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(&status, 0, &[0; 4]);
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_test_validation_staging"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_test_live_l4_encoder"),
+            });
+
+        for _ in 0..2 {
+            executor
+                .encode_dense_gemv_scratch_to_scratch(
+                    &mut encoder,
+                    &f32_gemv_handle,
+                    &input,
+                    &f32_output,
+                )
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &f32_output.buffer,
+                &f32_gemv_expected,
+                &status,
+                3,
+                1e-4,
+            );
+            executor
+                .encode_dense_gemv_scratch_to_scratch(
+                    &mut encoder,
+                    &q8_gemv_handle,
+                    &input,
+                    &q8_output,
+                )
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &q8_output.buffer,
+                &q8_gemv_expected,
+                &status,
+                3,
+                1e-4,
+            );
+        }
+
+        for (token, expected) in [0u32, 2, 4].into_iter().zip(&f32_embedding_expected) {
+            executor
+                .encode_embedding_lookup(&mut encoder, &f32_embedding_handle, token, &state)
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &state.hidden,
+                expected,
+                &status,
+                COLS,
+                1e-6,
+            );
+        }
+        for (token, expected) in [0u32, 1, 2].into_iter().zip(&q8_embedding_expected) {
+            executor
+                .encode_embedding_lookup(&mut encoder, &q8_embedding_handle, token, &state)
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &state.hidden,
+                expected,
+                &status,
+                COLS,
+                1e-6,
+            );
+        }
+
+        let encoded = executor.execution_snapshot();
+        assert_eq!(
+            encoded.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(
+            encoded.dense_weight_upload_bytes,
+            registered.dense_weight_upload_bytes
+        );
+        assert_eq!(encoded.intermediate_maps, 0);
+        assert_eq!(encoded.intermediate_readbacks, 0);
+        encoder.copy_buffer_to_buffer(&status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("validation map callback must be drained")
+            .expect("validation status must map");
+        let mapped = slice.get_mapped_range();
+        let status_value = u32::from_le_bytes(mapped[..4].try_into().unwrap());
+        drop(mapped);
+        staging.unmap();
+        assert_eq!(status_value, 0, "on-device GPU-native comparison failed");
+
+        let completed = executor.execution_snapshot();
+        assert_eq!(
+            completed.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(
+            completed.dense_weight_upload_bytes,
+            registered.dense_weight_upload_bytes
+        );
+        assert_eq!(completed.intermediate_maps, 0);
+        assert_eq!(completed.intermediate_readbacks, 0);
     }
 
     #[test]
