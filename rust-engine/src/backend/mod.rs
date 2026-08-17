@@ -1353,6 +1353,26 @@ impl ExpertWorkspace {
     }
 }
 
+struct PostMapCleanup<F: FnOnce()> {
+    cleanup: Option<F>,
+}
+
+impl<F: FnOnce()> PostMapCleanup<F> {
+    fn new(cleanup: F) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for PostMapCleanup<F> {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeviceLossState {
     lost: AtomicBool,
@@ -2847,13 +2867,20 @@ impl GpuBackend {
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
         self.device.poll(wgpu::Maintain::wait_for(submission));
 
+        // A device-loss return must not put a map-pending or mapped staging
+        // buffer back into the workspace pool. Drain the callback first, but
+        // retain DeviceLost precedence over callback/channel errors.
+        let map_result = rx.recv();
         if let Some(detail) = self.device_loss.detail() {
+            if map_result.as_ref().is_ok_and(|mapped| mapped.is_ok()) {
+                ws.staging.unmap();
+            }
             return Err(GpuExpertDispatchError::new(
                 layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
             ));
         }
 
-        rx.recv()
+        map_result
             .map_err(|e| GpuExpertDispatchError::new(
                 layer,
                 expert_id,
@@ -2866,6 +2893,7 @@ impl GpuBackend {
                 GpuExpertDispatchErrorKind::ReadbackMap,
                 format!("expert readback buffer map failed: {e:?}"),
             ))?;
+        let _unmap = PostMapCleanup::new(|| ws.staging.unmap());
 
         {
             use half::slice::HalfFloatSliceExt;
@@ -2877,7 +2905,6 @@ impl GpuBackend {
             // target-feature gating, and falls back to scalar elsewhere.
             out.data[..d_model].convert_from_f32_slice(&floats[..d_model]);
         }
-        ws.staging.unmap();
         self.expert_io
             .readback_completions
             .fetch_add(1, Ordering::Relaxed);
@@ -5427,6 +5454,17 @@ mod tests {
             .kind,
             Q4ParityGpuErrorKind::DeviceLost
         );
+    }
+
+    #[test]
+    fn successful_map_cleanup_runs_on_early_exit() {
+        let cleaned = std::cell::Cell::new(false);
+        let result: std::result::Result<(), ()> = (|| {
+            let _cleanup = PostMapCleanup::new(|| cleaned.set(true));
+            Err(())
+        })();
+        assert!(result.is_err());
+        assert!(cleaned.get());
     }
 
     #[test]
