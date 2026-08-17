@@ -1575,6 +1575,30 @@ fn run_compute_donated<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+fn accumulate_ordered_f16_outputs(
+    outputs: &[half::f16],
+    weights: &[f32],
+    d_model: usize,
+    out: &mut Vec<f32>,
+) -> bool {
+    let Some(expected) = weights.len().checked_mul(d_model) else {
+        return false;
+    };
+    if outputs.len() != expected {
+        return false;
+    }
+    out.clear();
+    out.resize(d_model, 0.0);
+    for (weight, values) in weights.iter().zip(outputs.chunks_exact(d_model)) {
+        if *weight != 0.0 {
+            for (dst, value) in out.iter_mut().zip(values) {
+                *dst += *weight * value.to_f32();
+            }
+        }
+    }
+    true
+}
+
 enum MoeStepOutputMode<'a> {
     PerExpert,
     WeightedInto {
@@ -4508,6 +4532,17 @@ impl Engine {
             }
         }
 
+        self.forward_moe_resident_cpu(token_idx, layer, r, x, timings)
+    }
+
+    fn forward_moe_resident_cpu(
+        &self,
+        token_idx: u64,
+        layer: u32,
+        r: &ExpertResident,
+        x: &HiddenState,
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<HiddenState, MoeStepError> {
         self.metrics
             .counters
             .cpu_routed_expert_dispatches
@@ -4584,6 +4619,145 @@ impl Engine {
             expert: r.id,
             source,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_forward_moe_q4_layer_batch(
+        &self,
+        token_idx: u64,
+        layer: u32,
+        expert_ids: &[u32],
+        residents: &[Option<Arc<ExpertResident>>],
+        x: &HiddenState,
+        weights: &[f32],
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        allow_degraded: bool,
+    ) -> Result<bool, MoeStepError> {
+        if self.core.options.dtype != WeightDtype::Q4_0
+            || expert_ids.len() != 8
+            || expert_ids.len() != residents.len()
+            || expert_ids.len() != weights.len()
+            || self.execution_context().plan().routed_experts()
+                != crate::backend::ExecutionPlane::Gpu
+            || !self.routed_expert_backend().is_gpu()
+            || !self.gpu_eligible_dtype()
+            || residents.iter().any(Option::is_none)
+        {
+            return Ok(false);
+        }
+        for resident in residents {
+            let resident = resident.as_deref().expect("batch eligibility checked residents");
+            if self.demand_admit_resident_to_gpu(layer, resident).is_err() {
+                return Ok(false);
+            }
+        }
+        let Some(output_len) = expert_ids.len().checked_mul(self.core.shape.d_model) else {
+            return Ok(false);
+        };
+        let x_f16: Vec<half::f16> = x.iter().map(|value| half::f16::from_f32(*value)).collect();
+        let x_view = crate::backend::TensorView {
+            data: &x_f16,
+            rows: 1,
+            cols: self.core.shape.d_model,
+        };
+        let mut outputs = vec![half::f16::ZERO; output_len];
+        let outcome = self.routed_expert_backend().routed_expert_matmul_batch_q4(
+            layer,
+            expert_ids,
+            x_view,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            &mut outputs,
+        );
+        let logical_dispatches = expert_ids.len() as u64;
+        if matches!(&outcome, crate::backend::GpuExpertBatchDispatchOutcome::Ineligible) {
+            return Ok(false);
+        }
+        self.metrics
+            .counters
+            .gpu_dispatch_attempts
+            .fetch_add(logical_dispatches, Ordering::Relaxed);
+        let source = match outcome {
+            crate::backend::GpuExpertBatchDispatchOutcome::Ineligible => unreachable!(),
+            crate::backend::GpuExpertBatchDispatchOutcome::Completed => {
+                if accumulate_ordered_f16_outputs(
+                    &outputs,
+                    weights,
+                    self.core.shape.d_model,
+                    out,
+                ) {
+                    self.metrics
+                        .counters
+                        .gpu_dispatch_successes
+                        .fetch_add(logical_dispatches, Ordering::Relaxed);
+                    return Ok(true);
+                }
+                crate::backend::GpuExpertDispatchError::new(
+                    layer,
+                    expert_ids[0],
+                    crate::backend::GpuExpertDispatchErrorKind::RuntimeInvariant,
+                    "completed Q4 layer batch returned malformed output geometry",
+                )
+            }
+            crate::backend::GpuExpertBatchDispatchOutcome::Failed(source) => source,
+        };
+        self.metrics
+            .counters
+            .gpu_dispatch_failures
+            .fetch_add(logical_dispatches, Ordering::Relaxed);
+        if self.core.routed_expert_gpu_failure_policy
+            == RoutedExpertGpuFailurePolicy::StrictFailClosed
+        {
+            return Err(MoeStepError::GpuExpertDispatch { source });
+        }
+
+        let previous_fallbacks = self
+            .metrics
+            .counters
+            .gpu_cpu_fallbacks
+            .fetch_add(logical_dispatches, Ordering::Relaxed);
+        if let Some(prom) = self.metrics.prom.as_ref() {
+            prom.record_gpu_cpu_fallback(logical_dispatches);
+        }
+        if previous_fallbacks == 0 {
+            warn!(
+                layer,
+                experts = expert_ids.len(),
+                error = %source,
+                "GPU Q4 layer batch fell back to ordered CPU expert execution"
+            );
+        }
+        out.clear();
+        out.resize(self.core.shape.d_model, 0.0);
+        for (slot, resident) in residents.iter().enumerate() {
+            let resident = resident.as_deref().expect("batch eligibility checked residents");
+            match self.forward_moe_resident_cpu(token_idx, layer, resident, x, timings) {
+                Ok(values) => {
+                    let weight = weights[slot];
+                    if weight != 0.0 {
+                        for (dst, value) in out.iter_mut().zip(values) {
+                            *dst += weight * value;
+                        }
+                    }
+                }
+                Err(error) if allow_degraded => {
+                    self.metrics
+                        .counters
+                        .degraded_expert_substitutions
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        token = token_idx,
+                        layer,
+                        expert = resident.id,
+                        error = %error,
+                        "DEGRADED MODE: batch CPU fallback failed; dropping contribution"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
     }
 
     pub async fn moe_step_with_timing(
@@ -4989,6 +5163,19 @@ impl Engine {
                             debug_assert_eq!(residents.len(), weights.len());
                             out.clear();
                             out.resize(self.core.shape.d_model, 0.0);
+                            if self.try_forward_moe_q4_layer_batch(
+                                token_idx,
+                                layer,
+                                &target,
+                                &residents,
+                                x,
+                                weights,
+                                out,
+                                timings,
+                                allow_degraded,
+                            )? {
+                                return Ok(MoeStepResult::WeightedInto);
+                            }
                             let accumulate_one = |slot: usize,
                                                   r_opt: &Option<Arc<ExpertResident>>,
                                                   acc: &mut [f32]|
@@ -5881,6 +6068,7 @@ mod tests {
             expert_execution_policy,
             allow_degraded_experts,
             64 * 1024,
+            base.core.options.dtype,
         )
     }
 
@@ -5891,6 +6079,7 @@ mod tests {
         expert_execution_policy: ExpertExecutionPolicy,
         allow_degraded_experts: bool,
         gpu_capacity_bytes: usize,
+        dtype: WeightDtype,
     ) -> Arc<Engine> {
         let gpu_expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
             gpu_capacity_bytes,
@@ -5911,7 +6100,7 @@ mod tests {
                 q4_truncation_tolerance: 0,
             },
             crate::backend::RoutedExpertGpuSpec {
-                dtype: base.core.options.dtype,
+                dtype,
                 d_model: base.core.shape.d_model,
                 d_ff: base.core.shape.d_ff,
             },
@@ -5921,6 +6110,7 @@ mod tests {
         .expect("test hybrid execution context");
 
         let mut options = base.core.options;
+        options.dtype = dtype;
         options.expert_execution_policy = expert_execution_policy;
         options.policy.allow_degraded_experts = allow_degraded_experts;
         let engine = Engine::with_options_and_execution_context(
@@ -5945,6 +6135,21 @@ mod tests {
             .counters
             .cpu_expert_forward_calls
             .load(Ordering::Relaxed)
+    }
+
+    fn rebuild_with_q4_test_gpu(
+        base: &Arc<Engine>,
+        test_gpu: crate::backend::TestGpuBackend,
+    ) -> Arc<Engine> {
+        rebuild_with_test_gpu_capacity(
+            base,
+            test_gpu,
+            Some(RoutedExpertGpuFailurePolicy::StrictFailClosed),
+            ExpertExecutionPolicy::SequentialExpertsRowParallel,
+            false,
+            1024 * 1024,
+            WeightDtype::Q4_0,
+        )
     }
 
     fn rendered_counter(metrics: &Metrics, name: &str) -> u64 {
@@ -5974,6 +6179,72 @@ mod tests {
             }
             other => panic!("expected typed GPU expert dispatch error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn ordered_batch_aggregation_preserves_f16_values_f32_weights_and_zero_slots() {
+        let outputs: Vec<half::f16> = (0..16)
+            .map(|value| half::f16::from_f32(value as f32 / 4.0))
+            .collect();
+        let weights = [0.5, 0.0, -0.25, 1.0, 0.125, -0.5, 0.25, 0.75];
+        let mut actual = Vec::new();
+        assert!(accumulate_ordered_f16_outputs(&outputs, &weights, 2, &mut actual));
+        assert_eq!(actual, [3.625, 4.09375]);
+        assert!(!accumulate_ordered_f16_outputs(&outputs[..15], &weights, 2, &mut actual));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warm_q4_top8_batch_preserves_duplicates_zero_weights_and_accounting() {
+        let dir = TempDir::new("q4-layer-batch");
+        let base = build_engine(&dir.path, 8, 32, 32, 8, 8, 0, 0xB47C);
+        let gpu = crate::backend::TestGpuBackend::batch_success(0.25);
+        let engine = rebuild_with_q4_test_gpu(&base, gpu.clone());
+        let experts = [1, 1, 2, 3, 4, 5, 6, 7];
+        let weights = [0.5, 0.0, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.015625];
+        let mut out = Vec::new();
+        engine.moe_step_weighted_into_with_timing(
+            0, 0, &vec![1.0; 32], &experts, &weights, &mut out, None,
+        ).await.unwrap();
+        assert_eq!(out, vec![0.25; 32]);
+        assert_eq!((gpu.batch_calls(), gpu.expert_calls()), (1, 8));
+        assert_eq!(engine.routed_expert_execution_snapshot(), RoutedExpertExecutionSnapshot {
+            selected_routed_experts: 8, gpu_dispatch_attempts: 8,
+            gpu_dispatch_successes: 8, ..RoutedExpertExecutionSnapshot::default()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ineligible_q4_batch_uses_unchanged_scalar_dispatch() {
+        let dir = TempDir::new("q4-layer-batch-scalar");
+        let base = build_engine(&dir.path, 8, 32, 32, 8, 8, 0, 0x5CA1A2);
+        let gpu = crate::backend::TestGpuBackend::success(0.5);
+        let engine = rebuild_with_q4_test_gpu(&base, gpu.clone());
+        let mut out = Vec::new();
+        engine.moe_step_weighted_into_with_timing(
+            0, 0, &vec![1.0; 32], &[0, 1, 2, 3, 4, 5, 6, 7], &[0.125; 8], &mut out, None,
+        ).await.unwrap();
+        assert_eq!(out, vec![0.5; 32]);
+        assert_eq!((gpu.batch_calls(), gpu.expert_calls()), (0, 8));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn started_strict_q4_batch_failure_is_counted_once_without_scalar_replay() {
+        let dir = TempDir::new("q4-layer-batch-failure");
+        let base = build_engine(&dir.path, 8, 32, 32, 8, 8, 0, 0xFA17);
+        let gpu = crate::backend::TestGpuBackend::batch_failure(
+            crate::backend::GpuExpertDispatchErrorKind::ReadbackMap,
+        );
+        let engine = rebuild_with_q4_test_gpu(&base, gpu.clone());
+        let mut out = Vec::new();
+        let error = engine.moe_step_weighted_into_with_timing(
+            0, 4, &vec![1.0; 32], &[0, 1, 2, 3, 4, 5, 6, 7], &[0.125; 8], &mut out, None,
+        ).await.unwrap_err();
+        assert_gpu_dispatch_error(error, crate::backend::GpuExpertDispatchErrorKind::ReadbackMap, 4, 0);
+        assert_eq!((gpu.batch_calls(), gpu.expert_calls()), (1, 8));
+        assert_eq!(engine.routed_expert_execution_snapshot(), RoutedExpertExecutionSnapshot {
+            selected_routed_experts: 8, gpu_dispatch_attempts: 8, gpu_dispatch_failures: 8,
+            ..RoutedExpertExecutionSnapshot::default()
+        });
     }
 
     #[tokio::test]
@@ -6270,6 +6541,7 @@ mod tests {
             ExpertExecutionPolicy::SequentialExpertsRowParallel,
             false,
             4 * 1024,
+            base.core.options.dtype,
         );
         let hidden = crate::inference::synth_hidden_state(0, 16, 0x309);
         let error = engine

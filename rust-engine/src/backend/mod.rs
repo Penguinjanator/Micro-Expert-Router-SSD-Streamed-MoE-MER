@@ -448,6 +448,13 @@ impl fmt::Display for GpuExpertDispatchError {
 
 impl std::error::Error for GpuExpertDispatchError {}
 
+/// `Ineligible` permits the engine to use the unchanged scalar path.
+pub(crate) enum GpuExpertBatchDispatchOutcome {
+    Ineligible,
+    Completed,
+    Failed(GpuExpertDispatchError),
+}
+
 /// PR4's exact MER-owned routed-expert GPU memory snapshot. Its scope is
 /// deliberately narrower than process/device memory: physical expert weight
 /// buffers plus the fixed routed-expert workspace buffers. Dense, attention,
@@ -729,6 +736,40 @@ impl<T: PhysicalRegistryEntry> PhysicalGpuExpertRegistry<T> {
 
         Self::retire_entry_locked(inner, key.expert_id);
         PhysicalRegistryLookup::Miss
+    }
+
+    /// Atomic, non-mutating hit proof; ordered duplicate Arcs are retained.
+    fn peek_all_current(&self, keys: &[PhysicalExpertKey]) -> Option<Vec<Arc<T>>> {
+        let inner = self.inner.lock();
+        keys.iter()
+            .map(|key| {
+                inner
+                    .entries
+                    .peek(&key.expert_id)
+                    .filter(|entry| entry.physical_key() == *key)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Commit recency only if the complete previously-peeked set is current.
+    fn touch_all_current(&self, keys: &[PhysicalExpertKey]) -> bool {
+        let mut inner = self.inner.lock();
+        if !keys.iter().all(|key| {
+            inner
+                .entries
+                .peek(&key.expert_id)
+                .is_some_and(|entry| entry.physical_key() == *key)
+        }) {
+            return false;
+        }
+        for key in keys {
+            let _ = inner
+                .entries
+                .get(&key.expert_id)
+                .expect("batch-prechecked physical entry must remain under lock");
+        }
+        true
     }
 
     fn retire_entry_locked(inner: &mut PhysicalRegistryInner<T>, expert_id: u32) {
@@ -1302,6 +1343,39 @@ impl GpuStorage for VramExpertEntry {
 /// bytes and excludes the host scratch vector from the GPU ledger.
 const EXPERT_WORKSPACE_POOL: usize = 4;
 const EXPERT_WORKSPACE_DEVICE_BUFFERS: u64 = 5;
+const Q4_LAYER_BATCH_EXPERTS: usize = 8;
+
+struct Q4LayerBatchPlan {
+    output_bytes_per_expert: u64,
+    total_output_bytes: u64,
+    staging_offsets: [u64; Q4_LAYER_BATCH_EXPERTS],
+}
+
+fn q4_layer_batch_plan(
+    expert_count: usize,
+    d_model: usize,
+    staging_bytes: u64,
+) -> Option<Q4LayerBatchPlan> {
+    if expert_count != Q4_LAYER_BATCH_EXPERTS || d_model == 0 {
+        return None;
+    }
+    let output_bytes_per_expert = u64::try_from(d_model)
+        .ok()?
+        .checked_mul(std::mem::size_of::<f32>() as u64)?;
+    let total_output_bytes = output_bytes_per_expert.checked_mul(expert_count as u64)?;
+    if total_output_bytes > staging_bytes {
+        return None;
+    }
+    let mut staging_offsets = [0; Q4_LAYER_BATCH_EXPERTS];
+    for (slot, offset) in staging_offsets.iter_mut().enumerate() {
+        *offset = output_bytes_per_expert.checked_mul(u64::try_from(slot).ok()?)?;
+    }
+    Some(Q4LayerBatchPlan {
+        output_bytes_per_expert,
+        total_output_bytes,
+        staging_offsets,
+    })
+}
 
 fn expert_workspace_device_bytes(buffer_bytes: u64, workspace_count: usize) -> Option<u64> {
     let workspace_count = u64::try_from(workspace_count).ok()?;
@@ -1370,6 +1444,32 @@ impl<F: FnOnce()> Drop for PostMapCleanup<F> {
         if let Some(cleanup) = self.cleanup.take() {
             cleanup();
         }
+    }
+}
+
+struct PoolLease<'a, T> {
+    item: Option<T>,
+    pool: &'a ParkingMutex<Vec<T>>,
+    available: &'a parking_lot::Condvar,
+}
+
+impl<T> std::ops::Deref for PoolLease<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.item.as_ref().expect("pool lease must own its item")
+    }
+}
+
+impl<T> std::ops::DerefMut for PoolLease<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.item.as_mut().expect("pool lease must own its item")
+    }
+}
+
+impl<T> Drop for PoolLease<'_, T> {
+    fn drop(&mut self) {
+        self.pool.lock().push(self.item.take().expect("pool lease item missing"));
+        self.available.notify_one();
     }
 }
 
@@ -2580,19 +2680,18 @@ impl GpuBackend {
     /// [`EXPERT_WORKSPACE_POOL`] = 4 against a typical MoE top-K of
     /// 2–4 concurrent dispatches, contention (let alone starvation)
     /// is not expected in practice.
-    fn acquire_expert_workspace(&self) -> ExpertWorkspace {
+    fn acquire_expert_workspace(&self) -> PoolLease<'_, ExpertWorkspace> {
         let mut pool = self.expert_workspaces.lock();
         loop {
             if let Some(ws) = pool.pop() {
-                return ws;
+                return PoolLease {
+                    item: Some(ws),
+                    pool: &self.expert_workspaces,
+                    available: &self.expert_workspace_cv,
+                };
             }
             self.expert_workspace_cv.wait(&mut pool);
         }
-    }
-
-    fn release_expert_workspace(&self, ws: ExpertWorkspace) {
-        self.expert_workspaces.lock().push(ws);
-        self.expert_workspace_cv.notify_one();
     }
 
     /// Dispatch a SwiGLU expert FFN where the weight buffer is already
@@ -2619,11 +2718,7 @@ impl GpuBackend {
         out:   &mut TensorViewMut<'_>,
     ) -> std::result::Result<(), GpuExpertDispatchError> {
         let mut ws = self.acquire_expert_workspace();
-        let result = self.expert_ffn_dispatch(layer, expert_id, entry, x, out, &mut ws);
-        // Always return the workspace — including on error paths — or
-        // the pool would leak a slot per failed dispatch.
-        self.release_expert_workspace(ws);
-        result
+        self.expert_ffn_dispatch(layer, expert_id, entry, x, out, &mut ws)
     }
 
     fn expert_ffn_dispatch(
@@ -2635,10 +2730,7 @@ impl GpuBackend {
         out:   &mut TensorViewMut<'_>,
         ws:    &mut ExpertWorkspace,
     ) -> std::result::Result<(), GpuExpertDispatchError> {
-        use std::num::NonZeroU64;
-
         let d_model = entry.d_model;
-        let d_ff    = entry.d_ff;
 
         if let Some(detail) = self.device_loss.detail() {
             return Err(GpuExpertDispatchError::new(
@@ -2681,11 +2773,218 @@ impl GpuBackend {
             .hidden_state_upload_bytes
             .fetch_add(hidden_bytes, Ordering::Relaxed);
 
-        // ── Per-dispatch bind groups against the workspace buffers ────────────
-        // Bind group creation is microseconds against a millisecond-scale
-        // submit+readback; paying it per dispatch is what frees the expert
-        // path from the shared `work_*` buffers (and the execution lock
-        // that serialized them).
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("expert_ffn_encoder"),
+        });
+        let out_bytes = u64::try_from(d_model)
+            .ok()
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| {
+                GpuExpertDispatchError::new(
+                    layer,
+                    expert_id,
+                    GpuExpertDispatchErrorKind::RuntimeInvariant,
+                    "routed-expert output byte size overflow",
+                )
+            })?;
+        self.encode_expert_ffn(layer, expert_id, entry, ws, &mut encoder, 0, out_bytes)?;
+        // Wait only for *this* submission — other in-flight expert
+        // dispatches (and dense ops) keep making progress on the queue.
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.expert_io
+            .queue_submissions
+            .fetch_add(1, Ordering::Relaxed);
+
+        let slice = ws.staging.slice(0..out_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.expert_io.map_requests.fetch_add(1, Ordering::Relaxed);
+        slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
+        self.device.poll(wgpu::Maintain::wait_for(submission));
+
+        // A device-loss return must not put a map-pending or mapped staging
+        // buffer back into the workspace pool. Drain the callback first, but
+        // retain DeviceLost precedence over callback/channel errors.
+        let map_result = rx.recv();
+        if let Some(detail) = self.device_loss.detail() {
+            if map_result.as_ref().is_ok_and(|mapped| mapped.is_ok()) {
+                ws.staging.unmap();
+            }
+            return Err(GpuExpertDispatchError::new(
+                layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
+            ));
+        }
+
+        map_result
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::ReadbackChannel,
+                format!("expert readback callback channel failed: {e:?}"),
+            ))?
+            .map_err(|e| GpuExpertDispatchError::new(
+                layer,
+                expert_id,
+                GpuExpertDispatchErrorKind::ReadbackMap,
+                format!("expert readback buffer map failed: {e:?}"),
+            ))?;
+        let _unmap = PostMapCleanup::new(|| ws.staging.unmap());
+
+        {
+            use half::slice::HalfFloatSliceExt;
+            let view   = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            // Vectorized f32 → f16 downcast. `half`'s slice conversion does
+            // runtime CPU-feature detection (F16C/AVX2/AVX-512), so this picks
+            // up hardware float-to-half on capable hosts without compile-time
+            // target-feature gating, and falls back to scalar elsewhere.
+            out.data[..d_model].convert_from_f32_slice(&floats[..d_model]);
+        }
+        self.expert_io
+            .readback_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .readback_bytes
+            .fetch_add(out_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expert_ffn_batch_dispatch(
+        &self,
+        layer: u32,
+        expert_ids: &[u32],
+        entries: &[Arc<VramExpertEntry>],
+        x: TensorView<'_>,
+        out: &mut [half::f16],
+        plan: &Q4LayerBatchPlan,
+        ws: &mut ExpertWorkspace,
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
+        let first_expert = expert_ids.first().copied().unwrap_or(0);
+        let error = |kind, detail| GpuExpertDispatchError::new(layer, first_expert, kind, detail);
+        if let Some(detail) = self.device_loss.detail() {
+            return Err(error(GpuExpertDispatchErrorKind::DeviceLost, detail));
+        }
+        if expert_ids.len() != entries.len()
+            || entries.len() != plan.staging_offsets.len()
+            || x.data.len() != entries[0].d_model
+            || out.len()
+                != entries[0]
+                    .d_model
+                    .checked_mul(entries.len())
+                    .unwrap_or(usize::MAX)
+        {
+            return Err(error(
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                "Q4 layer-batch buffers or slot counts disagree".into(),
+            ));
+        }
+        let d_model = entries[0].d_model;
+        let d_ff = entries[0].d_ff;
+        if entries.iter().zip(expert_ids).any(|(entry, expert_id)| {
+            entry.key.expert_id != *expert_id
+                || entry.layout != VramWeightLayout::Q4_0
+                || entry.d_model != d_model
+                || entry.d_ff != d_ff
+        }) {
+            return Err(error(
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                "Q4 layer-batch physical entries disagree with ordered slot geometry".into(),
+            ));
+        }
+        if d_model > ws.scratch.len() {
+            return Err(error(
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                format!("d_model {d_model} exceeds GPU expert workspace {}", ws.scratch.len()),
+            ));
+        }
+
+        for (dst, src) in ws.scratch[..d_model].iter_mut().zip(x.data.iter()) {
+            *dst = src.to_f32();
+        }
+        self.queue
+            .write_buffer(&ws.x_buf, 0, bytemuck::cast_slice(&ws.scratch[..d_model]));
+        self.expert_io
+            .hidden_state_uploads
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .hidden_state_upload_bytes
+            .fetch_add(plan.output_bytes_per_expert, Ordering::Relaxed);
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("expert_ffn_layer_batch_encoder"),
+        });
+        for ((expert_id, entry), staging_offset) in expert_ids
+            .iter()
+            .zip(entries)
+            .zip(&plan.staging_offsets)
+        {
+            self.encode_expert_ffn(
+                layer,
+                *expert_id,
+                entry,
+                ws,
+                &mut encoder,
+                *staging_offset,
+                plan.output_bytes_per_expert,
+            )?;
+        }
+
+        let submission = self.queue.submit(Some(encoder.finish()));
+        self.expert_io
+            .queue_submissions
+            .fetch_add(1, Ordering::Relaxed);
+        let slice = ws.staging.slice(0..plan.total_output_bytes);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.expert_io.map_requests.fetch_add(1, Ordering::Relaxed);
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::wait_for(submission));
+        let map_result = rx.recv();
+        if let Some(detail) = self.device_loss.detail() {
+            if map_result.as_ref().is_ok_and(|mapped| mapped.is_ok()) {
+                ws.staging.unmap();
+            }
+            return Err(error(GpuExpertDispatchErrorKind::DeviceLost, detail));
+        }
+        map_result
+            .map_err(|e| error(GpuExpertDispatchErrorKind::ReadbackChannel, format!("expert batch readback callback channel failed: {e:?}")))?
+            .map_err(|e| error(GpuExpertDispatchErrorKind::ReadbackMap, format!("expert batch readback buffer map failed: {e:?}")))?;
+        let _unmap = PostMapCleanup::new(|| ws.staging.unmap());
+        {
+            use half::slice::HalfFloatSliceExt;
+            let view = slice.get_mapped_range();
+            let floats: &[f32] = bytemuck::cast_slice(&view);
+            out.convert_from_f32_slice(floats);
+        }
+        self.expert_io
+            .readback_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.expert_io
+            .readback_bytes
+            .fetch_add(plan.total_output_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_expert_ffn(
+        &self,
+        layer: u32,
+        expert_id: u32,
+        entry: &VramExpertEntry,
+        ws: &ExpertWorkspace,
+        encoder: &mut wgpu::CommandEncoder,
+        staging_offset: u64,
+        output_bytes: u64,
+    ) -> std::result::Result<(), GpuExpertDispatchError> {
+        use std::num::NonZeroU64;
+
+        let d_model = entry.d_model;
+        let d_ff    = entry.d_ff;
+
+        // Per-dispatch bind groups against the workspace buffers. Keeping the
+        // existing four-pass encoder shared by scalar and layer-batch paths
+        // prevents shader or arithmetic drift.
         let matmul_pipeline = match entry.layout {
             VramWeightLayout::F32 => self.matmul_pipeline.as_ref(),
             VramWeightLayout::Q4_0 => self.matmul_q4_0_pipeline.as_ref(),
@@ -2704,10 +3003,6 @@ impl GpuBackend {
         })?;
         let matmul_bgl = matmul_pipeline.get_bind_group_layout(0);
         let swiglu_bgl = self.swiglu_pipeline.get_bind_group_layout(0);
-
-        // Weight binding for a projection pass. F32 binds the projection's
-        // sub-range (offsets validated in `build_expert_entry`); Q4_0 binds
-        // the whole buffer and selects the base via `w_block_off`.
         let weight_binding = |proj: u32| -> wgpu::BindingResource<'_> {
             match entry.layout {
                 VramWeightLayout::F32 => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -2746,13 +3041,6 @@ impl GpuBackend {
         });
         // Pass 4: down matmul — weight[down] × ffn_out → mid_1.
         let down_bg = make_matmul_bg("expert_down_bg", 2, &ws.ffn_out, &ws.mid_1);
-
-        // ── Single command buffer: 4 sequential compute passes ───────────────
-        // The GPU executes these in order; no host-side synchronization needed
-        // between passes. One submit = one PCIe round-trip for the whole FFN.
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("expert_ffn_encoder"),
-        });
 
         // Pass 1: gate_proj × x → mid_1   (M=d_ff, K=d_model, N=1)
         {
@@ -2850,67 +3138,13 @@ impl GpuBackend {
                 }
             }
         }
-
-        // ── Readback mid_1 → out ──────────────────────────────────────────────
-        let out_bytes = (d_model * 4) as u64;
-        encoder.copy_buffer_to_buffer(&ws.mid_1, 0, &ws.staging, 0, out_bytes);
-        // Wait only for *this* submission — other in-flight expert
-        // dispatches (and dense ops) keep making progress on the queue.
-        let submission = self.queue.submit(Some(encoder.finish()));
-        self.expert_io
-            .queue_submissions
-            .fetch_add(1, Ordering::Relaxed);
-
-        let slice = ws.staging.slice(0..out_bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.expert_io.map_requests.fetch_add(1, Ordering::Relaxed);
-        slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
-        self.device.poll(wgpu::Maintain::wait_for(submission));
-
-        // A device-loss return must not put a map-pending or mapped staging
-        // buffer back into the workspace pool. Drain the callback first, but
-        // retain DeviceLost precedence over callback/channel errors.
-        let map_result = rx.recv();
-        if let Some(detail) = self.device_loss.detail() {
-            if map_result.as_ref().is_ok_and(|mapped| mapped.is_ok()) {
-                ws.staging.unmap();
-            }
-            return Err(GpuExpertDispatchError::new(
-                layer, expert_id, GpuExpertDispatchErrorKind::DeviceLost, detail,
-            ));
-        }
-
-        map_result
-            .map_err(|e| GpuExpertDispatchError::new(
-                layer,
-                expert_id,
-                GpuExpertDispatchErrorKind::ReadbackChannel,
-                format!("expert readback callback channel failed: {e:?}"),
-            ))?
-            .map_err(|e| GpuExpertDispatchError::new(
-                layer,
-                expert_id,
-                GpuExpertDispatchErrorKind::ReadbackMap,
-                format!("expert readback buffer map failed: {e:?}"),
-            ))?;
-        let _unmap = PostMapCleanup::new(|| ws.staging.unmap());
-
-        {
-            use half::slice::HalfFloatSliceExt;
-            let view   = slice.get_mapped_range();
-            let floats: &[f32] = bytemuck::cast_slice(&view);
-            // Vectorized f32 → f16 downcast. `half`'s slice conversion does
-            // runtime CPU-feature detection (F16C/AVX2/AVX-512), so this picks
-            // up hardware float-to-half on capable hosts without compile-time
-            // target-feature gating, and falls back to scalar elsewhere.
-            out.data[..d_model].convert_from_f32_slice(&floats[..d_model]);
-        }
-        self.expert_io
-            .readback_completions
-            .fetch_add(1, Ordering::Relaxed);
-        self.expert_io
-            .readback_bytes
-            .fetch_add(out_bytes, Ordering::Relaxed);
+        encoder.copy_buffer_to_buffer(
+            &ws.mid_1,
+            0,
+            &ws.staging,
+            staging_offset,
+            output_bytes,
+        );
         Ok(())
     }
 }
@@ -3531,6 +3765,92 @@ impl GpuBackend {
         result
     }
 
+    fn routed_expert_matmul_batch_q4(
+        &self,
+        layer: u32,
+        expert_ids: &[u32],
+        x: TensorView<'_>,
+        d_model: usize,
+        d_ff: usize,
+        out: &mut [half::f16],
+    ) -> GpuExpertBatchDispatchOutcome {
+        let workspace_bytes = (MAX_EXPERT_D_FF * std::mem::size_of::<f32>()) as u64;
+        let failed = |expert_id: u32, kind: GpuExpertDispatchErrorKind, detail: String| {
+            GpuExpertBatchDispatchOutcome::Failed(GpuExpertDispatchError::new(
+                layer, expert_id, kind, detail,
+            ))
+        };
+        let Some(plan) = q4_layer_batch_plan(expert_ids.len(), d_model, workspace_bytes) else {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        };
+        if x.data.len() != d_model
+            || out.len() != expert_ids.len().checked_mul(d_model).unwrap_or(usize::MAX)
+        {
+            return failed(
+                expert_ids.first().copied().unwrap_or(0),
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                "Q4 layer-batch input or output geometry mismatch".into(),
+            );
+        }
+
+        let Some(keys) = expert_ids
+            .iter()
+            .map(|expert_id| {
+                self.gpu_expert_cache
+                    .current_admission(*expert_id)
+                    .map(|admission| PhysicalExpertKey {
+                        expert_id: *expert_id,
+                        generation: admission.generation(),
+                    })
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        };
+        let Some(entries) = self.physical_expert_registry.peek_all_current(&keys) else {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        };
+        if keys.iter().any(|key| {
+            !self
+                .gpu_expert_cache
+                .contains_generation(key.expert_id, key.generation)
+        }) {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        }
+        if !self.physical_expert_registry.touch_all_current(&keys) {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        }
+        if let Some((expert_id, _)) = expert_ids.iter().zip(&entries).find(|(_, entry)| {
+            entry.layout != VramWeightLayout::Q4_0
+                || entry.d_model != d_model
+                || entry.d_ff != d_ff
+        }) {
+            return failed(
+                *expert_id,
+                GpuExpertDispatchErrorKind::RuntimeInvariant,
+                "warm-hit Q4 layer batch encountered incompatible physical geometry".into(),
+            );
+        }
+        let mut workspace = self.acquire_expert_workspace();
+        if let Some(stale) = keys.iter().find(|key| {
+            !self
+                .gpu_expert_cache
+                .contains_generation(key.expert_id, key.generation)
+        }) {
+            return failed(
+                stale.expert_id,
+                GpuExpertDispatchErrorKind::ResidencyMiss,
+                "logical GPU admission changed before Q4 layer-batch dispatch".into(),
+            );
+        }
+        match self.expert_ffn_batch_dispatch(
+            layer, expert_ids, &entries, x, out, &plan, &mut workspace,
+        ) {
+            Ok(()) => GpuExpertBatchDispatchOutcome::Completed,
+            Err(error) => GpuExpertBatchDispatchOutcome::Failed(error),
+        }
+    }
+
     fn routed_expert_matmul(
         &self,
         layer: u32,
@@ -3879,6 +4199,8 @@ pub(crate) struct TestGpuBackend {
     cpu: CandleBackend,
     outcome: TestGpuExpertOutcome,
     expert_calls: Arc<AtomicU64>,
+    batch_eligible: bool,
+    batch_calls: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -3895,7 +4217,15 @@ impl TestGpuBackend {
             cpu: CandleBackend::new(),
             outcome: TestGpuExpertOutcome::Success(value),
             expert_calls: Arc::new(AtomicU64::new(0)),
+            batch_eligible: false,
+            batch_calls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn batch_success(value: f32) -> Self {
+        let mut backend = Self::success(value);
+        backend.batch_eligible = true;
+        backend
     }
 
     pub(crate) fn failure(kind: GpuExpertDispatchErrorKind) -> Self {
@@ -3903,11 +4233,51 @@ impl TestGpuBackend {
             cpu: CandleBackend::new(),
             outcome: TestGpuExpertOutcome::Failure(kind),
             expert_calls: Arc::new(AtomicU64::new(0)),
+            batch_eligible: false,
+            batch_calls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn batch_failure(kind: GpuExpertDispatchErrorKind) -> Self {
+        let mut backend = Self::failure(kind);
+        backend.batch_eligible = true;
+        backend
     }
 
     pub(crate) fn expert_calls(&self) -> u64 {
         self.expert_calls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn batch_calls(&self) -> u64 {
+        self.batch_calls.load(Ordering::Relaxed)
+    }
+
+    fn routed_expert_matmul_batch_q4(
+        &self,
+        layer: u32,
+        expert_ids: &[u32],
+        out: &mut [half::f16],
+    ) -> GpuExpertBatchDispatchOutcome {
+        if !self.batch_eligible || expert_ids.len() != Q4_LAYER_BATCH_EXPERTS {
+            return GpuExpertBatchDispatchOutcome::Ineligible;
+        }
+        self.batch_calls.fetch_add(1, Ordering::Relaxed);
+        self.expert_calls
+            .fetch_add(expert_ids.len() as u64, Ordering::Relaxed);
+        match self.outcome {
+            TestGpuExpertOutcome::Success(value) => {
+                out.fill(half::f16::from_f32(value));
+                GpuExpertBatchDispatchOutcome::Completed
+            }
+            TestGpuExpertOutcome::Failure(kind) => {
+                GpuExpertBatchDispatchOutcome::Failed(GpuExpertDispatchError::new(
+                    layer,
+                    expert_ids[0],
+                    kind,
+                    format!("injected {kind} batch failure"),
+                ))
+            }
+        }
     }
 
     fn routed_expert_matmul(
@@ -4025,6 +4395,26 @@ impl BackendBox {
 
     /// Typed dispatch for real-model routed experts. The legacy trait method
     /// maps this to anyhow only for synthetic compatibility diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn routed_expert_matmul_batch_q4(
+        &self,
+        layer: u32,
+        expert_ids: &[u32],
+        x: TensorView<'_>,
+        d_model: usize,
+        d_ff: usize,
+        out: &mut [half::f16],
+    ) -> GpuExpertBatchDispatchOutcome {
+        match self {
+            Self::Gpu(gpu) => {
+                gpu.routed_expert_matmul_batch_q4(layer, expert_ids, x, d_model, d_ff, out)
+            }
+            Self::Cpu(_) => GpuExpertBatchDispatchOutcome::Ineligible,
+            #[cfg(test)]
+            Self::TestGpu(gpu) => gpu.routed_expert_matmul_batch_q4(layer, expert_ids, out),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn routed_expert_matmul(
         &self,
@@ -5555,6 +5945,57 @@ mod tests {
             expert_id,
             generation,
         }
+    }
+
+    #[test]
+    fn q4_layer_batch_plan_checks_order_offsets_and_capacity() {
+        let plan = q4_layer_batch_plan(8, 2048, 65_536).expect("Qwen top-8 fits staging");
+        assert_eq!(plan.output_bytes_per_expert, 8192);
+        assert_eq!(plan.total_output_bytes, 65_536);
+        assert_eq!(plan.staging_offsets, [0, 8192, 16384, 24576, 32768, 40960, 49152, 57344]);
+        assert!(q4_layer_batch_plan(7, 2048, 65_536).is_none());
+        assert!(q4_layer_batch_plan(8, 0, 65_536).is_none());
+        assert!(q4_layer_batch_plan(8, 2048, 65_535).is_none());
+        assert!(q4_layer_batch_plan(8, usize::MAX, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn batch_physical_peek_is_atomic_nonmutating_and_retains_duplicate_arcs() {
+        let registry = test_physical_registry(64, 0);
+        let one = install_test_physical_entry(&registry, physical_key(1, 1), 32).unwrap();
+        drop(install_test_physical_entry(&registry, physical_key(2, 1), 32).unwrap());
+        let keys = [physical_key(1, 1), physical_key(1, 1), physical_key(2, 1)];
+        let retained = registry.peek_all_current(&keys).expect("all current");
+        assert_eq!(retained.len(), 3);
+        assert!(Arc::ptr_eq(&retained[0], &retained[1]));
+        assert!(registry.peek_all_current(&[physical_key(1, 2)]).is_none());
+        assert_eq!(registry.snapshot(32).stale_retirements, 0);
+
+        drop(one);
+        assert!(install_test_physical_entry(&registry, physical_key(3, 1), 32).is_err(),
+            "retained batch Arcs must keep their allocations charged");
+        drop(retained);
+        drop(install_test_physical_entry(&registry, physical_key(3, 1), 32).unwrap());
+        assert!(registry.peek_all_current(&[physical_key(1, 1)]).is_none());
+        assert_eq!(registry.snapshot(32).expert_live_bytes, 32);
+
+        let registry = test_physical_registry(64, 0);
+        for id in 1..=2 { drop(install_test_physical_entry(&registry, physical_key(id, 1), 32).unwrap()); }
+        assert!(!registry.touch_all_current(&[physical_key(1, 1), physical_key(9, 1)]));
+        drop(install_test_physical_entry(&registry, physical_key(3, 1), 32).unwrap());
+        assert!(registry.peek_all_current(&[physical_key(1, 1)]).is_none());
+    }
+
+    #[test]
+    fn pooled_workspace_lease_returns_item_on_error_exit() {
+        let pool = ParkingMutex::new(Vec::new());
+        let available = parking_lot::Condvar::new();
+        let result: std::result::Result<(), ()> = (|| {
+            let _lease = PoolLease { item: Some(7), pool: &pool, available: &available };
+            Err(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(*pool.lock(), vec![7]);
     }
 
     #[test]
