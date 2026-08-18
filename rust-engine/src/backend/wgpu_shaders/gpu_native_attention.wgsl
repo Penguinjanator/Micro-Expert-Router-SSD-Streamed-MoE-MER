@@ -17,15 +17,31 @@ var<push_constant> pc: PushConstants;
 @group(0) @binding(1) var<storage, read> KEY_CACHE: array<f32>;
 @group(0) @binding(2) var<storage, read> VALUE_CACHE: array<f32>;
 @group(0) @binding(3) var<storage, read_write> CONTEXT: array<f32>;
+struct Status {
+    bits: atomic<u32>,
+};
+@group(0) @binding(4) var<storage, read_write> STATUS: Status;
 
 const WG: u32 = 32u;
+const FINITE_NEGATIVE_SENTINEL: f32 = -3.402823e+38;
+const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1u;
 
 var<workgroup> running_max: f32;
 var<workgroup> running_denominator: f32;
+var<workgroup> numerical_failure: atomic<u32>;
 var<workgroup> tile_scores: array<f32, 32u>;
 var<workgroup> tile_maxima: array<f32, 32u>;
 var<workgroup> tile_denominators: array<f32, 32u>;
 var<workgroup> tile_weights: array<f32, 32u>;
+
+fn is_finite(value: f32) -> bool {
+    return value == value && abs(value) <= 3.402823e+38;
+}
+
+fn latch_numerical_failure() {
+    atomicOr(&STATUS.bits, GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE);
+    atomicOr(&numerical_failure, GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE);
+}
 
 @compute @workgroup_size(32, 1, 1)
 fn causal_attention_main(
@@ -39,8 +55,9 @@ fn causal_attention_main(
     }
 
     if (lane == 0u) {
-        running_max = -3.402823e+38;
+        running_max = FINITE_NEGATIVE_SENTINEL;
         running_denominator = 0.0;
+        atomicStore(&numerical_failure, 0u);
     }
     let context_base = query_head * pc.head_dim;
     for (var channel = lane; channel < pc.head_dim; channel += WG) {
@@ -60,21 +77,27 @@ fn causal_attention_main(
 
     for (var tile = 0u; tile < tile_count; tile++) {
         let position = tile * WG + lane;
-        let valid = position < pc.seq_len;
+        let causally_valid = position < pc.seq_len;
         let valid_positions = min(WG, pc.seq_len - tile * WG);
 
-        var score = -3.402823e+38;
-        if (valid) {
+        var score = FINITE_NEGATIVE_SENTINEL;
+        var numerically_valid = false;
+        if (causally_valid) {
             score = 0.0;
             let key_base = position * kv_width + kv_head * pc.head_dim;
             for (var channel = 0u; channel < pc.head_dim; channel++) {
                 score += Q[query_base + channel] * KEY_CACHE[key_base + channel];
             }
             score *= scale;
+            numerically_valid = is_finite(score);
+            if (!numerically_valid) {
+                latch_numerical_failure();
+                score = FINITE_NEGATIVE_SENTINEL;
+            }
         }
         tile_scores[lane] = score;
         tile_maxima[lane] = score;
-        tile_denominators[lane] = select(0.0, 1.0, valid);
+        tile_denominators[lane] = select(0.0, 1.0, numerically_valid);
         workgroupBarrier();
 
         for (var step = 0u; step < 5u; step++) {
@@ -97,7 +120,11 @@ fn causal_attention_main(
         let current_tile_max = tile_maxima[0];
         let new_max = max(old_max, current_tile_max);
         let old_factor = exp(old_max - new_max);
-        tile_weights[lane] = select(0.0, exp(tile_scores[lane] - new_max), valid);
+        tile_weights[lane] = select(
+            0.0,
+            exp(tile_scores[lane] - new_max),
+            numerically_valid,
+        );
         workgroupBarrier();
 
         for (var channel = lane; channel < pc.head_dim; channel += WG) {
@@ -123,13 +150,22 @@ fn causal_attention_main(
         workgroupBarrier();
     }
 
-    let inverse_denominator = select(
-        0.0,
-        1.0 / running_denominator,
-        running_denominator > 0.0,
-    );
+    if (lane == 0u && (!is_finite(running_denominator) || running_denominator <= 0.0)) {
+        latch_numerical_failure();
+    }
+    workgroupBarrier();
+
+    let head_failed = atomicLoad(&numerical_failure) != 0u;
+    var inverse_denominator = 0.0;
+    if (!head_failed) {
+        inverse_denominator = 1.0 / running_denominator;
+    }
     for (var channel = lane; channel < pc.head_dim; channel += WG) {
         let context_index = context_base + channel;
-        CONTEXT[context_index] *= inverse_denominator;
+        if (head_failed) {
+            CONTEXT[context_index] = 0.0;
+        } else {
+            CONTEXT[context_index] *= inverse_denominator;
+        }
     }
 }

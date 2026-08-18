@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
+// Request-local device failures are latched until token-boundary handling
+// retires the failed request; production encoding never clears this bit.
+const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1 << 0;
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
 const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
@@ -2865,6 +2868,12 @@ impl GpuNativeAttentionPipelines {
                         ty: read_write_storage,
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
                 ],
             });
         let rope_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3997,6 +4006,7 @@ impl GpuNativeExecutorContext {
         gpu: &super::GpuBackend,
         encoder: &mut wgpu::CommandEncoder,
         plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
         scratch: &GpuNativeAttentionScratch,
         kv: &GpuNativeKvState,
         seq_len: u32,
@@ -4021,6 +4031,10 @@ impl GpuNativeExecutorContext {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: scratch.context.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.status.as_entire_binding(),
                 },
             ],
         });
@@ -4109,7 +4123,7 @@ impl GpuNativeExecutorContext {
         let residual_workgroups =
             self.checked_workgroups(state.layout.d_model, &gpu.device.limits())?;
 
-        self.encode_causal_attention_pass(gpu, encoder, plan, scratch, kv, seq_len);
+        self.encode_causal_attention_pass(gpu, encoder, plan, state, scratch, kv, seq_len);
         self.encode_dense_gemv_resolved(
             gpu,
             encoder,
@@ -6109,6 +6123,16 @@ mod tests {
         assert_eq!(after_dispatch.causal_attention_dispatches, 1);
         assert_eq!(after_dispatch.o_projection_dispatches, 1);
         assert_eq!(after_dispatch.attention_complete_dispatches, 1);
+        assert_eq!(after_dispatch.numerical_failures, 0);
+    }
+
+    #[test]
+    fn attention_numerical_failure_status_bit_is_stable_and_latched() {
+        assert_eq!(GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE, 1);
+        assert!(GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE.is_power_of_two());
+        assert!(GPU_NATIVE_ATTENTION_SHADER
+            .contains("atomicOr(&STATUS.bits, GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE)"));
+        assert!(!GPU_NATIVE_ATTENTION_SHADER.contains("atomicStore(&STATUS"));
     }
 
     #[test]
@@ -6153,6 +6177,9 @@ mod tests {
         assert!(!GPU_NATIVE_ATTENTION_SHADER.contains("MAX_SEQ_LEN"));
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("KEY_CACHE"));
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("VALUE_CACHE"));
+        assert!(GPU_NATIVE_ATTENTION_SHADER.contains("@group(0) @binding(4)"));
+        assert!(GPU_NATIVE_ATTENTION_SHADER.contains("fn is_finite"));
+        assert!(GPU_NATIVE_ATTENTION_SHADER.contains("numerically_valid"));
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("running_denominator"));
     }
 
@@ -7265,7 +7292,8 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     /// Requires an actual NVIDIA L4 WGPU adapter. The production attention,
     /// KV, context, projected, and token-state buffers remain non-readable;
-    /// validation maps one aggregate status word after one queue submission.
+    /// validation maps one staging allocation containing the aggregate finite
+    /// result and invalid-row status after one queue submission.
     #[test]
     #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
     fn live_l4_gpu_native_causal_attention_residual() {
@@ -7418,6 +7446,13 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             executor.create_token_state().unwrap(),
             executor.create_token_state().unwrap(),
         ];
+        let invalid_scratch = executor.create_attention_scratch(geometry).unwrap();
+        let invalid_k = executor.create_scratch(geometry.kv_width).unwrap();
+        let invalid_v = executor.create_scratch(geometry.kv_width).unwrap();
+        let invalid_kv = executor
+            .create_kv_state(1, MAX_SEQ_LEN, geometry.kv_width)
+            .unwrap();
+        let invalid_state = executor.create_token_state().unwrap();
         let prepared_inputs = [
             vec![0.5, -1.0, 1.5, -2.0, 2.5, -3.0],
             vec![-0.25, 0.75, -1.25, 1.75, -2.25, 2.75],
@@ -7448,6 +7483,18 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             0,
             bytemuck::cast_slice(&future_value_poison),
         );
+        let invalid_query = vec![f32::INFINITY; geometry.q_width];
+        let invalid_key = [1.0, 2.0, 3.0, 4.0];
+        let invalid_value = [0.25, -0.5, 0.75, -1.0];
+        gpu.queue.write_buffer(
+            &invalid_scratch.q.buffer,
+            0,
+            bytemuck::cast_slice(&invalid_query),
+        );
+        gpu.queue
+            .write_buffer(&invalid_k.buffer, 0, bytemuck::cast_slice(&invalid_key));
+        gpu.queue
+            .write_buffer(&invalid_v.buffer, 0, bytemuck::cast_slice(&invalid_value));
 
         let inverse_frequencies = [1.0];
         let mut expected_keys = vec![0.0; MAX_SEQ_LEN * geometry.kv_width];
@@ -7536,6 +7583,12 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 )
             })
             .collect::<Vec<_>>();
+        let expected_sanitized_context = create_test_expected_buffer(
+            &gpu.device,
+            &gpu.queue,
+            "gpu_native_causal_invalid_context_expected",
+            &vec![0.0; geometry.q_width],
+        );
 
         let registered = executor.execution_snapshot();
         assert_eq!(registered.dense_weights_registered, 7);
@@ -7551,7 +7604,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         gpu.queue.write_buffer(&status, 0, &[0; 4]);
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_native_causal_attention_validation_staging"),
-            size: GPU_NATIVE_STATUS_BYTES,
+            size: GPU_NATIVE_STATUS_BYTES * 2,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -7606,6 +7659,34 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 );
             }
         }
+
+        // Keep the injected failure request-local: its own Q scratch, KV, and
+        // token status share the caller encoder but cannot perturb the finite
+        // 0/1/2-position correctness path above.
+        executor
+            .encode_kv_append(&mut encoder, &invalid_k, &invalid_v, &invalid_kv, 0, 0)
+            .unwrap();
+        executor
+            .encode_attention_complete(
+                &mut encoder,
+                &plan,
+                &invalid_state,
+                &invalid_scratch,
+                &invalid_kv,
+                0,
+            )
+            .unwrap();
+        encode_test_compare(
+            &gpu.device,
+            &mut encoder,
+            &compare_layout,
+            &compare_pipeline,
+            &invalid_scratch.context.buffer,
+            &expected_sanitized_context,
+            &status,
+            geometry.q_width,
+            0.0,
+        );
         for position in 0..MAX_SEQ_LEN {
             let offset = position * geometry.kv_width;
             encode_test_compare_at(
@@ -7647,7 +7728,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             encoded.rope_parameter_uploads,
             registered.rope_parameter_uploads
         );
-        assert_eq!(encoded.dense_gemv_dispatches, 12);
+        assert_eq!(encoded.dense_gemv_dispatches, 13);
         assert_eq!(encoded.rms_norm_dispatches, 6);
         assert_eq!(encoded.rms_norm_groups, 18);
         assert_eq!(encoded.attention_prepare_dispatches, 3);
@@ -7656,19 +7737,27 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(encoded.v_projection_dispatches, 3);
         assert_eq!(encoded.rope_dispatches, 6);
         assert_eq!(encoded.rope_groups, 18);
-        assert_eq!(encoded.kv_appends, 4);
-        assert_eq!(encoded.causal_attention_dispatches, 3);
-        assert_eq!(encoded.o_projection_dispatches, 3);
-        assert_eq!(encoded.attention_complete_dispatches, 3);
-        assert_eq!(encoded.residual_add_dispatches, 3);
+        assert_eq!(encoded.kv_appends, 5);
+        assert_eq!(encoded.causal_attention_dispatches, 4);
+        assert_eq!(encoded.o_projection_dispatches, 4);
+        assert_eq!(encoded.attention_complete_dispatches, 4);
+        assert_eq!(encoded.residual_add_dispatches, 4);
         assert_eq!(encoded.queue_submissions, 0);
         assert_eq!(encoded.intermediate_maps, 0);
         assert_eq!(encoded.intermediate_readbacks, 0);
         assert_eq!(encoded.cpu_attention_calls, 0);
         assert_eq!(encoded.cpu_kv_mutations, 0);
         assert_eq!(encoded.cpu_layer_reentries, 0);
+        assert_eq!(encoded.numerical_failures, 0);
 
         encoder.copy_buffer_to_buffer(&status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
+        encoder.copy_buffer_to_buffer(
+            &invalid_state.status,
+            0,
+            &staging,
+            GPU_NATIVE_STATUS_BYTES,
+            GPU_NATIVE_STATUS_BYTES,
+        );
         gpu.queue.submit(Some(encoder.finish()));
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -7681,9 +7770,15 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .expect("validation status must map");
         let mapped = slice.get_mapped_range();
         let status_value = u32::from_le_bytes(mapped[..4].try_into().unwrap());
+        let invalid_status_value = u32::from_le_bytes(mapped[4..8].try_into().unwrap());
         drop(mapped);
         staging.unmap();
         assert_eq!(status_value, 0, "on-device causal attention failed");
+        assert_ne!(
+            invalid_status_value & GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE,
+            0,
+            "invalid causal-attention score did not latch device status"
+        );
 
         let completed = executor.execution_snapshot();
         assert_eq!(
@@ -7699,6 +7794,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(completed.cpu_attention_calls, 0);
         assert_eq!(completed.cpu_kv_mutations, 0);
         assert_eq!(completed.cpu_layer_reentries, 0);
+        assert_eq!(completed.numerical_failures, 0);
     }
 
     #[test]
@@ -7761,6 +7857,8 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(!tensor.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
         let status = GpuNativeTokenStateLayout::status_usage();
+        assert!(status.contains(wgpu::BufferUsages::STORAGE));
+        assert!(status.contains(wgpu::BufferUsages::COPY_DST));
         assert!(status.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!status.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
