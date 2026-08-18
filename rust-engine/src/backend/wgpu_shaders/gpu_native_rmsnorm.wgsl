@@ -4,6 +4,8 @@
 // thread accumulates a strided f32 partial sum, then the workgroup reduces the
 // 64 partials. The F32 gain vector is shared across groups. The capture entry
 // also preserves the old target value in RESIDUAL before overwriting TARGET.
+// The power-of-two reduction width is fixed at 64: workgroup size, scratch
+// length, input stride, and the initial half-stride of 32 must change together.
 
 struct PushConstants {
     groups: u32,

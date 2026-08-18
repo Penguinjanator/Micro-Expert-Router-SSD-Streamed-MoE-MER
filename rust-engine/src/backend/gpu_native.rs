@@ -88,6 +88,9 @@ pub(crate) enum GpuNativeBootstrapError {
     InvalidRmsNormWeightWidth {
         width: usize,
     },
+    InvalidRmsNormEpsilon {
+        epsilon_bits: u32,
+    },
     ForeignRmsNormHandle,
     StaleRmsNormHandle {
         key: String,
@@ -230,6 +233,11 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::InvalidRmsNormWeightWidth { width } => write!(
                 f,
                 "GPU-native RMSNorm weight width must be non-zero, got {width}"
+            ),
+            Self::InvalidRmsNormEpsilon { epsilon_bits } => write!(
+                f,
+                "GPU-native RMSNorm epsilon must be finite and non-negative, got {}",
+                f32::from_bits(*epsilon_bits)
             ),
             Self::ForeignRmsNormHandle => write!(
                 f,
@@ -1169,6 +1177,15 @@ fn validate_residual_contribution_width(
 fn validate_rms_norm_weight_width(width: usize) -> Result<(), GpuNativeBootstrapError> {
     if width == 0 {
         return Err(GpuNativeBootstrapError::InvalidRmsNormWeightWidth { width });
+    }
+    Ok(())
+}
+
+fn validate_rms_norm_epsilon(epsilon: f32) -> Result<(), GpuNativeBootstrapError> {
+    if !epsilon.is_finite() || epsilon < 0.0 {
+        return Err(GpuNativeBootstrapError::InvalidRmsNormEpsilon {
+            epsilon_bits: epsilon.to_bits(),
+        });
     }
     Ok(())
 }
@@ -2146,6 +2163,7 @@ impl GpuNativeExecutorContext {
         group_width: usize,
         scratch_dispatch: bool,
     ) -> Result<(), GpuNativeBootstrapError> {
+        validate_rms_norm_epsilon(epsilon)?;
         let gpu = self.authoritative_gpu()?;
         let weight = self.dense_weights.lock().resolve_rms_norm(handle)?;
         let geometry = GpuNativeRmsNormGeometry::try_new(
@@ -2858,6 +2876,21 @@ mod tests {
     }
 
     #[test]
+    fn rms_norm_epsilon_rejects_non_finite_and_negative_values() {
+        for epsilon in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e-6] {
+            assert_eq!(
+                validate_rms_norm_epsilon(epsilon),
+                Err(GpuNativeBootstrapError::InvalidRmsNormEpsilon {
+                    epsilon_bits: epsilon.to_bits(),
+                })
+            );
+        }
+
+        assert_eq!(validate_rms_norm_epsilon(0.0), Ok(()));
+        assert_eq!(validate_rms_norm_epsilon(1e-6), Ok(()));
+    }
+
+    #[test]
     fn typed_rms_norm_handles_reuse_persistent_f32_registry_and_fail_closed() {
         let layout =
             GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 1, 7, 28).unwrap();
@@ -3005,9 +3038,13 @@ mod tests {
         residual_complete_mirror(&mut hidden, &residual, &second_contribution);
         let before_final_norm = hidden.clone();
         let residual_before_final_norm = residual.clone();
+        let expected_final_hidden =
+            rms_norm_mirror(&before_final_norm, &final_gain, epsilon, 1, WIDTH);
         hidden = rms_norm_mirror(&hidden, &final_gain, epsilon, 1, WIDTH);
 
         assert_eq!(residual, residual_before_final_norm);
+        assert_eq!(hidden, expected_final_hidden);
+        assert_ne!(hidden, before_final_norm);
         assert_eq!(before_final_norm.len(), WIDTH);
         assert_eq!(hidden.len(), WIDTH);
         assert!(hidden.iter().all(|value| value.is_finite()));
