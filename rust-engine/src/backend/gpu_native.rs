@@ -2,8 +2,8 @@
 //!
 //! This module is not reachable from current operator-facing execution modes.
 //! It owns request-local device state, persistent dense/RMSNorm model weights,
-//! and encoder-only embedding, GEMV, RMSNorm, and residual primitives on the
-//! authoritative WGPU device.
+//! and encoder-only embedding, GEMV, RMSNorm, residual, attention-preparation,
+//! and request-local KV primitives on the authoritative WGPU device.
 //! Later slices can compose those pieces without inheriting legacy host-shaped
 //! upload/readback APIs.
 
@@ -24,6 +24,8 @@ const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
 const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
+const GPU_NATIVE_ROPE_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rope.wgsl");
+const GPU_NATIVE_KV_APPEND_SHADER: &str = include_str!("wgpu_shaders/gpu_native_kv_append.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 
 /// Typed, fail-closed construction failure for the GPU-native bootstrap.
@@ -137,6 +139,102 @@ pub(crate) enum GpuNativeBootstrapError {
         actual: usize,
     },
     ResidualContributionWidth {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidAttentionHeadCount {
+        tensor: GpuNativeAttentionTensor,
+        heads: usize,
+    },
+    InvalidAttentionHeadGeometry {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    },
+    AttentionGeometryOverflow {
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    },
+    AttentionDModelMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    InvalidRopeDimension {
+        rope_dim: usize,
+        head_dim: usize,
+    },
+    OddRopeDimension {
+        rope_dim: usize,
+    },
+    InvalidRopeBase {
+        base_bits: u32,
+    },
+    InvalidRopeInverseFrequency {
+        index: usize,
+        value_bits: u32,
+    },
+    InvalidRopeAttentionFactor {
+        factor_bits: u32,
+    },
+    ForeignRopeHandle,
+    StaleRopeHandle {
+        key: String,
+    },
+    RopeDimensionMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    RopeParameterWidth {
+        expected: usize,
+        actual: usize,
+    },
+    ForeignAttentionPlan,
+    ForeignAttentionScratch,
+    AttentionScratchGeometry {
+        expected: GpuNativeAttentionGeometry,
+        actual: GpuNativeAttentionGeometry,
+    },
+    AttentionScratchWidth {
+        tensor: GpuNativeAttentionTensor,
+        expected: usize,
+        actual: usize,
+    },
+    AttentionProjectionShape {
+        tensor: GpuNativeAttentionTensor,
+        expected_rows: usize,
+        expected_cols: usize,
+        actual_rows: usize,
+        actual_cols: usize,
+    },
+    AttentionNormWidth {
+        tensor: GpuNativeAttentionTensor,
+        expected: usize,
+        actual: usize,
+    },
+    InvalidKvLayerCount,
+    InvalidKvCapacity,
+    InvalidKvWidth,
+    KvCapacityOverflow {
+        num_layers: usize,
+        max_seq_len: usize,
+        kv_width: usize,
+    },
+    KvBufferLimit {
+        required: u64,
+        max_buffer_size: u64,
+        max_storage_binding_size: u64,
+    },
+    ForeignKvState,
+    InvalidKvLayer {
+        layer: usize,
+        num_layers: usize,
+    },
+    InvalidKvPosition {
+        position: usize,
+        max_seq_len: usize,
+    },
+    KvWidth {
         expected: usize,
         actual: usize,
     },
@@ -310,6 +408,148 @@ impl fmt::Display for GpuNativeBootstrapError {
                 f,
                 "GPU-native residual contribution has {actual} elements, expected {expected}"
             ),
+            Self::InvalidAttentionHeadCount { tensor, heads } => write!(
+                f,
+                "GPU-native {tensor} head count must be non-zero, got {heads}"
+            ),
+            Self::InvalidAttentionHeadGeometry {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => write!(
+                f,
+                "GPU-native attention geometry requires non-zero head_dim and query heads divisible by KV heads, got num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+            ),
+            Self::AttentionGeometryOverflow {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            } => write!(
+                f,
+                "GPU-native attention geometry overflows for num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+            ),
+            Self::AttentionDModelMismatch { expected, actual } => write!(
+                f,
+                "GPU-native attention d_model is {actual}, expected executor width {expected}"
+            ),
+            Self::InvalidRopeDimension { rope_dim, head_dim } => write!(
+                f,
+                "GPU-native RoPE dimension must be in 1..={head_dim}, got {rope_dim}"
+            ),
+            Self::OddRopeDimension { rope_dim } => write!(
+                f,
+                "GPU-native RoPE dimension must be even, got {rope_dim}"
+            ),
+            Self::InvalidRopeBase { base_bits } => write!(
+                f,
+                "GPU-native RoPE base must be finite and positive, got {}",
+                f32::from_bits(*base_bits)
+            ),
+            Self::InvalidRopeInverseFrequency { index, value_bits } => write!(
+                f,
+                "GPU-native RoPE inverse frequency {index} must be finite and positive, got {}",
+                f32::from_bits(*value_bits)
+            ),
+            Self::InvalidRopeAttentionFactor { factor_bits } => write!(
+                f,
+                "GPU-native RoPE attention factor must be finite and positive, got {}",
+                f32::from_bits(*factor_bits)
+            ),
+            Self::ForeignRopeHandle => write!(
+                f,
+                "GPU-native RoPE handle belongs to a different executor context"
+            ),
+            Self::StaleRopeHandle { key } => {
+                write!(f, "GPU-native RoPE handle for {key:?} is stale")
+            }
+            Self::RopeDimensionMismatch { expected, actual } => write!(
+                f,
+                "GPU-native RoPE dimension is {actual}, expected {expected}"
+            ),
+            Self::RopeParameterWidth { expected, actual } => write!(
+                f,
+                "GPU-native RoPE inverse-frequency table has {actual} values, expected {expected}"
+            ),
+            Self::ForeignAttentionPlan => write!(
+                f,
+                "GPU-native attention plan belongs to a different executor context"
+            ),
+            Self::ForeignAttentionScratch => write!(
+                f,
+                "GPU-native attention scratch belongs to a different executor context"
+            ),
+            Self::AttentionScratchGeometry { expected, actual } => write!(
+                f,
+                "GPU-native attention scratch geometry {actual:?} does not match plan geometry {expected:?}"
+            ),
+            Self::AttentionScratchWidth {
+                tensor,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "GPU-native {tensor} scratch has {actual} elements, expected {expected}"
+            ),
+            Self::AttentionProjectionShape {
+                tensor,
+                expected_rows,
+                expected_cols,
+                actual_rows,
+                actual_cols,
+            } => write!(
+                f,
+                "GPU-native {tensor} projection has shape [{actual_rows}, {actual_cols}], expected [{expected_rows}, {expected_cols}]"
+            ),
+            Self::AttentionNormWidth {
+                tensor,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "GPU-native {tensor} norm gain has width {actual}, expected {expected}"
+            ),
+            Self::InvalidKvLayerCount => {
+                write!(f, "GPU-native KV layer count must be non-zero")
+            }
+            Self::InvalidKvCapacity => {
+                write!(f, "GPU-native KV maximum sequence length must be non-zero")
+            }
+            Self::InvalidKvWidth => write!(f, "GPU-native KV width must be non-zero"),
+            Self::KvCapacityOverflow {
+                num_layers,
+                max_seq_len,
+                kv_width,
+            } => write!(
+                f,
+                "GPU-native KV capacity overflows for layers={num_layers}, max_seq_len={max_seq_len}, width={kv_width}"
+            ),
+            Self::KvBufferLimit {
+                required,
+                max_buffer_size,
+                max_storage_binding_size,
+            } => write!(
+                f,
+                "GPU-native per-layer KV buffer requires {required} bytes, exceeding max_buffer_size={max_buffer_size} or max_storage_buffer_binding_size={max_storage_binding_size}"
+            ),
+            Self::ForeignKvState => write!(
+                f,
+                "GPU-native KV state belongs to a different executor context"
+            ),
+            Self::InvalidKvLayer { layer, num_layers } => write!(
+                f,
+                "GPU-native KV layer {layer} is outside layer count {num_layers}"
+            ),
+            Self::InvalidKvPosition {
+                position,
+                max_seq_len,
+            } => write!(
+                f,
+                "GPU-native KV position {position} is outside capacity {max_seq_len}"
+            ),
+            Self::KvWidth { expected, actual } => write!(
+                f,
+                "GPU-native KV width is {actual}, expected {expected}"
+            ),
             Self::DispatchGeometryUnsupported {
                 workgroups,
                 maximum,
@@ -334,6 +574,23 @@ impl std::error::Error for GpuNativeBootstrapError {
 impl From<GpuStartupAllocationError> for GpuNativeBootstrapError {
     fn from(error: GpuStartupAllocationError) -> Self {
         Self::Allocation(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GpuNativeAttentionTensor {
+    Query,
+    Key,
+    Value,
+}
+
+impl fmt::Display for GpuNativeAttentionTensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Query => write!(f, "query"),
+            Self::Key => write!(f, "key"),
+            Self::Value => write!(f, "value"),
+        }
     }
 }
 
@@ -726,6 +983,316 @@ impl GpuNativeRmsNormGeometry {
     }
 }
 
+/// Qwen-compatible attention-preparation geometry. Query heads may use GQA,
+/// but Q/K/V share one head width and V is deliberately not asymmetric in
+/// this slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeAttentionGeometry {
+    d_model: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+}
+
+impl GpuNativeAttentionGeometry {
+    pub(crate) fn try_new(
+        d_model: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if num_heads == 0 {
+            return Err(GpuNativeBootstrapError::InvalidAttentionHeadCount {
+                tensor: GpuNativeAttentionTensor::Query,
+                heads: num_heads,
+            });
+        }
+        if num_kv_heads == 0 {
+            return Err(GpuNativeBootstrapError::InvalidAttentionHeadCount {
+                tensor: GpuNativeAttentionTensor::Key,
+                heads: num_kv_heads,
+            });
+        }
+        if head_dim == 0 || num_heads < num_kv_heads || num_heads % num_kv_heads != 0 {
+            return Err(GpuNativeBootstrapError::InvalidAttentionHeadGeometry {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            });
+        }
+        validate_rope_dimension(rope_dim, head_dim)?;
+        let q_width = num_heads.checked_mul(head_dim).ok_or(
+            GpuNativeBootstrapError::AttentionGeometryOverflow {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+        )?;
+        let kv_width = num_kv_heads.checked_mul(head_dim).ok_or(
+            GpuNativeBootstrapError::AttentionGeometryOverflow {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+        )?;
+        if d_model == 0
+            || u32::try_from(d_model).is_err()
+            || u32::try_from(q_width).is_err()
+            || u32::try_from(kv_width).is_err()
+            || u32::try_from(head_dim).is_err()
+            || u32::try_from(rope_dim).is_err()
+        {
+            return Err(GpuNativeBootstrapError::AttentionGeometryOverflow {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            });
+        }
+        Ok(Self {
+            d_model,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            q_width,
+            kv_width,
+        })
+    }
+
+    pub(crate) const fn d_model(self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) const fn num_heads(self) -> usize {
+        self.num_heads
+    }
+
+    pub(crate) const fn num_kv_heads(self) -> usize {
+        self.num_kv_heads
+    }
+
+    pub(crate) const fn head_dim(self) -> usize {
+        self.head_dim
+    }
+
+    pub(crate) const fn rope_dim(self) -> usize {
+        self.rope_dim
+    }
+
+    pub(crate) const fn q_width(self) -> usize {
+        self.q_width
+    }
+
+    pub(crate) const fn kv_width(self) -> usize {
+        self.kv_width
+    }
+}
+
+fn validate_rope_dimension(
+    rope_dim: usize,
+    head_dim: usize,
+) -> Result<(), GpuNativeBootstrapError> {
+    if rope_dim == 0 || rope_dim > head_dim {
+        return Err(GpuNativeBootstrapError::InvalidRopeDimension { rope_dim, head_dim });
+    }
+    if !rope_dim.is_multiple_of(2) {
+        return Err(GpuNativeBootstrapError::OddRopeDimension { rope_dim });
+    }
+    Ok(())
+}
+
+fn validate_rope_parameters(
+    layout: GpuNativeRopeLayout,
+    inverse_frequencies: &[f32],
+    attention_factor: f32,
+) -> Result<(), GpuNativeBootstrapError> {
+    if inverse_frequencies.len() != layout.pairs {
+        return Err(GpuNativeBootstrapError::RopeParameterWidth {
+            expected: layout.pairs,
+            actual: inverse_frequencies.len(),
+        });
+    }
+    for (index, value) in inverse_frequencies.iter().copied().enumerate() {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(GpuNativeBootstrapError::InvalidRopeInverseFrequency {
+                index,
+                value_bits: value.to_bits(),
+            });
+        }
+    }
+    if !attention_factor.is_finite() || attention_factor <= 0.0 {
+        return Err(GpuNativeBootstrapError::InvalidRopeAttentionFactor {
+            factor_bits: attention_factor.to_bits(),
+        });
+    }
+    Ok(())
+}
+
+fn standard_rope_inverse_frequencies(
+    rope_dim: usize,
+    base: f32,
+) -> Result<Vec<f32>, GpuNativeBootstrapError> {
+    let layout = GpuNativeRopeLayout::try_new(rope_dim, rope_dim)?;
+    if !base.is_finite() || base <= 0.0 {
+        return Err(GpuNativeBootstrapError::InvalidRopeBase {
+            base_bits: base.to_bits(),
+        });
+    }
+    Ok((0..layout.pairs)
+        .map(|index| 1.0 / base.powf(2.0 * index as f32 / rope_dim as f32))
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuNativeRopeLayout {
+    rope_dim: usize,
+    pairs: usize,
+}
+
+impl GpuNativeRopeLayout {
+    fn try_new(rope_dim: usize, head_dim: usize) -> Result<Self, GpuNativeBootstrapError> {
+        validate_rope_dimension(rope_dim, head_dim)?;
+        Ok(Self {
+            rope_dim,
+            pairs: rope_dim / 2,
+        })
+    }
+}
+
+/// Checked request-local per-layer F32 KV capacity. Each physical K or V
+/// buffer stores `[max_seq_len, kv_width]` for exactly one layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeKvLayout {
+    num_layers: usize,
+    max_seq_len: usize,
+    kv_width: usize,
+    layer_elements: usize,
+    layer_bytes: u64,
+    total_bytes: u64,
+}
+
+impl GpuNativeKvLayout {
+    fn try_new(
+        num_layers: usize,
+        max_seq_len: usize,
+        kv_width: usize,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if num_layers == 0 {
+            return Err(GpuNativeBootstrapError::InvalidKvLayerCount);
+        }
+        if max_seq_len == 0 {
+            return Err(GpuNativeBootstrapError::InvalidKvCapacity);
+        }
+        if kv_width == 0 {
+            return Err(GpuNativeBootstrapError::InvalidKvWidth);
+        }
+        let capacity_error = || GpuNativeBootstrapError::KvCapacityOverflow {
+            num_layers,
+            max_seq_len,
+            kv_width,
+        };
+        let layer_elements = max_seq_len
+            .checked_mul(kv_width)
+            .ok_or_else(capacity_error)?;
+        if u32::try_from(max_seq_len).is_err()
+            || u32::try_from(kv_width).is_err()
+            || u32::try_from(layer_elements).is_err()
+        {
+            return Err(capacity_error());
+        }
+        let layer_bytes = layer_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(capacity_error)?;
+        let maximum_binding = u64::from(limits.max_storage_buffer_binding_size);
+        if layer_bytes > limits.max_buffer_size || layer_bytes > maximum_binding {
+            return Err(GpuNativeBootstrapError::KvBufferLimit {
+                required: layer_bytes,
+                max_buffer_size: limits.max_buffer_size,
+                max_storage_binding_size: maximum_binding,
+            });
+        }
+        let num_layers_u64 = u64::try_from(num_layers).map_err(|_| capacity_error())?;
+        let total_bytes = layer_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_mul(num_layers_u64))
+            .ok_or_else(capacity_error)?;
+        Ok(Self {
+            num_layers,
+            max_seq_len,
+            kv_width,
+            layer_elements,
+            layer_bytes,
+            total_bytes,
+        })
+    }
+
+    fn usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE
+    }
+
+    fn validate_layer(self, layer: usize) -> Result<(), GpuNativeBootstrapError> {
+        if layer >= self.num_layers {
+            return Err(GpuNativeBootstrapError::InvalidKvLayer {
+                layer,
+                num_layers: self.num_layers,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_position(self, position: usize) -> Result<(), GpuNativeBootstrapError> {
+        if position >= self.max_seq_len {
+            return Err(GpuNativeBootstrapError::InvalidKvPosition {
+                position,
+                max_seq_len: self.max_seq_len,
+            });
+        }
+        Ok(())
+    }
+
+    fn element_offset(
+        self,
+        layer: usize,
+        position: usize,
+    ) -> Result<usize, GpuNativeBootstrapError> {
+        self.validate_layer(layer)?;
+        self.validate_position(position)?;
+        position
+            .checked_mul(self.kv_width)
+            .ok_or(GpuNativeBootstrapError::KvCapacityOverflow {
+                num_layers: self.num_layers,
+                max_seq_len: self.max_seq_len,
+                kv_width: self.kv_width,
+            })
+    }
+
+    pub(crate) const fn num_layers(self) -> usize {
+        self.num_layers
+    }
+
+    pub(crate) const fn max_seq_len(self) -> usize {
+        self.max_seq_len
+    }
+
+    pub(crate) const fn kv_width(self) -> usize {
+        self.kv_width
+    }
+
+    pub(crate) const fn layer_bytes(self) -> u64 {
+        self.layer_bytes
+    }
+
+    pub(crate) const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+}
+
 /// Stable model-scoped key used to retrieve a registered dense tensor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct GpuNativeDenseWeightKey(Arc<str>);
@@ -782,6 +1349,68 @@ impl GpuNativeRmsNormHandle {
 
     pub(crate) const fn width(&self) -> usize {
         self.width
+    }
+}
+
+/// Persistent model-scoped RoPE parameters stored in the existing dense F32
+/// registry. `inv_freq` is `[rope_dim / 2]`; `attention_factor` is folded into
+/// both sine and cosine, matching the CPU helper when a derived scaling table
+/// is registered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeRopeHandle {
+    dense: GpuNativeDenseWeightHandle,
+    rope_dim: usize,
+    attention_factor_bits: u32,
+}
+
+impl GpuNativeRopeHandle {
+    pub(crate) const fn rope_dim(&self) -> usize {
+        self.rope_dim
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeAttentionNorm {
+    handle: GpuNativeRmsNormHandle,
+    epsilon_bits: u32,
+}
+
+impl GpuNativeAttentionNorm {
+    pub(crate) fn try_new(
+        handle: GpuNativeRmsNormHandle,
+        epsilon: f32,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        validate_rms_norm_epsilon(epsilon)?;
+        Ok(Self {
+            handle,
+            epsilon_bits: epsilon.to_bits(),
+        })
+    }
+
+    fn epsilon(&self) -> f32 {
+        f32::from_bits(self.epsilon_bits)
+    }
+}
+
+/// Immutable context-bound handles and geometry for one Qwen-compatible
+/// attention-preparation layer. Projection bias, asymmetric V, attention
+/// sinks, sliding-window execution, and post-attention scaling are outside
+/// this foundation contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeAttentionPlan {
+    context_id: u64,
+    geometry: GpuNativeAttentionGeometry,
+    q_projection: GpuNativeDenseWeightHandle,
+    k_projection: GpuNativeDenseWeightHandle,
+    v_projection: GpuNativeDenseWeightHandle,
+    q_norm: Option<GpuNativeAttentionNorm>,
+    k_norm: Option<GpuNativeAttentionNorm>,
+    rope: GpuNativeRopeHandle,
+}
+
+impl GpuNativeAttentionPlan {
+    pub(crate) const fn geometry(&self) -> GpuNativeAttentionGeometry {
+        self.geometry
     }
 }
 
@@ -918,6 +1547,44 @@ impl<B> GpuNativeDenseWeightRegistry<B> {
         }
         Ok(weight.clone())
     }
+}
+
+fn validate_rope_handle_with_registry<B>(
+    context_id: u64,
+    registry: &GpuNativeDenseWeightRegistry<B>,
+    handle: &GpuNativeRopeHandle,
+    expected_rope_dim: usize,
+) -> Result<(), GpuNativeBootstrapError> {
+    if handle.dense.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignRopeHandle);
+    }
+    if handle.rope_dim != expected_rope_dim {
+        return Err(GpuNativeBootstrapError::RopeDimensionMismatch {
+            expected: expected_rope_dim,
+            actual: handle.rope_dim,
+        });
+    }
+    let weight = registry
+        .resolve(&handle.dense)
+        .map_err(|error| match error {
+            GpuNativeBootstrapError::ForeignDenseWeightHandle => {
+                GpuNativeBootstrapError::ForeignRopeHandle
+            }
+            _ => GpuNativeBootstrapError::StaleRopeHandle {
+                key: handle.dense.key.as_str().to_string(),
+            },
+        })?;
+    if weight.layout.kind != GpuNativeDenseWeightKind::F32
+        || weight.layout.rows != 1
+        || weight.layout.cols != handle.rope_dim / 2
+        || !f32::from_bits(handle.attention_factor_bits).is_finite()
+        || f32::from_bits(handle.attention_factor_bits) <= 0.0
+    {
+        return Err(GpuNativeBootstrapError::StaleRopeHandle {
+            key: handle.dense.key.as_str().to_string(),
+        });
+    }
+    Ok(())
 }
 
 static NEXT_GPU_NATIVE_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1085,6 +1752,94 @@ impl<B> fmt::Debug for GpuNativeScratch<B> {
     }
 }
 
+/// Three request-scoped non-mappable F32 projections with geometry attached,
+/// preventing Q/K/V buffers from being interchanged at the composed API.
+pub(crate) struct GpuNativeAttentionScratch<B = wgpu::Buffer> {
+    context_id: u64,
+    geometry: GpuNativeAttentionGeometry,
+    q: GpuNativeScratch<B>,
+    k: GpuNativeScratch<B>,
+    v: GpuNativeScratch<B>,
+}
+
+impl<B> GpuNativeAttentionScratch<B> {
+    fn from_scratch(
+        context_id: u64,
+        geometry: GpuNativeAttentionGeometry,
+        q: GpuNativeScratch<B>,
+        k: GpuNativeScratch<B>,
+        v: GpuNativeScratch<B>,
+    ) -> Self {
+        Self {
+            context_id,
+            geometry,
+            q,
+            k,
+            v,
+        }
+    }
+
+    pub(crate) const fn geometry(&self) -> GpuNativeAttentionGeometry {
+        self.geometry
+    }
+}
+
+impl<B> fmt::Debug for GpuNativeAttentionScratch<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativeAttentionScratch")
+            .field("geometry", &self.geometry)
+            .field("q", &self.q)
+            .field("k", &self.k)
+            .field("v", &self.v)
+            .finish()
+    }
+}
+
+struct GpuNativeKvLayer<B = wgpu::Buffer> {
+    key: B,
+    value: B,
+}
+
+/// Explicitly request-local F32 KV storage. Physical buffers are per-layer so
+/// no single WGPU storage binding grows with the model's layer count.
+pub(crate) struct GpuNativeKvState<B = wgpu::Buffer> {
+    context_id: u64,
+    kv_id: u64,
+    layout: GpuNativeKvLayout,
+    layers: Vec<GpuNativeKvLayer<B>>,
+}
+
+impl<B> GpuNativeKvState<B> {
+    fn from_layers(
+        context_id: u64,
+        kv_id: u64,
+        layout: GpuNativeKvLayout,
+        layers: Vec<GpuNativeKvLayer<B>>,
+    ) -> Self {
+        Self {
+            context_id,
+            kv_id,
+            layout,
+            layers,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> GpuNativeKvLayout {
+        self.layout
+    }
+}
+
+impl<B> fmt::Debug for GpuNativeKvState<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativeKvState")
+            .field("kv_id", &self.kv_id)
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+static NEXT_GPU_NATIVE_KV_ID: AtomicU64 = AtomicU64::new(1);
+
 static NEXT_GPU_NATIVE_TOKEN_STATE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_gpu_native_token_state_id() -> u64 {
@@ -1190,6 +1945,73 @@ fn validate_rms_norm_epsilon(epsilon: f32) -> Result<(), GpuNativeBootstrapError
     Ok(())
 }
 
+fn validate_attention_scratch<B>(
+    context_id: u64,
+    geometry: GpuNativeAttentionGeometry,
+    scratch: &GpuNativeAttentionScratch<B>,
+) -> Result<(), GpuNativeBootstrapError> {
+    if scratch.context_id != context_id
+        || scratch.q.context_id != context_id
+        || scratch.k.context_id != context_id
+        || scratch.v.context_id != context_id
+    {
+        return Err(GpuNativeBootstrapError::ForeignAttentionScratch);
+    }
+    for (tensor, expected, actual) in [
+        (
+            GpuNativeAttentionTensor::Query,
+            geometry.q_width,
+            scratch.q.layout.elements,
+        ),
+        (
+            GpuNativeAttentionTensor::Key,
+            geometry.kv_width,
+            scratch.k.layout.elements,
+        ),
+        (
+            GpuNativeAttentionTensor::Value,
+            geometry.kv_width,
+            scratch.v.layout.elements,
+        ),
+    ] {
+        if actual != expected {
+            return Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor,
+                expected,
+                actual,
+            });
+        }
+    }
+    if scratch.geometry != geometry {
+        return Err(GpuNativeBootstrapError::AttentionScratchGeometry {
+            expected: geometry,
+            actual: scratch.geometry,
+        });
+    }
+    Ok(())
+}
+
+fn validate_kv_state<B>(
+    context_id: u64,
+    expected_width: usize,
+    kv: &GpuNativeKvState<B>,
+    layer: usize,
+    position: usize,
+) -> Result<(), GpuNativeBootstrapError> {
+    if kv.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignKvState);
+    }
+    if kv.layout.kv_width != expected_width {
+        return Err(GpuNativeBootstrapError::KvWidth {
+            expected: expected_width,
+            actual: kv.layout.kv_width,
+        });
+    }
+    kv.layout.validate_layer(layer)?;
+    kv.layout.validate_position(position)?;
+    Ok(())
+}
+
 /// Immutable, serializable evidence for GPU-native execution boundaries.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeExecutionSnapshot {
@@ -1206,6 +2028,16 @@ pub(crate) struct GpuNativeExecutionSnapshot {
     pub(crate) rms_norm_state_dispatches: u64,
     pub(crate) rms_norm_scratch_dispatches: u64,
     pub(crate) residual_add_dispatches: u64,
+    pub(crate) rope_parameters_registered: u64,
+    pub(crate) rope_parameter_uploads: u64,
+    pub(crate) rope_parameter_upload_bytes: u64,
+    pub(crate) attention_prepare_dispatches: u64,
+    pub(crate) q_projection_dispatches: u64,
+    pub(crate) k_projection_dispatches: u64,
+    pub(crate) v_projection_dispatches: u64,
+    pub(crate) rope_dispatches: u64,
+    pub(crate) rope_groups: u64,
+    pub(crate) kv_appends: u64,
     pub(crate) tokens_submitted: u64,
     pub(crate) tokens_completed: u64,
     pub(crate) layers_encoded: u64,
@@ -1239,6 +2071,16 @@ struct GpuNativeExecutionCounters {
     rms_norm_state_dispatches: AtomicU64,
     rms_norm_scratch_dispatches: AtomicU64,
     residual_add_dispatches: AtomicU64,
+    rope_parameters_registered: AtomicU64,
+    rope_parameter_uploads: AtomicU64,
+    rope_parameter_upload_bytes: AtomicU64,
+    attention_prepare_dispatches: AtomicU64,
+    q_projection_dispatches: AtomicU64,
+    k_projection_dispatches: AtomicU64,
+    v_projection_dispatches: AtomicU64,
+    rope_dispatches: AtomicU64,
+    rope_groups: AtomicU64,
+    kv_appends: AtomicU64,
     tokens_submitted: AtomicU64,
     tokens_completed: AtomicU64,
     layers_encoded: AtomicU64,
@@ -1273,6 +2115,16 @@ impl GpuNativeExecutionCounters {
             rms_norm_state_dispatches: self.rms_norm_state_dispatches.load(Ordering::Relaxed),
             rms_norm_scratch_dispatches: self.rms_norm_scratch_dispatches.load(Ordering::Relaxed),
             residual_add_dispatches: self.residual_add_dispatches.load(Ordering::Relaxed),
+            rope_parameters_registered: self.rope_parameters_registered.load(Ordering::Relaxed),
+            rope_parameter_uploads: self.rope_parameter_uploads.load(Ordering::Relaxed),
+            rope_parameter_upload_bytes: self.rope_parameter_upload_bytes.load(Ordering::Relaxed),
+            attention_prepare_dispatches: self.attention_prepare_dispatches.load(Ordering::Relaxed),
+            q_projection_dispatches: self.q_projection_dispatches.load(Ordering::Relaxed),
+            k_projection_dispatches: self.k_projection_dispatches.load(Ordering::Relaxed),
+            v_projection_dispatches: self.v_projection_dispatches.load(Ordering::Relaxed),
+            rope_dispatches: self.rope_dispatches.load(Ordering::Relaxed),
+            rope_groups: self.rope_groups.load(Ordering::Relaxed),
+            kv_appends: self.kv_appends.load(Ordering::Relaxed),
             tokens_submitted: self.tokens_submitted.load(Ordering::Relaxed),
             tokens_completed: self.tokens_completed.load(Ordering::Relaxed),
             layers_encoded: self.layers_encoded.load(Ordering::Relaxed),
@@ -1333,6 +2185,31 @@ impl GpuNativeExecutionCounters {
         self.residual_add_dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_rope_registration(&self, upload_bytes: u64) {
+        self.rope_parameters_registered
+            .fetch_add(1, Ordering::Relaxed);
+        self.rope_parameter_uploads.fetch_add(1, Ordering::Relaxed);
+        self.rope_parameter_upload_bytes
+            .fetch_add(upload_bytes, Ordering::Relaxed);
+    }
+
+    fn record_attention_prepare_dispatch(&self) {
+        self.attention_prepare_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+        self.q_projection_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.k_projection_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.v_projection_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rope_dispatch(&self, groups: u64) {
+        self.rope_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.rope_groups.fetch_add(groups, Ordering::Relaxed);
+    }
+
+    fn record_kv_append(&self) {
+        self.kv_appends.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     fn record_token_boundary_readback(&self) {
         self.token_boundary_readbacks
@@ -1370,6 +2247,23 @@ struct GpuNativeRmsNormPushConstants {
     group_width: u32,
     epsilon_bits: u32,
     _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeRopePushConstants {
+    groups: u32,
+    head_dim: u32,
+    rope_dim: u32,
+    position: u32,
+    attention_factor_bits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeKvAppendPushConstants {
+    width: u32,
+    position: u32,
 }
 
 struct GpuNativeDensePipelines {
@@ -1626,6 +2520,121 @@ impl GpuNativeStatePipelines {
     }
 }
 
+struct GpuNativeAttentionPipelines {
+    rope_bind_group_layout: wgpu::BindGroupLayout,
+    kv_append_bind_group_layout: wgpu::BindGroupLayout,
+    rope: wgpu::ComputePipeline,
+    kv_append: wgpu::ComputePipeline,
+}
+
+impl GpuNativeAttentionPipelines {
+    fn new(device: &wgpu::Device) -> Self {
+        let read_only_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let read_write_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let rope_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_rope_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_only_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                ],
+            });
+        let kv_append_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_kv_append_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_only_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_only_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: read_write_storage,
+                        count: None,
+                    },
+                ],
+            });
+        let rope_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_native_rope_pipeline_layout"),
+            bind_group_layouts: &[&rope_bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..20,
+            }],
+        });
+        let kv_append_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gpu_native_kv_append_pipeline_layout"),
+                bind_group_layouts: &[&kv_append_bind_group_layout],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..8,
+                }],
+            });
+        let rope_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_rope_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_ROPE_SHADER.into()),
+        });
+        let kv_append_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_kv_append_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_KV_APPEND_SHADER.into()),
+        });
+        let rope = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_rope_pipeline"),
+            layout: Some(&rope_pipeline_layout),
+            module: &rope_module,
+            entry_point: "rope_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        let kv_append = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_kv_append_pipeline"),
+            layout: Some(&kv_append_pipeline_layout),
+            module: &kv_append_module,
+            entry_point: "kv_append_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        Self {
+            rope_bind_group_layout,
+            kv_append_bind_group_layout,
+            rope,
+            kv_append,
+        }
+    }
+}
+
 /// Internal bootstrap for future GPU-owned token execution.
 ///
 /// Retaining the exact `Arc<BackendBox>` keeps the authoritative non-cloneable
@@ -1639,6 +2648,7 @@ pub(crate) struct GpuNativeExecutorContext {
     dense_weights: ParkingMutex<GpuNativeDenseWeightRegistry>,
     dense_pipelines: GpuNativeDensePipelines,
     state_pipelines: GpuNativeStatePipelines,
+    attention_pipelines: GpuNativeAttentionPipelines,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -1665,6 +2675,7 @@ impl GpuNativeExecutorContext {
         let context_id = next_nonzero_id(&NEXT_GPU_NATIVE_CONTEXT_ID, "context");
         let dense_pipelines = GpuNativeDensePipelines::new(&gpu.device);
         let state_pipelines = GpuNativeStatePipelines::new(&gpu.device);
+        let attention_pipelines = GpuNativeAttentionPipelines::new(&gpu.device);
 
         Ok(Self {
             context_id,
@@ -1674,6 +2685,7 @@ impl GpuNativeExecutorContext {
             dense_weights: ParkingMutex::new(GpuNativeDenseWeightRegistry::new(context_id)),
             dense_pipelines,
             state_pipelines,
+            attention_pipelines,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -1822,6 +2834,41 @@ impl GpuNativeExecutorContext {
             .map(GpuNativeRmsNormHandle::from_dense)
     }
 
+    /// Register already-derived model-scoped RoPE inverse frequencies. This
+    /// reuses the persistent dense F32 registry and performs no per-token
+    /// parameter upload.
+    pub(crate) fn register_rope_parameters(
+        &self,
+        key: GpuNativeDenseWeightKey,
+        rope_dim: usize,
+        inverse_frequencies: &[f32],
+        attention_factor: f32,
+    ) -> Result<GpuNativeRopeHandle, GpuNativeBootstrapError> {
+        let layout = GpuNativeRopeLayout::try_new(rope_dim, rope_dim)?;
+        validate_rope_parameters(layout, inverse_frequencies, attention_factor)?;
+        let dense =
+            DenseWeight::from_f32(inverse_frequencies.to_vec(), 1, inverse_frequencies.len());
+        let dense = self.register_dense_weight(key, &dense)?;
+        self.counters
+            .record_rope_registration(dense.layout.allocation_bytes);
+        Ok(GpuNativeRopeHandle {
+            dense,
+            rope_dim,
+            attention_factor_bits: attention_factor.to_bits(),
+        })
+    }
+
+    /// Register the standard Qwen/Llama inverse-frequency schedule.
+    pub(crate) fn register_standard_rope(
+        &self,
+        key: GpuNativeDenseWeightKey,
+        rope_dim: usize,
+        base: f32,
+    ) -> Result<GpuNativeRopeHandle, GpuNativeBootstrapError> {
+        let inverse_frequencies = standard_rope_inverse_frequencies(rope_dim, base)?;
+        self.register_rope_parameters(key, rope_dim, &inverse_frequencies, 1.0)
+    }
+
     pub(crate) fn dense_weight_handle(
         &self,
         key: &GpuNativeDenseWeightKey,
@@ -1846,6 +2893,31 @@ impl GpuNativeExecutorContext {
             .map(GpuNativeRmsNormHandle::from_dense)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_attention_plan(
+        &self,
+        geometry: GpuNativeAttentionGeometry,
+        q_projection: GpuNativeDenseWeightHandle,
+        k_projection: GpuNativeDenseWeightHandle,
+        v_projection: GpuNativeDenseWeightHandle,
+        q_norm: Option<GpuNativeAttentionNorm>,
+        k_norm: Option<GpuNativeAttentionNorm>,
+        rope: GpuNativeRopeHandle,
+    ) -> Result<GpuNativeAttentionPlan, GpuNativeBootstrapError> {
+        let plan = GpuNativeAttentionPlan {
+            context_id: self.context_id,
+            geometry,
+            q_projection,
+            k_projection,
+            v_projection,
+            q_norm,
+            k_norm,
+            rope,
+        };
+        self.validate_attention_plan(&plan)?;
+        Ok(plan)
+    }
+
     pub(crate) fn create_scratch(
         &self,
         elements: usize,
@@ -1866,6 +2938,134 @@ impl GpuNativeExecutorContext {
             layout,
             buffer,
         ))
+    }
+
+    pub(crate) fn create_attention_scratch(
+        &self,
+        geometry: GpuNativeAttentionGeometry,
+    ) -> Result<GpuNativeAttentionScratch, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::AttentionDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        for elements in [geometry.q_width, geometry.kv_width, geometry.kv_width] {
+            GpuNativeScratchLayout::try_new(elements)?.validate_for_limits(&gpu.device.limits())?;
+        }
+        let q = self.create_scratch(geometry.q_width)?;
+        let k = self.create_scratch(geometry.kv_width)?;
+        let v = self.create_scratch(geometry.kv_width)?;
+        Ok(GpuNativeAttentionScratch::from_scratch(
+            self.context_id,
+            geometry,
+            q,
+            k,
+            v,
+        ))
+    }
+
+    pub(crate) fn create_kv_state(
+        &self,
+        num_layers: usize,
+        max_seq_len: usize,
+        kv_width: usize,
+    ) -> Result<GpuNativeKvState, GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let layout =
+            GpuNativeKvLayout::try_new(num_layers, max_seq_len, kv_width, &gpu.device.limits())?;
+        let kv_id = next_nonzero_id(&NEXT_GPU_NATIVE_KV_ID, "KV state");
+        let mut layers = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            let key = create_startup_buffer(
+                &gpu.device,
+                &format!("gpu_native_kv_{kv_id}_layer_{layer}_key"),
+                layout.layer_bytes,
+                GpuNativeKvLayout::usage(),
+            )?;
+            let value = create_startup_buffer(
+                &gpu.device,
+                &format!("gpu_native_kv_{kv_id}_layer_{layer}_value"),
+                layout.layer_bytes,
+                GpuNativeKvLayout::usage(),
+            )?;
+            layers.push(GpuNativeKvLayer { key, value });
+        }
+        Ok(GpuNativeKvState::from_layers(
+            self.context_id,
+            kv_id,
+            layout,
+            layers,
+        ))
+    }
+
+    fn validate_attention_plan(
+        &self,
+        plan: &GpuNativeAttentionPlan,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        if plan.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignAttentionPlan);
+        }
+        if plan.geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::AttentionDModelMismatch {
+                expected: self.layout.d_model,
+                actual: plan.geometry.d_model,
+            });
+        }
+        let registry = self.dense_weights.lock();
+        for (tensor, handle, rows) in [
+            (
+                GpuNativeAttentionTensor::Query,
+                &plan.q_projection,
+                plan.geometry.q_width,
+            ),
+            (
+                GpuNativeAttentionTensor::Key,
+                &plan.k_projection,
+                plan.geometry.kv_width,
+            ),
+            (
+                GpuNativeAttentionTensor::Value,
+                &plan.v_projection,
+                plan.geometry.kv_width,
+            ),
+        ] {
+            let weight = registry.resolve(handle)?;
+            if weight.layout.rows != rows || weight.layout.cols != plan.geometry.d_model {
+                return Err(GpuNativeBootstrapError::AttentionProjectionShape {
+                    tensor,
+                    expected_rows: rows,
+                    expected_cols: plan.geometry.d_model,
+                    actual_rows: weight.layout.rows,
+                    actual_cols: weight.layout.cols,
+                });
+            }
+        }
+        for (tensor, norm) in [
+            (GpuNativeAttentionTensor::Query, plan.q_norm.as_ref()),
+            (GpuNativeAttentionTensor::Key, plan.k_norm.as_ref()),
+        ] {
+            let Some(norm) = norm else {
+                continue;
+            };
+            validate_rms_norm_epsilon(norm.epsilon())?;
+            let weight = registry.resolve_rms_norm(&norm.handle)?;
+            if weight.layout.cols != plan.geometry.head_dim {
+                return Err(GpuNativeBootstrapError::AttentionNormWidth {
+                    tensor,
+                    expected: plan.geometry.head_dim,
+                    actual: weight.layout.cols,
+                });
+            }
+        }
+        validate_rope_handle_with_registry(
+            self.context_id,
+            &registry,
+            &plan.rope,
+            plan.geometry.rope_dim,
+        )?;
+        Ok(())
     }
 
     /// Encode `weight[rows, cols] * state.hidden[cols] -> output[rows]`.
@@ -2252,6 +3452,261 @@ impl GpuNativeExecutorContext {
         Ok(())
     }
 
+    fn validate_attention_dispatch_limits(
+        &self,
+        plan: &GpuNativeAttentionPlan,
+        limits: &wgpu::Limits,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let registry = self.dense_weights.lock();
+        for handle in [&plan.q_projection, &plan.k_projection, &plan.v_projection] {
+            let weight = registry.resolve(handle)?;
+            for chunk in &weight.chunks {
+                self.checked_workgroups(chunk.plan.row_count, limits)?;
+            }
+        }
+        for groups in [plan.geometry.num_heads, plan.geometry.num_kv_heads] {
+            if groups as u64 > limits.max_compute_workgroups_per_dimension as u64 {
+                return Err(GpuNativeBootstrapError::DispatchGeometryUnsupported {
+                    workgroups: groups as u64,
+                    maximum: limits.max_compute_workgroups_per_dimension,
+                });
+            }
+            let pairs = groups.checked_mul(plan.geometry.rope_dim / 2).ok_or(
+                GpuNativeBootstrapError::AttentionGeometryOverflow {
+                    num_heads: plan.geometry.num_heads,
+                    num_kv_heads: plan.geometry.num_kv_heads,
+                    head_dim: plan.geometry.head_dim,
+                },
+            )?;
+            self.checked_workgroups(pairs, limits)?;
+        }
+        self.checked_workgroups(plan.geometry.kv_width, limits)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_rope_scratch_in_place(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        handle: &GpuNativeRopeHandle,
+        scratch: &GpuNativeScratch,
+        tensor: GpuNativeAttentionTensor,
+        groups: usize,
+        head_dim: usize,
+        position: usize,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_scratch_owner(self.context_id, scratch.context_id)?;
+        validate_rope_dimension(handle.rope_dim, head_dim)?;
+        let expected = groups.checked_mul(head_dim).ok_or(
+            GpuNativeBootstrapError::AttentionGeometryOverflow {
+                num_heads: groups,
+                num_kv_heads: groups,
+                head_dim,
+            },
+        )?;
+        if scratch.layout.elements != expected {
+            return Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor,
+                expected,
+                actual: scratch.layout.elements,
+            });
+        }
+        let position =
+            u32::try_from(position).map_err(|_| GpuNativeBootstrapError::InvalidKvPosition {
+                position,
+                max_seq_len: u32::MAX as usize,
+            })?;
+        let gpu = self.authoritative_gpu()?;
+        let registry = self.dense_weights.lock();
+        validate_rope_handle_with_registry(self.context_id, &registry, handle, handle.rope_dim)?;
+        let weight = registry.resolve(&handle.dense)?;
+        let chunk = match weight.chunks.as_slice() {
+            [chunk] => chunk,
+            _ => {
+                return Err(GpuNativeBootstrapError::StaleRopeHandle {
+                    key: handle.dense.key.as_str().to_string(),
+                });
+            }
+        };
+        let pairs = groups.checked_mul(handle.rope_dim / 2).ok_or(
+            GpuNativeBootstrapError::AttentionGeometryOverflow {
+                num_heads: groups,
+                num_kv_heads: groups,
+                head_dim,
+            },
+        )?;
+        let workgroups = self.checked_workgroups(pairs, &gpu.device.limits())?;
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_rope_bind_group"),
+            layout: &self.attention_pipelines.rope_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: chunk.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: scratch.buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_rope_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.attention_pipelines.rope);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_push_constants(
+            0,
+            bytemuck::bytes_of(&GpuNativeRopePushConstants {
+                groups: groups as u32,
+                head_dim: head_dim as u32,
+                rope_dim: handle.rope_dim as u32,
+                position,
+                attention_factor_bits: handle.attention_factor_bits,
+            }),
+        );
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        drop(pass);
+        self.counters.record_rope_dispatch(groups as u64);
+        Ok(())
+    }
+
+    fn encode_kv_append(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        k: &GpuNativeScratch,
+        v: &GpuNativeScratch,
+        kv: &GpuNativeKvState,
+        layer: usize,
+        position: usize,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        validate_scratch_owner(self.context_id, k.context_id)?;
+        validate_scratch_owner(self.context_id, v.context_id)?;
+        validate_kv_state(self.context_id, k.layout.elements, kv, layer, position)?;
+        if v.layout.elements != kv.layout.kv_width {
+            return Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor: GpuNativeAttentionTensor::Value,
+                expected: kv.layout.kv_width,
+                actual: v.layout.elements,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let workgroups = self.checked_workgroups(kv.layout.kv_width, &gpu.device.limits())?;
+        let layer_buffers = &kv.layers[layer];
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_kv_append_bind_group"),
+            layout: &self.attention_pipelines.kv_append_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: k.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: v.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: layer_buffers.key.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: layer_buffers.value.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_kv_append_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.attention_pipelines.kv_append);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_push_constants(
+            0,
+            bytemuck::bytes_of(&GpuNativeKvAppendPushConstants {
+                width: kv.layout.kv_width as u32,
+                position: position as u32,
+            }),
+        );
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        drop(pass);
+        self.counters.record_kv_append();
+        Ok(())
+    }
+
+    /// Compose Q/K/V projection, optional per-head QK-Norm, per-head RoPE,
+    /// and absolute-position request-local KV append into the caller's encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_attention_prepare(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        layer: usize,
+        position: usize,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        self.validate_attention_plan(plan)?;
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        if state.layout.d_model != plan.geometry.d_model {
+            return Err(GpuNativeBootstrapError::AttentionDModelMismatch {
+                expected: plan.geometry.d_model,
+                actual: state.layout.d_model,
+            });
+        }
+        validate_attention_scratch(self.context_id, plan.geometry, scratch)?;
+        validate_kv_state(self.context_id, plan.geometry.kv_width, kv, layer, position)?;
+        self.validate_attention_dispatch_limits(plan, &gpu.device.limits())?;
+
+        self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.q_projection, state, &scratch.q)?;
+        self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.k_projection, state, &scratch.k)?;
+        self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.v_projection, state, &scratch.v)?;
+        if let Some(norm) = &plan.q_norm {
+            self.encode_rms_norm_scratch_in_place(
+                encoder,
+                &norm.handle,
+                norm.epsilon(),
+                &scratch.q,
+                plan.geometry.num_heads,
+                plan.geometry.head_dim,
+            )?;
+        }
+        if let Some(norm) = &plan.k_norm {
+            self.encode_rms_norm_scratch_in_place(
+                encoder,
+                &norm.handle,
+                norm.epsilon(),
+                &scratch.k,
+                plan.geometry.num_kv_heads,
+                plan.geometry.head_dim,
+            )?;
+        }
+        self.encode_rope_scratch_in_place(
+            encoder,
+            &plan.rope,
+            &scratch.q,
+            GpuNativeAttentionTensor::Query,
+            plan.geometry.num_heads,
+            plan.geometry.head_dim,
+            position,
+        )?;
+        self.encode_rope_scratch_in_place(
+            encoder,
+            &plan.rope,
+            &scratch.k,
+            GpuNativeAttentionTensor::Key,
+            plan.geometry.num_kv_heads,
+            plan.geometry.head_dim,
+            position,
+        )?;
+        self.encode_kv_append(encoder, &scratch.k, &scratch.v, kv, layer, position)?;
+        self.counters.record_attention_prepare_dispatch();
+        Ok(())
+    }
+
     /// Complete a prepared sub-block entirely on device:
     /// `hidden = residual + contribution`.
     pub(crate) fn encode_residual_add_scratch_to_hidden(
@@ -2468,6 +3923,94 @@ mod tests {
 
     fn residual_complete_mirror(hidden: &mut Vec<f32>, residual: &[f32], contribution: &[f32]) {
         *hidden = residual_add_mirror(residual, contribution);
+    }
+
+    fn rope_mirror(
+        values: &[f32],
+        groups: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        position: usize,
+        inverse_frequencies: &[f32],
+        attention_factor: f32,
+    ) -> Vec<f32> {
+        assert_eq!(values.len(), groups * head_dim);
+        assert_eq!(inverse_frequencies.len(), rope_dim / 2);
+        let mut result = values.to_vec();
+        let pairs = rope_dim / 2;
+        for group in 0..groups {
+            let head_start = group * head_dim;
+            for pair in 0..pairs {
+                let theta = position as f32 * inverse_frequencies[pair];
+                let (sin_theta, cos_theta) = theta.sin_cos();
+                let sin_theta = sin_theta * attention_factor;
+                let cos_theta = cos_theta * attention_factor;
+                let first = head_start + pair;
+                let second = first + pairs;
+                let a = result[first];
+                let b = result[second];
+                result[first] = a * cos_theta - b * sin_theta;
+                result[second] = a * sin_theta + b * cos_theta;
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prepare_mirror(
+        hidden: &[f32],
+        geometry: GpuNativeAttentionGeometry,
+        q_projection: &DenseWeight,
+        k_projection: &DenseWeight,
+        v_projection: &DenseWeight,
+        q_norm: Option<(&[f32], f32)>,
+        k_norm: Option<(&[f32], f32)>,
+        inverse_frequencies: &[f32],
+        attention_factor: f32,
+        position: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut q = q_projection.matvec(hidden);
+        let mut k = k_projection.matvec(hidden);
+        let v = v_projection.matvec(hidden);
+        if let Some((gain, epsilon)) = q_norm {
+            q = rms_norm_mirror(&q, gain, epsilon, geometry.num_heads, geometry.head_dim);
+        }
+        if let Some((gain, epsilon)) = k_norm {
+            k = rms_norm_mirror(&k, gain, epsilon, geometry.num_kv_heads, geometry.head_dim);
+        }
+        q = rope_mirror(
+            &q,
+            geometry.num_heads,
+            geometry.head_dim,
+            geometry.rope_dim,
+            position,
+            inverse_frequencies,
+            attention_factor,
+        );
+        k = rope_mirror(
+            &k,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+            geometry.rope_dim,
+            position,
+            inverse_frequencies,
+            attention_factor,
+        );
+        (q, k, v)
+    }
+
+    fn test_scratch<B>(
+        context_id: u64,
+        scratch_id: u64,
+        elements: usize,
+        buffer: B,
+    ) -> GpuNativeScratch<B> {
+        GpuNativeScratch::from_buffer(
+            context_id,
+            scratch_id,
+            GpuNativeScratchLayout::try_new(elements).unwrap(),
+            buffer,
+        )
     }
 
     fn test_weight<B>(
@@ -2891,6 +4434,496 @@ mod tests {
     }
 
     #[test]
+    fn attention_geometry_accepts_qwen_gqa_and_non_power_of_two_head_counts() {
+        let geometry = GpuNativeAttentionGeometry::try_new(12, 6, 2, 4, 4).unwrap();
+        assert_eq!(geometry.d_model(), 12);
+        assert_eq!(geometry.num_heads(), 6);
+        assert_eq!(geometry.num_kv_heads(), 2);
+        assert_eq!(geometry.head_dim(), 4);
+        assert_eq!(geometry.rope_dim(), 4);
+        assert_eq!(geometry.q_width(), 24);
+        assert_eq!(geometry.kv_width(), 8);
+
+        assert_eq!(
+            GpuNativeAttentionGeometry::try_new(12, 0, 2, 4, 4),
+            Err(GpuNativeBootstrapError::InvalidAttentionHeadCount {
+                tensor: GpuNativeAttentionTensor::Query,
+                heads: 0,
+            })
+        );
+        assert_eq!(
+            GpuNativeAttentionGeometry::try_new(12, 6, 0, 4, 4),
+            Err(GpuNativeBootstrapError::InvalidAttentionHeadCount {
+                tensor: GpuNativeAttentionTensor::Key,
+                heads: 0,
+            })
+        );
+        assert!(matches!(
+            GpuNativeAttentionGeometry::try_new(12, 6, 4, 4, 4),
+            Err(GpuNativeBootstrapError::InvalidAttentionHeadGeometry { .. })
+        ));
+        assert_eq!(
+            GpuNativeAttentionGeometry::try_new(12, 6, 2, 4, 3),
+            Err(GpuNativeBootstrapError::OddRopeDimension { rope_dim: 3 })
+        );
+        assert_eq!(
+            GpuNativeAttentionGeometry::try_new(12, 6, 2, 4, 6),
+            Err(GpuNativeBootstrapError::InvalidRopeDimension {
+                rope_dim: 6,
+                head_dim: 4,
+            })
+        );
+        assert!(matches!(
+            GpuNativeAttentionGeometry::try_new(12, u32::MAX as usize, 1, 2, 2),
+            Err(GpuNativeBootstrapError::AttentionGeometryOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn qk_norm_groups_are_independent_for_gqa_geometry() {
+        let geometry = GpuNativeAttentionGeometry::try_new(12, 6, 2, 4, 4).unwrap();
+        let gain = [0.7, 1.1, 0.9, 1.3];
+        let epsilon = 1e-6;
+        let q = (0..geometry.q_width)
+            .map(|index| (index as f32 - 11.0) / 3.0)
+            .collect::<Vec<_>>();
+        let k = (0..geometry.kv_width)
+            .map(|index| (index as f32 - 3.0) / 2.0)
+            .collect::<Vec<_>>();
+        let q_norm = rms_norm_mirror(&q, &gain, epsilon, geometry.num_heads, geometry.head_dim);
+        let k_norm = rms_norm_mirror(&k, &gain, epsilon, geometry.num_kv_heads, geometry.head_dim);
+        let cpu_norm = crate::transformer::RmsNorm::new(gain.to_vec(), epsilon);
+        let expected_q = q
+            .chunks_exact(geometry.head_dim)
+            .flat_map(|head| cpu_norm.forward(head))
+            .collect::<Vec<_>>();
+        let expected_k = k
+            .chunks_exact(geometry.head_dim)
+            .flat_map(|head| cpu_norm.forward(head))
+            .collect::<Vec<_>>();
+        assert_eq!(q_norm, expected_q);
+        assert_eq!(k_norm, expected_k);
+
+        let mut changed_q = q.clone();
+        changed_q[5 * geometry.head_dim..].fill(10_000.0);
+        let changed_q_norm = rms_norm_mirror(
+            &changed_q,
+            &gain,
+            epsilon,
+            geometry.num_heads,
+            geometry.head_dim,
+        );
+        assert_eq!(
+            &q_norm[..5 * geometry.head_dim],
+            &changed_q_norm[..5 * geometry.head_dim]
+        );
+    }
+
+    #[test]
+    fn rope_mirror_matches_cpu_pairing_positions_and_partial_tail() {
+        const GROUPS: usize = 3;
+        const HEAD_DIM: usize = 6;
+        const ROPE_DIM: usize = 4;
+        let inverse_frequencies = [1.0, 0.01];
+        let values = (0..GROUPS * HEAD_DIM)
+            .map(|index| (index as f32 - 7.0) / 4.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rope_mirror(
+                &values,
+                GROUPS,
+                HEAD_DIM,
+                ROPE_DIM,
+                0,
+                &inverse_frequencies,
+                1.0,
+            ),
+            values
+        );
+
+        let actual = rope_mirror(
+            &values,
+            GROUPS,
+            HEAD_DIM,
+            ROPE_DIM,
+            7,
+            &inverse_frequencies,
+            1.0,
+        );
+        let mut expected = values.clone();
+        for head in expected.chunks_exact_mut(HEAD_DIM) {
+            crate::transformer::apply_rope_inplace(&mut head[..ROPE_DIM], 7, 10_000.0);
+        }
+        assert_close(&actual, &expected, 1e-6);
+        for head in 0..GROUPS {
+            let start = head * HEAD_DIM;
+            assert_eq!(
+                &actual[start + ROPE_DIM..start + HEAD_DIM],
+                &values[start + ROPE_DIM..start + HEAD_DIM]
+            );
+        }
+
+        let one_head = rope_mirror(&[1.0, 2.0, 3.0, 4.0], 1, 4, 4, 1, &inverse_frequencies, 1.0);
+        let mut cpu_pairing = vec![1.0, 2.0, 3.0, 4.0];
+        crate::transformer::apply_rope_inplace(&mut cpu_pairing, 1, 10_000.0);
+        assert_close(&one_head, &cpu_pairing, 1e-6);
+    }
+
+    #[test]
+    fn rope_parameters_and_typed_handle_fail_closed() {
+        let layout = GpuNativeRopeLayout::try_new(4, 4).unwrap();
+        assert_close(
+            &standard_rope_inverse_frequencies(4, 10_000.0).unwrap(),
+            &[1.0, 0.01],
+            1e-7,
+        );
+        for invalid_base in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                standard_rope_inverse_frequencies(4, invalid_base),
+                Err(GpuNativeBootstrapError::InvalidRopeBase {
+                    base_bits: invalid_base.to_bits(),
+                })
+            );
+        }
+        assert_eq!(validate_rope_parameters(layout, &[1.0, 0.01], 1.0), Ok(()));
+        assert_eq!(
+            validate_rope_parameters(layout, &[1.0], 1.0),
+            Err(GpuNativeBootstrapError::RopeParameterWidth {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                validate_rope_parameters(layout, &[1.0, invalid], 1.0),
+                Err(GpuNativeBootstrapError::InvalidRopeInverseFrequency {
+                    index: 1,
+                    value_bits: invalid.to_bits(),
+                })
+            );
+        }
+        assert_eq!(
+            validate_rope_parameters(layout, &[1.0, 0.01], f32::NAN),
+            Err(GpuNativeBootstrapError::InvalidRopeAttentionFactor {
+                factor_bits: f32::NAN.to_bits(),
+            })
+        );
+
+        let dense_layout =
+            GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 1, 2, 8).unwrap();
+        let mut registry = GpuNativeDenseWeightRegistry::new(41);
+        let dense = registry
+            .insert(test_weight(7, "model.rope", dense_layout, ()))
+            .unwrap();
+        let handle = GpuNativeRopeHandle {
+            dense,
+            rope_dim: 4,
+            attention_factor_bits: 1.0f32.to_bits(),
+        };
+        assert_eq!(
+            validate_rope_handle_with_registry(41, &registry, &handle, 4),
+            Ok(())
+        );
+        assert_eq!(
+            validate_rope_handle_with_registry(42, &registry, &handle, 4),
+            Err(GpuNativeBootstrapError::ForeignRopeHandle)
+        );
+        let mut stale = handle.clone();
+        stale.dense.weight_id += 1;
+        assert!(matches!(
+            validate_rope_handle_with_registry(41, &registry, &stale, 4),
+            Err(GpuNativeBootstrapError::StaleRopeHandle { .. })
+        ));
+    }
+
+    #[test]
+    fn kv_layout_checks_offsets_capacity_overflow_and_binding_limits() {
+        let layout = GpuNativeKvLayout::try_new(3, 5, 8, &wgpu::Limits::default()).unwrap();
+        assert_eq!(layout.num_layers(), 3);
+        assert_eq!(layout.max_seq_len(), 5);
+        assert_eq!(layout.kv_width(), 8);
+        assert_eq!(layout.layer_bytes(), 160);
+        assert_eq!(layout.total_bytes(), 960);
+        assert_eq!(layout.element_offset(2, 4), Ok(32));
+        assert_eq!(
+            layout.element_offset(3, 0),
+            Err(GpuNativeBootstrapError::InvalidKvLayer {
+                layer: 3,
+                num_layers: 3,
+            })
+        );
+        assert_eq!(
+            layout.element_offset(0, 5),
+            Err(GpuNativeBootstrapError::InvalidKvPosition {
+                position: 5,
+                max_seq_len: 5,
+            })
+        );
+        assert!(matches!(
+            GpuNativeKvLayout::try_new(1, usize::MAX, 8, &wgpu::Limits::default()),
+            Err(GpuNativeBootstrapError::KvCapacityOverflow { .. })
+        ));
+        let limits = wgpu::Limits {
+            max_buffer_size: 128,
+            max_storage_buffer_binding_size: 128,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            GpuNativeKvLayout::try_new(1, 5, 8, &limits),
+            Err(GpuNativeBootstrapError::KvBufferLimit {
+                required: 160,
+                max_buffer_size: 128,
+                max_storage_binding_size: 128,
+            })
+        );
+        assert!(!GpuNativeKvLayout::usage()
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(!GpuNativeKvLayout::usage().contains(wgpu::BufferUsages::COPY_SRC));
+    }
+
+    #[test]
+    fn attention_scratch_and_kv_ownership_and_widths_fail_closed() {
+        let geometry = GpuNativeAttentionGeometry::try_new(12, 6, 2, 4, 4).unwrap();
+        let scratch = GpuNativeAttentionScratch::from_scratch(
+            7,
+            geometry,
+            test_scratch(7, 1, geometry.q_width, ()),
+            test_scratch(7, 2, geometry.kv_width, ()),
+            test_scratch(7, 3, geometry.kv_width, ()),
+        );
+        assert_eq!(validate_attention_scratch(7, geometry, &scratch), Ok(()));
+        assert_eq!(
+            validate_attention_scratch(8, geometry, &scratch),
+            Err(GpuNativeBootstrapError::ForeignAttentionScratch)
+        );
+        let wrong_q = GpuNativeAttentionScratch::from_scratch(
+            7,
+            geometry,
+            test_scratch(7, 4, geometry.q_width - 1, ()),
+            test_scratch(7, 5, geometry.kv_width, ()),
+            test_scratch(7, 6, geometry.kv_width, ()),
+        );
+        assert_eq!(
+            validate_attention_scratch(7, geometry, &wrong_q),
+            Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor: GpuNativeAttentionTensor::Query,
+                expected: geometry.q_width,
+                actual: geometry.q_width - 1,
+            })
+        );
+        let wrong_k = GpuNativeAttentionScratch::from_scratch(
+            7,
+            geometry,
+            test_scratch(7, 7, geometry.q_width, ()),
+            test_scratch(7, 8, geometry.kv_width - 1, ()),
+            test_scratch(7, 9, geometry.kv_width, ()),
+        );
+        assert_eq!(
+            validate_attention_scratch(7, geometry, &wrong_k),
+            Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor: GpuNativeAttentionTensor::Key,
+                expected: geometry.kv_width,
+                actual: geometry.kv_width - 1,
+            })
+        );
+        let wrong_v = GpuNativeAttentionScratch::from_scratch(
+            7,
+            geometry,
+            test_scratch(7, 10, geometry.q_width, ()),
+            test_scratch(7, 11, geometry.kv_width, ()),
+            test_scratch(7, 12, geometry.kv_width - 1, ()),
+        );
+        assert_eq!(
+            validate_attention_scratch(7, geometry, &wrong_v),
+            Err(GpuNativeBootstrapError::AttentionScratchWidth {
+                tensor: GpuNativeAttentionTensor::Value,
+                expected: geometry.kv_width,
+                actual: geometry.kv_width - 1,
+            })
+        );
+
+        let kv_layout = GpuNativeKvLayout::try_new(2, 4, 8, &wgpu::Limits::default()).unwrap();
+        let kv = GpuNativeKvState::from_layers(
+            7,
+            1,
+            kv_layout,
+            vec![
+                GpuNativeKvLayer { key: (), value: () },
+                GpuNativeKvLayer { key: (), value: () },
+            ],
+        );
+        assert_eq!(validate_kv_state(7, 8, &kv, 1, 3), Ok(()));
+        assert_eq!(
+            validate_kv_state(8, 8, &kv, 1, 3),
+            Err(GpuNativeBootstrapError::ForeignKvState)
+        );
+        assert_eq!(
+            validate_kv_state(7, 7, &kv, 1, 3),
+            Err(GpuNativeBootstrapError::KvWidth {
+                expected: 7,
+                actual: 8,
+            })
+        );
+        assert!(matches!(
+            validate_kv_state(7, 8, &kv, 2, 3),
+            Err(GpuNativeBootstrapError::InvalidKvLayer { .. })
+        ));
+        assert!(matches!(
+            validate_kv_state(7, 8, &kv, 1, 4),
+            Err(GpuNativeBootstrapError::InvalidKvPosition { .. })
+        ));
+    }
+
+    #[test]
+    fn hardware_independent_attention_prepare_chain_preserves_two_kv_positions() {
+        let geometry = GpuNativeAttentionGeometry::try_new(6, 4, 2, 4, 4).unwrap();
+        let q_projection = DenseWeight::from_f32(
+            (0..geometry.q_width * geometry.d_model)
+                .map(|index| ((index * 11 % 37) as f32 - 18.0) / 19.0)
+                .collect(),
+            geometry.q_width,
+            geometry.d_model,
+        );
+        let k_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * geometry.d_model)
+                .map(|index| ((index * 13 % 41) as f32 - 20.0) / 17.0)
+                .collect(),
+            geometry.kv_width,
+            geometry.d_model,
+        );
+        let v_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * geometry.d_model)
+                .map(|index| ((index * 17 % 43) as f32 - 21.0) / 23.0)
+                .collect(),
+            geometry.kv_width,
+            geometry.d_model,
+        );
+        let q_gain = [0.8, 1.1, 0.9, 1.2];
+        let k_gain = [1.3, 0.7, 1.0, 0.85];
+        let epsilon = 1e-6;
+        let inverse_frequencies = [1.0, 0.01];
+        let kv_layout =
+            GpuNativeKvLayout::try_new(1, 4, geometry.kv_width, &wgpu::Limits::default()).unwrap();
+        let mut key_cache = vec![f32::NAN; kv_layout.layer_elements];
+        let mut value_cache = vec![f32::NAN; kv_layout.layer_elements];
+        let mut first_key = Vec::new();
+        let mut first_value = Vec::new();
+
+        for (position, hidden) in [
+            (1usize, vec![0.5, -1.0, 1.5, -2.0, 2.5, -3.0]),
+            (3usize, vec![-0.25, 0.75, -1.25, 1.75, -2.25, 2.75]),
+        ] {
+            let (q, k, v) = attention_prepare_mirror(
+                &hidden,
+                geometry,
+                &q_projection,
+                &k_projection,
+                &v_projection,
+                Some((&q_gain, epsilon)),
+                Some((&k_gain, epsilon)),
+                &inverse_frequencies,
+                1.0,
+                position,
+            );
+            assert_eq!(q.len(), geometry.q_width);
+            assert_eq!(k.len(), geometry.kv_width);
+            assert_eq!(v.len(), geometry.kv_width);
+            assert!(q.iter().chain(&k).chain(&v).all(|value| value.is_finite()));
+            let offset = kv_layout.element_offset(0, position).unwrap();
+            key_cache[offset..offset + geometry.kv_width].copy_from_slice(&k);
+            value_cache[offset..offset + geometry.kv_width].copy_from_slice(&v);
+            if position == 1 {
+                first_key = k;
+                first_value = v;
+            }
+        }
+
+        let first_offset = kv_layout.element_offset(0, 1).unwrap();
+        assert_eq!(
+            &key_cache[first_offset..first_offset + geometry.kv_width],
+            first_key
+        );
+        assert_eq!(
+            &value_cache[first_offset..first_offset + geometry.kv_width],
+            first_value
+        );
+        assert!(key_cache[..geometry.kv_width]
+            .iter()
+            .all(|value| value.is_nan()));
+        let unused_offset = kv_layout.element_offset(0, 2).unwrap();
+        assert!(key_cache[unused_offset..unused_offset + geometry.kv_width]
+            .iter()
+            .all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn attention_prepare_allows_absent_qk_norm_as_a_clean_noop() {
+        let geometry = GpuNativeAttentionGeometry::try_new(4, 2, 1, 4, 4).unwrap();
+        let q_projection = DenseWeight::from_f32(
+            (0..geometry.q_width * geometry.d_model)
+                .map(|index| (index as f32 - 8.0) / 7.0)
+                .collect(),
+            geometry.q_width,
+            geometry.d_model,
+        );
+        let k_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * geometry.d_model)
+                .map(|index| (index as f32 - 5.0) / 9.0)
+                .collect(),
+            geometry.kv_width,
+            geometry.d_model,
+        );
+        let v_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * geometry.d_model)
+                .map(|index| (index as f32 - 3.0) / 11.0)
+                .collect(),
+            geometry.kv_width,
+            geometry.d_model,
+        );
+        let hidden = [0.25, -0.5, 0.75, -1.0];
+        let inverse_frequencies = [1.0, 0.01];
+        let (q, k, v) = attention_prepare_mirror(
+            &hidden,
+            geometry,
+            &q_projection,
+            &k_projection,
+            &v_projection,
+            None,
+            None,
+            &inverse_frequencies,
+            1.0,
+            2,
+        );
+        assert_close(
+            &q,
+            &rope_mirror(
+                &q_projection.matvec(&hidden),
+                geometry.num_heads,
+                geometry.head_dim,
+                geometry.rope_dim,
+                2,
+                &inverse_frequencies,
+                1.0,
+            ),
+            1e-6,
+        );
+        assert_close(
+            &k,
+            &rope_mirror(
+                &k_projection.matvec(&hidden),
+                geometry.num_kv_heads,
+                geometry.head_dim,
+                geometry.rope_dim,
+                2,
+                &inverse_frequencies,
+                1.0,
+            ),
+            1e-6,
+        );
+        assert_eq!(v, v_projection.matvec(&hidden));
+    }
+
+    #[test]
     fn typed_rms_norm_handles_reuse_persistent_f32_registry_and_fail_closed() {
         let layout =
             GpuNativeDenseWeightLayout::try_new(GpuNativeDenseWeightKind::F32, 1, 7, 28).unwrap();
@@ -3200,6 +5233,11 @@ mod tests {
         counters.record_rms_norm_scratch_dispatch(4);
         counters.record_residual_add_dispatch();
         counters.record_residual_add_dispatch();
+        counters.record_rope_registration(8);
+        counters.record_attention_prepare_dispatch();
+        counters.record_rope_dispatch(6);
+        counters.record_rope_dispatch(2);
+        counters.record_kv_append();
         let after_dispatch = counters.snapshot();
         assert_eq!(after_dispatch.dense_weight_uploads, 3);
         assert_eq!(after_dispatch.dense_weight_upload_bytes, 108);
@@ -3211,10 +5249,20 @@ mod tests {
         assert_eq!(after_dispatch.rms_norm_state_dispatches, 2);
         assert_eq!(after_dispatch.rms_norm_scratch_dispatches, 1);
         assert_eq!(after_dispatch.residual_add_dispatches, 2);
+        assert_eq!(after_dispatch.rope_parameters_registered, 1);
+        assert_eq!(after_dispatch.rope_parameter_uploads, 1);
+        assert_eq!(after_dispatch.rope_parameter_upload_bytes, 8);
+        assert_eq!(after_dispatch.attention_prepare_dispatches, 1);
+        assert_eq!(after_dispatch.q_projection_dispatches, 1);
+        assert_eq!(after_dispatch.k_projection_dispatches, 1);
+        assert_eq!(after_dispatch.v_projection_dispatches, 1);
+        assert_eq!(after_dispatch.rope_dispatches, 2);
+        assert_eq!(after_dispatch.rope_groups, 8);
+        assert_eq!(after_dispatch.kv_appends, 1);
     }
 
     #[test]
-    fn gpu_native_dense_shaders_parse_and_validate_without_hardware() {
+    fn gpu_native_shaders_parse_and_validate_without_hardware() {
         for (source, entry_points) in [
             (
                 GPU_NATIVE_DENSE_GEMV_SHADER,
@@ -3232,6 +5280,8 @@ mod tests {
                     "residual_add_main",
                 ][..],
             ),
+            (GPU_NATIVE_ROPE_SHADER, &["rope_main"][..]),
+            (GPU_NATIVE_KV_APPEND_SHADER, &["kv_append_main"][..]),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("GPU-native WGSL must parse");
@@ -3254,6 +5304,7 @@ mod tests {
 struct PushConstants {
     elements: u32,
     tolerance_bits: u32,
+    actual_offset: u32,
 };
 var<push_constant> pc: PushConstants;
 
@@ -3266,7 +5317,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= pc.elements) {
         return;
     }
-    let difference = abs(ACTUAL[gid.x] - EXPECTED[gid.x]);
+    let difference = abs(ACTUAL[pc.actual_offset + gid.x] - EXPECTED[gid.x]);
     if (!(difference <= bitcast<f32>(pc.tolerance_bits))) {
         atomicStore(&STATUS[0], 1u);
     }
@@ -3278,6 +5329,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     struct GpuNativeTestComparePushConstants {
         elements: u32,
         tolerance_bits: u32,
+        actual_offset: u32,
     }
 
     fn create_test_compare_pipeline(
@@ -3323,7 +5375,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bind_group_layouts: &[&layout],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..8,
+                range: 0..12,
             }],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3367,6 +5419,24 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         elements: usize,
         tolerance: f32,
     ) {
+        encode_test_compare_at(
+            device, encoder, layout, pipeline, actual, expected, status, elements, tolerance, 0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_test_compare_at(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layout: &wgpu::BindGroupLayout,
+        pipeline: &wgpu::ComputePipeline,
+        actual: &wgpu::Buffer,
+        expected: &wgpu::Buffer,
+        status: &wgpu::Buffer,
+        elements: usize,
+        tolerance: f32,
+        actual_offset: usize,
+    ) {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gpu_native_test_compare_bind_group"),
             layout,
@@ -3396,6 +5466,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bytemuck::bytes_of(&GpuNativeTestComparePushConstants {
                 elements: elements as u32,
                 tolerance_bits: tolerance.to_bits(),
+                actual_offset: actual_offset as u32,
             }),
         );
         pass.dispatch_workgroups((elements as u32).div_ceil(GPU_NATIVE_WORKGROUP_SIZE), 1, 1);
@@ -3986,6 +6057,342 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(completed.intermediate_readbacks, 0);
     }
 
+    /// Requires an actual NVIDIA L4 WGPU adapter. The production Q/K/V/KV
+    /// buffers remain non-readable; validation maps one aggregate status word.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_attention_prepare_kv() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::inference::WeightDtype;
+
+        const D_MODEL: usize = 6;
+        const NUM_HEADS: usize = 4;
+        const NUM_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const ROPE_DIM: usize = 4;
+        const MAX_SEQ_LEN: usize = 4;
+        const EPSILON: f32 = 1e-6;
+        let geometry = GpuNativeAttentionGeometry::try_new(
+            D_MODEL,
+            NUM_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            ROPE_DIM,
+        )
+        .unwrap();
+        let expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024 * 1024,
+            0.5,
+            16,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: MAX_SEQ_LEN,
+                num_heads: NUM_HEADS,
+                num_kv_heads: NUM_KV_HEADS,
+                head_dim: HEAD_DIM,
+                v_head_dim: HEAD_DIM,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: D_MODEL,
+                d_ff: 8,
+            },
+            expert_cache,
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = execution
+            .create_gpu_native_executor_context(D_MODEL)
+            .expect("GPU-native executor must retain the authoritative backend");
+        let gpu = executor.authoritative_gpu().unwrap();
+
+        let q_projection = DenseWeight::from_f32(
+            (0..geometry.q_width * D_MODEL)
+                .map(|index| ((index * 11 % 37) as f32 - 18.0) / 19.0)
+                .collect(),
+            geometry.q_width,
+            D_MODEL,
+        );
+        let k_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * D_MODEL)
+                .map(|index| ((index * 13 % 41) as f32 - 20.0) / 17.0)
+                .collect(),
+            geometry.kv_width,
+            D_MODEL,
+        );
+        let v_projection = DenseWeight::from_f32(
+            (0..geometry.kv_width * D_MODEL)
+                .map(|index| ((index * 17 % 43) as f32 - 21.0) / 23.0)
+                .collect(),
+            geometry.kv_width,
+            D_MODEL,
+        );
+        let q_gain = vec![0.8, 1.1, 0.9, 1.2];
+        let k_gain = vec![1.3, 0.7, 1.0, 0.85];
+        let q_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.attention.q").unwrap(),
+                &q_projection,
+            )
+            .unwrap();
+        let k_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.attention.k").unwrap(),
+                &k_projection,
+            )
+            .unwrap();
+        let v_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.attention.v").unwrap(),
+                &v_projection,
+            )
+            .unwrap();
+        let q_norm_handle = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.attention.q_norm").unwrap(),
+                &q_gain,
+            )
+            .unwrap();
+        let k_norm_handle = executor
+            .register_rms_norm(
+                GpuNativeDenseWeightKey::try_new("test.attention.k_norm").unwrap(),
+                &k_gain,
+            )
+            .unwrap();
+        let rope_handle = executor
+            .register_standard_rope(
+                GpuNativeDenseWeightKey::try_new("test.attention.rope").unwrap(),
+                ROPE_DIM,
+                10_000.0,
+            )
+            .unwrap();
+        let plan = executor
+            .create_attention_plan(
+                geometry,
+                q_handle,
+                k_handle,
+                v_handle,
+                Some(GpuNativeAttentionNorm::try_new(q_norm_handle, EPSILON).unwrap()),
+                Some(GpuNativeAttentionNorm::try_new(k_norm_handle, EPSILON).unwrap()),
+                rope_handle,
+            )
+            .unwrap();
+        let scratch = executor.create_attention_scratch(geometry).unwrap();
+        let kv = executor
+            .create_kv_state(1, MAX_SEQ_LEN, geometry.kv_width)
+            .unwrap();
+        let states = [
+            executor.create_token_state().unwrap(),
+            executor.create_token_state().unwrap(),
+        ];
+        let inputs = [
+            vec![0.5, -1.0, 1.5, -2.0, 2.5, -3.0],
+            vec![-0.25, 0.75, -1.25, 1.75, -2.25, 2.75],
+        ];
+        let positions = [1usize, 3usize];
+        for (state, input) in states.iter().zip(&inputs) {
+            gpu.queue
+                .write_buffer(&state.hidden, 0, bytemuck::cast_slice(input));
+        }
+        let inverse_frequencies = [1.0, 0.01];
+        let expected = inputs
+            .iter()
+            .zip(positions)
+            .map(|(input, position)| {
+                attention_prepare_mirror(
+                    input,
+                    geometry,
+                    &q_projection,
+                    &k_projection,
+                    &v_projection,
+                    Some((&q_gain, EPSILON)),
+                    Some((&k_gain, EPSILON)),
+                    &inverse_frequencies,
+                    1.0,
+                    position,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_buffers = expected
+            .iter()
+            .enumerate()
+            .map(|(index, (q, k, v))| {
+                (
+                    create_test_expected_buffer(
+                        &gpu.device,
+                        &gpu.queue,
+                        &format!("gpu_native_attention_q_expected_{index}"),
+                        q,
+                    ),
+                    create_test_expected_buffer(
+                        &gpu.device,
+                        &gpu.queue,
+                        &format!("gpu_native_attention_k_expected_{index}"),
+                        k,
+                    ),
+                    create_test_expected_buffer(
+                        &gpu.device,
+                        &gpu.queue,
+                        &format!("gpu_native_attention_v_expected_{index}"),
+                        v,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let registered = executor.execution_snapshot();
+        assert_eq!(registered.dense_weights_registered, 6);
+        assert_eq!(registered.rope_parameters_registered, 1);
+        assert_eq!(registered.rope_parameter_uploads, 1);
+        let status = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_attention_validation_status"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        gpu.queue.write_buffer(&status, 0, &[0; 4]);
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_attention_validation_staging"),
+            size: GPU_NATIVE_STATUS_BYTES,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_attention_prepare_live_l4_encoder"),
+            });
+
+        for index in 0..states.len() {
+            executor
+                .encode_attention_prepare(
+                    &mut encoder,
+                    &plan,
+                    &states[index],
+                    &scratch,
+                    &kv,
+                    0,
+                    positions[index],
+                )
+                .unwrap();
+            let (expected_q, expected_k, expected_v) = &expected_buffers[index];
+            for (actual, expected_buffer, elements) in [
+                (&scratch.q.buffer, expected_q, geometry.q_width),
+                (&scratch.k.buffer, expected_k, geometry.kv_width),
+                (&scratch.v.buffer, expected_v, geometry.kv_width),
+            ] {
+                encode_test_compare(
+                    &gpu.device,
+                    &mut encoder,
+                    &compare_layout,
+                    &compare_pipeline,
+                    actual,
+                    expected_buffer,
+                    &status,
+                    elements,
+                    2e-3,
+                );
+            }
+        }
+        for index in 0..positions.len() {
+            let offset = kv.layout.element_offset(0, positions[index]).unwrap();
+            let (_, expected_k, expected_v) = &expected_buffers[index];
+            encode_test_compare_at(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &kv.layers[0].key,
+                expected_k,
+                &status,
+                geometry.kv_width,
+                2e-3,
+                offset,
+            );
+            encode_test_compare_at(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &kv.layers[0].value,
+                expected_v,
+                &status,
+                geometry.kv_width,
+                2e-3,
+                offset,
+            );
+        }
+
+        let encoded = executor.execution_snapshot();
+        assert_eq!(
+            encoded.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(
+            encoded.dense_weight_upload_bytes,
+            registered.dense_weight_upload_bytes
+        );
+        assert_eq!(
+            encoded.rope_parameter_uploads,
+            registered.rope_parameter_uploads
+        );
+        assert_eq!(
+            encoded.rope_parameter_upload_bytes,
+            registered.rope_parameter_upload_bytes
+        );
+        assert_eq!(encoded.dense_gemv_dispatches, 6);
+        assert_eq!(encoded.rms_norm_dispatches, 4);
+        assert_eq!(encoded.rms_norm_groups, 12);
+        assert_eq!(encoded.attention_prepare_dispatches, 2);
+        assert_eq!(encoded.q_projection_dispatches, 2);
+        assert_eq!(encoded.k_projection_dispatches, 2);
+        assert_eq!(encoded.v_projection_dispatches, 2);
+        assert_eq!(encoded.rope_dispatches, 4);
+        assert_eq!(encoded.rope_groups, 12);
+        assert_eq!(encoded.kv_appends, 2);
+        assert_eq!(encoded.queue_submissions, 0);
+        assert_eq!(encoded.intermediate_maps, 0);
+        assert_eq!(encoded.intermediate_readbacks, 0);
+
+        encoder.copy_buffer_to_buffer(&status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("validation map callback must be drained")
+            .expect("validation status must map");
+        let mapped = slice.get_mapped_range();
+        let status_value = u32::from_le_bytes(mapped[..4].try_into().unwrap());
+        drop(mapped);
+        staging.unmap();
+        assert_eq!(status_value, 0, "on-device attention preparation failed");
+
+        let completed = executor.execution_snapshot();
+        assert_eq!(
+            completed.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(
+            completed.rope_parameter_uploads,
+            registered.rope_parameter_uploads
+        );
+        assert_eq!(completed.intermediate_maps, 0);
+        assert_eq!(completed.intermediate_readbacks, 0);
+    }
+
     #[test]
     fn checked_layout_derives_qwen_vector_bytes() {
         let layout = GpuNativeTokenStateLayout::try_new(2048).expect("Qwen layout");
@@ -4052,6 +6459,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for usage in [
             GpuNativeScratchLayout::usage(),
             GpuNativeDenseWeightLayout::usage(),
+            GpuNativeKvLayout::usage(),
         ] {
             assert!(usage.contains(wgpu::BufferUsages::STORAGE));
             assert!(!usage.contains(wgpu::BufferUsages::COPY_SRC));
@@ -4135,6 +6543,43 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         drop(state);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn request_local_kv_drops_each_per_layer_buffer_exactly_once() {
+        let layout = GpuNativeKvLayout::try_new(2, 4, 8, &wgpu::Limits::default()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = |allocation_id| DropProbe {
+            allocation_id,
+            drops: drops.clone(),
+        };
+        let kv = GpuNativeKvState::from_layers(
+            7,
+            1,
+            layout,
+            vec![
+                GpuNativeKvLayer {
+                    key: probe(10),
+                    value: probe(11),
+                },
+                GpuNativeKvLayer {
+                    key: probe(20),
+                    value: probe(21),
+                },
+            ],
+        );
+        assert_eq!(kv.layout(), layout);
+        assert_ne!(
+            kv.layers[0].key.allocation_id,
+            kv.layers[0].value.allocation_id
+        );
+        assert_ne!(
+            kv.layers[0].key.allocation_id,
+            kv.layers[1].key.allocation_id
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(kv);
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
     }
 
     #[test]
