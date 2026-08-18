@@ -7484,8 +7484,16 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             bytemuck::cast_slice(&future_value_poison),
         );
         let invalid_query = vec![f32::INFINITY; geometry.q_width];
-        let invalid_key = [1.0, 2.0, 3.0, 4.0];
-        let invalid_value = [0.25, -0.5, 0.75, -1.0];
+        let invalid_key: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let invalid_value: [f32; 4] = [0.25, -0.5, 0.75, -1.0];
+        assert_eq!(
+            std::mem::size_of_val(&invalid_key),
+            geometry.kv_width * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            std::mem::size_of_val(&invalid_value),
+            geometry.kv_width * std::mem::size_of::<f32>()
+        );
         gpu.queue.write_buffer(
             &invalid_scratch.q.buffer,
             0,
