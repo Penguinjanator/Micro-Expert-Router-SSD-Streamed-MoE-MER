@@ -3,8 +3,8 @@
 //! This module is not reachable from current operator-facing execution modes.
 //! It owns request-local device state, persistent dense/RMSNorm model weights,
 //! and encoder-only embedding, GEMV, RMSNorm, residual, attention-preparation,
-//! causal-attention completion, and request-local KV primitives on the
-//! authoritative WGPU device.
+//! causal-attention completion, request-local KV, routing, and an immutable
+//! banked Q4_0 expert arena on the authoritative WGPU device.
 //! Later slices can compose those pieces without inheriting legacy host-shaped
 //! upload/readback APIs.
 
@@ -13,10 +13,10 @@
 
 use super::{create_startup_buffer, BackendBox, GpuDeviceIdentity, GpuStartupAllocationError};
 use crate::dense_tensor::{DenseDType, DenseWeight};
-use crate::inference::{Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
+use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -26,6 +26,8 @@ const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 // retires the failed request; production encoding never clears these bits.
 const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1 << 0;
 const GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE: u32 = 1 << 1;
+const GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS: u32 = 1 << 2;
+const GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE: u32 = 1 << 3;
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
 const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
@@ -33,15 +35,25 @@ const GPU_NATIVE_ROPE_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rope.
 const GPU_NATIVE_KV_APPEND_SHADER: &str = include_str!("wgpu_shaders/gpu_native_kv_append.wgsl");
 const GPU_NATIVE_ATTENTION_SHADER: &str = include_str!("wgpu_shaders/gpu_native_attention.wgsl");
 const GPU_NATIVE_ROUTER_SHADER: &str = include_str!("wgpu_shaders/gpu_native_router.wgsl");
+const GPU_NATIVE_Q4_EXPERT_SHADER: &str = include_str!("wgpu_shaders/gpu_native_q4_expert.wgsl");
+const GPU_NATIVE_EXPERT_CONTROL_SHADER: &str =
+    include_str!("wgpu_shaders/gpu_native_expert_control.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 const GPU_NATIVE_ATTENTION_WORKGROUP_SIZE: u32 = 32;
 const GPU_NATIVE_ROUTER_WORKGROUP_SIZE: u32 = 64;
+const GPU_NATIVE_EXPERT_WORKGROUP_SIZE: u32 = 64;
 const GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES: u32 = ((MAX_GPU_NATIVE_ROUTER_EXPERTS
     + GPU_NATIVE_ROUTER_WORKGROUP_SIZE as usize)
     * std::mem::size_of::<f32>()
     + std::mem::size_of::<u32>()) as u32;
 pub(crate) const MAX_GPU_NATIVE_ROUTER_EXPERTS: usize = 128;
 pub(crate) const MAX_GPU_NATIVE_ROUTER_TOP_K: usize = 8;
+pub(crate) const MAX_GPU_NATIVE_EXPERT_BANKS: usize = 4;
+const GPU_NATIVE_EXPERT_LOCATION_BANK_SHIFT: u32 = 30;
+const GPU_NATIVE_EXPERT_LOCATION_SLOT_MASK: u32 = (1 << 30) - 1;
+const GPU_NATIVE_EXPERT_UNMAPPED: u32 = u32::MAX;
+const GPU_NATIVE_EXPERT_REQUIRED_STORAGE_BUFFERS: u32 = 8;
+const GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES: u32 = 32;
 
 /// Typed, fail-closed construction failure for the GPU-native bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +217,103 @@ pub(crate) enum GpuNativeBootstrapError {
     RouterWorkgroupStorageUnsupported {
         required: u32,
         maximum: u32,
+    },
+    InvalidExpertDff {
+        d_ff: usize,
+    },
+    ExpertQ4GeometryIncompatible {
+        d_model: usize,
+        d_ff: usize,
+        block_elements: usize,
+    },
+    ExpertGeometryOverflow {
+        d_model: usize,
+        d_ff: usize,
+        num_experts: usize,
+        top_k: usize,
+    },
+    ExpertDModelMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ExpertRouterGeometryMismatch {
+        router: GpuNativeRouterGeometry,
+        expert: GpuNativeQ4ExpertGeometry,
+    },
+    ForeignExpertArena,
+    ForeignExpertScratch,
+    ExpertLayerMismatch {
+        router_layer: usize,
+        expert_layer: usize,
+    },
+    InvalidExpertSlotCapacity {
+        capacity: usize,
+    },
+    ExpertArenaBankLimit {
+        required_banks: usize,
+        maximum_banks: usize,
+    },
+    ExpertArenaBankCapacity {
+        bank: usize,
+        required_bytes: u64,
+        maximum_bytes: u64,
+    },
+    ExpertStorageBuffersUnsupported {
+        required: u32,
+        maximum: u32,
+    },
+    ExpertPushConstantsUnsupported {
+        required: u32,
+        maximum: u32,
+    },
+    ExpertWorkgroupUnsupported {
+        required: u32,
+        max_size_x: u32,
+        max_invocations: u32,
+    },
+    DuplicateExpertLogicalId {
+        logical_id: u32,
+    },
+    ExpertLogicalIdOutOfRange {
+        logical_id: u32,
+        num_experts: usize,
+    },
+    DuplicateExpertPhysicalLocation {
+        packed: u32,
+    },
+    ExpertBankOutOfRange {
+        bank: u32,
+        active_banks: usize,
+    },
+    ExpertSlotOutOfRange {
+        bank: u32,
+        slot: u32,
+        capacity: usize,
+    },
+    ExpertLocationUnrepresentable {
+        bank: u32,
+        slot: u32,
+    },
+    ExpertPayloadTooShort {
+        logical_id: u32,
+        expected: usize,
+        actual: usize,
+    },
+    ExpertPayloadTrailingBytes {
+        logical_id: u32,
+        maximum: usize,
+        actual: usize,
+    },
+    ExpertPayloadNonZeroPadding {
+        logical_id: u32,
+    },
+    ExpertResidentCountExceedsCapacity {
+        residents: usize,
+        capacity: usize,
+    },
+    ExpertScratchGeometry {
+        expected: GpuNativeQ4ExpertGeometry,
+        actual: GpuNativeQ4ExpertGeometry,
     },
     InvalidAttentionHeadCount {
         tensor: GpuNativeAttentionTensor,
@@ -552,6 +661,146 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::RouterWorkgroupStorageUnsupported { required, maximum } => write!(
                 f,
                 "GPU-native router requires {required} bytes of workgroup storage, exceeding device maximum {maximum}"
+            ),
+            Self::InvalidExpertDff { d_ff } => {
+                write!(f, "GPU-native expert d_ff must be non-zero, got {d_ff}")
+            }
+            Self::ExpertQ4GeometryIncompatible {
+                d_model,
+                d_ff,
+                block_elements,
+            } => write!(
+                f,
+                "GPU-native Q4_0 expert geometry requires d_model and d_ff to be multiples of {block_elements}, got d_model={d_model} d_ff={d_ff}"
+            ),
+            Self::ExpertGeometryOverflow {
+                d_model,
+                d_ff,
+                num_experts,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native expert geometry overflows shader/address space for d_model={d_model}, d_ff={d_ff}, num_experts={num_experts}, top_k={top_k}"
+            ),
+            Self::ExpertDModelMismatch { expected, actual } => write!(
+                f,
+                "GPU-native expert d_model is {actual}, expected executor width {expected}"
+            ),
+            Self::ExpertRouterGeometryMismatch { router, expert } => write!(
+                f,
+                "GPU-native router geometry {router:?} does not agree with expert geometry {expert:?}"
+            ),
+            Self::ForeignExpertArena => write!(
+                f,
+                "GPU-native expert arena belongs to a different executor context"
+            ),
+            Self::ForeignExpertScratch => write!(
+                f,
+                "GPU-native expert scratch belongs to a different executor context"
+            ),
+            Self::ExpertLayerMismatch {
+                router_layer,
+                expert_layer,
+            } => write!(
+                f,
+                "GPU-native router layer {router_layer} does not match expert arena layer {expert_layer}"
+            ),
+            Self::InvalidExpertSlotCapacity { capacity } => write!(
+                f,
+                "GPU-native expert arena physical slot capacity must be non-zero, got {capacity}"
+            ),
+            Self::ExpertArenaBankLimit {
+                required_banks,
+                maximum_banks,
+            } => write!(
+                f,
+                "GPU-native expert arena requires {required_banks} banks, exceeding maximum {maximum_banks}"
+            ),
+            Self::ExpertArenaBankCapacity {
+                bank,
+                required_bytes,
+                maximum_bytes,
+            } => write!(
+                f,
+                "GPU-native expert arena bank {bank} requires {required_bytes} bytes, exceeding {maximum_bytes} bytes"
+            ),
+            Self::ExpertStorageBuffersUnsupported { required, maximum } => write!(
+                f,
+                "GPU-native expert execution requires {required} storage buffers per shader stage, device supports {maximum}"
+            ),
+            Self::ExpertPushConstantsUnsupported { required, maximum } => write!(
+                f,
+                "GPU-native expert execution requires {required} push-constant bytes, device supports {maximum}"
+            ),
+            Self::ExpertWorkgroupUnsupported {
+                required,
+                max_size_x,
+                max_invocations,
+            } => write!(
+                f,
+                "GPU-native expert execution requires a {required}-lane workgroup, exceeding max_compute_workgroup_size_x={max_size_x} or max_compute_invocations_per_workgroup={max_invocations}"
+            ),
+            Self::DuplicateExpertLogicalId { logical_id } => write!(
+                f,
+                "GPU-native expert logical id {logical_id} is installed more than once"
+            ),
+            Self::ExpertLogicalIdOutOfRange {
+                logical_id,
+                num_experts,
+            } => write!(
+                f,
+                "GPU-native expert logical id {logical_id} is outside layer-local expert count {num_experts}"
+            ),
+            Self::DuplicateExpertPhysicalLocation { packed } => write!(
+                f,
+                "GPU-native expert physical location 0x{packed:08x} is installed more than once"
+            ),
+            Self::ExpertBankOutOfRange { bank, active_banks } => write!(
+                f,
+                "GPU-native expert bank {bank} is outside active bank count {active_banks}"
+            ),
+            Self::ExpertSlotOutOfRange {
+                bank,
+                slot,
+                capacity,
+            } => write!(
+                f,
+                "GPU-native expert bank {bank} slot {slot} is outside bank capacity {capacity}"
+            ),
+            Self::ExpertLocationUnrepresentable { bank, slot } => write!(
+                f,
+                "GPU-native expert location bank={bank} slot={slot} cannot be packed without aliasing UNMAPPED"
+            ),
+            Self::ExpertPayloadTooShort {
+                logical_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "GPU-native Q4_0 expert {logical_id} payload has {actual} bytes, expected at least {expected}"
+            ),
+            Self::ExpertPayloadTrailingBytes {
+                logical_id,
+                maximum,
+                actual,
+            } => write!(
+                f,
+                "GPU-native Q4_0 expert {logical_id} payload has {actual} bytes, exceeding canonical aligned maximum {maximum}"
+            ),
+            Self::ExpertPayloadNonZeroPadding { logical_id } => write!(
+                f,
+                "GPU-native Q4_0 expert {logical_id} has non-zero trailing alignment padding"
+            ),
+            Self::ExpertResidentCountExceedsCapacity {
+                residents,
+                capacity,
+            } => write!(
+                f,
+                "GPU-native expert arena has {residents} residents for {capacity} physical slots"
+            ),
+            Self::ExpertScratchGeometry { expected, actual } => write!(
+                f,
+                "GPU-native expert scratch geometry {actual:?} does not match {expected:?}"
             ),
             Self::InvalidAttentionHeadCount { tensor, heads } => write!(
                 f,
@@ -1246,6 +1495,390 @@ fn validate_router_dispatch(limits: &wgpu::Limits) -> Result<(), GpuNativeBootst
     Ok(())
 }
 
+/// Canonical Q4_0 SwiGLU geometry for one layer's immutable expert arena.
+/// Projection blocks are laid out as `[gate][up][down]`; physical slot tail
+/// padding is excluded from every logical block offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeQ4ExpertGeometry {
+    d_model: usize,
+    d_ff: usize,
+    num_experts: usize,
+    top_k: usize,
+    blocks_per_projection: usize,
+    logical_expert_bytes: usize,
+    slot_stride_bytes: usize,
+}
+
+impl GpuNativeQ4ExpertGeometry {
+    pub(crate) fn try_new(
+        d_model: usize,
+        d_ff: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        let router = GpuNativeRouterGeometry::try_new(d_model, num_experts, top_k)?;
+        if d_ff == 0 {
+            return Err(GpuNativeBootstrapError::InvalidExpertDff { d_ff });
+        }
+        if !d_model.is_multiple_of(Q4_0_BLOCK_ELEMS) || !d_ff.is_multiple_of(Q4_0_BLOCK_ELEMS) {
+            return Err(GpuNativeBootstrapError::ExpertQ4GeometryIncompatible {
+                d_model,
+                d_ff,
+                block_elements: Q4_0_BLOCK_ELEMS,
+            });
+        }
+        let overflow = || GpuNativeBootstrapError::ExpertGeometryOverflow {
+            d_model,
+            d_ff,
+            num_experts,
+            top_k,
+        };
+        let projection_elements = d_model.checked_mul(d_ff).ok_or_else(overflow)?;
+        let blocks_per_projection = projection_elements / Q4_0_BLOCK_ELEMS;
+        let logical_expert_bytes = blocks_per_projection
+            .checked_mul(3)
+            .and_then(|blocks| blocks.checked_mul(Q4_0_BLOCK_BYTES))
+            .ok_or_else(overflow)?;
+        let slot_stride_bytes = logical_expert_bytes
+            .checked_add(3)
+            .map(|bytes| bytes & !3)
+            .ok_or_else(overflow)?;
+        let route_output_elements = top_k.checked_mul(d_model).ok_or_else(overflow)?;
+        if u32::try_from(d_ff).is_err()
+            || u32::try_from(projection_elements).is_err()
+            || u32::try_from(blocks_per_projection).is_err()
+            || u32::try_from(logical_expert_bytes).is_err()
+            || u32::try_from(slot_stride_bytes).is_err()
+            || u32::try_from(route_output_elements).is_err()
+        {
+            return Err(overflow());
+        }
+        debug_assert_eq!(router.d_model, d_model);
+        Ok(Self {
+            d_model,
+            d_ff,
+            num_experts,
+            top_k,
+            blocks_per_projection,
+            logical_expert_bytes,
+            slot_stride_bytes,
+        })
+    }
+
+    pub(crate) const fn d_model(self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) const fn d_ff(self) -> usize {
+        self.d_ff
+    }
+
+    pub(crate) const fn num_experts(self) -> usize {
+        self.num_experts
+    }
+
+    pub(crate) const fn top_k(self) -> usize {
+        self.top_k
+    }
+
+    pub(crate) const fn blocks_per_projection(self) -> usize {
+        self.blocks_per_projection
+    }
+
+    pub(crate) const fn gate_block_offset(self) -> usize {
+        0
+    }
+
+    pub(crate) const fn up_block_offset(self) -> usize {
+        self.blocks_per_projection
+    }
+
+    pub(crate) const fn down_block_offset(self) -> usize {
+        self.blocks_per_projection * 2
+    }
+
+    pub(crate) const fn logical_expert_bytes(self) -> usize {
+        self.logical_expert_bytes
+    }
+
+    pub(crate) const fn slot_stride_bytes(self) -> usize {
+        self.slot_stride_bytes
+    }
+
+    fn router_geometry(self) -> GpuNativeRouterGeometry {
+        GpuNativeRouterGeometry {
+            d_model: self.d_model,
+            num_experts: self.num_experts,
+            top_k: self.top_k,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeQ4ExpertLocation {
+    bank: u32,
+    slot: u32,
+}
+
+impl GpuNativeQ4ExpertLocation {
+    pub(crate) fn try_new(bank: u32, slot: u32) -> Result<Self, GpuNativeBootstrapError> {
+        let location = Self { bank, slot };
+        location.pack()?;
+        Ok(location)
+    }
+
+    pub(crate) const fn bank(self) -> u32 {
+        self.bank
+    }
+
+    pub(crate) const fn slot(self) -> u32 {
+        self.slot
+    }
+
+    pub(crate) fn pack(self) -> Result<u32, GpuNativeBootstrapError> {
+        if self.bank as usize >= MAX_GPU_NATIVE_EXPERT_BANKS
+            || self.slot > GPU_NATIVE_EXPERT_LOCATION_SLOT_MASK
+        {
+            return Err(GpuNativeBootstrapError::ExpertLocationUnrepresentable {
+                bank: self.bank,
+                slot: self.slot,
+            });
+        }
+        let packed = (self.bank << GPU_NATIVE_EXPERT_LOCATION_BANK_SHIFT) | self.slot;
+        if packed == GPU_NATIVE_EXPERT_UNMAPPED {
+            return Err(GpuNativeBootstrapError::ExpertLocationUnrepresentable {
+                bank: self.bank,
+                slot: self.slot,
+            });
+        }
+        Ok(packed)
+    }
+
+    pub(crate) fn unpack(packed: u32) -> Option<Self> {
+        (packed != GPU_NATIVE_EXPERT_UNMAPPED).then_some(Self {
+            bank: packed >> GPU_NATIVE_EXPERT_LOCATION_BANK_SHIFT,
+            slot: packed & GPU_NATIVE_EXPERT_LOCATION_SLOT_MASK,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuNativeQ4ExpertBankLayout {
+    slot_capacity: usize,
+    allocation_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuNativeQ4ExpertArenaLayout {
+    slot_capacity: usize,
+    active_banks: usize,
+    banks: [GpuNativeQ4ExpertBankLayout; MAX_GPU_NATIVE_EXPERT_BANKS],
+    mapping_bytes: u64,
+}
+
+impl GpuNativeQ4ExpertArenaLayout {
+    fn try_new(
+        geometry: GpuNativeQ4ExpertGeometry,
+        slot_capacity: usize,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if slot_capacity == 0 {
+            return Err(GpuNativeBootstrapError::InvalidExpertSlotCapacity {
+                capacity: slot_capacity,
+            });
+        }
+        let stride = u64::try_from(geometry.slot_stride_bytes).map_err(|_| {
+            GpuNativeBootstrapError::ExpertGeometryOverflow {
+                d_model: geometry.d_model,
+                d_ff: geometry.d_ff,
+                num_experts: geometry.num_experts,
+                top_k: geometry.top_k,
+            }
+        })?;
+        let shader_addressable_bytes = u64::from(u32::MAX & !3);
+        let maximum_bank_bytes = limits
+            .max_buffer_size
+            .min(u64::from(limits.max_storage_buffer_binding_size))
+            .min(shader_addressable_bytes);
+        let maximum_slots = (maximum_bank_bytes / stride)
+            .min(u64::from(GPU_NATIVE_EXPERT_LOCATION_SLOT_MASK))
+            as usize;
+        if maximum_slots == 0 {
+            return Err(GpuNativeBootstrapError::ExpertArenaBankCapacity {
+                bank: 0,
+                required_bytes: stride,
+                maximum_bytes: maximum_bank_bytes,
+            });
+        }
+        let required_banks = slot_capacity.div_ceil(maximum_slots);
+        if required_banks > MAX_GPU_NATIVE_EXPERT_BANKS {
+            return Err(GpuNativeBootstrapError::ExpertArenaBankLimit {
+                required_banks,
+                maximum_banks: MAX_GPU_NATIVE_EXPERT_BANKS,
+            });
+        }
+        let mut remaining = slot_capacity;
+        let mut banks = [GpuNativeQ4ExpertBankLayout {
+            slot_capacity: 0,
+            allocation_bytes: 4,
+        }; MAX_GPU_NATIVE_EXPERT_BANKS];
+        for (bank, layout) in banks.iter_mut().take(required_banks).enumerate() {
+            let slots = remaining.min(maximum_slots);
+            let allocation_bytes = (slots as u64).checked_mul(stride).ok_or(
+                GpuNativeBootstrapError::ExpertArenaBankCapacity {
+                    bank,
+                    required_bytes: u64::MAX,
+                    maximum_bytes: maximum_bank_bytes,
+                },
+            )?;
+            if allocation_bytes > maximum_bank_bytes {
+                return Err(GpuNativeBootstrapError::ExpertArenaBankCapacity {
+                    bank,
+                    required_bytes: allocation_bytes,
+                    maximum_bytes: maximum_bank_bytes,
+                });
+            }
+            *layout = GpuNativeQ4ExpertBankLayout {
+                slot_capacity: slots,
+                allocation_bytes,
+            };
+            remaining -= slots;
+        }
+        let mapping_bytes = geometry
+            .num_experts
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(GpuNativeBootstrapError::ExpertGeometryOverflow {
+                d_model: geometry.d_model,
+                d_ff: geometry.d_ff,
+                num_experts: geometry.num_experts,
+                top_k: geometry.top_k,
+            })?;
+        Ok(Self {
+            slot_capacity,
+            active_banks: required_banks,
+            banks,
+            mapping_bytes,
+        })
+    }
+
+    fn weight_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+    }
+
+    fn mapping_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+    }
+}
+
+/// One immutable setup-time placement. The caller chooses the physical slot;
+/// host validation rejects every alias or out-of-range address before upload.
+pub(crate) struct GpuNativeQ4ExpertUpload<'a> {
+    pub(crate) logical_id: u32,
+    pub(crate) location: GpuNativeQ4ExpertLocation,
+    pub(crate) payload: &'a [u8],
+}
+
+fn validate_q4_expert_uploads(
+    geometry: GpuNativeQ4ExpertGeometry,
+    layout: GpuNativeQ4ExpertArenaLayout,
+    uploads: &[GpuNativeQ4ExpertUpload<'_>],
+) -> Result<Vec<u32>, GpuNativeBootstrapError> {
+    if uploads.len() > layout.slot_capacity {
+        return Err(
+            GpuNativeBootstrapError::ExpertResidentCountExceedsCapacity {
+                residents: uploads.len(),
+                capacity: layout.slot_capacity,
+            },
+        );
+    }
+    let mut mapping = vec![GPU_NATIVE_EXPERT_UNMAPPED; geometry.num_experts];
+    let mut physical = HashSet::with_capacity(uploads.len());
+    for upload in uploads {
+        let logical_id = upload.logical_id as usize;
+        if logical_id >= geometry.num_experts {
+            return Err(GpuNativeBootstrapError::ExpertLogicalIdOutOfRange {
+                logical_id: upload.logical_id,
+                num_experts: geometry.num_experts,
+            });
+        }
+        if mapping[logical_id] != GPU_NATIVE_EXPERT_UNMAPPED {
+            return Err(GpuNativeBootstrapError::DuplicateExpertLogicalId {
+                logical_id: upload.logical_id,
+            });
+        }
+        let bank = upload.location.bank as usize;
+        if bank >= layout.active_banks {
+            return Err(GpuNativeBootstrapError::ExpertBankOutOfRange {
+                bank: upload.location.bank,
+                active_banks: layout.active_banks,
+            });
+        }
+        if upload.location.slot as usize >= layout.banks[bank].slot_capacity {
+            return Err(GpuNativeBootstrapError::ExpertSlotOutOfRange {
+                bank: upload.location.bank,
+                slot: upload.location.slot,
+                capacity: layout.banks[bank].slot_capacity,
+            });
+        }
+        let packed = upload.location.pack()?;
+        if !physical.insert(packed) {
+            return Err(GpuNativeBootstrapError::DuplicateExpertPhysicalLocation { packed });
+        }
+        if upload.payload.len() < geometry.logical_expert_bytes {
+            return Err(GpuNativeBootstrapError::ExpertPayloadTooShort {
+                logical_id: upload.logical_id,
+                expected: geometry.logical_expert_bytes,
+                actual: upload.payload.len(),
+            });
+        }
+        if upload.payload.len() > geometry.slot_stride_bytes {
+            return Err(GpuNativeBootstrapError::ExpertPayloadTrailingBytes {
+                logical_id: upload.logical_id,
+                maximum: geometry.slot_stride_bytes,
+                actual: upload.payload.len(),
+            });
+        }
+        if upload.payload[geometry.logical_expert_bytes..]
+            .iter()
+            .any(|&byte| byte != 0)
+        {
+            return Err(GpuNativeBootstrapError::ExpertPayloadNonZeroPadding {
+                logical_id: upload.logical_id,
+            });
+        }
+        mapping[logical_id] = packed;
+    }
+    Ok(mapping)
+}
+
+fn validate_q4_expert_pipeline_limits(
+    limits: &wgpu::Limits,
+) -> Result<(), GpuNativeBootstrapError> {
+    if limits.max_storage_buffers_per_shader_stage < GPU_NATIVE_EXPERT_REQUIRED_STORAGE_BUFFERS {
+        return Err(GpuNativeBootstrapError::ExpertStorageBuffersUnsupported {
+            required: GPU_NATIVE_EXPERT_REQUIRED_STORAGE_BUFFERS,
+            maximum: limits.max_storage_buffers_per_shader_stage,
+        });
+    }
+    if limits.max_push_constant_size < GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES {
+        return Err(GpuNativeBootstrapError::ExpertPushConstantsUnsupported {
+            required: GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
+            maximum: limits.max_push_constant_size,
+        });
+    }
+    if limits.max_compute_workgroup_size_x < GPU_NATIVE_EXPERT_WORKGROUP_SIZE
+        || limits.max_compute_invocations_per_workgroup < GPU_NATIVE_EXPERT_WORKGROUP_SIZE
+    {
+        return Err(GpuNativeBootstrapError::ExpertWorkgroupUnsupported {
+            required: GPU_NATIVE_EXPERT_WORKGROUP_SIZE,
+            max_size_x: limits.max_compute_workgroup_size_x,
+            max_invocations: limits.max_compute_invocations_per_workgroup,
+        });
+    }
+    Ok(())
+}
+
 /// Qwen-compatible GPU-native attention geometry. Query heads may use GQA,
 /// but Q/K/V share one head width and V is deliberately not asymmetric.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1671,6 +2304,72 @@ impl GpuNativeRouterPlan {
 
     pub(crate) const fn layer_index(&self) -> usize {
         self.layer_index
+    }
+}
+
+/// Immutable, context- and layer-bound four-bank Q4_0 slot arena. Unused
+/// shader banks hold a minimal zero buffer; only `active_banks` participate in
+/// route validation. Mapping and weight bytes cannot be changed by this API.
+pub(crate) struct GpuNativeQ4ExpertArena<B = wgpu::Buffer> {
+    context_id: u64,
+    layer_index: usize,
+    geometry: GpuNativeQ4ExpertGeometry,
+    layout: GpuNativeQ4ExpertArenaLayout,
+    resident_experts: usize,
+    banks: [B; MAX_GPU_NATIVE_EXPERT_BANKS],
+    mapping: B,
+}
+
+impl<B> GpuNativeQ4ExpertArena<B> {
+    fn from_buffers(
+        context_id: u64,
+        layer_index: usize,
+        geometry: GpuNativeQ4ExpertGeometry,
+        layout: GpuNativeQ4ExpertArenaLayout,
+        resident_experts: usize,
+        banks: [B; MAX_GPU_NATIVE_EXPERT_BANKS],
+        mapping: B,
+    ) -> Self {
+        Self {
+            context_id,
+            layer_index,
+            geometry,
+            layout,
+            resident_experts,
+            banks,
+            mapping,
+        }
+    }
+
+    pub(crate) const fn layer_index(&self) -> usize {
+        self.layer_index
+    }
+
+    pub(crate) const fn geometry(&self) -> GpuNativeQ4ExpertGeometry {
+        self.geometry
+    }
+
+    pub(crate) const fn slot_capacity(&self) -> usize {
+        self.layout.slot_capacity
+    }
+
+    pub(crate) const fn active_banks(&self) -> usize {
+        self.layout.active_banks
+    }
+
+    pub(crate) const fn resident_experts(&self) -> usize {
+        self.resident_experts
+    }
+}
+
+impl<B> fmt::Debug for GpuNativeQ4ExpertArena<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativeQ4ExpertArena")
+            .field("layer_index", &self.layer_index)
+            .field("geometry", &self.geometry)
+            .field("layout", &self.layout)
+            .field("resident_experts", &self.resident_experts)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2209,6 +2908,163 @@ impl<B> fmt::Debug for GpuNativeRouterScratch<B> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeQ4ExpertScratchLayout {
+    geometry: GpuNativeQ4ExpertGeometry,
+    resolved_locations_bytes: u64,
+    activation: GpuNativeScratchLayout,
+    route_outputs: GpuNativeScratchLayout,
+    combined: GpuNativeScratchLayout,
+    total_bytes: u64,
+}
+
+impl GpuNativeQ4ExpertScratchLayout {
+    fn try_new(geometry: GpuNativeQ4ExpertGeometry) -> Result<Self, GpuNativeBootstrapError> {
+        GpuNativeQ4ExpertGeometry::try_new(
+            geometry.d_model,
+            geometry.d_ff,
+            geometry.num_experts,
+            geometry.top_k,
+        )?;
+        let resolved_locations_bytes = geometry
+            .top_k
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(GpuNativeBootstrapError::ExpertGeometryOverflow {
+                d_model: geometry.d_model,
+                d_ff: geometry.d_ff,
+                num_experts: geometry.num_experts,
+                top_k: geometry.top_k,
+            })?;
+        let activation = GpuNativeScratchLayout::try_new(geometry.d_ff)?;
+        let route_outputs =
+            GpuNativeScratchLayout::try_new(geometry.top_k.checked_mul(geometry.d_model).ok_or(
+                GpuNativeBootstrapError::ExpertGeometryOverflow {
+                    d_model: geometry.d_model,
+                    d_ff: geometry.d_ff,
+                    num_experts: geometry.num_experts,
+                    top_k: geometry.top_k,
+                },
+            )?)?;
+        let combined = GpuNativeScratchLayout::try_new(geometry.d_model)?;
+        let total_bytes = resolved_locations_bytes
+            .checked_add(activation.bytes)
+            .and_then(|bytes| bytes.checked_add(route_outputs.bytes))
+            .and_then(|bytes| bytes.checked_add(combined.bytes))
+            .ok_or(GpuNativeBootstrapError::ExpertGeometryOverflow {
+                d_model: geometry.d_model,
+                d_ff: geometry.d_ff,
+                num_experts: geometry.num_experts,
+                top_k: geometry.top_k,
+            })?;
+        Ok(Self {
+            geometry,
+            resolved_locations_bytes,
+            activation,
+            route_outputs,
+            combined,
+            total_bytes,
+        })
+    }
+
+    fn resolved_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+    }
+
+    fn tensor_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE
+    }
+
+    fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_expert_resolved_locations",
+            self.resolved_locations_bytes,
+            Self::resolved_usage(),
+            limits,
+        )?;
+        for (label, layout) in [
+            ("gpu_native_expert_activation", self.activation),
+            ("gpu_native_expert_route_outputs", self.route_outputs),
+            ("gpu_native_expert_combined", self.combined),
+        ] {
+            super::validate_startup_buffer(label, layout.bytes, Self::tensor_usage(), limits)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn geometry(self) -> GpuNativeQ4ExpertGeometry {
+        self.geometry
+    }
+
+    pub(crate) const fn resolved_locations_bytes(self) -> u64 {
+        self.resolved_locations_bytes
+    }
+
+    pub(crate) const fn activation_bytes(self) -> u64 {
+        self.activation.bytes
+    }
+
+    pub(crate) const fn route_outputs_bytes(self) -> u64 {
+        self.route_outputs.bytes
+    }
+
+    pub(crate) const fn combined_bytes(self) -> u64 {
+        self.combined.bytes
+    }
+
+    pub(crate) const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+}
+
+/// Request-local expert resolution and compute scratch. None of these
+/// allocations is CPU mappable; `resolved_locations` is a copy source solely
+/// for the ignored physical-hardware seam.
+pub(crate) struct GpuNativeQ4ExpertScratch<B = wgpu::Buffer> {
+    context_id: u64,
+    scratch_id: u64,
+    layout: GpuNativeQ4ExpertScratchLayout,
+    resolved_locations: B,
+    activation: GpuNativeScratch<B>,
+    route_outputs: GpuNativeScratch<B>,
+    combined: GpuNativeScratch<B>,
+}
+
+impl<B> GpuNativeQ4ExpertScratch<B> {
+    fn from_buffers(
+        context_id: u64,
+        scratch_id: u64,
+        layout: GpuNativeQ4ExpertScratchLayout,
+        resolved_locations: B,
+        activation: GpuNativeScratch<B>,
+        route_outputs: GpuNativeScratch<B>,
+        combined: GpuNativeScratch<B>,
+    ) -> Self {
+        Self {
+            context_id,
+            scratch_id,
+            layout,
+            resolved_locations,
+            activation,
+            route_outputs,
+            combined,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> GpuNativeQ4ExpertScratchLayout {
+        self.layout
+    }
+}
+
+impl<B> fmt::Debug for GpuNativeQ4ExpertScratch<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativeQ4ExpertScratch")
+            .field("scratch_id", &self.scratch_id)
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Request-scoped, non-mappable F32 attention intermediates with geometry
 /// attached, preventing projection, context, and output buffers from being
 /// interchanged at the composed API.
@@ -2450,6 +3306,111 @@ fn validate_router_plan_with_registry<B>(
         });
     }
     Ok(gate)
+}
+
+fn validate_q4_expert_arena<B>(
+    context_id: u64,
+    arena: &GpuNativeQ4ExpertArena<B>,
+    limits: &wgpu::Limits,
+) -> Result<(), GpuNativeBootstrapError> {
+    if arena.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignExpertArena);
+    }
+    let geometry = GpuNativeQ4ExpertGeometry::try_new(
+        arena.geometry.d_model,
+        arena.geometry.d_ff,
+        arena.geometry.num_experts,
+        arena.geometry.top_k,
+    )?;
+    let expected =
+        GpuNativeQ4ExpertArenaLayout::try_new(geometry, arena.layout.slot_capacity, limits)?;
+    if arena.layout != expected || arena.resident_experts > arena.layout.slot_capacity {
+        return Err(
+            GpuNativeBootstrapError::ExpertResidentCountExceedsCapacity {
+                residents: arena.resident_experts,
+                capacity: arena.layout.slot_capacity,
+            },
+        );
+    }
+    for (bank, layout) in arena.layout.banks.iter().enumerate() {
+        super::validate_startup_buffer(
+            &format!("gpu_native_q4_expert_bank_{bank}"),
+            layout.allocation_bytes,
+            GpuNativeQ4ExpertArenaLayout::weight_usage(),
+            limits,
+        )?;
+    }
+    super::validate_startup_buffer(
+        "gpu_native_q4_expert_mapping",
+        arena.layout.mapping_bytes,
+        GpuNativeQ4ExpertArenaLayout::mapping_usage(),
+        limits,
+    )?;
+    Ok(())
+}
+
+fn validate_q4_expert_scratch<B>(
+    context_id: u64,
+    geometry: GpuNativeQ4ExpertGeometry,
+    scratch: &GpuNativeQ4ExpertScratch<B>,
+    limits: &wgpu::Limits,
+) -> Result<(), GpuNativeBootstrapError> {
+    if scratch.context_id != context_id
+        || scratch.activation.context_id != context_id
+        || scratch.route_outputs.context_id != context_id
+        || scratch.combined.context_id != context_id
+    {
+        return Err(GpuNativeBootstrapError::ForeignExpertScratch);
+    }
+    let scratch_ids = [
+        scratch.activation.scratch_id,
+        scratch.route_outputs.scratch_id,
+        scratch.combined.scratch_id,
+    ];
+    if scratch_ids[0] == scratch_ids[1]
+        || scratch_ids[0] == scratch_ids[2]
+        || scratch_ids[1] == scratch_ids[2]
+    {
+        return Err(GpuNativeBootstrapError::AliasedInputOutput);
+    }
+    if scratch.layout.geometry != geometry {
+        return Err(GpuNativeBootstrapError::ExpertScratchGeometry {
+            expected: geometry,
+            actual: scratch.layout.geometry,
+        });
+    }
+    let expected = GpuNativeQ4ExpertScratchLayout::try_new(geometry)?;
+    if scratch.layout != expected
+        || scratch.activation.layout != expected.activation
+        || scratch.route_outputs.layout != expected.route_outputs
+        || scratch.combined.layout != expected.combined
+    {
+        return Err(GpuNativeBootstrapError::ExpertScratchGeometry {
+            expected: geometry,
+            actual: scratch.layout.geometry,
+        });
+    }
+    scratch.layout.validate_for_limits(limits)?;
+    Ok(())
+}
+
+fn validate_router_expert_geometry<B>(
+    router: &GpuNativeRouterPlan,
+    arena: &GpuNativeQ4ExpertArena<B>,
+) -> Result<(), GpuNativeBootstrapError> {
+    if router.layer_index != arena.layer_index {
+        return Err(GpuNativeBootstrapError::ExpertLayerMismatch {
+            router_layer: router.layer_index,
+            expert_layer: arena.layer_index,
+        });
+    }
+    if router.geometry != arena.geometry.router_geometry() {
+        return Err(GpuNativeBootstrapError::ExpertRouterGeometryMismatch {
+            router: router.geometry,
+            expert: arena.geometry,
+        });
+    }
+    Ok(())
 }
 
 fn validate_residual_contribution_width(
@@ -2707,6 +3668,12 @@ pub(crate) struct GpuNativeExecutionSnapshot {
     pub(crate) attention_complete_dispatches: u64,
     pub(crate) router_logit_dispatches: u64,
     pub(crate) router_topk_dispatches: u64,
+    pub(crate) expert_slots_registered: u64,
+    pub(crate) expert_weight_upload_bytes: u64,
+    pub(crate) expert_route_resolve_dispatches: u64,
+    pub(crate) q4_expert_gate_up_dispatches: u64,
+    pub(crate) q4_expert_down_dispatches: u64,
+    pub(crate) expert_combine_dispatches: u64,
     pub(crate) tokens_submitted: u64,
     pub(crate) tokens_completed: u64,
     pub(crate) layers_encoded: u64,
@@ -2755,6 +3722,12 @@ struct GpuNativeExecutionCounters {
     attention_complete_dispatches: AtomicU64,
     router_logit_dispatches: AtomicU64,
     router_topk_dispatches: AtomicU64,
+    expert_slots_registered: AtomicU64,
+    expert_weight_upload_bytes: AtomicU64,
+    expert_route_resolve_dispatches: AtomicU64,
+    q4_expert_gate_up_dispatches: AtomicU64,
+    q4_expert_down_dispatches: AtomicU64,
+    expert_combine_dispatches: AtomicU64,
     tokens_submitted: AtomicU64,
     tokens_completed: AtomicU64,
     layers_encoded: AtomicU64,
@@ -2806,6 +3779,14 @@ impl GpuNativeExecutionCounters {
                 .load(Ordering::Relaxed),
             router_logit_dispatches: self.router_logit_dispatches.load(Ordering::Relaxed),
             router_topk_dispatches: self.router_topk_dispatches.load(Ordering::Relaxed),
+            expert_slots_registered: self.expert_slots_registered.load(Ordering::Relaxed),
+            expert_weight_upload_bytes: self.expert_weight_upload_bytes.load(Ordering::Relaxed),
+            expert_route_resolve_dispatches: self
+                .expert_route_resolve_dispatches
+                .load(Ordering::Relaxed),
+            q4_expert_gate_up_dispatches: self.q4_expert_gate_up_dispatches.load(Ordering::Relaxed),
+            q4_expert_down_dispatches: self.q4_expert_down_dispatches.load(Ordering::Relaxed),
+            expert_combine_dispatches: self.expert_combine_dispatches.load(Ordering::Relaxed),
             tokens_submitted: self.tokens_submitted.load(Ordering::Relaxed),
             tokens_completed: self.tokens_completed.load(Ordering::Relaxed),
             layers_encoded: self.layers_encoded.load(Ordering::Relaxed),
@@ -2907,6 +3888,24 @@ impl GpuNativeExecutionCounters {
         self.router_topk_dispatches.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_expert_arena_registration(&self, slots: u64, upload_bytes: u64) {
+        self.expert_slots_registered
+            .fetch_add(slots, Ordering::Relaxed);
+        self.expert_weight_upload_bytes
+            .fetch_add(upload_bytes, Ordering::Relaxed);
+    }
+
+    fn record_expert_dispatches(&self, routes: u64) {
+        self.expert_route_resolve_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+        self.q4_expert_gate_up_dispatches
+            .fetch_add(routes, Ordering::Relaxed);
+        self.q4_expert_down_dispatches
+            .fetch_add(routes, Ordering::Relaxed);
+        self.expert_combine_dispatches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     fn record_token_boundary_readback(&self) {
         self.token_boundary_readbacks
@@ -2976,6 +3975,38 @@ struct GpuNativeAttentionPushConstants {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuNativeRouterPushConstants {
     num_experts: u32,
+    top_k: u32,
+    _reserved_0: u32,
+    _reserved_1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeExpertResolvePushConstants {
+    num_experts: u32,
+    top_k: u32,
+    active_banks: u32,
+    _reserved: u32,
+    bank_slots: [u32; MAX_GPU_NATIVE_EXPERT_BANKS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeQ4ExpertPushConstants {
+    d_model: u32,
+    d_ff: u32,
+    blocks_per_projection: u32,
+    slot_stride_bytes: u32,
+    route_slot: u32,
+    top_k: u32,
+    swiglu_limit: f32,
+    _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeExpertCombinePushConstants {
+    d_model: u32,
     top_k: u32,
     _reserved_0: u32,
     _reserved_1: u32,
@@ -3482,6 +4513,167 @@ impl GpuNativeRouterPipeline {
     }
 }
 
+struct GpuNativeQ4ExpertPipelines {
+    route_bind_group_layout: wgpu::BindGroupLayout,
+    expert_bind_group_layout: wgpu::BindGroupLayout,
+    combine_bind_group_layout: wgpu::BindGroupLayout,
+    control_empty_bind_group: wgpu::BindGroup,
+    route_resolve: wgpu::ComputePipeline,
+    gate_up: wgpu::ComputePipeline,
+    down: wgpu::ComputePipeline,
+    validate: wgpu::ComputePipeline,
+    combine: wgpu::ComputePipeline,
+    contain: wgpu::ComputePipeline,
+}
+
+impl GpuNativeQ4ExpertPipelines {
+    fn try_new(device: &wgpu::Device) -> Result<Self, GpuNativeBootstrapError> {
+        validate_q4_expert_pipeline_limits(&device.limits())?;
+        let read_only_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let read_write_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let route_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_expert_route_bind_group_layout"),
+                entries: &[
+                    entry(0, read_only_storage),
+                    entry(1, read_only_storage),
+                    entry(2, read_write_storage),
+                    entry(3, read_write_storage),
+                ],
+            });
+        let expert_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_q4_expert_bind_group_layout"),
+                entries: &[
+                    entry(0, read_only_storage),
+                    entry(1, read_only_storage),
+                    entry(2, read_only_storage),
+                    entry(3, read_only_storage),
+                    entry(4, read_only_storage),
+                    entry(5, read_only_storage),
+                    entry(6, read_write_storage),
+                    entry(7, read_write_storage),
+                ],
+            });
+        let combine_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_expert_combine_bind_group_layout"),
+                entries: &[
+                    entry(0, read_only_storage),
+                    entry(1, read_only_storage),
+                    entry(2, read_only_storage),
+                    entry(3, read_write_storage),
+                    entry(4, read_write_storage),
+                ],
+            });
+        let empty_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gpu_native_expert_control_empty_group_0_layout"),
+                entries: &[],
+            });
+        let control_empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_expert_control_empty_group_0"),
+            layout: &empty_bind_group_layout,
+            entries: &[],
+        });
+        let push_range = [wgpu::PushConstantRange {
+            stages: wgpu::ShaderStages::COMPUTE,
+            range: 0..GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
+        }];
+        let route_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gpu_native_expert_route_pipeline_layout"),
+                bind_group_layouts: &[&route_bind_group_layout],
+                push_constant_ranges: &push_range,
+            });
+        let expert_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gpu_native_q4_expert_pipeline_layout"),
+                bind_group_layouts: &[&expert_bind_group_layout],
+                push_constant_ranges: &push_range,
+            });
+        let combine_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gpu_native_expert_combine_pipeline_layout"),
+                bind_group_layouts: &[&empty_bind_group_layout, &combine_bind_group_layout],
+                push_constant_ranges: &push_range,
+            });
+        let expert_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_q4_expert_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_Q4_EXPERT_SHADER.into()),
+        });
+        let control_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_expert_control_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_EXPERT_CONTROL_SHADER.into()),
+        });
+        let pipeline = |label, layout: &wgpu::PipelineLayout, module, entry_point| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                module,
+                entry_point,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
+        };
+        Ok(Self {
+            route_bind_group_layout,
+            expert_bind_group_layout,
+            combine_bind_group_layout,
+            control_empty_bind_group,
+            route_resolve: pipeline(
+                "gpu_native_expert_route_resolve_pipeline",
+                &route_pipeline_layout,
+                &control_module,
+                "expert_route_resolve_main",
+            ),
+            gate_up: pipeline(
+                "gpu_native_q4_expert_gate_up_pipeline",
+                &expert_pipeline_layout,
+                &expert_module,
+                "q4_expert_gate_up_main",
+            ),
+            down: pipeline(
+                "gpu_native_q4_expert_down_pipeline",
+                &expert_pipeline_layout,
+                &expert_module,
+                "q4_expert_down_main",
+            ),
+            validate: pipeline(
+                "gpu_native_expert_validate_pipeline",
+                &combine_pipeline_layout,
+                &control_module,
+                "expert_validate_main",
+            ),
+            combine: pipeline(
+                "gpu_native_expert_combine_pipeline",
+                &combine_pipeline_layout,
+                &control_module,
+                "expert_combine_main",
+            ),
+            contain: pipeline(
+                "gpu_native_expert_contain_pipeline",
+                &combine_pipeline_layout,
+                &control_module,
+                "expert_contain_main",
+            ),
+        })
+    }
+}
+
 /// Internal bootstrap for future GPU-owned token execution.
 ///
 /// Retaining the exact `Arc<BackendBox>` keeps the authoritative non-cloneable
@@ -3497,6 +4689,7 @@ pub(crate) struct GpuNativeExecutorContext {
     state_pipelines: GpuNativeStatePipelines,
     attention_pipelines: GpuNativeAttentionPipelines,
     router_pipeline: GpuNativeRouterPipeline,
+    q4_expert_pipelines: GpuNativeQ4ExpertPipelines,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -3525,6 +4718,7 @@ impl GpuNativeExecutorContext {
         let state_pipelines = GpuNativeStatePipelines::new(&gpu.device);
         let attention_pipelines = GpuNativeAttentionPipelines::new(&gpu.device);
         let router_pipeline = GpuNativeRouterPipeline::new(&gpu.device);
+        let q4_expert_pipelines = GpuNativeQ4ExpertPipelines::try_new(&gpu.device)?;
 
         Ok(Self {
             context_id,
@@ -3536,6 +4730,7 @@ impl GpuNativeExecutorContext {
             state_pipelines,
             attention_pipelines,
             router_pipeline,
+            q4_expert_pipelines,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -3855,6 +5050,151 @@ impl GpuNativeExecutorContext {
             logits,
             selected_ids,
             selected_weights,
+        ))
+    }
+
+    /// Construct one layer's immutable physical Q4_0 arena. This setup seam
+    /// may upload weights and the mapping table; token-time expert encoding
+    /// performs no writes from the host.
+    pub(crate) fn create_q4_expert_arena(
+        &self,
+        layer_index: usize,
+        geometry: GpuNativeQ4ExpertGeometry,
+        slot_capacity: usize,
+        uploads: &[GpuNativeQ4ExpertUpload<'_>],
+    ) -> Result<GpuNativeQ4ExpertArena, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let limits = gpu.device.limits();
+        validate_q4_expert_pipeline_limits(&limits)?;
+        let layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, slot_capacity, &limits)?;
+        let mapping = validate_q4_expert_uploads(geometry, layout, uploads)?;
+        for (bank, bank_layout) in layout.banks.iter().enumerate() {
+            super::validate_startup_buffer(
+                &format!("gpu_native_q4_expert_bank_{bank}"),
+                bank_layout.allocation_bytes,
+                GpuNativeQ4ExpertArenaLayout::weight_usage(),
+                &limits,
+            )?;
+        }
+        super::validate_startup_buffer(
+            "gpu_native_q4_expert_mapping",
+            layout.mapping_bytes,
+            GpuNativeQ4ExpertArenaLayout::mapping_usage(),
+            &limits,
+        )?;
+
+        // All payload, location, arithmetic, and device-limit validation is
+        // complete before the first setup-time upload below.
+        let mut banks = Vec::with_capacity(MAX_GPU_NATIVE_EXPERT_BANKS);
+        for (bank, bank_layout) in layout.banks.iter().enumerate() {
+            banks.push(create_startup_buffer(
+                &gpu.device,
+                &format!("gpu_native_q4_expert_layer_{layer_index}_bank_{bank}"),
+                bank_layout.allocation_bytes,
+                GpuNativeQ4ExpertArenaLayout::weight_usage(),
+            )?);
+        }
+        for upload in uploads {
+            let mut physical = vec![0; geometry.slot_stride_bytes];
+            physical[..geometry.logical_expert_bytes]
+                .copy_from_slice(&upload.payload[..geometry.logical_expert_bytes]);
+            let offset = u64::from(upload.location.slot)
+                .checked_mul(geometry.slot_stride_bytes as u64)
+                .expect("validated Q4 expert slot byte offset");
+            gpu.queue
+                .write_buffer(&banks[upload.location.bank as usize], offset, &physical);
+        }
+        let mapping_buffer = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_q4_expert_layer_{layer_index}_mapping"),
+            layout.mapping_bytes,
+            GpuNativeQ4ExpertArenaLayout::mapping_usage(),
+        )?;
+        gpu.queue
+            .write_buffer(&mapping_buffer, 0, bytemuck::cast_slice(&mapping));
+        let banks: [wgpu::Buffer; MAX_GPU_NATIVE_EXPERT_BANKS] = banks
+            .try_into()
+            .expect("exactly four GPU-native expert bank buffers");
+        let upload_bytes = uploads
+            .len()
+            .checked_mul(geometry.slot_stride_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .expect("validated Q4 expert upload byte total");
+        self.counters
+            .record_expert_arena_registration(uploads.len() as u64, upload_bytes);
+        Ok(GpuNativeQ4ExpertArena::from_buffers(
+            self.context_id,
+            layer_index,
+            geometry,
+            layout,
+            uploads.len(),
+            banks,
+            mapping_buffer,
+        ))
+    }
+
+    pub(crate) fn create_q4_expert_scratch(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+    ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeQ4ExpertScratchLayout::try_new(geometry)?;
+        layout.validate_for_limits(&gpu.device.limits())?;
+        validate_q4_expert_pipeline_limits(&gpu.device.limits())?;
+        let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "expert scratch");
+        let resolved_locations = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_expert_scratch_{scratch_id}_resolved"),
+            layout.resolved_locations_bytes,
+            GpuNativeQ4ExpertScratchLayout::resolved_usage(),
+        )?;
+        let create_tensor = |label: &str,
+                             tensor_layout: GpuNativeScratchLayout|
+         -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+            Ok(GpuNativeScratch::from_buffer(
+                self.context_id,
+                next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "expert tensor scratch"),
+                tensor_layout,
+                create_startup_buffer(
+                    &gpu.device,
+                    label,
+                    tensor_layout.bytes,
+                    GpuNativeQ4ExpertScratchLayout::tensor_usage(),
+                )?,
+            ))
+        };
+        let activation = create_tensor(
+            &format!("gpu_native_expert_scratch_{scratch_id}_activation"),
+            layout.activation,
+        )?;
+        let route_outputs = create_tensor(
+            &format!("gpu_native_expert_scratch_{scratch_id}_route_outputs"),
+            layout.route_outputs,
+        )?;
+        let combined = create_tensor(
+            &format!("gpu_native_expert_scratch_{scratch_id}_combined"),
+            layout.combined,
+        )?;
+        Ok(GpuNativeQ4ExpertScratch::from_buffers(
+            self.context_id,
+            scratch_id,
+            layout,
+            resolved_locations,
+            activation,
+            route_outputs,
+            combined,
         ))
     }
 
@@ -4179,6 +5519,251 @@ impl GpuNativeExecutorContext {
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
         self.counters.record_router_dispatch();
+        Ok(())
+    }
+
+    /// Resolve Slice 6's device-resident routes, execute their immutable Q4_0
+    /// experts, fail the whole mixture closed, combine with device-resident
+    /// weights, and complete `hidden = residual + combined`. The caller owns
+    /// command submission; this method performs no upload, map, poll, or
+    /// readback.
+    pub(crate) fn encode_q4_expert_arena_combine(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        router_plan: &GpuNativeRouterPlan,
+        router_scratch: &GpuNativeRouterScratch,
+        arena: &GpuNativeQ4ExpertArena,
+        state: &GpuNativeTokenState,
+        expert_scratch: &GpuNativeQ4ExpertScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let limits = gpu.device.limits();
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        let _gate = validate_router_plan_with_registry(
+            self.context_id,
+            self.layout.d_model,
+            &self.dense_weights.lock(),
+            router_plan,
+        )?;
+        validate_router_scratch(self.context_id, router_plan.geometry, router_scratch)?;
+        validate_q4_expert_arena(self.context_id, arena, &limits)?;
+        validate_q4_expert_scratch(self.context_id, arena.geometry, expert_scratch, &limits)?;
+        validate_router_expert_geometry(router_plan, arena)?;
+        if state.layout.d_model != arena.geometry.d_model {
+            return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
+                expected: arena.geometry.d_model,
+                actual: state.layout.d_model,
+            });
+        }
+        validate_q4_expert_pipeline_limits(&limits)?;
+        router_scratch.layout.validate_for_limits(&limits)?;
+        state.layout.validate_for_limits(&limits)?;
+        let route_workgroups = self.checked_workgroups(arena.geometry.top_k, &limits)?;
+        let gate_up_workgroups = self.checked_workgroups(arena.geometry.d_ff, &limits)?;
+        let down_workgroups = self.checked_workgroups(arena.geometry.d_model, &limits)?;
+        let combine_workgroups = down_workgroups;
+        let residual_workgroups = down_workgroups;
+        let bank_slots = arena
+            .layout
+            .banks
+            .map(|bank| u32::try_from(bank.slot_capacity).expect("validated bank slot capacity"));
+        let resolve_pc = GpuNativeExpertResolvePushConstants {
+            num_experts: arena.geometry.num_experts as u32,
+            top_k: arena.geometry.top_k as u32,
+            active_banks: arena.layout.active_banks as u32,
+            _reserved: 0,
+            bank_slots,
+        };
+        let combine_pc = GpuNativeExpertCombinePushConstants {
+            d_model: arena.geometry.d_model as u32,
+            top_k: arena.geometry.top_k as u32,
+            _reserved_0: 0,
+            _reserved_1: 0,
+        };
+
+        // All fallible host-side validation and dispatch planning above is
+        // complete before this first expert command is recorded.
+        let route_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_expert_route_resolve_bind_group"),
+            layout: &self.q4_expert_pipelines.route_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: router_scratch.selected_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: arena.mapping.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_native_expert_route_resolve_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.q4_expert_pipelines.route_resolve);
+            pass.set_bind_group(0, &route_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&resolve_pc));
+            pass.dispatch_workgroups(route_workgroups, 1, 1);
+        }
+
+        let expert_bind_group =
+            |label: &'static str, input: &wgpu::Buffer, output: &wgpu::Buffer| {
+                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.q4_expert_pipelines.expert_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: arena.banks[0].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: arena.banks[1].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: arena.banks[2].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: arena.banks[3].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: input.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: expert_scratch.resolved_locations.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: output.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: state.status.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
+        let gate_up_bind_group = expert_bind_group(
+            "gpu_native_q4_expert_gate_up_bind_group",
+            &state.hidden,
+            &expert_scratch.activation.buffer,
+        );
+        let down_bind_group = expert_bind_group(
+            "gpu_native_q4_expert_down_bind_group",
+            &expert_scratch.activation.buffer,
+            &expert_scratch.route_outputs.buffer,
+        );
+        for route_slot in 0..arena.geometry.top_k {
+            let pc = GpuNativeQ4ExpertPushConstants {
+                d_model: arena.geometry.d_model as u32,
+                d_ff: arena.geometry.d_ff as u32,
+                blocks_per_projection: arena.geometry.blocks_per_projection as u32,
+                slot_stride_bytes: arena.geometry.slot_stride_bytes as u32,
+                route_slot: route_slot as u32,
+                top_k: arena.geometry.top_k as u32,
+                swiglu_limit: crate::inference::swiglu_limit().unwrap_or(f32::INFINITY),
+                _reserved: 0,
+            };
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_gate_up_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.gate_up);
+                pass.set_bind_group(0, &gate_up_bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(gate_up_workgroups, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_down_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.down);
+                pass.set_bind_group(0, &down_bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(down_workgroups, 1, 1);
+            }
+        }
+
+        let combine_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_expert_combine_bind_group"),
+            layout: &self.q4_expert_pipelines.combine_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: router_scratch.selected_weights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: expert_scratch.route_outputs.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: expert_scratch.combined.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        let mut control_pass = |label, pipeline: &wgpu::ComputePipeline, workgroups| {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            // Control resources intentionally occupy @group(1), but WGPU still
+            // requires the pipeline's explicit empty group-0 layout to be bound.
+            pass.set_bind_group(0, &self.q4_expert_pipelines.control_empty_bind_group, &[]);
+            pass.set_bind_group(1, &combine_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&combine_pc));
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        };
+        control_pass(
+            "gpu_native_expert_validate_pass",
+            &self.q4_expert_pipelines.validate,
+            1,
+        );
+        control_pass(
+            "gpu_native_expert_combine_pass",
+            &self.q4_expert_pipelines.combine,
+            combine_workgroups,
+        );
+        control_pass(
+            "gpu_native_expert_contain_pass",
+            &self.q4_expert_pipelines.contain,
+            combine_workgroups,
+        );
+        drop(control_pass);
+        self.encode_residual_add_pass(
+            gpu,
+            encoder,
+            state,
+            &expert_scratch.combined,
+            residual_workgroups,
+        );
+        self.counters
+            .record_expert_dispatches(arena.geometry.top_k as u64);
         Ok(())
     }
 
@@ -5068,6 +6653,191 @@ mod tests {
         )
     }
 
+    fn q4_uniform_projection(rows: usize, cols: usize, weight: f32) -> Vec<u8> {
+        assert!(cols.is_multiple_of(Q4_0_BLOCK_ELEMS));
+        let (scale, nibble) = if weight > 0.0 {
+            (weight, 9u8)
+        } else if weight < 0.0 {
+            (-weight, 7u8)
+        } else {
+            (0.0, 8u8)
+        };
+        let scale = half::f16::from_f32(scale).to_bits().to_le_bytes();
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&scale);
+        block[2..].fill(nibble | (nibble << 4));
+        block.repeat(rows * cols / Q4_0_BLOCK_ELEMS).to_vec()
+    }
+
+    fn q4_uniform_expert(
+        geometry: GpuNativeQ4ExpertGeometry,
+        gate_weight: f32,
+        up_weight: f32,
+        down_weight: f32,
+    ) -> Vec<u8> {
+        let mut payload = q4_uniform_projection(geometry.d_ff, geometry.d_model, gate_weight);
+        payload.extend(q4_uniform_projection(
+            geometry.d_ff,
+            geometry.d_model,
+            up_weight,
+        ));
+        payload.extend(q4_uniform_projection(
+            geometry.d_model,
+            geometry.d_ff,
+            down_weight,
+        ));
+        assert_eq!(payload.len(), geometry.logical_expert_bytes);
+        payload
+    }
+
+    fn q4_projection_mirror(
+        payload: &[u8],
+        first_block: usize,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Vec<f32> {
+        assert_eq!(input.len(), cols);
+        let blocks_per_row = cols / Q4_0_BLOCK_ELEMS;
+        (0..rows)
+            .map(|row| {
+                let mut sum = 0.0;
+                for block in 0..blocks_per_row {
+                    let block_index = first_block + row * blocks_per_row + block;
+                    let offset = block_index * Q4_0_BLOCK_BYTES;
+                    let mut decoded = [0.0; Q4_0_BLOCK_ELEMS];
+                    crate::inference::dequantize_q4_0_block(
+                        &payload[offset..offset + Q4_0_BLOCK_BYTES],
+                        &mut decoded,
+                    );
+                    let input_offset = block * Q4_0_BLOCK_ELEMS;
+                    sum += decoded
+                        .iter()
+                        .zip(&input[input_offset..input_offset + Q4_0_BLOCK_ELEMS])
+                        .map(|(weight, value)| weight * value)
+                        .sum::<f32>();
+                }
+                sum
+            })
+            .collect()
+    }
+
+    fn q4_expert_mirror(
+        payload: &[u8],
+        geometry: GpuNativeQ4ExpertGeometry,
+        hidden: &[f32],
+    ) -> Vec<f32> {
+        let gate = q4_projection_mirror(
+            payload,
+            geometry.gate_block_offset(),
+            geometry.d_ff,
+            geometry.d_model,
+            hidden,
+        );
+        let up = q4_projection_mirror(
+            payload,
+            geometry.up_block_offset(),
+            geometry.d_ff,
+            geometry.d_model,
+            hidden,
+        );
+        let activation = gate
+            .into_iter()
+            .zip(up)
+            .map(|(gate, up)| {
+                let gate = crate::inference::swiglu_limit()
+                    .map(|limit| gate.clamp(-limit, limit))
+                    .unwrap_or(gate);
+                gate / (1.0 + (-gate).exp()) * up
+            })
+            .collect::<Vec<_>>();
+        q4_projection_mirror(
+            payload,
+            geometry.down_block_offset(),
+            geometry.d_model,
+            geometry.d_ff,
+            &activation,
+        )
+    }
+
+    fn weighted_expert_combine_mirror(outputs: &[Vec<f32>], weights: &[f32]) -> Vec<f32> {
+        assert_eq!(outputs.len(), weights.len());
+        let width = outputs.first().map(Vec::len).unwrap_or(0);
+        assert!(outputs.iter().all(|output| output.len() == width));
+        (0..width)
+            .map(|element| {
+                outputs
+                    .iter()
+                    .zip(weights)
+                    .map(|(output, weight)| output[element] * weight)
+                    .sum()
+            })
+            .collect()
+    }
+
+    fn fail_closed_expert_combine_mirror(
+        outputs: &[Vec<f32>],
+        weights: &[f32],
+        status: u32,
+    ) -> Vec<f32> {
+        let width = outputs.first().map(Vec::len).unwrap_or(0);
+        if status != 0
+            || outputs.len() != weights.len()
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || outputs.iter().any(|output| {
+                output.len() != width || output.iter().any(|value| !value.is_finite())
+            })
+        {
+            return vec![0.0; width];
+        }
+        let combined = weighted_expert_combine_mirror(outputs, weights);
+        if combined.iter().any(|value| !value.is_finite()) {
+            vec![0.0; width]
+        } else {
+            combined
+        }
+    }
+
+    fn resolve_routes_mirror(
+        selected_ids: &[u32],
+        mapping: &[u32],
+        layout: GpuNativeQ4ExpertArenaLayout,
+        initial_status: u32,
+    ) -> (Vec<u32>, u32) {
+        if initial_status != 0 {
+            return (
+                vec![GPU_NATIVE_EXPERT_UNMAPPED; selected_ids.len()],
+                initial_status,
+            );
+        }
+        let mut status = initial_status;
+        let resolved = selected_ids
+            .iter()
+            .map(|&logical_id| {
+                let Some(&packed) = mapping.get(logical_id as usize) else {
+                    status |= GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS;
+                    return GPU_NATIVE_EXPERT_UNMAPPED;
+                };
+                let Some(location) = GpuNativeQ4ExpertLocation::unpack(packed) else {
+                    status |= GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS;
+                    return GPU_NATIVE_EXPERT_UNMAPPED;
+                };
+                let bank = location.bank as usize;
+                if bank >= layout.active_banks
+                    || location.slot as usize >= layout.banks[bank].slot_capacity
+                {
+                    status |= GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS;
+                    GPU_NATIVE_EXPERT_UNMAPPED
+                } else {
+                    packed
+                }
+            })
+            .collect();
+        (resolved, status)
+    }
+
     fn rms_norm_mirror(
         values: &[f32],
         weight: &[f32],
@@ -5776,6 +7546,347 @@ mod tests {
                 required: GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES,
                 maximum: 512,
             })
+        );
+    }
+
+    #[test]
+    fn q4_expert_geometry_preserves_projection_layout_and_checked_stride() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 64, 128, 8).unwrap();
+        let blocks = 32 * 64 / Q4_0_BLOCK_ELEMS;
+        assert_eq!(geometry.blocks_per_projection(), blocks);
+        assert_eq!(geometry.gate_block_offset(), 0);
+        assert_eq!(geometry.up_block_offset(), blocks);
+        assert_eq!(geometry.down_block_offset(), blocks * 2);
+        assert_eq!(
+            geometry.logical_expert_bytes(),
+            blocks * 3 * Q4_0_BLOCK_BYTES
+        );
+        assert_eq!(
+            geometry.slot_stride_bytes(),
+            (geometry.logical_expert_bytes() + 3) & !3
+        );
+        assert!(geometry.slot_stride_bytes().is_multiple_of(4));
+        assert_eq!(
+            geometry.router_geometry(),
+            GpuNativeRouterGeometry::try_new(32, 128, 8).unwrap()
+        );
+
+        for (d_model, d_ff) in [(31, 32), (32, 31)] {
+            assert!(matches!(
+                GpuNativeQ4ExpertGeometry::try_new(d_model, d_ff, 128, 8),
+                Err(GpuNativeBootstrapError::ExpertQ4GeometryIncompatible { .. })
+            ));
+        }
+        assert_eq!(
+            GpuNativeQ4ExpertGeometry::try_new(32, 0, 128, 8),
+            Err(GpuNativeBootstrapError::InvalidExpertDff { d_ff: 0 })
+        );
+        let overflowing_d_ff = usize::MAX & !(Q4_0_BLOCK_ELEMS - 1);
+        assert!(matches!(
+            GpuNativeQ4ExpertGeometry::try_new(32, overflowing_d_ff, 128, 8),
+            Err(GpuNativeBootstrapError::ExpertGeometryOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn q4_expert_bank_plan_virtualizes_logical_experts_and_honors_binding_limits() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 8).unwrap();
+        let stride = geometry.slot_stride_bytes() as u32;
+        let limits = wgpu::Limits {
+            max_buffer_size: u64::from(stride) * 2,
+            max_storage_buffer_binding_size: stride * 2,
+            ..wgpu::Limits::default()
+        };
+        let layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, 8, &limits).unwrap();
+        assert_eq!(layout.slot_capacity, 8);
+        assert_eq!(layout.active_banks, 4);
+        assert_eq!(layout.banks.map(|bank| bank.slot_capacity), [2, 2, 2, 2]);
+        assert!(layout
+            .banks
+            .iter()
+            .all(|bank| bank.allocation_bytes <= u64::from(stride) * 2));
+        assert!(8 < geometry.num_experts());
+        assert!(matches!(
+            GpuNativeQ4ExpertArenaLayout::try_new(geometry, 9, &limits),
+            Err(GpuNativeBootstrapError::ExpertArenaBankLimit {
+                required_banks: 5,
+                maximum_banks: MAX_GPU_NATIVE_EXPERT_BANKS,
+            })
+        ));
+    }
+
+    #[test]
+    fn q4_expert_pipeline_limits_require_four_banks_and_fixed_dispatch_geometry() {
+        let supported = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: GPU_NATIVE_EXPERT_REQUIRED_STORAGE_BUFFERS,
+            max_push_constant_size: GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
+            max_compute_workgroup_size_x: GPU_NATIVE_EXPERT_WORKGROUP_SIZE,
+            max_compute_invocations_per_workgroup: GPU_NATIVE_EXPERT_WORKGROUP_SIZE,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(validate_q4_expert_pipeline_limits(&supported), Ok(()));
+        assert!(matches!(
+            validate_q4_expert_pipeline_limits(&wgpu::Limits {
+                max_storage_buffers_per_shader_stage: GPU_NATIVE_EXPERT_REQUIRED_STORAGE_BUFFERS
+                    - 1,
+                ..supported.clone()
+            }),
+            Err(GpuNativeBootstrapError::ExpertStorageBuffersUnsupported { .. })
+        ));
+        assert!(matches!(
+            validate_q4_expert_pipeline_limits(&wgpu::Limits {
+                max_push_constant_size: GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES - 1,
+                ..supported.clone()
+            }),
+            Err(GpuNativeBootstrapError::ExpertPushConstantsUnsupported { .. })
+        ));
+        assert!(matches!(
+            validate_q4_expert_pipeline_limits(&wgpu::Limits {
+                max_compute_workgroup_size_x: GPU_NATIVE_EXPERT_WORKGROUP_SIZE - 1,
+                ..supported
+            }),
+            Err(GpuNativeBootstrapError::ExpertWorkgroupUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn q4_expert_mapping_and_payload_validation_fail_closed() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 8).unwrap();
+        let layout =
+            GpuNativeQ4ExpertArenaLayout::try_new(geometry, 2, &wgpu::Limits::default()).unwrap();
+        let first_payload = q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
+        let second_payload = q4_uniform_expert(geometry, -0.01, 0.03, 0.004);
+        let first_location = GpuNativeQ4ExpertLocation::try_new(0, 0).unwrap();
+        let second_location = GpuNativeQ4ExpertLocation::try_new(0, 1).unwrap();
+        let uploads = [
+            GpuNativeQ4ExpertUpload {
+                logical_id: 7,
+                location: first_location,
+                payload: &first_payload,
+            },
+            GpuNativeQ4ExpertUpload {
+                logical_id: 91,
+                location: second_location,
+                payload: &second_payload,
+            },
+        ];
+        let mapping = validate_q4_expert_uploads(geometry, layout, &uploads).unwrap();
+        assert_eq!(mapping[7], first_location.pack().unwrap());
+        assert_eq!(mapping[91], second_location.pack().unwrap());
+        assert!(mapping
+            .iter()
+            .enumerate()
+            .all(|(id, &location)| id == 7 || id == 91 || location == GPU_NATIVE_EXPERT_UNMAPPED));
+        assert_eq!(
+            GpuNativeQ4ExpertLocation::unpack(first_location.pack().unwrap()),
+            Some(first_location)
+        );
+        assert_eq!(
+            GpuNativeQ4ExpertLocation::unpack(GPU_NATIVE_EXPERT_UNMAPPED),
+            None
+        );
+        assert!(
+            GpuNativeQ4ExpertLocation::try_new(3, GPU_NATIVE_EXPERT_LOCATION_SLOT_MASK).is_err()
+        );
+
+        let duplicate_logical = [
+            GpuNativeQ4ExpertUpload {
+                logical_id: 7,
+                location: first_location,
+                payload: &first_payload,
+            },
+            GpuNativeQ4ExpertUpload {
+                logical_id: 7,
+                location: second_location,
+                payload: &second_payload,
+            },
+        ];
+        assert!(matches!(
+            validate_q4_expert_uploads(geometry, layout, &duplicate_logical),
+            Err(GpuNativeBootstrapError::DuplicateExpertLogicalId { logical_id: 7 })
+        ));
+        let duplicate_physical = [
+            GpuNativeQ4ExpertUpload {
+                logical_id: 7,
+                location: first_location,
+                payload: &first_payload,
+            },
+            GpuNativeQ4ExpertUpload {
+                logical_id: 8,
+                location: first_location,
+                payload: &second_payload,
+            },
+        ];
+        assert!(matches!(
+            validate_q4_expert_uploads(geometry, layout, &duplicate_physical),
+            Err(GpuNativeBootstrapError::DuplicateExpertPhysicalLocation { .. })
+        ));
+        let out_of_range = [GpuNativeQ4ExpertUpload {
+            logical_id: 128,
+            location: first_location,
+            payload: &first_payload,
+        }];
+        assert!(matches!(
+            validate_q4_expert_uploads(geometry, layout, &out_of_range),
+            Err(GpuNativeBootstrapError::ExpertLogicalIdOutOfRange { .. })
+        ));
+        let short = [GpuNativeQ4ExpertUpload {
+            logical_id: 7,
+            location: first_location,
+            payload: &first_payload[..first_payload.len() - 1],
+        }];
+        assert!(matches!(
+            validate_q4_expert_uploads(geometry, layout, &short),
+            Err(GpuNativeBootstrapError::ExpertPayloadTooShort { .. })
+        ));
+        let mut unexpected_trailing = first_payload.clone();
+        unexpected_trailing.push(1);
+        let trailing = [GpuNativeQ4ExpertUpload {
+            logical_id: 7,
+            location: first_location,
+            payload: &unexpected_trailing,
+        }];
+        assert!(matches!(
+            validate_q4_expert_uploads(geometry, layout, &trailing),
+            Err(GpuNativeBootstrapError::ExpertPayloadTrailingBytes { .. })
+                | Err(GpuNativeBootstrapError::ExpertPayloadNonZeroPadding { .. })
+        ));
+    }
+
+    #[test]
+    fn q4_expert_route_resolution_contains_prior_failure_and_latches_real_miss() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 8).unwrap();
+        let layout =
+            GpuNativeQ4ExpertArenaLayout::try_new(geometry, 8, &wgpu::Limits::default()).unwrap();
+        let mut mapping = vec![GPU_NATIVE_EXPERT_UNMAPPED; 128];
+        mapping[0] = GpuNativeQ4ExpertLocation::try_new(0, 0)
+            .unwrap()
+            .pack()
+            .unwrap();
+        let (resolved, status) = resolve_routes_mirror(
+            &[0; 8],
+            &mapping,
+            layout,
+            GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
+        );
+        assert_eq!(resolved, vec![GPU_NATIVE_EXPERT_UNMAPPED; 8]);
+        assert_eq!(status, GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE);
+        assert_eq!(status & GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS, 0);
+
+        let (resolved, status) = resolve_routes_mirror(&[0, 17], &mapping, layout, 0);
+        assert_ne!(resolved[0], GPU_NATIVE_EXPERT_UNMAPPED);
+        assert_eq!(resolved[1], GPU_NATIVE_EXPERT_UNMAPPED);
+        assert_ne!(status & GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS, 0);
+    }
+
+    #[test]
+    fn q4_expert_layer_ownership_and_scratch_geometry_are_typed() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 8).unwrap();
+        let limits = wgpu::Limits::default();
+        let arena_layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, 8, &limits).unwrap();
+        let arena = GpuNativeQ4ExpertArena::from_buffers(
+            7,
+            3,
+            geometry,
+            arena_layout,
+            0,
+            [(); MAX_GPU_NATIVE_EXPERT_BANKS],
+            (),
+        );
+        let gate_layout = GpuNativeDenseWeightLayout::try_new(
+            GpuNativeDenseWeightKind::F32,
+            128,
+            32,
+            128 * 32 * std::mem::size_of::<f32>(),
+        )
+        .unwrap();
+        let plan = GpuNativeRouterPlan {
+            context_id: 7,
+            layer_index: 2,
+            geometry: geometry.router_geometry(),
+            gate: GpuNativeDenseWeightHandle {
+                context_id: 7,
+                weight_id: 1,
+                key: GpuNativeDenseWeightKey::try_new("test.expert.router").unwrap(),
+                layout: gate_layout,
+            },
+        };
+        assert_eq!(
+            validate_router_expert_geometry(&plan, &arena),
+            Err(GpuNativeBootstrapError::ExpertLayerMismatch {
+                router_layer: 2,
+                expert_layer: 3,
+            })
+        );
+        assert_eq!(
+            validate_q4_expert_arena(8, &arena, &limits),
+            Err(GpuNativeBootstrapError::ForeignExpertArena)
+        );
+
+        let scratch_layout = GpuNativeQ4ExpertScratchLayout::try_new(geometry).unwrap();
+        let scratch = GpuNativeQ4ExpertScratch::from_buffers(
+            7,
+            1,
+            scratch_layout,
+            (),
+            test_scratch(7, 2, geometry.d_ff, ()),
+            test_scratch(7, 3, geometry.top_k * geometry.d_model, ()),
+            test_scratch(7, 4, geometry.d_model, ()),
+        );
+        validate_q4_expert_scratch(7, geometry, &scratch, &limits).unwrap();
+        assert_eq!(
+            validate_q4_expert_scratch(8, geometry, &scratch, &limits),
+            Err(GpuNativeBootstrapError::ForeignExpertScratch)
+        );
+        assert!(
+            GpuNativeQ4ExpertScratchLayout::resolved_usage().contains(wgpu::BufferUsages::COPY_SRC)
+        );
+        assert!(!GpuNativeQ4ExpertScratchLayout::resolved_usage()
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(!GpuNativeQ4ExpertScratchLayout::tensor_usage()
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert_eq!(
+            scratch_layout.total_bytes(),
+            scratch_layout.resolved_locations_bytes()
+                + scratch_layout.activation_bytes()
+                + scratch_layout.route_outputs_bytes()
+                + scratch_layout.combined_bytes()
+        );
+    }
+
+    #[test]
+    fn q4_expert_cpu_mirror_covers_swiglu_weighted_combine_and_residual() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(32, 32, 128, 2).unwrap();
+        let hidden = vec![1.0; geometry.d_model];
+        let first_payload = q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
+        let second_payload = q4_uniform_expert(geometry, -0.005, 0.015, 0.002);
+        let first = q4_expert_mirror(&first_payload, geometry, &hidden);
+        let second = q4_expert_mirror(&second_payload, geometry, &hidden);
+        assert!(first.iter().all(|value| value.is_finite()));
+        assert!(second.iter().all(|value| value.is_finite()));
+        assert!(first.windows(2).all(|values| values[0] == values[1]));
+        assert!(second.windows(2).all(|values| values[0] == values[1]));
+        let combined =
+            weighted_expert_combine_mirror(&[first.clone(), second.clone()], &[0.25, 0.75]);
+        let expected = vec![first[0] * 0.25 + second[0] * 0.75; geometry.d_model];
+        assert_close(&combined, &expected, 1e-7);
+        let residual = vec![0.5; geometry.d_model];
+        assert_close(
+            &residual_add_mirror(&residual, &combined),
+            &combined.iter().map(|value| value + 0.5).collect::<Vec<_>>(),
+            1e-7,
+        );
+        let failed = fail_closed_expert_combine_mirror(
+            &[first.clone(), second.clone()],
+            &[0.25, 0.75],
+            GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS,
+        );
+        assert_eq!(failed, vec![0.0; geometry.d_model]);
+        let mut non_finite = second;
+        non_finite[3] = f32::NAN;
+        assert_eq!(
+            fail_closed_expert_combine_mirror(&[first, non_finite], &[0.25, 0.75], 0),
+            vec![0.0; geometry.d_model]
         );
     }
 
@@ -7130,6 +9241,8 @@ mod tests {
         counters.record_causal_attention_dispatch();
         counters.record_attention_complete_dispatch();
         counters.record_router_dispatch();
+        counters.record_expert_arena_registration(8, 13_824);
+        counters.record_expert_dispatches(8);
         let after_dispatch = counters.snapshot();
         assert_eq!(after_dispatch.dense_weight_uploads, 3);
         assert_eq!(after_dispatch.dense_weight_upload_bytes, 108);
@@ -7156,7 +9269,15 @@ mod tests {
         assert_eq!(after_dispatch.attention_complete_dispatches, 1);
         assert_eq!(after_dispatch.router_logit_dispatches, 1);
         assert_eq!(after_dispatch.router_topk_dispatches, 1);
+        assert_eq!(after_dispatch.expert_slots_registered, 8);
+        assert_eq!(after_dispatch.expert_weight_upload_bytes, 13_824);
+        assert_eq!(after_dispatch.expert_route_resolve_dispatches, 1);
+        assert_eq!(after_dispatch.q4_expert_gate_up_dispatches, 8);
+        assert_eq!(after_dispatch.q4_expert_down_dispatches, 8);
+        assert_eq!(after_dispatch.expert_combine_dispatches, 1);
         assert_eq!(after_dispatch.cpu_router_calls, 0);
+        assert_eq!(after_dispatch.cpu_expert_combines, 0);
+        assert_eq!(after_dispatch.expert_slot_misses, 0);
         assert_eq!(after_dispatch.numerical_failures, 0);
     }
 
@@ -7188,6 +9309,33 @@ mod tests {
     }
 
     #[test]
+    fn expert_status_bits_are_stable_non_overlapping_and_only_latched() {
+        assert_eq!(GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE, 1);
+        assert_eq!(GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE, 2);
+        assert_eq!(GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS, 4);
+        assert_eq!(GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE, 8);
+        let bits = [
+            GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE,
+            GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
+            GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS,
+            GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE,
+        ];
+        assert!(bits.iter().all(|bit| bit.is_power_of_two()));
+        for (index, bit) in bits.iter().enumerate() {
+            assert!(bits[index + 1..].iter().all(|other| bit & other == 0));
+        }
+        assert!(GPU_NATIVE_EXPERT_CONTROL_SHADER
+            .contains("atomicOr(&RESOLVE_STATUS.bits, EXPERT_RESIDENCY_MISS)"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER
+            .contains("atomicOr(&STATUS.bits, EXPERT_NUMERICAL_FAILURE)"));
+        assert!(GPU_NATIVE_EXPERT_CONTROL_SHADER
+            .contains("atomicOr(&COMBINE_STATUS.bits, EXPERT_NUMERICAL_FAILURE)"));
+        assert!(!GPU_NATIVE_EXPERT_CONTROL_SHADER.contains("atomicStore(&RESOLVE_STATUS"));
+        assert!(!GPU_NATIVE_EXPERT_CONTROL_SHADER.contains("atomicStore(&COMBINE_STATUS"));
+        assert!(!GPU_NATIVE_Q4_EXPERT_SHADER.contains("atomicStore(&STATUS"));
+    }
+
+    #[test]
     fn gpu_native_shaders_parse_and_validate_without_hardware() {
         for (source, entry_points) in [
             (
@@ -7210,6 +9358,19 @@ mod tests {
             (GPU_NATIVE_KV_APPEND_SHADER, &["kv_append_main"][..]),
             (GPU_NATIVE_ATTENTION_SHADER, &["causal_attention_main"][..]),
             (GPU_NATIVE_ROUTER_SHADER, &["router_topk_main"][..]),
+            (
+                GPU_NATIVE_Q4_EXPERT_SHADER,
+                &["q4_expert_gate_up_main", "q4_expert_down_main"][..],
+            ),
+            (
+                GPU_NATIVE_EXPERT_CONTROL_SHADER,
+                &[
+                    "expert_route_resolve_main",
+                    "expert_validate_main",
+                    "expert_combine_main",
+                    "expert_contain_main",
+                ][..],
+            ),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("GPU-native WGSL must parse");
@@ -7237,6 +9398,10 @@ mod tests {
         assert!(GPU_NATIVE_ROUTER_SHADER.contains("@workgroup_size(64, 1, 1)"));
         assert!(GPU_NATIVE_ROUTER_SHADER.contains("MAX_EXPERTS: u32 = 128u"));
         assert!(GPU_NATIVE_ROUTER_SHADER.contains("MAX_TOP_K: u32 = 8u"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("W0"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("W3"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("BLOCK_BYTES: u32 = 18u"));
+        assert!(GPU_NATIVE_EXPERT_CONTROL_SHADER.contains("UNMAPPED: u32 = 0xffffffffu"));
     }
 
     const GPU_NATIVE_TEST_COMPARE_SHADER: &str = r#"
@@ -9080,6 +11245,390 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(completed.intermediate_readbacks, 0);
         assert_eq!(completed.cpu_router_calls, 0);
         assert_eq!(completed.numerical_failures, 0);
+    }
+
+    /// Requires an actual NVIDIA L4. Three isolated requests prove a finite
+    /// eight-of-128 arena route, an unmapped demand miss with no partial
+    /// mixture, and prior-router-failure containment. All commands share one
+    /// caller-owned encoder, one submission, and one final test-only map.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_q4_expert_arena_combine() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::inference::WeightDtype;
+
+        const D_MODEL: usize = 32;
+        const D_FF: usize = 32;
+        const NUM_EXPERTS: usize = 128;
+        const TOP_K: usize = 8;
+        const IDS_BYTES: u64 = (TOP_K * std::mem::size_of::<u32>()) as u64;
+        const WEIGHTS_BYTES: u64 = (TOP_K * std::mem::size_of::<f32>()) as u64;
+        const RESOLVED_BYTES: u64 = IDS_BYTES;
+        const CASE_BYTES: u64 =
+            IDS_BYTES + WEIGHTS_BYTES + RESOLVED_BYTES + GPU_NATIVE_STATUS_BYTES * 2;
+        const CASES: usize = 3;
+
+        let expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024 * 1024,
+            0.5,
+            16,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 8,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: D_MODEL,
+                v_head_dim: D_MODEL,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::Q4_0,
+                d_model: D_MODEL,
+                d_ff: D_FF,
+            },
+            expert_cache,
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = execution
+            .create_gpu_native_executor_context(D_MODEL)
+            .expect("GPU-native executor must retain the authoritative backend");
+        assert_eq!(executor.device_identity().vendor_id, 0x10de);
+        assert!(
+            executor.device_identity().name.contains("L4"),
+            "ignored Q4 expert arena test must run only on an NVIDIA L4, got {}",
+            executor.device_identity().name
+        );
+        let gpu = executor.authoritative_gpu().unwrap();
+        let router_geometry =
+            GpuNativeRouterGeometry::try_new(D_MODEL, NUM_EXPERTS, TOP_K).unwrap();
+        let expert_geometry =
+            GpuNativeQ4ExpertGeometry::try_new(D_MODEL, D_FF, NUM_EXPERTS, TOP_K).unwrap();
+
+        let mut gate_values = vec![0.0; NUM_EXPERTS * D_MODEL];
+        for expert in 0..NUM_EXPERTS {
+            gate_values[expert * D_MODEL] = expert as f32 / 32.0;
+        }
+        let gate = DenseWeight::from_f32(gate_values.clone(), NUM_EXPERTS, D_MODEL);
+        let gate_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.q4_expert.router").unwrap(),
+                &gate,
+            )
+            .unwrap();
+        let router_plan = executor
+            .create_router_plan(0, router_geometry, gate_handle)
+            .unwrap();
+
+        let finite_hidden = vec![1.0; D_MODEL];
+        let finite_logits = gate.matvec(&finite_hidden);
+        let (selected_ids, selected_weights, router_failed) =
+            router_topk_mirror(&finite_logits, TOP_K);
+        assert!(!router_failed);
+        assert_eq!(selected_ids, (120..128).rev().collect::<Vec<_>>());
+
+        let payloads = selected_ids
+            .iter()
+            .enumerate()
+            .map(|(slot, &logical_id)| {
+                (
+                    logical_id,
+                    q4_uniform_expert(
+                        expert_geometry,
+                        0.001 * (slot as f32 + 1.0),
+                        0.0015 * (slot as f32 + 1.0),
+                        0.0005 * (slot as f32 + 1.0),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let full_uploads = payloads
+            .iter()
+            .enumerate()
+            .map(|(slot, (logical_id, payload))| GpuNativeQ4ExpertUpload {
+                logical_id: *logical_id,
+                location: GpuNativeQ4ExpertLocation::try_new(0, slot as u32).unwrap(),
+                payload,
+            })
+            .collect::<Vec<_>>();
+        let missing_uploads = payloads
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(slot, (logical_id, payload))| GpuNativeQ4ExpertUpload {
+                logical_id: *logical_id,
+                location: GpuNativeQ4ExpertLocation::try_new(0, slot as u32).unwrap(),
+                payload,
+            })
+            .collect::<Vec<_>>();
+        let full_arena = executor
+            .create_q4_expert_arena(0, expert_geometry, TOP_K, &full_uploads)
+            .unwrap();
+        let missing_arena = executor
+            .create_q4_expert_arena(0, expert_geometry, TOP_K, &missing_uploads)
+            .unwrap();
+        assert_eq!(full_arena.slot_capacity(), TOP_K);
+        assert_eq!(full_arena.resident_experts(), TOP_K);
+        assert_eq!(missing_arena.resident_experts(), TOP_K - 1);
+        assert_eq!(full_arena.geometry(), expert_geometry);
+        assert_eq!(full_arena.layer_index(), 0);
+        assert!(full_arena.active_banks() <= MAX_GPU_NATIVE_EXPERT_BANKS);
+
+        let expert_outputs = payloads
+            .iter()
+            .map(|(_, payload)| q4_expert_mirror(payload, expert_geometry, &finite_hidden))
+            .collect::<Vec<_>>();
+        let combined = weighted_expert_combine_mirror(&expert_outputs, &selected_weights);
+        let finite_residual = vec![0.25; D_MODEL];
+        let missing_residual = vec![-0.125; D_MODEL];
+        let prior_failure_residual = vec![0.5; D_MODEL];
+        let finite_expected = residual_add_mirror(&finite_residual, &combined);
+        let expected_hidden = [
+            finite_expected,
+            missing_residual.clone(),
+            prior_failure_residual.clone(),
+        ];
+
+        let states = [
+            executor.create_token_state().unwrap(),
+            executor.create_token_state().unwrap(),
+            executor.create_token_state().unwrap(),
+        ];
+        let router_scratches = [
+            executor.create_router_scratch(router_geometry).unwrap(),
+            executor.create_router_scratch(router_geometry).unwrap(),
+            executor.create_router_scratch(router_geometry).unwrap(),
+        ];
+        let expert_scratches = [
+            executor.create_q4_expert_scratch(expert_geometry).unwrap(),
+            executor.create_q4_expert_scratch(expert_geometry).unwrap(),
+            executor.create_q4_expert_scratch(expert_geometry).unwrap(),
+        ];
+        let invalid_hidden = vec![f32::NAN; D_MODEL];
+        for (state, (hidden, residual)) in states.iter().zip([
+            (&finite_hidden, &finite_residual),
+            (&finite_hidden, &missing_residual),
+            (&invalid_hidden, &prior_failure_residual),
+        ]) {
+            gpu.queue
+                .write_buffer(&state.hidden, 0, bytemuck::cast_slice(hidden));
+            gpu.queue
+                .write_buffer(&state.residual, 0, bytemuck::cast_slice(residual));
+            gpu.queue.write_buffer(&state.status, 0, &[0; 4]);
+        }
+
+        let comparison_statuses = std::array::from_fn::<_, CASES, _>(|index| {
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("gpu_native_q4_expert_compare_status_{index}")),
+                size: GPU_NATIVE_STATUS_BYTES,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.queue.write_buffer(&buffer, 0, &[0; 4]);
+            buffer
+        });
+        let expected_buffers = std::array::from_fn::<_, CASES, _>(|index| {
+            create_test_expected_buffer(
+                &gpu.device,
+                &gpu.queue,
+                &format!("gpu_native_q4_expert_expected_{index}"),
+                &expected_hidden[index],
+            )
+        });
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_q4_expert_validation_staging"),
+            size: CASE_BYTES * CASES as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
+        let before = executor.execution_snapshot();
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_q4_expert_live_l4_encoder"),
+            });
+        for index in 0..CASES {
+            executor
+                .encode_router(
+                    &mut encoder,
+                    &router_plan,
+                    &states[index],
+                    &router_scratches[index],
+                )
+                .unwrap();
+            executor
+                .encode_q4_expert_arena_combine(
+                    &mut encoder,
+                    &router_plan,
+                    &router_scratches[index],
+                    if index == 1 {
+                        &missing_arena
+                    } else {
+                        &full_arena
+                    },
+                    &states[index],
+                    &expert_scratches[index],
+                )
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &states[index].hidden,
+                &expected_buffers[index],
+                &comparison_statuses[index],
+                D_MODEL,
+                5e-4,
+            );
+            let offset = index as u64 * CASE_BYTES;
+            encoder.copy_buffer_to_buffer(
+                &router_scratches[index].selected_ids,
+                0,
+                &staging,
+                offset,
+                IDS_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &router_scratches[index].selected_weights,
+                0,
+                &staging,
+                offset + IDS_BYTES,
+                WEIGHTS_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &expert_scratches[index].resolved_locations,
+                0,
+                &staging,
+                offset + IDS_BYTES + WEIGHTS_BYTES,
+                RESOLVED_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &states[index].status,
+                0,
+                &staging,
+                offset + IDS_BYTES + WEIGHTS_BYTES + RESOLVED_BYTES,
+                GPU_NATIVE_STATUS_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &comparison_statuses[index],
+                0,
+                &staging,
+                offset + IDS_BYTES + WEIGHTS_BYTES + RESOLVED_BYTES + GPU_NATIVE_STATUS_BYTES,
+                GPU_NATIVE_STATUS_BYTES,
+            );
+        }
+        let encoded = executor.execution_snapshot();
+        assert_eq!(
+            encoded.expert_slots_registered - before.expert_slots_registered,
+            0
+        );
+        assert_eq!(
+            encoded.expert_weight_upload_bytes - before.expert_weight_upload_bytes,
+            0
+        );
+        assert_eq!(
+            encoded.expert_route_resolve_dispatches - before.expert_route_resolve_dispatches,
+            3
+        );
+        assert_eq!(
+            encoded.q4_expert_gate_up_dispatches - before.q4_expert_gate_up_dispatches,
+            24
+        );
+        assert_eq!(
+            encoded.q4_expert_down_dispatches - before.q4_expert_down_dispatches,
+            24
+        );
+        assert_eq!(
+            encoded.expert_combine_dispatches - before.expert_combine_dispatches,
+            3
+        );
+        assert_eq!(encoded.cpu_expert_combines, 0);
+        assert_eq!(encoded.expert_slot_misses, 0);
+        assert_eq!(encoded.queue_submissions, 0);
+        assert_eq!(encoded.intermediate_maps, 0);
+        assert_eq!(encoded.intermediate_readbacks, 0);
+
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("validation map callback must be drained")
+            .expect("Q4 expert validation staging must map");
+        let mapped = slice.get_mapped_range();
+        let parse_u32s = |start: usize, bytes: usize| {
+            mapped[start..start + bytes]
+                .chunks_exact(4)
+                .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let mut cases = Vec::with_capacity(CASES);
+        for index in 0..CASES {
+            let start = index * CASE_BYTES as usize;
+            let ids = parse_u32s(start, IDS_BYTES as usize);
+            let weights_start = start + IDS_BYTES as usize;
+            let weights = mapped[weights_start..weights_start + WEIGHTS_BYTES as usize]
+                .chunks_exact(4)
+                .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let resolved_start = weights_start + WEIGHTS_BYTES as usize;
+            let resolved = parse_u32s(resolved_start, RESOLVED_BYTES as usize);
+            let status_start = resolved_start + RESOLVED_BYTES as usize;
+            let status = parse_u32s(status_start, GPU_NATIVE_STATUS_BYTES as usize)[0];
+            let comparison = parse_u32s(
+                status_start + GPU_NATIVE_STATUS_BYTES as usize,
+                GPU_NATIVE_STATUS_BYTES as usize,
+            )[0];
+            cases.push((ids, weights, resolved, status, comparison));
+        }
+        drop(mapped);
+        staging.unmap();
+
+        assert_eq!(cases[0].0, selected_ids);
+        assert_close(&cases[0].1, &selected_weights, 2e-5);
+        assert!(cases[0]
+            .2
+            .iter()
+            .all(|&location| location != GPU_NATIVE_EXPERT_UNMAPPED));
+        assert_eq!(cases[0].3, 0);
+        assert_eq!(cases[0].4, 0);
+
+        assert_eq!(cases[1].0, selected_ids);
+        assert_eq!(cases[1].2[0], GPU_NATIVE_EXPERT_UNMAPPED);
+        assert_eq!(
+            cases[1].3 & GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS,
+            GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS
+        );
+        assert_eq!(cases[1].4, 0, "miss containment hidden must equal residual");
+
+        assert_eq!(cases[2].0, vec![0; TOP_K]);
+        assert_eq!(cases[2].1, vec![0.0; TOP_K]);
+        assert_eq!(cases[2].2, vec![GPU_NATIVE_EXPERT_UNMAPPED; TOP_K]);
+        assert_eq!(
+            cases[2].3, GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
+            "prior router failure must not invent an expert miss"
+        );
+        assert_eq!(cases[2].4, 0);
+
+        let completed = executor.execution_snapshot();
+        assert_eq!(completed.cpu_router_calls, 0);
+        assert_eq!(completed.cpu_expert_combines, 0);
+        assert_eq!(completed.expert_slot_misses, 0);
+        assert_eq!(completed.numerical_failures, 0);
+        assert_eq!(completed.intermediate_maps, 0);
+        assert_eq!(completed.intermediate_readbacks, 0);
     }
 
     #[test]
