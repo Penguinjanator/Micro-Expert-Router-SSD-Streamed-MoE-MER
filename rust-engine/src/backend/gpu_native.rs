@@ -23,16 +23,25 @@ use std::sync::Arc;
 
 const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 // Request-local device failures are latched until token-boundary handling
-// retires the failed request; production encoding never clears this bit.
+// retires the failed request; production encoding never clears these bits.
 const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1 << 0;
+const GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE: u32 = 1 << 1;
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
 const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
 const GPU_NATIVE_ROPE_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rope.wgsl");
 const GPU_NATIVE_KV_APPEND_SHADER: &str = include_str!("wgpu_shaders/gpu_native_kv_append.wgsl");
 const GPU_NATIVE_ATTENTION_SHADER: &str = include_str!("wgpu_shaders/gpu_native_attention.wgsl");
+const GPU_NATIVE_ROUTER_SHADER: &str = include_str!("wgpu_shaders/gpu_native_router.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 const GPU_NATIVE_ATTENTION_WORKGROUP_SIZE: u32 = 32;
+const GPU_NATIVE_ROUTER_WORKGROUP_SIZE: u32 = 64;
+const GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES: u32 = ((MAX_GPU_NATIVE_ROUTER_EXPERTS
+    + GPU_NATIVE_ROUTER_WORKGROUP_SIZE as usize)
+    * std::mem::size_of::<f32>()
+    + std::mem::size_of::<u32>()) as u32;
+pub(crate) const MAX_GPU_NATIVE_ROUTER_EXPERTS: usize = 128;
+pub(crate) const MAX_GPU_NATIVE_ROUTER_TOP_K: usize = 8;
 
 /// Typed, fail-closed construction failure for the GPU-native bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +156,55 @@ pub(crate) enum GpuNativeBootstrapError {
     ResidualContributionWidth {
         expected: usize,
         actual: usize,
+    },
+    InvalidRouterExpertCount {
+        num_experts: usize,
+    },
+    InvalidRouterTopK {
+        top_k: usize,
+        num_experts: usize,
+    },
+    RouterGeometryOverflow {
+        d_model: usize,
+        num_experts: usize,
+        top_k: usize,
+    },
+    RouterDModelMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ForeignRouterPlan,
+    ForeignRouterScratch,
+    RouterScratchGeometry {
+        expected: GpuNativeRouterGeometry,
+        actual: GpuNativeRouterGeometry,
+    },
+    RouterLogitsLength {
+        expected: usize,
+        actual: usize,
+    },
+    RouterSelectedIdsLength {
+        expected: usize,
+        actual: usize,
+    },
+    RouterSelectedWeightsLength {
+        expected: usize,
+        actual: usize,
+    },
+    RouterGateShape {
+        expected_rows: usize,
+        expected_cols: usize,
+        actual_rows: usize,
+        actual_cols: usize,
+    },
+    RouterWorkgroupUnsupported {
+        required: u32,
+        max_size_x: u32,
+        max_invocations: u32,
+    },
+    RouterWorkgroupStorageUnsupported {
+        required: u32,
+        maximum: u32,
     },
     InvalidAttentionHeadCount {
         tensor: GpuNativeAttentionTensor,
@@ -429,6 +487,71 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::ResidualContributionWidth { expected, actual } => write!(
                 f,
                 "GPU-native residual contribution has {actual} elements, expected {expected}"
+            ),
+            Self::InvalidRouterExpertCount { num_experts } => write!(
+                f,
+                "GPU-native router expert count must be in 1..={MAX_GPU_NATIVE_ROUTER_EXPERTS}, got {num_experts}"
+            ),
+            Self::InvalidRouterTopK { top_k, num_experts } => write!(
+                f,
+                "GPU-native router top_k must be in 1..=min({MAX_GPU_NATIVE_ROUTER_TOP_K}, {num_experts}), got {top_k}"
+            ),
+            Self::RouterGeometryOverflow {
+                d_model,
+                num_experts,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native router geometry exceeds u32 shader geometry for d_model={d_model}, num_experts={num_experts}, top_k={top_k}"
+            ),
+            Self::RouterDModelMismatch { expected, actual } => write!(
+                f,
+                "GPU-native router d_model is {actual}, expected executor width {expected}"
+            ),
+            Self::ForeignRouterPlan => write!(
+                f,
+                "GPU-native router plan belongs to a different executor context"
+            ),
+            Self::ForeignRouterScratch => write!(
+                f,
+                "GPU-native router scratch belongs to a different executor context"
+            ),
+            Self::RouterScratchGeometry { expected, actual } => write!(
+                f,
+                "GPU-native router scratch geometry {actual:?} does not match plan geometry {expected:?}"
+            ),
+            Self::RouterLogitsLength { expected, actual } => write!(
+                f,
+                "GPU-native router logits have {actual} elements, expected {expected}"
+            ),
+            Self::RouterSelectedIdsLength { expected, actual } => write!(
+                f,
+                "GPU-native router selected ids have {actual} elements, expected {expected}"
+            ),
+            Self::RouterSelectedWeightsLength { expected, actual } => write!(
+                f,
+                "GPU-native router selected weights have {actual} elements, expected {expected}"
+            ),
+            Self::RouterGateShape {
+                expected_rows,
+                expected_cols,
+                actual_rows,
+                actual_cols,
+            } => write!(
+                f,
+                "GPU-native router gate has shape [{actual_rows}, {actual_cols}], expected [{expected_rows}, {expected_cols}]"
+            ),
+            Self::RouterWorkgroupUnsupported {
+                required,
+                max_size_x,
+                max_invocations,
+            } => write!(
+                f,
+                "GPU-native router requires a {required}-lane workgroup, exceeding max_compute_workgroup_size_x={max_size_x} or max_compute_invocations_per_workgroup={max_invocations}"
+            ),
+            Self::RouterWorkgroupStorageUnsupported { required, maximum } => write!(
+                f,
+                "GPU-native router requires {required} bytes of workgroup storage, exceeding device maximum {maximum}"
             ),
             Self::InvalidAttentionHeadCount { tensor, heads } => write!(
                 f,
@@ -1035,6 +1158,94 @@ impl GpuNativeRmsNormGeometry {
     }
 }
 
+/// Bounded Qwen/Mixtral router geometry for one token. This first GPU-native
+/// contract intentionally supports only softmax scoring, deterministic top-k,
+/// and selected-weight renormalisation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeRouterGeometry {
+    d_model: usize,
+    num_experts: usize,
+    top_k: usize,
+}
+
+impl GpuNativeRouterGeometry {
+    pub(crate) fn try_new(
+        d_model: usize,
+        num_experts: usize,
+        top_k: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if d_model == 0 {
+            return Err(GpuNativeBootstrapError::InvalidDModel);
+        }
+        if num_experts == 0 || num_experts > MAX_GPU_NATIVE_ROUTER_EXPERTS {
+            return Err(GpuNativeBootstrapError::InvalidRouterExpertCount { num_experts });
+        }
+        if top_k == 0 || top_k > MAX_GPU_NATIVE_ROUTER_TOP_K || top_k > num_experts {
+            return Err(GpuNativeBootstrapError::InvalidRouterTopK { top_k, num_experts });
+        }
+        let gate_elements = d_model.checked_mul(num_experts).ok_or(
+            GpuNativeBootstrapError::RouterGeometryOverflow {
+                d_model,
+                num_experts,
+                top_k,
+            },
+        )?;
+        if u32::try_from(d_model).is_err()
+            || u32::try_from(num_experts).is_err()
+            || u32::try_from(top_k).is_err()
+            || u32::try_from(gate_elements).is_err()
+        {
+            return Err(GpuNativeBootstrapError::RouterGeometryOverflow {
+                d_model,
+                num_experts,
+                top_k,
+            });
+        }
+        Ok(Self {
+            d_model,
+            num_experts,
+            top_k,
+        })
+    }
+
+    pub(crate) const fn d_model(self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) const fn num_experts(self) -> usize {
+        self.num_experts
+    }
+
+    pub(crate) const fn top_k(self) -> usize {
+        self.top_k
+    }
+}
+
+fn validate_router_dispatch(limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+    if limits.max_compute_workgroup_size_x < GPU_NATIVE_ROUTER_WORKGROUP_SIZE
+        || limits.max_compute_invocations_per_workgroup < GPU_NATIVE_ROUTER_WORKGROUP_SIZE
+    {
+        return Err(GpuNativeBootstrapError::RouterWorkgroupUnsupported {
+            required: GPU_NATIVE_ROUTER_WORKGROUP_SIZE,
+            max_size_x: limits.max_compute_workgroup_size_x,
+            max_invocations: limits.max_compute_invocations_per_workgroup,
+        });
+    }
+    if limits.max_compute_workgroup_storage_size < GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES {
+        return Err(GpuNativeBootstrapError::RouterWorkgroupStorageUnsupported {
+            required: GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES,
+            maximum: limits.max_compute_workgroup_storage_size,
+        });
+    }
+    if limits.max_compute_workgroups_per_dimension == 0 {
+        return Err(GpuNativeBootstrapError::DispatchGeometryUnsupported {
+            workgroups: 1,
+            maximum: 0,
+        });
+    }
+    Ok(())
+}
+
 /// Qwen-compatible GPU-native attention geometry. Query heads may use GQA,
 /// but Q/K/V share one head width and V is deliberately not asymmetric.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1442,6 +1653,27 @@ impl GpuNativeRopeHandle {
     }
 }
 
+/// Immutable context-bound gate handle and geometry for one Qwen-compatible
+/// MoE router. `layer_index` is retained for the later expert-residency key;
+/// it does not alter routing in this slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeRouterPlan {
+    context_id: u64,
+    layer_index: usize,
+    geometry: GpuNativeRouterGeometry,
+    gate: GpuNativeDenseWeightHandle,
+}
+
+impl GpuNativeRouterPlan {
+    pub(crate) const fn geometry(&self) -> GpuNativeRouterGeometry {
+        self.geometry
+    }
+
+    pub(crate) const fn layer_index(&self) -> usize {
+        self.layer_index
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GpuNativeAttentionNorm {
     handle: GpuNativeRmsNormHandle,
@@ -1832,6 +2064,151 @@ impl<B> fmt::Debug for GpuNativeScratch<B> {
     }
 }
 
+/// Checked request-local router storage. Logits and selected weights are F32;
+/// selected expert ids are a distinct u32 allocation. Result allocations are
+/// copy sources only for the ignored hardware seam and are never mappable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativeRouterScratchLayout {
+    geometry: GpuNativeRouterGeometry,
+    logits_elements: usize,
+    selected_ids_elements: usize,
+    selected_weights_elements: usize,
+    logits_bytes: u64,
+    selected_ids_bytes: u64,
+    selected_weights_bytes: u64,
+    total_bytes: u64,
+}
+
+impl GpuNativeRouterScratchLayout {
+    fn try_new(geometry: GpuNativeRouterGeometry) -> Result<Self, GpuNativeBootstrapError> {
+        GpuNativeRouterGeometry::try_new(geometry.d_model, geometry.num_experts, geometry.top_k)?;
+        let bytes = |elements: usize| {
+            elements
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(GpuNativeBootstrapError::RouterGeometryOverflow {
+                    d_model: geometry.d_model,
+                    num_experts: geometry.num_experts,
+                    top_k: geometry.top_k,
+                })
+        };
+        let logits_bytes = bytes(geometry.num_experts)?;
+        let selected_ids_bytes = bytes(geometry.top_k)?;
+        let selected_weights_bytes = bytes(geometry.top_k)?;
+        let total_bytes = logits_bytes
+            .checked_add(selected_ids_bytes)
+            .and_then(|value| value.checked_add(selected_weights_bytes))
+            .ok_or(GpuNativeBootstrapError::RouterGeometryOverflow {
+                d_model: geometry.d_model,
+                num_experts: geometry.num_experts,
+                top_k: geometry.top_k,
+            })?;
+        Ok(Self {
+            geometry,
+            logits_elements: geometry.num_experts,
+            selected_ids_elements: geometry.top_k,
+            selected_weights_elements: geometry.top_k,
+            logits_bytes,
+            selected_ids_bytes,
+            selected_weights_bytes,
+            total_bytes,
+        })
+    }
+
+    fn logits_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE
+    }
+
+    fn result_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+    }
+
+    fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_router_logits",
+            self.logits_bytes,
+            Self::logits_usage(),
+            limits,
+        )?;
+        super::validate_startup_buffer(
+            "gpu_native_router_selected_ids",
+            self.selected_ids_bytes,
+            Self::result_usage(),
+            limits,
+        )?;
+        super::validate_startup_buffer(
+            "gpu_native_router_selected_weights",
+            self.selected_weights_bytes,
+            Self::result_usage(),
+            limits,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) const fn geometry(self) -> GpuNativeRouterGeometry {
+        self.geometry
+    }
+
+    pub(crate) const fn logits_bytes(self) -> u64 {
+        self.logits_bytes
+    }
+
+    pub(crate) const fn selected_ids_bytes(self) -> u64 {
+        self.selected_ids_bytes
+    }
+
+    pub(crate) const fn selected_weights_bytes(self) -> u64 {
+        self.selected_weights_bytes
+    }
+
+    pub(crate) const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+}
+
+/// Opaque request-local GPU router logits and result allocations.
+pub(crate) struct GpuNativeRouterScratch<B = wgpu::Buffer> {
+    context_id: u64,
+    scratch_id: u64,
+    layout: GpuNativeRouterScratchLayout,
+    logits: B,
+    selected_ids: B,
+    selected_weights: B,
+}
+
+impl<B> GpuNativeRouterScratch<B> {
+    fn from_buffers(
+        context_id: u64,
+        scratch_id: u64,
+        layout: GpuNativeRouterScratchLayout,
+        logits: B,
+        selected_ids: B,
+        selected_weights: B,
+    ) -> Self {
+        Self {
+            context_id,
+            scratch_id,
+            layout,
+            logits,
+            selected_ids,
+            selected_weights,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> GpuNativeRouterScratchLayout {
+        self.layout
+    }
+}
+
+impl<B> fmt::Debug for GpuNativeRouterScratch<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativeRouterScratch")
+            .field("scratch_id", &self.scratch_id)
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Request-scoped, non-mappable F32 attention intermediates with geometry
 /// attached, preventing projection, context, and output buffers from being
 /// interchanged at the composed API.
@@ -2006,6 +2383,73 @@ fn validate_scratch_owner(
         return Err(GpuNativeBootstrapError::ForeignScratch);
     }
     Ok(())
+}
+
+fn validate_router_scratch<B>(
+    context_id: u64,
+    geometry: GpuNativeRouterGeometry,
+    scratch: &GpuNativeRouterScratch<B>,
+) -> Result<(), GpuNativeBootstrapError> {
+    if scratch.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignRouterScratch);
+    }
+    if scratch.layout.geometry != geometry {
+        return Err(GpuNativeBootstrapError::RouterScratchGeometry {
+            expected: geometry,
+            actual: scratch.layout.geometry,
+        });
+    }
+    if scratch.layout.logits_elements != geometry.num_experts {
+        return Err(GpuNativeBootstrapError::RouterLogitsLength {
+            expected: geometry.num_experts,
+            actual: scratch.layout.logits_elements,
+        });
+    }
+    if scratch.layout.selected_ids_elements != geometry.top_k {
+        return Err(GpuNativeBootstrapError::RouterSelectedIdsLength {
+            expected: geometry.top_k,
+            actual: scratch.layout.selected_ids_elements,
+        });
+    }
+    if scratch.layout.selected_weights_elements != geometry.top_k {
+        return Err(GpuNativeBootstrapError::RouterSelectedWeightsLength {
+            expected: geometry.top_k,
+            actual: scratch.layout.selected_weights_elements,
+        });
+    }
+    Ok(())
+}
+
+fn validate_router_plan_with_registry<B>(
+    context_id: u64,
+    d_model: usize,
+    registry: &GpuNativeDenseWeightRegistry<B>,
+    plan: &GpuNativeRouterPlan,
+) -> Result<Arc<GpuNativeDenseWeight<B>>, GpuNativeBootstrapError> {
+    if plan.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignRouterPlan);
+    }
+    GpuNativeRouterGeometry::try_new(
+        plan.geometry.d_model,
+        plan.geometry.num_experts,
+        plan.geometry.top_k,
+    )?;
+    if plan.geometry.d_model != d_model {
+        return Err(GpuNativeBootstrapError::RouterDModelMismatch {
+            expected: d_model,
+            actual: plan.geometry.d_model,
+        });
+    }
+    let gate = registry.resolve(&plan.gate)?;
+    if gate.layout.rows != plan.geometry.num_experts || gate.layout.cols != plan.geometry.d_model {
+        return Err(GpuNativeBootstrapError::RouterGateShape {
+            expected_rows: plan.geometry.num_experts,
+            expected_cols: plan.geometry.d_model,
+            actual_rows: gate.layout.rows,
+            actual_cols: gate.layout.cols,
+        });
+    }
+    Ok(gate)
 }
 
 fn validate_residual_contribution_width(
@@ -2261,6 +2705,8 @@ pub(crate) struct GpuNativeExecutionSnapshot {
     pub(crate) causal_attention_dispatches: u64,
     pub(crate) o_projection_dispatches: u64,
     pub(crate) attention_complete_dispatches: u64,
+    pub(crate) router_logit_dispatches: u64,
+    pub(crate) router_topk_dispatches: u64,
     pub(crate) tokens_submitted: u64,
     pub(crate) tokens_completed: u64,
     pub(crate) layers_encoded: u64,
@@ -2307,6 +2753,8 @@ struct GpuNativeExecutionCounters {
     causal_attention_dispatches: AtomicU64,
     o_projection_dispatches: AtomicU64,
     attention_complete_dispatches: AtomicU64,
+    router_logit_dispatches: AtomicU64,
+    router_topk_dispatches: AtomicU64,
     tokens_submitted: AtomicU64,
     tokens_completed: AtomicU64,
     layers_encoded: AtomicU64,
@@ -2356,6 +2804,8 @@ impl GpuNativeExecutionCounters {
             attention_complete_dispatches: self
                 .attention_complete_dispatches
                 .load(Ordering::Relaxed),
+            router_logit_dispatches: self.router_logit_dispatches.load(Ordering::Relaxed),
+            router_topk_dispatches: self.router_topk_dispatches.load(Ordering::Relaxed),
             tokens_submitted: self.tokens_submitted.load(Ordering::Relaxed),
             tokens_completed: self.tokens_completed.load(Ordering::Relaxed),
             layers_encoded: self.layers_encoded.load(Ordering::Relaxed),
@@ -2452,6 +2902,11 @@ impl GpuNativeExecutionCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_router_dispatch(&self) {
+        self.router_logit_dispatches.fetch_add(1, Ordering::Relaxed);
+        self.router_topk_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(test)]
     fn record_token_boundary_readback(&self) {
         self.token_boundary_readbacks
@@ -2515,6 +2970,15 @@ struct GpuNativeAttentionPushConstants {
     num_kv_heads: u32,
     head_dim: u32,
     seq_len: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeRouterPushConstants {
+    num_experts: u32,
+    top_k: u32,
+    _reserved_0: u32,
+    _reserved_1: u32,
 }
 
 struct GpuNativeDensePipelines {
@@ -2946,6 +3410,78 @@ impl GpuNativeAttentionPipelines {
     }
 }
 
+struct GpuNativeRouterPipeline {
+    bind_group_layout: wgpu::BindGroupLayout,
+    topk: wgpu::ComputePipeline,
+}
+
+impl GpuNativeRouterPipeline {
+    fn new(device: &wgpu::Device) -> Self {
+        let read_only_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let read_write_storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_native_router_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_only_storage,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_write_storage,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_write_storage,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: read_write_storage,
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_native_router_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_router_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_ROUTER_SHADER.into()),
+        });
+        let topk = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_router_topk_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "router_topk_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        Self {
+            bind_group_layout,
+            topk,
+        }
+    }
+}
+
 /// Internal bootstrap for future GPU-owned token execution.
 ///
 /// Retaining the exact `Arc<BackendBox>` keeps the authoritative non-cloneable
@@ -2960,6 +3496,7 @@ pub(crate) struct GpuNativeExecutorContext {
     dense_pipelines: GpuNativeDensePipelines,
     state_pipelines: GpuNativeStatePipelines,
     attention_pipelines: GpuNativeAttentionPipelines,
+    router_pipeline: GpuNativeRouterPipeline,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -2987,6 +3524,7 @@ impl GpuNativeExecutorContext {
         let dense_pipelines = GpuNativeDensePipelines::new(&gpu.device);
         let state_pipelines = GpuNativeStatePipelines::new(&gpu.device);
         let attention_pipelines = GpuNativeAttentionPipelines::new(&gpu.device);
+        let router_pipeline = GpuNativeRouterPipeline::new(&gpu.device);
 
         Ok(Self {
             context_id,
@@ -2997,6 +3535,7 @@ impl GpuNativeExecutorContext {
             dense_pipelines,
             state_pipelines,
             attention_pipelines,
+            router_pipeline,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -3204,6 +3743,27 @@ impl GpuNativeExecutorContext {
             .map(GpuNativeRmsNormHandle::from_dense)
     }
 
+    pub(crate) fn create_router_plan(
+        &self,
+        layer_index: usize,
+        geometry: GpuNativeRouterGeometry,
+        gate: GpuNativeDenseWeightHandle,
+    ) -> Result<GpuNativeRouterPlan, GpuNativeBootstrapError> {
+        let plan = GpuNativeRouterPlan {
+            context_id: self.context_id,
+            layer_index,
+            geometry,
+            gate,
+        };
+        validate_router_plan_with_registry(
+            self.context_id,
+            self.layout.d_model,
+            &self.dense_weights.lock(),
+            &plan,
+        )?;
+        Ok(plan)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_attention_plan(
         &self,
@@ -3252,6 +3812,49 @@ impl GpuNativeExecutorContext {
             scratch_id,
             layout,
             buffer,
+        ))
+    }
+
+    pub(crate) fn create_router_scratch(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::RouterDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeRouterScratchLayout::try_new(geometry)?;
+        layout.validate_for_limits(&gpu.device.limits())?;
+        validate_router_dispatch(&gpu.device.limits())?;
+        let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "router scratch");
+        let logits = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_router_scratch_{scratch_id}_logits"),
+            layout.logits_bytes,
+            GpuNativeRouterScratchLayout::logits_usage(),
+        )?;
+        let selected_ids = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_router_scratch_{scratch_id}_selected_ids"),
+            layout.selected_ids_bytes,
+            GpuNativeRouterScratchLayout::result_usage(),
+        )?;
+        let selected_weights = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_router_scratch_{scratch_id}_selected_weights"),
+            layout.selected_weights_bytes,
+            GpuNativeRouterScratchLayout::result_usage(),
+        )?;
+        Ok(GpuNativeRouterScratch::from_buffers(
+            self.context_id,
+            scratch_id,
+            layout,
+            logits,
+            selected_ids,
+            selected_weights,
         ))
     }
 
@@ -3490,6 +4093,93 @@ impl GpuNativeExecutorContext {
         }
         self.counters
             .record_dense_gemv_dispatch(weight.chunks.len() as u64);
+    }
+
+    /// Encode Qwen/Mixtral routing into caller-owned command storage:
+    /// persistent gate GEMV followed by stable softmax, deterministic top-k,
+    /// and selected-weight renormalisation. Hidden and residual state are
+    /// read-only, and selected ids/weights remain device-resident.
+    pub(crate) fn encode_router(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeRouterPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeRouterScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        let gate = validate_router_plan_with_registry(
+            self.context_id,
+            self.layout.d_model,
+            &self.dense_weights.lock(),
+            plan,
+        )?;
+        if state.layout.d_model != plan.geometry.d_model {
+            return Err(GpuNativeBootstrapError::RouterDModelMismatch {
+                expected: plan.geometry.d_model,
+                actual: state.layout.d_model,
+            });
+        }
+        validate_router_scratch(self.context_id, plan.geometry, scratch)?;
+        scratch.layout.validate_for_limits(&gpu.device.limits())?;
+        validate_router_dispatch(&gpu.device.limits())?;
+        let gate_workgroups = gate
+            .chunks
+            .iter()
+            .map(|chunk| self.checked_workgroups(chunk.plan.row_count, &gpu.device.limits()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Every fallible host validation above completes before this first
+        // router command is recorded.
+        self.encode_dense_gemv_resolved(
+            gpu,
+            encoder,
+            &gate,
+            &state.hidden,
+            &scratch.logits,
+            &gate_workgroups,
+        );
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_router_bind_group"),
+            layout: &self.router_pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scratch.logits.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: scratch.selected_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scratch.selected_weights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_router_topk_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.router_pipeline.topk);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_push_constants(
+            0,
+            bytemuck::bytes_of(&GpuNativeRouterPushConstants {
+                num_experts: plan.geometry.num_experts as u32,
+                top_k: plan.geometry.top_k as u32,
+                _reserved_0: 0,
+                _reserved_1: 0,
+            }),
+        );
+        pass.dispatch_workgroups(1, 1, 1);
+        drop(pass);
+        self.counters.record_router_dispatch();
+        Ok(())
     }
 
     /// Encode one embedding row directly into request-local hidden state.
@@ -4319,6 +5009,65 @@ mod tests {
         }
     }
 
+    fn router_topk_mirror(logits: &[f32], top_k: usize) -> (Vec<u32>, Vec<f32>, bool) {
+        let sanitized = || (vec![0; top_k], vec![0.0; top_k], true);
+        if logits.is_empty()
+            || top_k == 0
+            || top_k > logits.len()
+            || logits.iter().any(|value| !value.is_finite())
+        {
+            return sanitized();
+        }
+        let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if !maximum.is_finite() {
+            return sanitized();
+        }
+        let mut scores = Vec::with_capacity(logits.len());
+        let mut denominator = 0.0f32;
+        for &logit in logits {
+            let exponent = (logit - maximum).exp();
+            if !exponent.is_finite() || exponent < 0.0 {
+                return sanitized();
+            }
+            scores.push(exponent);
+            denominator += exponent;
+        }
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return sanitized();
+        }
+        for score in &mut scores {
+            *score /= denominator;
+            if !score.is_finite() || *score < 0.0 {
+                return sanitized();
+            }
+        }
+
+        let mut ids = (0..logits.len()).collect::<Vec<_>>();
+        ids.sort_by(|&left, &right| {
+            scores[right]
+                .total_cmp(&scores[left])
+                .then_with(|| left.cmp(&right))
+        });
+        ids.truncate(top_k);
+        let selected_sum = ids.iter().map(|&expert| scores[expert]).sum::<f32>();
+        if !selected_sum.is_finite() || selected_sum <= 0.0 {
+            return sanitized();
+        }
+        let mut selected_weights = Vec::with_capacity(top_k);
+        for &expert in &ids {
+            let weight = scores[expert] / selected_sum;
+            if !weight.is_finite() || weight < 0.0 {
+                return sanitized();
+            }
+            selected_weights.push(weight);
+        }
+        (
+            ids.into_iter().map(|expert| expert as u32).collect(),
+            selected_weights,
+            false,
+        )
+    }
+
     fn rms_norm_mirror(
         values: &[f32],
         weight: &[f32],
@@ -4964,6 +5713,287 @@ mod tests {
 
         assert_eq!(validate_rms_norm_epsilon(0.0), Ok(()));
         assert_eq!(validate_rms_norm_epsilon(1e-6), Ok(()));
+    }
+
+    #[test]
+    fn router_geometry_accepts_qwen_bounds_and_rejects_invalid_geometry() {
+        let geometry = GpuNativeRouterGeometry::try_new(16, 128, 8).unwrap();
+        assert_eq!(geometry.d_model(), 16);
+        assert_eq!(geometry.num_experts(), 128);
+        assert_eq!(geometry.top_k(), 8);
+        assert_eq!(MAX_GPU_NATIVE_ROUTER_EXPERTS, 128);
+        assert_eq!(MAX_GPU_NATIVE_ROUTER_TOP_K, 8);
+
+        assert_eq!(
+            GpuNativeRouterGeometry::try_new(0, 128, 8),
+            Err(GpuNativeBootstrapError::InvalidDModel)
+        );
+        for num_experts in [0, 129] {
+            assert_eq!(
+                GpuNativeRouterGeometry::try_new(16, num_experts, 1),
+                Err(GpuNativeBootstrapError::InvalidRouterExpertCount { num_experts })
+            );
+        }
+        for (num_experts, top_k) in [(128, 0), (128, 9), (4, 5)] {
+            assert_eq!(
+                GpuNativeRouterGeometry::try_new(16, num_experts, top_k),
+                Err(GpuNativeBootstrapError::InvalidRouterTopK { top_k, num_experts })
+            );
+        }
+        assert!(matches!(
+            GpuNativeRouterGeometry::try_new(u32::MAX as usize + 1, 128, 8),
+            Err(GpuNativeBootstrapError::RouterGeometryOverflow { .. })
+        ));
+        assert!(matches!(
+            GpuNativeRouterGeometry::try_new(u32::MAX as usize / 128 + 1, 128, 8),
+            Err(GpuNativeBootstrapError::RouterGeometryOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn router_dispatch_fails_closed_for_device_workgroup_limits() {
+        assert_eq!(validate_router_dispatch(&wgpu::Limits::default()), Ok(()));
+        let narrow_workgroup = wgpu::Limits {
+            max_compute_workgroup_size_x: 32,
+            max_compute_invocations_per_workgroup: 32,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            validate_router_dispatch(&narrow_workgroup),
+            Err(GpuNativeBootstrapError::RouterWorkgroupUnsupported {
+                required: 64,
+                max_size_x: 32,
+                max_invocations: 32,
+            })
+        );
+        let narrow_storage = wgpu::Limits {
+            max_compute_workgroup_storage_size: 512,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            validate_router_dispatch(&narrow_storage),
+            Err(GpuNativeBootstrapError::RouterWorkgroupStorageUnsupported {
+                required: GPU_NATIVE_ROUTER_WORKGROUP_STORAGE_BYTES,
+                maximum: 512,
+            })
+        );
+    }
+
+    #[test]
+    fn router_softmax_topk_matches_linear_gate_and_is_deterministic() {
+        use crate::gating::LinearGate;
+        use std::collections::HashSet;
+
+        let (known_ids, known_weights, failed) =
+            router_topk_mirror(&[0.25, 2.0, -1.0, 2.0, 1.0], 3);
+        assert!(!failed);
+        assert_eq!(known_ids, vec![1, 3, 4]);
+        assert!((known_weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        let (tie_ids, tie_weights, failed) = router_topk_mirror(&[0.0; 128], 8);
+        assert!(!failed);
+        assert_eq!(tie_ids, (0..8).collect::<Vec<_>>());
+        assert!(tie_weights.iter().all(|&weight| weight == 0.125));
+
+        const D_MODEL: usize = 16;
+        const NUM_EXPERTS: usize = 128;
+        const TOP_K: usize = 8;
+        let hidden = [
+            1.0, -0.5, 0.25, 0.75, -1.0, 0.5, 0.0, 0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let mut gate_values = vec![0.0; NUM_EXPERTS * D_MODEL];
+        for expert in 0..NUM_EXPERTS {
+            gate_values[expert * D_MODEL] = expert as f32 / 10.0;
+            gate_values[expert * D_MODEL + 1] = (expert % 3) as f32 / 100.0;
+        }
+        let gate = LinearGate::new(gate_values, NUM_EXPERTS, D_MODEL, TOP_K);
+        let cpu_reference = gate.route(&hidden);
+        let logits = gate.weights.matvec(&hidden);
+        let first = router_topk_mirror(&logits, TOP_K);
+        let second = router_topk_mirror(&logits, TOP_K);
+        assert_eq!(first, second);
+        assert!(!first.2);
+        assert_eq!(first.0, cpu_reference.experts);
+        assert_close(&first.1, &cpu_reference.weights, 1e-6);
+        assert_eq!(first.0.len(), TOP_K);
+        assert_eq!(first.0.iter().copied().collect::<HashSet<_>>().len(), TOP_K);
+        assert!((first.1.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        let (ids, weights, failed) = router_topk_mirror(&[0.0, f32::NAN, 1.0], 2);
+        assert!(failed);
+        assert_eq!(ids, vec![0, 0]);
+        assert_eq!(weights, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn router_plan_accepts_existing_dense_kinds_and_rejects_foreign_stale_or_wrong_gate() {
+        let context_id = 41;
+        let geometry = GpuNativeRouterGeometry::try_new(16, 128, 8).unwrap();
+        let mut registry = GpuNativeDenseWeightRegistry::new(context_id);
+        let gate = insert_test_f32_weight(
+            &mut registry,
+            1,
+            "layer.2.router.gate",
+            geometry.num_experts,
+            geometry.d_model,
+        );
+        let plan = GpuNativeRouterPlan {
+            context_id,
+            layer_index: 2,
+            geometry,
+            gate,
+        };
+        assert_eq!(plan.layer_index(), 2);
+        assert_eq!(plan.geometry(), geometry);
+        assert!(
+            validate_router_plan_with_registry(context_id, geometry.d_model, &registry, &plan)
+                .is_ok()
+        );
+
+        let q8_elements = geometry.num_experts * geometry.d_model;
+        let q8_layout = GpuNativeDenseWeightLayout::try_new(
+            GpuNativeDenseWeightKind::Q8_0,
+            geometry.num_experts,
+            geometry.d_model,
+            q8_elements.div_ceil(Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_BYTES,
+        )
+        .unwrap();
+        let q8_gate = registry
+            .insert(test_weight(2, "layer.3.router.q8_gate", q8_layout, ()))
+            .unwrap();
+        let q8_plan = GpuNativeRouterPlan {
+            context_id,
+            layer_index: 3,
+            geometry,
+            gate: q8_gate,
+        };
+        assert_eq!(
+            validate_router_plan_with_registry(context_id, geometry.d_model, &registry, &q8_plan)
+                .unwrap()
+                .layout
+                .kind,
+            GpuNativeDenseWeightKind::Q8_0
+        );
+
+        let mut foreign_plan = plan.clone();
+        foreign_plan.context_id += 1;
+        assert!(matches!(
+            validate_router_plan_with_registry(
+                context_id,
+                geometry.d_model,
+                &registry,
+                &foreign_plan
+            ),
+            Err(GpuNativeBootstrapError::ForeignRouterPlan)
+        ));
+
+        let mut foreign_gate = plan.clone();
+        foreign_gate.gate.context_id += 1;
+        assert!(matches!(
+            validate_router_plan_with_registry(
+                context_id,
+                geometry.d_model,
+                &registry,
+                &foreign_gate
+            ),
+            Err(GpuNativeBootstrapError::ForeignDenseWeightHandle)
+        ));
+
+        let mut stale_gate = plan.clone();
+        stale_gate.gate.weight_id += 1;
+        assert!(matches!(
+            validate_router_plan_with_registry(
+                context_id,
+                geometry.d_model,
+                &registry,
+                &stale_gate
+            ),
+            Err(GpuNativeBootstrapError::StaleDenseWeightHandle { .. })
+        ));
+
+        let transposed = insert_test_f32_weight(
+            &mut registry,
+            3,
+            "layer.2.router.transposed_gate",
+            geometry.d_model,
+            geometry.num_experts,
+        );
+        let mut wrong_shape = plan;
+        wrong_shape.gate = transposed;
+        assert!(matches!(
+            validate_router_plan_with_registry(
+                context_id,
+                geometry.d_model,
+                &registry,
+                &wrong_shape
+            ),
+            Err(GpuNativeBootstrapError::RouterGateShape { .. })
+        ));
+        assert!(matches!(
+            validate_router_plan_with_registry(
+                context_id,
+                geometry.d_model + 1,
+                &registry,
+                &q8_plan
+            ),
+            Err(GpuNativeBootstrapError::RouterDModelMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn router_scratch_layout_and_ownership_fail_closed() {
+        let geometry = GpuNativeRouterGeometry::try_new(16, 128, 8).unwrap();
+        let layout = GpuNativeRouterScratchLayout::try_new(geometry).unwrap();
+        assert_eq!(layout.geometry(), geometry);
+        assert_eq!(layout.logits_bytes(), 512);
+        assert_eq!(layout.selected_ids_bytes(), 32);
+        assert_eq!(layout.selected_weights_bytes(), 32);
+        assert_eq!(layout.total_bytes(), 576);
+        assert!(!GpuNativeRouterScratchLayout::logits_usage()
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(!GpuNativeRouterScratchLayout::result_usage()
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_SRC));
+
+        let scratch = GpuNativeRouterScratch::from_buffers(7, 1, layout, (), (), ());
+        assert_eq!(validate_router_scratch(7, geometry, &scratch), Ok(()));
+        assert_eq!(
+            validate_router_scratch(8, geometry, &scratch),
+            Err(GpuNativeBootstrapError::ForeignRouterScratch)
+        );
+
+        let smaller = GpuNativeRouterGeometry::try_new(16, 64, 4).unwrap();
+        assert_eq!(
+            validate_router_scratch(7, smaller, &scratch),
+            Err(GpuNativeBootstrapError::RouterScratchGeometry {
+                expected: smaller,
+                actual: geometry,
+            })
+        );
+
+        let mut wrong_logits_layout = layout;
+        wrong_logits_layout.logits_elements -= 1;
+        let wrong_logits =
+            GpuNativeRouterScratch::from_buffers(7, 2, wrong_logits_layout, (), (), ());
+        assert!(matches!(
+            validate_router_scratch(7, geometry, &wrong_logits),
+            Err(GpuNativeBootstrapError::RouterLogitsLength { .. })
+        ));
+        let mut wrong_ids_layout = layout;
+        wrong_ids_layout.selected_ids_elements -= 1;
+        let wrong_ids = GpuNativeRouterScratch::from_buffers(7, 3, wrong_ids_layout, (), (), ());
+        assert!(matches!(
+            validate_router_scratch(7, geometry, &wrong_ids),
+            Err(GpuNativeBootstrapError::RouterSelectedIdsLength { .. })
+        ));
+        let mut wrong_weights_layout = layout;
+        wrong_weights_layout.selected_weights_elements -= 1;
+        let wrong_weights =
+            GpuNativeRouterScratch::from_buffers(7, 4, wrong_weights_layout, (), (), ());
+        assert!(matches!(
+            validate_router_scratch(7, geometry, &wrong_weights),
+            Err(GpuNativeBootstrapError::RouterSelectedWeightsLength { .. })
+        ));
     }
 
     #[test]
@@ -6099,6 +7129,7 @@ mod tests {
         counters.record_kv_append();
         counters.record_causal_attention_dispatch();
         counters.record_attention_complete_dispatch();
+        counters.record_router_dispatch();
         let after_dispatch = counters.snapshot();
         assert_eq!(after_dispatch.dense_weight_uploads, 3);
         assert_eq!(after_dispatch.dense_weight_upload_bytes, 108);
@@ -6123,6 +7154,9 @@ mod tests {
         assert_eq!(after_dispatch.causal_attention_dispatches, 1);
         assert_eq!(after_dispatch.o_projection_dispatches, 1);
         assert_eq!(after_dispatch.attention_complete_dispatches, 1);
+        assert_eq!(after_dispatch.router_logit_dispatches, 1);
+        assert_eq!(after_dispatch.router_topk_dispatches, 1);
+        assert_eq!(after_dispatch.cpu_router_calls, 0);
         assert_eq!(after_dispatch.numerical_failures, 0);
     }
 
@@ -6133,6 +7167,24 @@ mod tests {
         assert!(GPU_NATIVE_ATTENTION_SHADER
             .contains("atomicOr(&STATUS.bits, GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE)"));
         assert!(!GPU_NATIVE_ATTENTION_SHADER.contains("atomicStore(&STATUS"));
+    }
+
+    #[test]
+    fn router_numerical_failure_status_bit_is_distinct_stable_and_latched() {
+        assert_eq!(GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE, 1);
+        assert_eq!(GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE, 2);
+        assert!(GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE.is_power_of_two());
+        assert!(GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE.is_power_of_two());
+        assert_eq!(
+            GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE
+                & GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
+            0
+        );
+        assert!(GPU_NATIVE_ROUTER_SHADER
+            .contains("atomicOr(&STATUS.bits, GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE)"));
+        assert!(!GPU_NATIVE_ROUTER_SHADER.contains("atomicStore(&STATUS"));
+        assert!(GPU_NATIVE_ROUTER_SHADER.contains("SELECTED_IDS[slot] = 0u"));
+        assert!(GPU_NATIVE_ROUTER_SHADER.contains("SELECTED_WEIGHTS[slot] = 0.0"));
     }
 
     #[test]
@@ -6157,6 +7209,7 @@ mod tests {
             (GPU_NATIVE_ROPE_SHADER, &["rope_main"][..]),
             (GPU_NATIVE_KV_APPEND_SHADER, &["kv_append_main"][..]),
             (GPU_NATIVE_ATTENTION_SHADER, &["causal_attention_main"][..]),
+            (GPU_NATIVE_ROUTER_SHADER, &["router_topk_main"][..]),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("GPU-native WGSL must parse");
@@ -6181,6 +7234,9 @@ mod tests {
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("fn is_finite"));
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("numerically_valid"));
         assert!(GPU_NATIVE_ATTENTION_SHADER.contains("running_denominator"));
+        assert!(GPU_NATIVE_ROUTER_SHADER.contains("@workgroup_size(64, 1, 1)"));
+        assert!(GPU_NATIVE_ROUTER_SHADER.contains("MAX_EXPERTS: u32 = 128u"));
+        assert!(GPU_NATIVE_ROUTER_SHADER.contains("MAX_TOP_K: u32 = 8u"));
     }
 
     const GPU_NATIVE_TEST_COMPARE_SHADER: &str = r#"
@@ -7802,6 +8858,227 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(completed.cpu_attention_calls, 0);
         assert_eq!(completed.cpu_kv_mutations, 0);
         assert_eq!(completed.cpu_layer_reentries, 0);
+        assert_eq!(completed.numerical_failures, 0);
+    }
+
+    /// Requires an actual NVIDIA L4 WGPU adapter. Three isolated requests
+    /// (finite, exact-tie, and non-finite) share one caller-owned encoder, one
+    /// explicit queue submission, and one final test-only staging map.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_router_topk() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::gating::LinearGate;
+        use crate::inference::WeightDtype;
+
+        const D_MODEL: usize = 16;
+        const NUM_EXPERTS: usize = 128;
+        const TOP_K: usize = 8;
+        const IDS_BYTES: u64 = (TOP_K * std::mem::size_of::<u32>()) as u64;
+        const WEIGHTS_BYTES: u64 = (TOP_K * std::mem::size_of::<f32>()) as u64;
+        const CASE_BYTES: u64 = IDS_BYTES + WEIGHTS_BYTES + GPU_NATIVE_STATUS_BYTES;
+        const CASES: usize = 3;
+
+        let expert_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            1024 * 1024,
+            0.5,
+            16,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: 1,
+                max_seq_len: 8,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: D_MODEL,
+                v_head_dim: D_MODEL,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::F32,
+                d_model: D_MODEL,
+                d_ff: 32,
+            },
+            expert_cache,
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = execution
+            .create_gpu_native_executor_context(D_MODEL)
+            .expect("GPU-native executor must retain the authoritative backend");
+        assert_eq!(executor.device_identity().vendor_id, 0x10de);
+        assert!(
+            executor.device_identity().name.contains("L4"),
+            "ignored router test must run only on an NVIDIA L4, got {}",
+            executor.device_identity().name
+        );
+        let gpu = executor.authoritative_gpu().unwrap();
+        let geometry = GpuNativeRouterGeometry::try_new(D_MODEL, NUM_EXPERTS, TOP_K).unwrap();
+
+        let mut gate_values = vec![0.0; NUM_EXPERTS * D_MODEL];
+        for expert in 0..NUM_EXPERTS {
+            for column in 0..D_MODEL {
+                gate_values[expert * D_MODEL + column] = if column == 0 {
+                    expert as f32 / 4.0
+                } else {
+                    ((expert * 17 + column * 13) % 19) as f32 / 100_000.0
+                };
+            }
+        }
+        let gate_weight = DenseWeight::from_f32(gate_values.clone(), NUM_EXPERTS, D_MODEL);
+        let gate_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.router.gate").unwrap(),
+                &gate_weight,
+            )
+            .unwrap();
+        let plan = executor
+            .create_router_plan(0, geometry, gate_handle)
+            .unwrap();
+
+        let finite_hidden = [
+            1.0, -0.5, 0.25, 0.75, -1.0, 0.5, 0.125, -0.25, 0.375, -0.625, 0.875, -0.75, 0.625,
+            -0.375, 0.2, -0.1,
+        ];
+        let tie_hidden = [0.0; D_MODEL];
+        let invalid_hidden = [f32::NAN; D_MODEL];
+        let states = [
+            executor.create_token_state().unwrap(),
+            executor.create_token_state().unwrap(),
+            executor.create_token_state().unwrap(),
+        ];
+        let scratches = [
+            executor.create_router_scratch(geometry).unwrap(),
+            executor.create_router_scratch(geometry).unwrap(),
+            executor.create_router_scratch(geometry).unwrap(),
+        ];
+        for (state, hidden) in
+            states
+                .iter()
+                .zip([&finite_hidden[..], &tie_hidden[..], &invalid_hidden[..]])
+        {
+            gpu.queue
+                .write_buffer(&state.hidden, 0, bytemuck::cast_slice(hidden));
+            gpu.queue.write_buffer(&state.status, 0, &[0; 4]);
+        }
+
+        let cpu_reference =
+            LinearGate::new(gate_values, NUM_EXPERTS, D_MODEL, TOP_K).route(&finite_hidden);
+        assert_eq!(cpu_reference.experts.len(), TOP_K);
+        assert!((cpu_reference.weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_router_validation_staging"),
+            size: CASE_BYTES * CASES as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let registered = executor.execution_snapshot();
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_router_live_l4_encoder"),
+            });
+        for (index, (state, scratch)) in states.iter().zip(&scratches).enumerate() {
+            executor
+                .encode_router(&mut encoder, &plan, state, scratch)
+                .unwrap();
+            let case_offset = index as u64 * CASE_BYTES;
+            encoder.copy_buffer_to_buffer(
+                &scratch.selected_ids,
+                0,
+                &staging,
+                case_offset,
+                IDS_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &scratch.selected_weights,
+                0,
+                &staging,
+                case_offset + IDS_BYTES,
+                WEIGHTS_BYTES,
+            );
+            encoder.copy_buffer_to_buffer(
+                &state.status,
+                0,
+                &staging,
+                case_offset + IDS_BYTES + WEIGHTS_BYTES,
+                GPU_NATIVE_STATUS_BYTES,
+            );
+        }
+
+        let encoded = executor.execution_snapshot();
+        assert_eq!(
+            encoded.dense_weight_uploads,
+            registered.dense_weight_uploads
+        );
+        assert_eq!(encoded.dense_gemv_dispatches, 3);
+        assert_eq!(encoded.router_logit_dispatches, 3);
+        assert_eq!(encoded.router_topk_dispatches, 3);
+        assert_eq!(encoded.queue_submissions, 0);
+        assert_eq!(encoded.intermediate_maps, 0);
+        assert_eq!(encoded.intermediate_readbacks, 0);
+        assert_eq!(encoded.cpu_router_calls, 0);
+        assert_eq!(encoded.numerical_failures, 0);
+
+        gpu.queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("validation map callback must be drained")
+            .expect("router validation staging must map");
+        let mapped = slice.get_mapped_range();
+        let parse_case = |index: usize| {
+            let start = index * CASE_BYTES as usize;
+            let ids = mapped[start..start + IDS_BYTES as usize]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let weights_start = start + IDS_BYTES as usize;
+            let weights = mapped[weights_start..weights_start + WEIGHTS_BYTES as usize]
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let status_start = weights_start + WEIGHTS_BYTES as usize;
+            let status = u32::from_le_bytes(
+                mapped[status_start..status_start + GPU_NATIVE_STATUS_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            (ids, weights, status)
+        };
+        let finite = parse_case(0);
+        let tied = parse_case(1);
+        let invalid = parse_case(2);
+        drop(mapped);
+        staging.unmap();
+
+        assert_eq!(finite.0, cpu_reference.experts);
+        assert_close(&finite.1, &cpu_reference.weights, 2e-5);
+        assert!((finite.1.iter().sum::<f32>() - 1.0).abs() < 2e-5);
+        assert_eq!(finite.2, 0, "finite request status must remain clear");
+        assert_eq!(tied.0, (0..TOP_K as u32).collect::<Vec<_>>());
+        assert_close(&tied.1, &[0.125; TOP_K], 1e-6);
+        assert_eq!(tied.2, 0, "tie request status must remain clear");
+        assert_eq!(invalid.0, vec![0; TOP_K]);
+        assert_eq!(invalid.1, vec![0.0; TOP_K]);
+        assert_ne!(
+            invalid.2 & GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
+            0,
+            "non-finite router row must latch request-local status"
+        );
+
+        let completed = executor.execution_snapshot();
+        assert_eq!(completed.intermediate_maps, 0);
+        assert_eq!(completed.intermediate_readbacks, 0);
+        assert_eq!(completed.cpu_router_calls, 0);
         assert_eq!(completed.numerical_failures, 0);
     }
 
