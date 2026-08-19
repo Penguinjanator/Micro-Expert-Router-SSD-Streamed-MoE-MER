@@ -4517,6 +4517,7 @@ struct GpuNativeQ4ExpertPipelines {
     route_bind_group_layout: wgpu::BindGroupLayout,
     expert_bind_group_layout: wgpu::BindGroupLayout,
     combine_bind_group_layout: wgpu::BindGroupLayout,
+    control_empty_bind_group: wgpu::BindGroup,
     route_resolve: wgpu::ComputePipeline,
     gate_up: wgpu::ComputePipeline,
     down: wgpu::ComputePipeline,
@@ -4584,6 +4585,11 @@ impl GpuNativeQ4ExpertPipelines {
                 label: Some("gpu_native_expert_control_empty_group_0_layout"),
                 entries: &[],
             });
+        let control_empty_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_expert_control_empty_group_0"),
+            layout: &empty_bind_group_layout,
+            entries: &[],
+        });
         let push_range = [wgpu::PushConstantRange {
             stages: wgpu::ShaderStages::COMPUTE,
             range: 0..GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
@@ -4627,6 +4633,7 @@ impl GpuNativeQ4ExpertPipelines {
             route_bind_group_layout,
             expert_bind_group_layout,
             combine_bind_group_layout,
+            control_empty_bind_group,
             route_resolve: pipeline(
                 "gpu_native_expert_route_resolve_pipeline",
                 &route_pipeline_layout,
@@ -5725,6 +5732,9 @@ impl GpuNativeExecutorContext {
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
+            // Control resources intentionally occupy @group(1), but WGPU still
+            // requires the pipeline's explicit empty group-0 layout to be bound.
+            pass.set_bind_group(0, &self.q4_expert_pipelines.control_empty_bind_group, &[]);
             pass.set_bind_group(1, &combine_bind_group, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&combine_pc));
             pass.dispatch_workgroups(workgroups, 1, 1);
