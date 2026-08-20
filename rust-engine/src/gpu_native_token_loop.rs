@@ -2173,6 +2173,49 @@ pub(crate) mod tests {
         assert!(cfg.validate().is_ok());
     }
 
+    #[test]
+    fn multi_layer_ram_cache_seeding_and_lookup() {
+        use crate::buffer_pool::BufferPool;
+        use crate::expert_cache::ExpertResident;
+        use crate::multi_layer_cache::MultiLayerExpertCache;
+
+        const NUM_LAYERS: usize = 2;
+        const NUM_EXPERTS: u32 = 4;
+        const EXPERT_SIZE: usize = 64;
+
+        let ram_cache = Arc::new(MultiLayerExpertCache::with_uniform_capacity(
+            NUM_LAYERS,
+            16,
+            NUM_EXPERTS,
+        ));
+        let pool = BufferPool::new(16, EXPERT_SIZE, 4);
+
+        for layer_idx in 0..NUM_LAYERS {
+            for local_id in 0..NUM_EXPERTS {
+                let global_id = layer_idx as u32 * NUM_EXPERTS + local_id;
+                let mut buffer = pool.try_acquire().expect("buffer slot");
+                buffer.as_mut_slice().fill((global_id + 1) as u8);
+                let resident = Arc::new(ExpertResident::new_with_block_align(global_id, buffer, 4));
+                assert!(
+                    ram_cache.insert(resident).is_ok(),
+                    "RAM cache insert must succeed for global_id {global_id}"
+                );
+            }
+        }
+
+        for layer_idx in 0..NUM_LAYERS {
+            for local_id in 0..NUM_EXPERTS {
+                let global_id = layer_idx as u32 * NUM_EXPERTS + local_id;
+                assert!(ram_cache.contains(global_id));
+                let resident = ram_cache
+                    .get(global_id)
+                    .expect("must retrieve seeded resident");
+                assert_eq!(resident.id, global_id);
+                assert_eq!(resident.data()[0], (global_id + 1) as u8);
+            }
+        }
+    }
+
     struct TempDir {
         path: std::path::PathBuf,
     }
@@ -2280,14 +2323,16 @@ pub(crate) mod tests {
             42,
         ));
 
-        let mut engine_builder = Engine::with_options_and_execution_context(
-            Arc::new(
-                crate::multi_layer_cache::MultiLayerExpertCache::with_uniform_capacity(
-                    NUM_LAYERS,
-                    16,
-                    NUM_EXPERTS as u32,
-                ),
+        let ram_cache = Arc::new(
+            crate::multi_layer_cache::MultiLayerExpertCache::with_uniform_capacity(
+                NUM_LAYERS,
+                16,
+                NUM_EXPERTS as u32,
             ),
+        );
+
+        let mut engine_builder = Engine::with_options_and_execution_context(
+            ram_cache.clone(),
             BufferPool::new(16, payload_bytes, 4),
             storage,
             router,
@@ -2363,6 +2408,10 @@ pub(crate) mod tests {
                 let mut buffer = pool.try_acquire().expect("synthetic RAM slot");
                 buffer.as_mut_slice().copy_from_slice(&payload);
                 let resident = Arc::new(ExpertResident::new_with_block_align(global_id, buffer, 4));
+                assert!(
+                    ram_cache.insert(resident).is_ok(),
+                    "synthetic RAM expert must be admitted"
+                );
                 gpu_cache
                     .demand_admit_lru(Arc::new(GpuResident::new_with_dtype(
                         global_id,
@@ -2371,7 +2420,27 @@ pub(crate) mod tests {
                     )))
                     .unwrap();
                 let admission = gpu_cache.current_admission(global_id).unwrap();
-                let _ = (resident, admission);
+                let _ = admission;
+            }
+        }
+
+        // Precondition assertions: RAM warm, logical GPU admissions present, physical VRAM cold.
+        for layer_idx in 0..NUM_LAYERS {
+            for local_id in 0..NUM_EXPERTS as u32 {
+                let global_id = layer_idx as u32 * NUM_EXPERTS as u32 + local_id;
+                assert!(
+                    ram_cache.contains(global_id),
+                    "RAM cache must contain global_id {global_id}"
+                );
+                assert!(
+                    gpu_cache.current_admission(global_id).is_some(),
+                    "gpu_cache must contain logical admission for global_id {global_id}"
+                );
+                assert_eq!(
+                    residency_manager.has_current_for_demand(global_id).unwrap(),
+                    false,
+                    "physical residency manager must initially be cold for global_id {global_id}"
+                );
             }
         }
 
@@ -2409,5 +2478,11 @@ pub(crate) mod tests {
         assert_eq!(snap2.boundary_readbacks, 4);
         assert_eq!(snap2.residency_services, 2);
         assert_eq!(snap2.fatal_failures, 0);
+
+        assert_eq!(
+            engine.report().bytes_read,
+            0,
+            "pure RAM->VRAM qualification must not fall back to storage reads"
+        );
     }
 }
