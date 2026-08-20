@@ -13131,8 +13131,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const NUM_EXPERTS: usize = 128;
         const TOP_K: usize = 2;
         const NUM_LAYERS: usize = 2;
-        const STATUS_AND_HIDDEN_BYTES: u64 =
-            GPU_NATIVE_STATUS_BYTES + (D_MODEL * std::mem::size_of::<f32>()) as u64;
+        const READBACK_BYTES: u64 = GPU_NATIVE_STATUS_BYTES + GPU_NATIVE_STATUS_BYTES;
 
         let geometry =
             GpuNativeQ4ExpertGeometry::try_new(D_MODEL, D_FF, NUM_EXPERTS, TOP_K).unwrap();
@@ -13268,19 +13267,35 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let router_plan = executor
             .create_router_plan(0, router_geometry, gate_handle)
             .unwrap();
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
         let state = executor.create_token_state().unwrap();
         let router_scratch = executor.create_router_scratch(router_geometry).unwrap();
         let expert_scratch = executor.create_q4_expert_scratch(geometry).unwrap();
         let hidden = vec![1.0; D_MODEL];
         let residual = vec![0.25; D_MODEL];
-        let run = |label: &str, clear_retryable: bool| {
+        let run = |label: &str, clear_retryable: bool, expected_hidden: &[f32], tolerance: f32| {
             gpu.queue
                 .write_buffer(&state.hidden, 0, bytemuck::cast_slice(&hidden));
             gpu.queue
                 .write_buffer(&state.residual, 0, bytemuck::cast_slice(&residual));
+            let expected_buffer = create_test_expected_buffer(
+                &gpu.device,
+                &gpu.queue,
+                &format!("{label}_expected_hidden"),
+                expected_hidden,
+            );
+            let comparison_status = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("{label}_comparison_status")),
+                size: GPU_NATIVE_STATUS_BYTES,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.queue.write_buffer(&comparison_status, 0, &[0; 4]);
             let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: STATUS_AND_HIDDEN_BYTES,
+                size: READBACK_BYTES,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -13305,13 +13320,24 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     &expert_scratch,
                 )
                 .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &state.hidden,
+                &expected_buffer,
+                &comparison_status,
+                D_MODEL,
+                tolerance,
+            );
             encoder.copy_buffer_to_buffer(&state.status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
             encoder.copy_buffer_to_buffer(
-                &state.hidden,
+                &comparison_status,
                 0,
                 &staging,
                 GPU_NATIVE_STATUS_BYTES,
-                (D_MODEL * std::mem::size_of::<f32>()) as u64,
+                GPU_NATIVE_STATUS_BYTES,
             );
             gpu.queue.submit(Some(encoder.finish()));
             let slice = staging.slice(..);
@@ -13324,24 +13350,31 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .expect("tiered residency map callback must be drained")
                 .expect("tiered residency staging must map");
             let mapped = slice.get_mapped_range();
-            let status = u32::from_le_bytes(mapped[..4].try_into().unwrap());
-            let output = mapped[4..]
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect::<Vec<_>>();
+            let request_status = u32::from_le_bytes(
+                mapped[..GPU_NATIVE_STATUS_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            let comparison_status = u32::from_le_bytes(
+                mapped[GPU_NATIVE_STATUS_BYTES as usize
+                    ..GPU_NATIVE_STATUS_BYTES as usize + GPU_NATIVE_STATUS_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
             drop(mapped);
             staging.unmap();
-            (status, output)
+            (request_status, comparison_status)
         };
 
         gpu.queue.write_buffer(&state.status, 0, &[0; 4]);
-        let miss = run("gpu_native_tiered_residency_miss", false);
+        let (miss_request_status, miss_comparison_status) =
+            run("gpu_native_tiered_residency_miss", false, &residual, 0.0);
+        assert_eq!(miss_comparison_status, 0);
         assert_eq!(
-            miss.0 & GPU_NATIVE_STATUS_RETRYABLE_MASK,
+            miss_request_status & GPU_NATIVE_STATUS_RETRYABLE_MASK,
             GPU_NATIVE_STATUS_RETRYABLE_MASK
         );
-        assert_eq!(miss.0 & GPU_NATIVE_STATUS_FATAL_MASK, 0);
-        assert_close(&miss.1, &residual, 0.0);
+        assert_eq!(miss_request_status & GPU_NATIVE_STATUS_FATAL_MASK, 0);
 
         let payload_a = q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
         let payload_b = q4_uniform_expert(geometry, -0.012, 0.018, 0.004);
@@ -13369,8 +13402,6 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(manager.has_current_for_demand(128).unwrap());
         assert!(manager.has_current_for_demand(129).unwrap());
 
-        let replay = run("gpu_native_tiered_residency_replay", true);
-        assert_eq!(replay.0, 0);
         let logits = gate.matvec(&hidden);
         let (selected_ids, selected_weights, failed) = router_topk_mirror(&logits, TOP_K);
         assert!(!failed);
@@ -13383,8 +13414,16 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             &residual,
             &weighted_expert_combine_mirror(&expert_outputs, &selected_weights),
         );
-        assert!(replay.1.iter().all(|value| value.is_finite()));
-        assert_close(&replay.1, &expected, 5e-4);
+        assert!(expected.iter().all(|value| value.is_finite()));
+        assert!(expected
+            .iter()
+            .zip(&residual)
+            .any(|(expected, residual)| expected != residual));
+
+        let (replay_request_status, replay_comparison_status) =
+            run("gpu_native_tiered_residency_replay", true, &expected, 5e-4);
+        assert_eq!(replay_request_status, 0);
+        assert_eq!(replay_comparison_status, 0);
 
         // Evict and re-admit logical id 2 to obtain a strictly newer real
         // generation, then prove the saved stale requester cannot disturb it.
