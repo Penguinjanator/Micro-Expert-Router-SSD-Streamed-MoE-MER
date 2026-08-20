@@ -82,6 +82,10 @@ pub enum GpuNativeTokenLoopError {
         requested_position: usize,
         max_seq_len: usize,
     },
+    PositionMismatch {
+        requested_position: usize,
+        committed_position: usize,
+    },
     AttemptBoundExceeded {
         attempts: usize,
         max_attempts: usize,
@@ -127,6 +131,13 @@ impl fmt::Display for GpuNativeTokenLoopError {
             } => write!(
                 f,
                 "requested position {requested_position} exceeds gpu_native_max_seq_len {max_seq_len}"
+            ),
+            Self::PositionMismatch {
+                requested_position,
+                committed_position,
+            } => write!(
+                f,
+                "position mismatch: requested position {requested_position} does not match committed position {committed_position}"
             ),
             Self::AttemptBoundExceeded {
                 attempts,
@@ -1178,9 +1189,9 @@ impl GpuNativeTokenLoop {
         replay: bool,
     ) -> Result<GpuNativeBoundaryReport, GpuNativeTokenLoopError> {
         if position != request.committed_position {
-            return Err(GpuNativeTokenLoopError::ContextLimitExceeded {
+            return Err(GpuNativeTokenLoopError::PositionMismatch {
                 requested_position: position,
-                max_seq_len: request.committed_position,
+                committed_position: request.committed_position,
             });
         }
         if position >= request.max_seq_len {
@@ -1925,7 +1936,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn token_loop_counters_track_actual_operations_only() {
+    fn position_mismatch_error_behavior() {
+        let err = GpuNativeTokenLoopError::PositionMismatch {
+            requested_position: 3,
+            committed_position: 2,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("position mismatch"));
+        assert!(msg.contains("requested position 3"));
+        assert!(msg.contains("committed position 2"));
+    }
+
+    #[test]
+    fn token_loop_counters_snapshot_and_accounting_semantics() {
+        // Unit-tests the internal snapshotting, atomic counter representations,
+        // and stage-by-stage accounting invariants of GpuNativeTokenLoopCounters.
+        // (End-to-end WGPU hardware execution is validated under the ignored L4 test fixture).
         let counters = GpuNativeTokenLoopCounters::default();
         let snap0 = counters.snapshot();
         assert_eq!(snap0.token_attempts, 0);
@@ -1934,12 +1960,11 @@ pub(crate) mod tests {
         assert_eq!(snap0.boundary_readbacks, 0);
         assert_eq!(snap0.replay_attempts, 0);
 
-        // Simulate an attempt starting: token_attempts is incremented
+        // In GpuNativeTokenLoop::execute_token_attempt, token_attempts is incremented
+        // when a valid attempt starts (after position validation).
         counters.token_attempts.fetch_add(1, Ordering::Relaxed);
         let snap1 = counters.snapshot();
         assert_eq!(snap1.token_attempts, 1);
-        // An encode-time failure before submission leaves queue_submissions, boundary_maps,
-        // and boundary_readbacks at 0
         assert_eq!(snap1.queue_submissions, 0);
         assert_eq!(snap1.boundary_maps, 0);
         assert_eq!(snap1.boundary_readbacks, 0);

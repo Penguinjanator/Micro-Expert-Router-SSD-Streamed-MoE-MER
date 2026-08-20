@@ -554,7 +554,8 @@ pub(crate) fn map_gpu_native_token_loop_error(
         | GpuNativeTokenLoopError::UnsupportedSampling { .. } => {
             GenerateError::InvalidRequest(err.to_string())
         }
-        GpuNativeTokenLoopError::IncompatibleModel(_)
+        GpuNativeTokenLoopError::PositionMismatch { .. }
+        | GpuNativeTokenLoopError::IncompatibleModel(_)
         | GpuNativeTokenLoopError::AttemptBoundExceeded { .. }
         | GpuNativeTokenLoopError::NoProgress { .. }
         | GpuNativeTokenLoopError::FatalNumericalFailure { .. }
@@ -3830,6 +3831,15 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
 
         // 2. Runtime / GPU execution errors map to GenerateError::Inference -> HTTP 500 (server_error)
+        let position_mismatch_err = GpuNativeTokenLoopError::PositionMismatch {
+            requested_position: 3,
+            committed_position: 2,
+        };
+        let gen_err_pos = map_gpu_native_token_loop_error(position_mismatch_err);
+        assert!(matches!(gen_err_pos, GenerateError::Inference(_)));
+        let resp_pos = error_response(gen_err_pos);
+        assert_eq!(resp_pos.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
         let fatal_err = GpuNativeTokenLoopError::FatalNumericalFailure {
             layer_index: Some(0),
             status_bits: 0x1,
