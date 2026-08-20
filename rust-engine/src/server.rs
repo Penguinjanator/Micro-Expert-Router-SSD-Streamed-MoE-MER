@@ -83,6 +83,9 @@ pub struct AppState {
     /// when `cfg.predictive.speculator_enabled = true`.
     pub draft_engine: Option<Arc<crate::draft::DraftEngine>>,
 
+    /// Optional persistent GPU-native token loop for GPU-owned execution.
+    pub gpu_native_token_loop: Option<Arc<crate::gpu_native_token_loop::GpuNativeTokenLoop>>,
+
     /// Number of draft tokens to attempt per speculative step.
     /// Populated from `cfg.real_transformer.speculation_base_depth`.
     /// `0` or `1` disables speculation (falls back to sequential).
@@ -309,6 +312,14 @@ async fn completions(
     let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
     let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
+        if state.gpu_native_token_loop.is_some() {
+            state
+                .metrics
+                .record_request("/v1/completions", started.elapsed().as_secs_f64());
+            return error_response(GenerateError::InvalidRequest(
+                "streaming is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
         // Server-Sent Events streaming path: emit one OpenAI-style chunk
         // per generated token, terminated with `data: [DONE]`. The whole
         // SSD-streaming substrate is exercised inside the generator
@@ -422,6 +433,14 @@ async fn chat_completions(
     let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
     let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
+        if state.gpu_native_token_loop.is_some() {
+            state
+                .metrics
+                .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+            return error_response(GenerateError::InvalidRequest(
+                "streaming is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
         match build_chat_stream(
             &state,
             &prompt,
@@ -730,7 +749,35 @@ async fn generate(
     let mut misses_total = 0u64;
     let mut completion_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    if let Some(model) = state.real_model.as_ref() {
+    if let Some(ref gpu_native_loop) = state.gpu_native_token_loop {
+        if session_id.is_some() {
+            return Err(GenerateError::InvalidRequest(
+                "session persistence is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
+        if !params.is_greedy() {
+            return Err(GenerateError::InvalidRequest(
+                "only greedy sampling (temperature=0.0) is supported in gpu_native mode in this slice".into(),
+            ));
+        }
+        let mut req_state = gpu_native_loop
+            .create_request_state()
+            .map_err(|e| GenerateError::Inference(e.to_string()))?;
+        let pre_hits = state.engine.report().hits;
+        let pre_misses = state.engine.report().misses;
+        completion_ids = gpu_native_loop
+            .ingest_prompt_and_generate(
+                &state.engine,
+                &mut req_state,
+                &prompt_ids,
+                max_tokens,
+                &params,
+            )
+            .await
+            .map_err(|e| GenerateError::Inference(e.to_string()))?;
+        hits_total = state.engine.report().hits.saturating_sub(pre_hits);
+        misses_total = state.engine.report().misses.saturating_sub(pre_misses);
+    } else if let Some(model) = state.real_model.as_ref() {
         // Resolve session: take any existing KV state, then put it
         // back at the end. When no session is configured the request
         // is fully stateless (legacy behaviour).
@@ -2315,6 +2362,7 @@ mod tests {
             real_model: None,
             batch_scheduler: None,
             draft_engine: None,
+            gpu_native_token_loop: None,
             speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();
@@ -2749,6 +2797,7 @@ mod tests {
             real_model: Some(model),
             batch_scheduler: Some(scheduler),
             draft_engine: None,
+            gpu_native_token_loop: None,
             speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();

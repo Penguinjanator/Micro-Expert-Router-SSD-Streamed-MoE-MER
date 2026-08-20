@@ -1716,8 +1716,8 @@ fn create_startup_buffer(
 }
 
 pub struct GpuBackend {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     /// `wgpu` 0.20 has no synchronous device-loss return from submit, so
     /// dispatch checks this per-device callback state at entry and after poll.
     device_loss: Arc<DeviceLossState>,
@@ -4848,6 +4848,7 @@ impl ResolvedExecutionPlan {
         gpu_expert_cache_available: bool,
         routed_expert_gpu_spec: RoutedExpertGpuSpec,
         routed_expert_gpu_compatible: bool,
+        legacy_routed_experts_enabled: bool,
     ) -> Self {
         let cpu = ExecutionPlane::Cpu;
         let (attention, kv, routed_experts) = match resolution.resolved {
@@ -4855,7 +4856,10 @@ impl ResolvedExecutionPlan {
             ResolvedBackend::Gpu => (
                 ExecutionPlane::Gpu,
                 ExecutionPlane::Gpu,
-                if gpu_expert_cache_available && routed_expert_gpu_compatible {
+                if gpu_expert_cache_available
+                    && routed_expert_gpu_compatible
+                    && legacy_routed_experts_enabled
+                {
                     ExecutionPlane::Gpu
                 } else {
                     cpu
@@ -4864,7 +4868,10 @@ impl ResolvedExecutionPlan {
             ResolvedBackend::HybridCpuAttentionGpuExperts => (
                 cpu,
                 cpu,
-                if gpu_expert_cache_available && routed_expert_gpu_compatible {
+                if gpu_expert_cache_available
+                    && routed_expert_gpu_compatible
+                    && legacy_routed_experts_enabled
+                {
                     ExecutionPlane::Gpu
                 } else {
                     cpu
@@ -5511,10 +5518,53 @@ pub fn resolve_execution_context(
     routed_expert_gpu_spec: RoutedExpertGpuSpec,
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
 ) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError> {
+    resolve_execution_context_custom(
+        requested,
+        strict_attention,
+        true,
+        geometry,
+        routed_expert_gpu_spec,
+        gpu_expert_cache,
+    )
+}
+
+/// Specialized resolution boundary for the GPU-native runtime.
+/// It constructs the authoritative full GPU backend for device ownership
+/// while disabling the legacy physical routed-expert registry so the
+/// model-wide expert VRAM budget remains exclusively owned by Slice 9's
+/// tiered residency manager.
+pub fn resolve_execution_context_for_gpu_native(
+    geometry: GpuBackendGeometry,
+    gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError> {
+    let d_model = geometry.head_dim * geometry.num_heads;
+    resolve_execution_context_custom(
+        ComputeOffload::Gpu,
+        false,
+        false,
+        geometry,
+        RoutedExpertGpuSpec {
+            dtype: crate::inference::WeightDtype::Q4_0,
+            d_model,
+            d_ff: d_model,
+        },
+        gpu_expert_cache,
+    )
+}
+
+pub fn resolve_execution_context_custom(
+    requested: ComputeOffload,
+    strict_attention: bool,
+    legacy_routed_experts_enabled: bool,
+    geometry: GpuBackendGeometry,
+    routed_expert_gpu_spec: RoutedExpertGpuSpec,
+    gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
+) -> std::result::Result<Arc<ExecutionContext>, BackendResolutionError> {
     let context_gpu_expert_cache = gpu_expert_cache.clone();
     resolve_execution_context_with_resource_plan(
         requested,
         strict_attention,
+        legacy_routed_experts_enabled,
         geometry,
         routed_expert_gpu_spec,
         context_gpu_expert_cache,
@@ -5581,6 +5631,7 @@ pub(crate) fn test_gpu_execution_context_unchecked(
         true,
         routed_expert_gpu_spec,
         true,
+        true,
     );
     Arc::new(ExecutionContext::new(
         plan,
@@ -5606,6 +5657,7 @@ where
     resolve_execution_context_with_resource_plan(
         requested,
         strict_attention,
+        true,
         geometry,
         routed_expert_gpu_spec,
         gpu_expert_cache,
@@ -5621,6 +5673,7 @@ where
 fn resolve_execution_context_with_resource_plan<F>(
     requested: ComputeOffload,
     strict_attention: bool,
+    legacy_routed_experts_enabled: bool,
     geometry: GpuBackendGeometry,
     routed_expert_gpu_spec: RoutedExpertGpuSpec,
     gpu_expert_cache: Arc<crate::expert_cache::GpuExpertCache>,
@@ -5659,6 +5712,7 @@ where
             gpu_expert_cache_available,
             routed_expert_gpu_spec,
             expert_compatibility.is_ok(),
+            legacy_routed_experts_enabled,
         );
         Some(GpuResourcePlan::from_execution_plan(
             &successful_plan,
@@ -5710,6 +5764,7 @@ where
         gpu_expert_cache_available,
         routed_expert_gpu_spec,
         routed_expert_gpu_compatible,
+        legacy_routed_experts_enabled,
     );
     Ok(Arc::new(ExecutionContext::new(
         plan,
@@ -5738,6 +5793,7 @@ pub fn cpu_execution_context() -> Arc<ExecutionContext> {
             d_ff: 0,
         },
         true,
+        false,
     );
     Arc::new(ExecutionContext::new(
         plan,
@@ -6449,6 +6505,7 @@ mod tests {
             true,
             test_routed_expert_gpu_spec(dtype),
             true,
+            true,
         )
     }
 
@@ -6675,6 +6732,7 @@ mod tests {
         let mut observed = None;
         let context = resolve_execution_context_with_resource_plan(
             ComputeOffload::Hybrid,
+            true,
             true,
             qwen3_coder_geometry(),
             test_routed_expert_gpu_spec(crate::inference::WeightDtype::Q4_0),
@@ -7103,6 +7161,7 @@ mod tests {
             true,
             test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
             true,
+            true,
         );
         let _ = ExecutionContext::new(plan, None, test_gpu_expert_cache(1024));
     }
@@ -7120,6 +7179,7 @@ mod tests {
             next_execution_context_id(),
             true,
             test_routed_expert_gpu_spec(crate::inference::WeightDtype::F32),
+            true,
             true,
         );
         let _ = ExecutionContext::new(plan, Some(test_gpu_backend()), test_gpu_expert_cache(0));
@@ -7204,6 +7264,7 @@ mod tests {
         geometry.v_head_dim = 0;
         let context = resolve_execution_context_with_resource_plan(
             ComputeOffload::Hybrid,
+            true,
             true,
             geometry,
             test_routed_expert_gpu_spec(crate::inference::WeightDtype::Q4_0),

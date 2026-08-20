@@ -451,6 +451,16 @@ pub struct RealTransformerConfig {
     #[serde(default)]
     pub window_size: usize,
 
+    /// Explicit opt-in to the GPU-native, GPU-owned token loop.
+    /// Default: `false`. When false, all existing behavior is unchanged.
+    #[serde(default)]
+    pub gpu_native: bool,
+
+    /// Maximum sequence length for the GPU-native request KV allocation.
+    /// Default: 4096. Must be > 0 when `gpu_native = true`.
+    #[serde(default = "default_gpu_native_max_seq_len")]
+    pub gpu_native_max_seq_len: usize,
+
     /// **Pool back-pressure: "high" threshold** (gist Part 1, fix #4).
     /// Fraction of [`block_pool::BlockPool`] primary capacity at or
     /// above which the scheduler classifies the pool as
@@ -658,6 +668,9 @@ fn default_idle_eviction_threshold_ms() -> u64 {
 }
 fn default_speculation_base_depth() -> usize {
     1
+}
+fn default_gpu_native_max_seq_len() -> usize {
+    4096
 }
 
 /// Configuration for the predictive architecture (`[predictive]` block).
@@ -1228,6 +1241,93 @@ impl Config {
             if rt.max_fetch_yields == 0 {
                 return Err(ConfigError::Invalid(
                     "real_transformer.max_fetch_yields must be > 0".into(),
+                ));
+            }
+        }
+        if self.real_transformer.gpu_native {
+            if !self.real_transformer.enabled {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires real_transformer.enabled = true".into(),
+                ));
+            }
+            if self.real_transformer.compute_offload != crate::backend::ComputeOffload::Gpu {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires real_transformer.compute_offload = \"gpu\"".into(),
+                ));
+            }
+            if !self.gpu_cache.enabled {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires gpu_cache.enabled = true".into(),
+                ));
+            }
+            if self.gpu_cache.vram_capacity_mb == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires gpu_cache.vram_capacity_mb > 0".into(),
+                ));
+            }
+            if self.model.dtype != crate::inference::WeightDtype::Q4_0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires model.dtype = \"q4_0\"".into(),
+                ));
+            }
+            if !self.real_transformer.strict_weights {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires real_transformer.strict_weights = true".into(),
+                ));
+            }
+            if self.real_transformer.allow_seeded_fallback {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects real_transformer.allow_seeded_fallback = true".into(),
+                ));
+            }
+            if self.real_transformer.allow_degraded_experts {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects real_transformer.allow_degraded_experts = true".into(),
+                ));
+            }
+            if self.real_transformer.allow_nonfinite_attention_fallback {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects real_transformer.allow_nonfinite_attention_fallback = true".into(),
+                ));
+            }
+            if self.real_transformer.allow_truncated_expert_payloads {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects real_transformer.allow_truncated_expert_payloads = true".into(),
+                ));
+            }
+            if self.distributed.enabled {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects distributed.enabled = true".into(),
+                ));
+            }
+            if self.server.session_ttl_secs != 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires server.session_ttl_secs = 0".into(),
+                ));
+            }
+            if self.server.max_concurrent_requests != 1 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires server.max_concurrent_requests = 1".into(),
+                ));
+            }
+            if self.real_transformer.max_batch_size != 1 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native requires real_transformer.max_batch_size = 1".into(),
+                ));
+            }
+            if self.real_transformer.gpu_native_max_seq_len == 0 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native_max_seq_len must be > 0".into(),
+                ));
+            }
+            if self.predictive.speculator_enabled {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects predictive.speculator_enabled = true (neural speculation requires CPU hidden state readback)".into(),
+                ));
+            }
+            if self.real_transformer.speculation_base_depth > 1 {
+                return Err(ConfigError::Invalid(
+                    "real_transformer.gpu_native rejects speculative token decoding (speculation_base_depth > 1)".into(),
                 ));
             }
         }

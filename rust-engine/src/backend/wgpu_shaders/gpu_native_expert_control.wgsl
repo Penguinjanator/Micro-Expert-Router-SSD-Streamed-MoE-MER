@@ -28,7 +28,7 @@ const LOCATION_BANK_SHIFT: u32 = 30u;
 const LOCATION_SLOT_MASK: u32 = 0x3fffffffu;
 const UNMAPPED: u32 = 0xffffffffu;
 const EXPERT_RESIDENCY_MISS: u32 = 4u;
-const FATAL_STATUS_MASK: u32 = 11u;
+const FATAL_STATUS_MASK: u32 = 27u;
 const RETRYABLE_STATUS_MASK: u32 = EXPERT_RESIDENCY_MISS;
 
 fn bank_capacity(bank: u32) -> u32 {
