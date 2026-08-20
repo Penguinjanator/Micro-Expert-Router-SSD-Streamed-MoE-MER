@@ -26,13 +26,15 @@ const GPU_NATIVE_STATUS_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 // scheduler handles it; production encoding never clears these bits. Fatal
 // numerical failures retire the request. A residency miss is retryable after
 // residency service and must not be classified as a numerical failure.
-const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1 << 0;
-const GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE: u32 = 1 << 1;
-const GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS: u32 = 1 << 2;
-const GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE: u32 = 1 << 3;
+pub(crate) const GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE: u32 = 1 << 0;
+pub(crate) const GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE: u32 = 1 << 1;
+pub(crate) const GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS: u32 = 1 << 2;
+pub(crate) const GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE: u32 = 1 << 3;
+pub(crate) const GPU_NATIVE_STATUS_LM_HEAD_NUMERICAL_FAILURE: u32 = 1 << 4;
 pub(crate) const GPU_NATIVE_STATUS_FATAL_MASK: u32 = GPU_NATIVE_STATUS_ATTENTION_NUMERICAL_FAILURE
     | GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE
-    | GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE;
+    | GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE
+    | GPU_NATIVE_STATUS_LM_HEAD_NUMERICAL_FAILURE;
 pub(crate) const GPU_NATIVE_STATUS_RETRYABLE_MASK: u32 = GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS;
 
 #[inline]
@@ -51,6 +53,8 @@ const GPU_NATIVE_EXPERT_CONTROL_SHADER: &str =
     include_str!("wgpu_shaders/gpu_native_expert_control.wgsl");
 const GPU_NATIVE_STATUS_CONTROL_SHADER: &str =
     include_str!("wgpu_shaders/gpu_native_status_control.wgsl");
+const GPU_NATIVE_GREEDY_ARGMAX_SHADER: &str =
+    include_str!("wgpu_shaders/gpu_native_greedy_argmax.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 const GPU_NATIVE_ATTENTION_WORKGROUP_SIZE: u32 = 32;
 const GPU_NATIVE_ROUTER_WORKGROUP_SIZE: u32 = 64;
@@ -3574,11 +3578,11 @@ impl GpuNativeTokenStateLayout {
         self.total_buffer_bytes
     }
 
-    fn tensor_usage() -> wgpu::BufferUsages {
+    pub(crate) fn tensor_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
     }
 
-    fn status_usage() -> wgpu::BufferUsages {
+    pub(crate) fn status_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
     }
 
@@ -3635,12 +3639,29 @@ impl GpuNativeScratchLayout {
         self.bytes
     }
 
-    fn usage() -> wgpu::BufferUsages {
+    pub(crate) fn usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+    }
+
+    pub(crate) fn boundary_result_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
 
     fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
         super::validate_startup_buffer("gpu_native_scratch", self.bytes, Self::usage(), limits)?;
+        Ok(())
+    }
+
+    fn validate_for_boundary_result_limits(
+        self,
+        limits: &wgpu::Limits,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_boundary_result_scratch",
+            self.bytes,
+            Self::boundary_result_usage(),
+            limits,
+        )?;
         Ok(())
     }
 }
@@ -3669,6 +3690,10 @@ impl<B> GpuNativeScratch<B> {
 
     pub(crate) const fn layout(&self) -> GpuNativeScratchLayout {
         self.layout
+    }
+
+    pub(crate) fn buffer(&self) -> &B {
+        &self.buffer
     }
 }
 
@@ -3732,11 +3757,11 @@ impl GpuNativeRouterScratchLayout {
         })
     }
 
-    fn logits_usage() -> wgpu::BufferUsages {
+    pub(crate) fn logits_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE
     }
 
-    fn result_usage() -> wgpu::BufferUsages {
+    pub(crate) fn result_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
 
@@ -3814,6 +3839,10 @@ impl<B> GpuNativeRouterScratch<B> {
 
     pub(crate) const fn layout(&self) -> GpuNativeRouterScratchLayout {
         self.layout
+    }
+
+    pub(crate) fn selected_ids_buffer(&self) -> &B {
+        &self.selected_ids
     }
 }
 
@@ -4127,6 +4156,10 @@ impl<B> GpuNativeTokenState<B> {
 
     pub(crate) const fn layout(&self) -> GpuNativeTokenStateLayout {
         self.layout
+    }
+
+    pub(crate) fn status_buffer(&self) -> &B {
+        &self.status
     }
 }
 
@@ -5504,6 +5537,83 @@ impl GpuNativeStatusControlPipeline {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuNativeGreedyArgmaxPushConstants {
+    vocab_size: u32,
+    _reserved_0: u32,
+    _reserved_1: u32,
+    _reserved_2: u32,
+}
+
+struct GpuNativeGreedyArgmaxPipeline {
+    bind_group_layout: wgpu::BindGroupLayout,
+    compute_pipeline: wgpu::ComputePipeline,
+}
+
+impl GpuNativeGreedyArgmaxPipeline {
+    fn new(device: &wgpu::Device) -> Self {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_native_greedy_argmax_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_native_greedy_argmax_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_greedy_argmax_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_GREEDY_ARGMAX_SHADER.into()),
+        });
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_greedy_argmax_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "greedy_argmax_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        Self {
+            bind_group_layout,
+            compute_pipeline,
+        }
+    }
+}
+
 impl GpuNativeQ4ExpertPipelines {
     fn try_new(device: &wgpu::Device) -> Result<Self, GpuNativeBootstrapError> {
         validate_q4_expert_pipeline_limits(&device.limits())?;
@@ -5669,6 +5779,7 @@ pub(crate) struct GpuNativeExecutorContext {
     router_pipeline: GpuNativeRouterPipeline,
     q4_expert_pipelines: GpuNativeQ4ExpertPipelines,
     status_control_pipeline: GpuNativeStatusControlPipeline,
+    greedy_argmax_pipeline: GpuNativeGreedyArgmaxPipeline,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -5699,6 +5810,7 @@ impl GpuNativeExecutorContext {
         let router_pipeline = GpuNativeRouterPipeline::new(&gpu.device);
         let q4_expert_pipelines = GpuNativeQ4ExpertPipelines::try_new(&gpu.device)?;
         let status_control_pipeline = GpuNativeStatusControlPipeline::new(&gpu.device);
+        let greedy_argmax_pipeline = GpuNativeGreedyArgmaxPipeline::new(&gpu.device);
 
         Ok(Self {
             context_id,
@@ -5712,6 +5824,7 @@ impl GpuNativeExecutorContext {
             router_pipeline,
             q4_expert_pipelines,
             status_control_pipeline,
+            greedy_argmax_pipeline,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -6015,6 +6128,28 @@ impl GpuNativeExecutorContext {
             &format!("gpu_native_scratch_{scratch_id}"),
             layout.bytes,
             GpuNativeScratchLayout::usage(),
+        )?;
+        Ok(GpuNativeScratch::from_buffer(
+            self.context_id,
+            scratch_id,
+            layout,
+            buffer,
+        ))
+    }
+
+    pub(crate) fn create_boundary_result_scratch(
+        &self,
+        elements: usize,
+    ) -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeScratchLayout::try_new(elements)?;
+        layout.validate_for_boundary_result_limits(&gpu.device.limits())?;
+        let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "boundary result scratch");
+        let buffer = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_boundary_result_scratch_{scratch_id}"),
+            layout.bytes,
+            GpuNativeScratchLayout::boundary_result_usage(),
         )?;
         Ok(GpuNativeScratch::from_buffer(
             self.context_id,
@@ -6959,6 +7094,71 @@ impl GpuNativeExecutorContext {
         )
     }
 
+    /// Perform GPU greedy argmax over logits and write the selected token to `sampled_token_buf`.
+    /// On numerical failure or prior non-zero status, latches status and writes u32::MAX.
+    pub(crate) fn encode_greedy_argmax(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        logits: &GpuNativeScratch,
+        sampled_token_buf: &GpuNativeScratch,
+        state: &GpuNativeTokenState,
+        vocab_size: usize,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        if logits.context_id != self.context_id || sampled_token_buf.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignScratch);
+        }
+        if state.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignTokenState);
+        }
+        if logits.layout.elements() < vocab_size {
+            return Err(GpuNativeBootstrapError::GemvInputLength {
+                expected: vocab_size,
+                actual: logits.layout.elements(),
+            });
+        }
+        if sampled_token_buf.layout.elements() < 1 {
+            return Err(GpuNativeBootstrapError::GemvOutputLength {
+                expected: 1,
+                actual: sampled_token_buf.layout.elements(),
+            });
+        }
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_greedy_argmax_bind_group"),
+            layout: &self.greedy_argmax_pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: logits.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sampled_token_buf.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_greedy_argmax_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.greedy_argmax_pipeline.compute_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let pc = GpuNativeGreedyArgmaxPushConstants {
+            vocab_size: vocab_size as u32,
+            _reserved_0: 0,
+            _reserved_1: 0,
+            _reserved_2: 0,
+        };
+        pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+        pass.dispatch_workgroups(1, 1, 1);
+        drop(pass);
+        Ok(())
+    }
+
     /// RMS-normalise each logical scratch group independently using a shared
     /// `group_width`-element gain vector.
     pub(crate) fn encode_rms_norm_scratch_in_place(
@@ -7557,7 +7757,7 @@ impl GpuNativeExecutorContext {
         self.counters.record_residual_add_dispatch();
     }
 
-    fn authoritative_gpu(&self) -> Result<&super::GpuBackend, GpuNativeBootstrapError> {
+    pub(crate) fn authoritative_gpu(&self) -> Result<&super::GpuBackend, GpuNativeBootstrapError> {
         let gpu = match self.authoritative_backend.as_ref() {
             BackendBox::Gpu(gpu) => gpu,
             BackendBox::Cpu(_) => return Err(GpuNativeBootstrapError::GpuBackendUnavailable),
@@ -7617,7 +7817,7 @@ impl fmt::Debug for GpuNativeExecutorContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::inference::{dequantize_q8_0_block, quantize_q8_0_block};
     use std::sync::atomic::AtomicUsize;
@@ -7751,7 +7951,7 @@ mod tests {
         block.repeat(rows * cols / Q4_0_BLOCK_ELEMS).to_vec()
     }
 
-    fn q4_uniform_expert(
+    pub(crate) fn q4_uniform_expert(
         geometry: GpuNativeQ4ExpertGeometry,
         gate_weight: f32,
         up_weight: f32,
@@ -10783,7 +10983,8 @@ mod tests {
         assert_eq!(GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE, 2);
         assert_eq!(GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS, 4);
         assert_eq!(GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE, 8);
-        assert_eq!(GPU_NATIVE_STATUS_FATAL_MASK, 11);
+        assert_eq!(GPU_NATIVE_STATUS_LM_HEAD_NUMERICAL_FAILURE, 16);
+        assert_eq!(GPU_NATIVE_STATUS_FATAL_MASK, 27);
         assert_eq!(GPU_NATIVE_STATUS_RETRYABLE_MASK, 4);
         assert_eq!(
             GPU_NATIVE_STATUS_FATAL_MASK & GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS,
@@ -10798,6 +10999,7 @@ mod tests {
             GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE,
             GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS,
             GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE,
+            GPU_NATIVE_STATUS_LM_HEAD_NUMERICAL_FAILURE,
         ];
         assert!(bits.iter().all(|bit| bit.is_power_of_two()));
         for (index, bit) in bits.iter().enumerate() {
@@ -10883,6 +11085,7 @@ mod tests {
                 GPU_NATIVE_STATUS_CONTROL_SHADER,
                 &["clear_retryable_expert_residency_main"][..],
             ),
+            (GPU_NATIVE_GREEDY_ARGMAX_SHADER, &["greedy_argmax_main"][..]),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("GPU-native WGSL must parse");
@@ -13935,8 +14138,28 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(status.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!status.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
+        let generic_scratch = GpuNativeScratchLayout::usage();
+        assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!generic_scratch
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        let boundary_result = GpuNativeScratchLayout::boundary_result_usage();
+        assert!(boundary_result.contains(wgpu::BufferUsages::STORAGE));
+        assert!(boundary_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!boundary_result.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!boundary_result
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        let router_result = GpuNativeRouterScratchLayout::result_usage();
+        assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(
+            !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
+        );
+
         for usage in [
-            GpuNativeScratchLayout::usage(),
             GpuNativeDenseWeightLayout::usage(),
             GpuNativeKvLayout::usage(),
         ] {

@@ -340,7 +340,7 @@ enum FetchOnceError {
 /// `fetch_with_retry` (via [`Engine::moe_step`]) so a single corrupt
 /// expert downgrades gracefully into a missing top-K member rather
 /// than killing the server.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ExpertReadError {
     /// Storage returned a (possibly transient) I/O error every attempt.
     Io {
@@ -375,7 +375,7 @@ impl std::fmt::Display for ExpertReadError {
 
 impl std::error::Error for ExpertReadError {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum GpuNativeDemandResidencyError {
     ManagerNotInstalled,
     ExpertRead(ExpertReadError),
@@ -2531,6 +2531,84 @@ impl Engine {
             .gpu_native_residency
             .as_ref()
             .map(|manager| manager.snapshot())
+    }
+
+    /// Record actual GPU-native route selections across layers into the engine's
+    /// route observation and prefetch infrastructure without requiring CPU hidden state.
+    pub(crate) fn record_gpu_native_actual_routes(
+        self: &Arc<Self>,
+        selected_ids_by_layer: &[Vec<u32>],
+    ) {
+        self.core.governor.refresh();
+        let per_layer_opt = self.core.storage.config().num_experts_per_layer;
+
+        for (layer_idx, local_ids) in selected_ids_by_layer.iter().enumerate() {
+            if local_ids.is_empty() {
+                continue;
+            }
+            let per_layer = per_layer_opt.unwrap_or(0);
+            let target: Vec<u32> = if per_layer > 0 {
+                local_ids
+                    .iter()
+                    .map(|&loc| self.resolve_alias(layer_idx as u32 * per_layer + loc))
+                    .collect()
+            } else {
+                local_ids.iter().map(|&id| self.resolve_alias(id)).collect()
+            };
+
+            self.metrics
+                .counters
+                .selected_routed_experts
+                .fetch_add(target.len() as u64, Ordering::Relaxed);
+
+            self.locality_observe_and_reconcile(&target);
+
+            if let Some(affinity) = self.speculation.affinity.as_ref() {
+                affinity.observe_layer(layer_idx, local_ids);
+            }
+
+            if self.core.options.pin_after_observations > 0
+                || self.core.options.collect_route_profile
+                || self.static_residency_needs_counts()
+            {
+                self.bump_route_observations(&target);
+            }
+            self.maybe_apply_static_residency();
+
+            if let Some(&seed) = target.last() {
+                let ring = self.speculation.markov_ring.lock();
+                let contiguous = self.markov_layers_contiguous(ring.last.layer, Some(layer_idx as u32));
+                let s_markov = match ring.last.ids.last() {
+                    Some(&pp) if contiguous => self.core.predictor.predict_next2(pp, seed),
+                    _ => self.core.predictor.predict_next(seed),
+                };
+                drop(ring);
+                let in_flight: HashSet<u32> = target.iter().copied().collect();
+                self.union_prefetch(&s_markov, &[], &in_flight, Some(layer_idx as u32));
+            }
+
+            if !target.is_empty() {
+                let mut ring = self.speculation.markov_ring.lock();
+                if !ring.last.ids.is_empty()
+                    && self.markov_layers_contiguous(ring.last.layer, Some(layer_idx as u32))
+                {
+                    let pp: &[u32] =
+                        if self.markov_layers_contiguous(ring.last_last.layer, ring.last.layer) {
+                            &ring.last_last.ids
+                        } else {
+                            &[]
+                        };
+                    self.core
+                        .predictor
+                        .observe_step2(pp, &ring.last.ids, &target);
+                }
+                ring.last_last = ring.last.clone();
+                ring.last = MarkovHistory {
+                    ids: target.clone(),
+                    layer: Some(layer_idx as u32),
+                };
+            }
+        }
     }
 
     /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.

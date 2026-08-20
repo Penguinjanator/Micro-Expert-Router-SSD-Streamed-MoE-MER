@@ -83,6 +83,9 @@ pub struct AppState {
     /// when `cfg.predictive.speculator_enabled = true`.
     pub draft_engine: Option<Arc<crate::draft::DraftEngine>>,
 
+    /// Optional persistent GPU-native token loop for GPU-owned execution.
+    pub gpu_native_token_loop: Option<Arc<crate::gpu_native_token_loop::GpuNativeTokenLoop>>,
+
     /// Number of draft tokens to attempt per speculative step.
     /// Populated from `cfg.real_transformer.speculation_base_depth`.
     /// `0` or `1` disables speculation (falls back to sequential).
@@ -309,6 +312,14 @@ async fn completions(
     let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
     let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
+        if state.gpu_native_token_loop.is_some() {
+            state
+                .metrics
+                .record_request("/v1/completions", started.elapsed().as_secs_f64());
+            return error_response(GenerateError::InvalidRequest(
+                "streaming is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
         // Server-Sent Events streaming path: emit one OpenAI-style chunk
         // per generated token, terminated with `data: [DONE]`. The whole
         // SSD-streaming substrate is exercised inside the generator
@@ -422,6 +433,14 @@ async fn chat_completions(
     let params = resolve_params(&state, req.temperature, req.top_p, req.top_k, req.seed);
     let session_id = req.session_id.clone();
     if req.stream.unwrap_or(false) {
+        if state.gpu_native_token_loop.is_some() {
+            state
+                .metrics
+                .record_request("/v1/chat/completions", started.elapsed().as_secs_f64());
+            return error_response(GenerateError::InvalidRequest(
+                "streaming is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
         match build_chat_stream(
             &state,
             &prompt,
@@ -524,6 +543,30 @@ pub enum GenerateError {
     /// but continuing (or persisting) the sequence would silently reset
     /// its context. Maps to a 500 with its own error type.
     KvStateLost(String),
+}
+
+pub(crate) fn map_gpu_native_token_loop_error(
+    err: crate::gpu_native_token_loop::GpuNativeTokenLoopError,
+) -> GenerateError {
+    use crate::gpu_native_token_loop::GpuNativeTokenLoopError;
+    match err {
+        GpuNativeTokenLoopError::ContextLimitExceeded { .. }
+        | GpuNativeTokenLoopError::UnsupportedSampling { .. } => {
+            GenerateError::InvalidRequest(err.to_string())
+        }
+        GpuNativeTokenLoopError::PositionMismatch { .. }
+        | GpuNativeTokenLoopError::IncompatibleModel(_)
+        | GpuNativeTokenLoopError::AttemptBoundExceeded { .. }
+        | GpuNativeTokenLoopError::NoProgress { .. }
+        | GpuNativeTokenLoopError::FatalNumericalFailure { .. }
+        | GpuNativeTokenLoopError::ResidencyServiceFailed(_)
+        | GpuNativeTokenLoopError::Bootstrap(_)
+        | GpuNativeTokenLoopError::InvalidBoundaryReport { .. }
+        | GpuNativeTokenLoopError::InvalidSelectedExpertId { .. }
+        | GpuNativeTokenLoopError::DuplicateSelectedExpertId { .. }
+        | GpuNativeTokenLoopError::InvalidTopKCount { .. }
+        | GpuNativeTokenLoopError::MapFailed(_) => GenerateError::Inference(err.to_string()),
+    }
 }
 
 impl std::fmt::Display for GenerateError {
@@ -730,7 +773,35 @@ async fn generate(
     let mut misses_total = 0u64;
     let mut completion_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    if let Some(model) = state.real_model.as_ref() {
+    if let Some(ref gpu_native_loop) = state.gpu_native_token_loop {
+        if session_id.is_some() {
+            return Err(GenerateError::InvalidRequest(
+                "session persistence is unsupported in gpu_native mode in this slice".into(),
+            ));
+        }
+        if !params.is_greedy() {
+            return Err(GenerateError::InvalidRequest(
+                "only greedy sampling (temperature=0.0) is supported in gpu_native mode in this slice".into(),
+            ));
+        }
+        let mut req_state = gpu_native_loop
+            .create_request_state()
+            .map_err(map_gpu_native_token_loop_error)?;
+        let pre_hits = state.engine.report().hits;
+        let pre_misses = state.engine.report().misses;
+        completion_ids = gpu_native_loop
+            .ingest_prompt_and_generate(
+                &state.engine,
+                &mut req_state,
+                &prompt_ids,
+                max_tokens,
+                &params,
+            )
+            .await
+            .map_err(map_gpu_native_token_loop_error)?;
+        hits_total = state.engine.report().hits.saturating_sub(pre_hits);
+        misses_total = state.engine.report().misses.saturating_sub(pre_misses);
+    } else if let Some(model) = state.real_model.as_ref() {
         // Resolve session: take any existing KV state, then put it
         // back at the end. When no session is configured the request
         // is fully stateless (legacy behaviour).
@@ -2315,6 +2386,7 @@ mod tests {
             real_model: None,
             batch_scheduler: None,
             draft_engine: None,
+            gpu_native_token_loop: None,
             speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();
@@ -2749,6 +2821,7 @@ mod tests {
             real_model: Some(model),
             batch_scheduler: Some(scheduler),
             draft_engine: None,
+            gpu_native_token_loop: None,
             speculation_k: 0,
             runtime: crate::config::LiveConfig::from_config(&{
                 let mut c = test_minimal_cfg();
@@ -3732,5 +3805,72 @@ mod tests {
                 "chat={chat}: metrics must count only successfully emitted tokens"
             );
         }
+    }
+
+    #[test]
+    fn gpu_native_error_mapping_to_http_status_codes() {
+        use crate::gpu_native_token_loop::GpuNativeTokenLoopError;
+        use axum::http::StatusCode;
+
+        // 1. Client/Request errors map to GenerateError::InvalidRequest -> HTTP 400 (invalid_request_error)
+        let context_limit_err = GpuNativeTokenLoopError::ContextLimitExceeded {
+            requested_position: 9,
+            max_seq_len: 8,
+        };
+        let gen_err1 = map_gpu_native_token_loop_error(context_limit_err);
+        assert!(matches!(gen_err1, GenerateError::InvalidRequest(_)));
+        let resp1 = error_response(gen_err1);
+        assert_eq!(resp1.status(), StatusCode::BAD_REQUEST);
+
+        let unsupported_sampling_err = GpuNativeTokenLoopError::UnsupportedSampling {
+            reason: "temperature must be 0.0".into(),
+        };
+        let gen_err2 = map_gpu_native_token_loop_error(unsupported_sampling_err);
+        assert!(matches!(gen_err2, GenerateError::InvalidRequest(_)));
+        let resp2 = error_response(gen_err2);
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+
+        // 2. Runtime / GPU execution errors map to GenerateError::Inference -> HTTP 500 (server_error)
+        let position_mismatch_err = GpuNativeTokenLoopError::PositionMismatch {
+            requested_position: 3,
+            committed_position: 2,
+        };
+        let gen_err_pos = map_gpu_native_token_loop_error(position_mismatch_err);
+        assert!(matches!(gen_err_pos, GenerateError::Inference(_)));
+        let resp_pos = error_response(gen_err_pos);
+        assert_eq!(resp_pos.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let fatal_err = GpuNativeTokenLoopError::FatalNumericalFailure {
+            layer_index: Some(0),
+            status_bits: 0x1,
+        };
+        let gen_err3 = map_gpu_native_token_loop_error(fatal_err);
+        assert!(matches!(gen_err3, GenerateError::Inference(_)));
+        let resp3 = error_response(gen_err3);
+        assert_eq!(resp3.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let map_failed_err = GpuNativeTokenLoopError::MapFailed("device lost".into());
+        let gen_err4 = map_gpu_native_token_loop_error(map_failed_err);
+        assert!(matches!(gen_err4, GenerateError::Inference(_)));
+        let resp4 = error_response(gen_err4);
+        assert_eq!(resp4.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let no_progress_err = GpuNativeTokenLoopError::NoProgress {
+            layer_index: 1,
+            selected_ids: vec![0, 1],
+        };
+        let gen_err5 = map_gpu_native_token_loop_error(no_progress_err);
+        assert!(matches!(gen_err5, GenerateError::Inference(_)));
+        let resp5 = error_response(gen_err5);
+        assert_eq!(resp5.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let attempt_bound_err = GpuNativeTokenLoopError::AttemptBoundExceeded {
+            attempts: 4,
+            max_attempts: 3,
+        };
+        let gen_err6 = map_gpu_native_token_loop_error(attempt_bound_err);
+        assert!(matches!(gen_err6, GenerateError::Inference(_)));
+        let resp6 = error_response(gen_err6);
+        assert_eq!(resp6.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

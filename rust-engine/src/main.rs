@@ -140,6 +140,7 @@ mod gating;
 mod gguf;
 mod gguf_loader;
 mod gpu_native_residency;
+pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
 mod grpc;
 #[cfg(feature = "grpc")]
@@ -8159,34 +8160,44 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     } else {
         cfg.real_transformer.head_dim
     };
-    let execution_context = crate::backend::resolve_execution_context(
-        cfg.real_transformer.compute_offload,
-        strict_attention,
-        crate::backend::GpuBackendGeometry {
-            num_layers: cfg.model.num_layers,
-            max_seq_len: if cfg.real_transformer.window_size == 0 {
-                4096
-            } else {
-                cfg.real_transformer.window_size
+    let gpu_geometry = crate::backend::GpuBackendGeometry {
+        num_layers: cfg.model.num_layers,
+        max_seq_len: if cfg.real_transformer.gpu_native {
+            cfg.real_transformer.gpu_native_max_seq_len
+        } else if cfg.real_transformer.window_size == 0 {
+            4096
+        } else {
+            cfg.real_transformer.window_size
+        },
+        num_heads,
+        num_kv_heads: cfg.real_transformer.num_kv_heads,
+        head_dim,
+        // Finding 12: asymmetric-V models keep the CPU attention path;
+        // zero retains the existing symmetric GPU sizing contract.
+        v_head_dim: 0,
+        q4_truncation_tolerance: cfg
+            .real_transformer
+            .inference_policy()
+            .expert_size_tolerance(),
+    };
+    let execution_context = if cfg.real_transformer.gpu_native {
+        crate::backend::resolve_execution_context_for_gpu_native(
+            gpu_geometry,
+            gpu_expert_cache.clone(),
+        )?
+    } else {
+        crate::backend::resolve_execution_context(
+            cfg.real_transformer.compute_offload,
+            strict_attention,
+            gpu_geometry,
+            crate::backend::RoutedExpertGpuSpec {
+                dtype: cfg.model.dtype,
+                d_model: cfg.model.d_model,
+                d_ff: cfg.model.d_ff,
             },
-            num_heads,
-            num_kv_heads: cfg.real_transformer.num_kv_heads,
-            head_dim,
-            // Finding 12: asymmetric-V models keep the CPU attention path;
-            // zero retains the existing symmetric GPU sizing contract.
-            v_head_dim: 0,
-            q4_truncation_tolerance: cfg
-                .real_transformer
-                .inference_policy()
-                .expert_size_tolerance(),
-        },
-        crate::backend::RoutedExpertGpuSpec {
-            dtype: cfg.model.dtype,
-            d_model: cfg.model.d_model,
-            d_ff: cfg.model.d_ff,
-        },
-        gpu_expert_cache.clone(),
-    )?;
+            gpu_expert_cache.clone(),
+        )?
+    };
     crate::backend::set_execution_context(execution_context.clone())
         .map_err(|e| format!("failed to install resolved execution context: {e}"))?;
     {
@@ -8673,23 +8684,55 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         );
         engine_builder.install_gpu_cache();
     }
-    let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
 
-    let tokenizer = resolve_serving_tokenizer(
-        cfg.real_transformer.enabled,
-        cfg.tokenizer.path.as_deref(),
-        real_model.as_ref().map(|m| m.config.vocab_size),
-    )?;
-
-    // Optional real-transformer pipeline. When enabled, every request
-    // runs `embedding -> stacked layers (each with SSD-streamed MoE) ->
-    // LM head -> argmax`; when disabled, the legacy benchmark generator
-    // is used (the engine still streams expert FFN compute either way).
-    // Note: `real_model` was constructed above so its per-layer gate
-    // could be wired into the engine; here we just spawn the
-    // continuous-batching scheduler against the already-built model.
-    let (real_model, batch_scheduler) = if let Some(model_arc) = real_model {
-        let rt = &cfg.real_transformer;
+    let (real_model, batch_scheduler, gpu_native_token_loop, engine) = if let Some(model_arc) = real_model {
+        if cfg.real_transformer.gpu_native {
+            let executor = Arc::new(
+                execution_context
+                    .create_gpu_native_executor_context(cfg.model.d_model)
+                    .map_err(|e| format!("failed to create GPU-native executor context: {e}"))?,
+            );
+            let total_expert_budget = (cfg.gpu_cache.vram_capacity_mb as u64) * 1024 * 1024;
+            let expert_geom = crate::backend::gpu_native::GpuNativeQ4ExpertGeometry::try_new(
+                cfg.model.d_model,
+                cfg.model.d_ff,
+                cfg.model.num_experts as usize,
+                cfg.model.top_k,
+            )
+            .map_err(|e| format!("invalid GPU-native Q4 expert geometry: {e}"))?;
+            let residency_manager = Arc::new(
+                crate::gpu_native_residency::GpuNativeTieredResidencyManager::try_new(
+                    executor.clone(),
+                    gpu_expert_cache.clone(),
+                    cfg.model.num_layers,
+                    expert_geom,
+                    total_expert_budget,
+                )
+                .map_err(|e| format!("failed to construct tiered residency manager: {e}"))?,
+            );
+            engine_builder
+                .install_gpu_native_residency_manager(residency_manager.clone())
+                .map_err(|e| format!("failed to install tiered residency manager on engine: {e}"))?;
+            let token_loop = crate::gpu_native_token_loop::GpuNativeTokenLoop::try_new(
+                executor,
+                residency_manager,
+                &model_arc,
+                cfg.real_transformer.gpu_native_max_seq_len,
+            )
+            .map_err(|e| format!("failed to initialize GPU-native token loop: {e}"))?;
+            let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
+            info!(
+                num_layers = cfg.model.num_layers,
+                d_model = cfg.model.d_model,
+                num_experts = cfg.model.num_experts,
+                top_k = cfg.model.top_k,
+                max_seq_len = cfg.real_transformer.gpu_native_max_seq_len,
+                "GPU-native token loop initialized (authoritative GPU-owned execution)"
+            );
+            (Some(model_arc), None, Some(token_loop), engine)
+        } else {
+            let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
+            let rt = &cfg.real_transformer;
         let head_dim = if rt.head_dim == 0 {
             cfg.model.d_model / rt.num_heads
         } else {
@@ -8758,11 +8801,19 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             speculation_base_depth = rt.speculation_base_depth,
             "real transformer pipeline enabled (with continuous batching)"
         );
-        (Some(model_arc), Some(Arc::new(scheduler)))
-    } else {
-        info!("real_transformer disabled; using legacy benchmark generator");
-        (None, None)
-    };
+        (Some(model_arc), Some(Arc::new(scheduler)), None, engine)
+    }
+} else {
+    let engine = Arc::new(engine_builder.with_metrics(metrics.clone()));
+    info!("real_transformer disabled; using legacy benchmark generator");
+    (None, None, None, engine)
+};
+
+let tokenizer = resolve_serving_tokenizer(
+    cfg.real_transformer.enabled,
+    cfg.tokenizer.path.as_deref(),
+    real_model.as_ref().map(|m| m.config.vocab_size),
+)?;
 
     let sessions = if cfg.server.session_ttl_secs > 0 {
         let store = crate::session::SessionStore::new(std::time::Duration::from_secs(
@@ -8842,6 +8893,7 @@ async fn cmd_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         real_model,
         batch_scheduler,
         draft_engine,
+        gpu_native_token_loop,
         speculation_k,
         runtime: runtime.clone(),
         sessions,
