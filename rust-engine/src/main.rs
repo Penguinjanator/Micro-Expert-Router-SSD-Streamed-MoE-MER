@@ -139,6 +139,7 @@ mod expert_cache;
 mod gating;
 mod gguf;
 mod gguf_loader;
+mod gpu_native_residency;
 #[cfg(feature = "grpc")]
 mod grpc;
 #[cfg(feature = "grpc")]

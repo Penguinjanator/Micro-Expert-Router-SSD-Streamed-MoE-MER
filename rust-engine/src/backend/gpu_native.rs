@@ -34,6 +34,11 @@ pub(crate) const GPU_NATIVE_STATUS_FATAL_MASK: u32 = GPU_NATIVE_STATUS_ATTENTION
     | GPU_NATIVE_STATUS_ROUTER_NUMERICAL_FAILURE
     | GPU_NATIVE_STATUS_EXPERT_NUMERICAL_FAILURE;
 pub(crate) const GPU_NATIVE_STATUS_RETRYABLE_MASK: u32 = GPU_NATIVE_STATUS_EXPERT_RESIDENCY_MISS;
+
+#[inline]
+pub(crate) const fn status_after_retryable_clear(status: u32) -> u32 {
+    status & !GPU_NATIVE_STATUS_RETRYABLE_MASK
+}
 const GPU_NATIVE_DENSE_GEMV_SHADER: &str = include_str!("wgpu_shaders/gpu_native_dense_gemv.wgsl");
 const GPU_NATIVE_EMBEDDING_SHADER: &str = include_str!("wgpu_shaders/gpu_native_embedding.wgsl");
 const GPU_NATIVE_RMSNORM_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rmsnorm.wgsl");
@@ -44,6 +49,8 @@ const GPU_NATIVE_ROUTER_SHADER: &str = include_str!("wgpu_shaders/gpu_native_rou
 const GPU_NATIVE_Q4_EXPERT_SHADER: &str = include_str!("wgpu_shaders/gpu_native_q4_expert.wgsl");
 const GPU_NATIVE_EXPERT_CONTROL_SHADER: &str =
     include_str!("wgpu_shaders/gpu_native_expert_control.wgsl");
+const GPU_NATIVE_STATUS_CONTROL_SHADER: &str =
+    include_str!("wgpu_shaders/gpu_native_status_control.wgsl");
 const GPU_NATIVE_WORKGROUP_SIZE: u32 = 64;
 const GPU_NATIVE_ATTENTION_WORKGROUP_SIZE: u32 = 32;
 const GPU_NATIVE_ROUTER_WORKGROUP_SIZE: u32 = 64;
@@ -1966,6 +1973,38 @@ pub(crate) struct GpuNativeQ4ExpertVramPlan {
 }
 
 impl GpuNativeQ4ExpertVramPlan {
+    /// Construct the exact fixed allocation for a requested physical slot
+    /// count. Model-wide planning uses this helper so Slice 8 remains the
+    /// single owner of bank, dummy-binding, mapping, and device-limit
+    /// arithmetic.
+    pub(crate) fn try_for_slot_capacity(
+        geometry: GpuNativeQ4ExpertGeometry,
+        slot_capacity: usize,
+        limits: &wgpu::Limits,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        validate_q4_expert_pipeline_limits(limits)?;
+        if slot_capacity > geometry.num_experts {
+            return Err(
+                GpuNativeBootstrapError::ExpertResidentCountExceedsCapacity {
+                    residents: slot_capacity,
+                    capacity: geometry.num_experts,
+                },
+            );
+        }
+        let layout = GpuNativeQ4ExpertArenaLayout::try_new(geometry, slot_capacity, limits)?;
+        let active_bank_allocation_bytes = layout.active_bank_allocation_bytes()?;
+        let physical_bank_allocation_bytes = layout.physical_bank_allocation_bytes()?;
+        let total_arena_allocation_bytes = layout.total_allocation_bytes()?;
+        Ok(Self {
+            geometry,
+            requested_expert_budget_bytes: total_arena_allocation_bytes,
+            layout,
+            active_bank_allocation_bytes,
+            physical_bank_allocation_bytes,
+            total_arena_allocation_bytes,
+        })
+    }
+
     pub(crate) fn try_new(
         geometry: GpuNativeQ4ExpertGeometry,
         expert_budget_bytes: u64,
@@ -5422,6 +5461,49 @@ struct GpuNativeQ4ExpertPipelines {
     contain: wgpu::ComputePipeline,
 }
 
+struct GpuNativeStatusControlPipeline {
+    bind_group_layout: wgpu::BindGroupLayout,
+    clear_retryable: wgpu::ComputePipeline,
+}
+
+impl GpuNativeStatusControlPipeline {
+    fn new(device: &wgpu::Device) -> Self {
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu_native_status_control_bind_group_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gpu_native_status_control_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_status_control_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_STATUS_CONTROL_SHADER.into()),
+        });
+        let clear_retryable = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("gpu_native_clear_retryable_status_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: "clear_retryable_expert_residency_main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        });
+        Self {
+            bind_group_layout,
+            clear_retryable,
+        }
+    }
+}
+
 impl GpuNativeQ4ExpertPipelines {
     fn try_new(device: &wgpu::Device) -> Result<Self, GpuNativeBootstrapError> {
         validate_q4_expert_pipeline_limits(&device.limits())?;
@@ -5586,6 +5668,7 @@ pub(crate) struct GpuNativeExecutorContext {
     attention_pipelines: GpuNativeAttentionPipelines,
     router_pipeline: GpuNativeRouterPipeline,
     q4_expert_pipelines: GpuNativeQ4ExpertPipelines,
+    status_control_pipeline: GpuNativeStatusControlPipeline,
     counters: GpuNativeExecutionCounters,
 }
 
@@ -5615,6 +5698,7 @@ impl GpuNativeExecutorContext {
         let attention_pipelines = GpuNativeAttentionPipelines::new(&gpu.device);
         let router_pipeline = GpuNativeRouterPipeline::new(&gpu.device);
         let q4_expert_pipelines = GpuNativeQ4ExpertPipelines::try_new(&gpu.device)?;
+        let status_control_pipeline = GpuNativeStatusControlPipeline::new(&gpu.device);
 
         Ok(Self {
             context_id,
@@ -5627,6 +5711,7 @@ impl GpuNativeExecutorContext {
             attention_pipelines,
             router_pipeline,
             q4_expert_pipelines,
+            status_control_pipeline,
             counters: GpuNativeExecutionCounters::default(),
         })
     }
@@ -5674,6 +5759,39 @@ impl GpuNativeExecutorContext {
             residual,
             status,
         ))
+    }
+
+    /// Record the future replay boundary into the caller-owned encoder.
+    /// Only the expert-residency retry bit is cleared; fatal and unknown bits
+    /// remain latched. This method never submits, polls, maps, or reads back.
+    pub(crate) fn encode_clear_retryable_status(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        state: &GpuNativeTokenState,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        state.layout.validate_for_limits(&gpu.device.limits())?;
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_clear_retryable_status_bind_group"),
+            layout: &self.status_control_pipeline.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: state.status.as_entire_binding(),
+            }],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gpu_native_clear_retryable_status_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.status_control_pipeline.clear_retryable);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        Ok(())
+    }
+
+    pub(crate) fn device_limits(&self) -> Result<wgpu::Limits, GpuNativeBootstrapError> {
+        Ok(self.authoritative_gpu()?.device.limits())
     }
 
     /// Register one immutable model-scoped dense tensor and upload its payload
@@ -10703,6 +10821,29 @@ mod tests {
     }
 
     #[test]
+    fn retryable_status_clear_preserves_fatal_and_unknown_bits() {
+        assert_eq!(
+            status_after_retryable_clear(GPU_NATIVE_STATUS_RETRYABLE_MASK),
+            0
+        );
+        assert_eq!(
+            status_after_retryable_clear(GPU_NATIVE_STATUS_FATAL_MASK),
+            GPU_NATIVE_STATUS_FATAL_MASK
+        );
+        assert_eq!(
+            status_after_retryable_clear(
+                GPU_NATIVE_STATUS_FATAL_MASK | GPU_NATIVE_STATUS_RETRYABLE_MASK
+            ),
+            GPU_NATIVE_STATUS_FATAL_MASK
+        );
+        let unknown = 1 << 17;
+        assert_eq!(status_after_retryable_clear(unknown), unknown);
+        assert!(GPU_NATIVE_STATUS_CONTROL_SHADER
+            .contains("atomicAnd(&STATUS.bits, ~EXPERT_RESIDENCY_RETRYABLE)"));
+        assert!(!GPU_NATIVE_STATUS_CONTROL_SHADER.contains("atomicStore"));
+    }
+
+    #[test]
     fn gpu_native_shaders_parse_and_validate_without_hardware() {
         for (source, entry_points) in [
             (
@@ -10737,6 +10878,10 @@ mod tests {
                     "expert_combine_main",
                     "expert_contain_main",
                 ][..],
+            ),
+            (
+                GPU_NATIVE_STATUS_CONTROL_SHADER,
+                &["clear_retryable_expert_residency_main"][..],
             ),
             (GPU_NATIVE_TEST_COMPARE_SHADER, &["compare_main"][..]),
         ] {
@@ -12960,6 +13105,375 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert_eq!(completed.queue_submissions, 0);
         assert_eq!(completed.intermediate_maps, 0);
         assert_eq!(completed.intermediate_readbacks, 0);
+    }
+
+    /// Requires an actual NVIDIA L4. Exercises one model-wide two-layer
+    /// budget, real logical generations, per-layer replacement, retryable
+    /// miss containment, encoder-only retry clearing, and replay against the
+    /// new slot epochs. Test-owned submissions and final readbacks are the
+    /// only submit/map operations in this fixture.
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_tiered_residency_retry() {
+        use super::super::{
+            resolve_execution_context, ComputeOffload, GpuBackendGeometry, RoutedExpertGpuSpec,
+        };
+        use crate::buffer_pool::BufferPool;
+        use crate::expert_cache::{ExpertResident, GpuResident};
+        use crate::gpu_native_residency::{
+            GpuNativeDemandExpert, GpuNativeModelExpertVramPlan, GpuNativeResidencyPriority,
+            GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
+        };
+        use crate::inference::WeightDtype;
+
+        const D_MODEL: usize = 32;
+        const D_FF: usize = 32;
+        const NUM_EXPERTS: usize = 128;
+        const TOP_K: usize = 2;
+        const NUM_LAYERS: usize = 2;
+        const READBACK_BYTES: u64 = GPU_NATIVE_STATUS_BYTES + GPU_NATIVE_STATUS_BYTES;
+
+        let geometry =
+            GpuNativeQ4ExpertGeometry::try_new(D_MODEL, D_FF, NUM_EXPERTS, TOP_K).unwrap();
+        let payload_template = q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
+        let payload_bytes = payload_template.len();
+        let gpu_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
+            payload_bytes * 8,
+            0.0,
+            u64::MAX,
+        ));
+        let execution = resolve_execution_context(
+            ComputeOffload::Gpu,
+            false,
+            GpuBackendGeometry {
+                num_layers: NUM_LAYERS,
+                max_seq_len: 8,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: D_MODEL,
+                v_head_dim: D_MODEL,
+                q4_truncation_tolerance: 0,
+            },
+            RoutedExpertGpuSpec {
+                dtype: WeightDtype::Q4_0,
+                d_model: D_MODEL,
+                d_ff: D_FF,
+            },
+            gpu_cache.clone(),
+        )
+        .expect("L4 must construct the authoritative production GPU backend");
+        let executor = Arc::new(
+            execution
+                .create_gpu_native_executor_context(D_MODEL)
+                .expect("GPU-native executor must retain the authoritative backend"),
+        );
+        assert_eq!(executor.device_identity().vendor_id, 0x10de);
+        assert!(
+            executor.device_identity().name.contains("L4"),
+            "ignored tiered residency test must run only on an NVIDIA L4, got {}",
+            executor.device_identity().name
+        );
+        let gpu = executor.authoritative_gpu().unwrap();
+        let one_layer_min =
+            GpuNativeQ4ExpertVramPlan::try_for_slot_capacity(geometry, TOP_K, &gpu.device.limits())
+                .unwrap();
+        let total_budget = one_layer_min.total_arena_allocation_bytes() * NUM_LAYERS as u64;
+        let model_plan = GpuNativeModelExpertVramPlan::try_new(
+            NUM_LAYERS,
+            geometry,
+            total_budget,
+            &gpu.device.limits(),
+        )
+        .unwrap();
+        assert_eq!(model_plan.total_arena_allocation_bytes(), total_budget);
+        assert!(model_plan
+            .layer_plans()
+            .iter()
+            .all(|plan| plan.slot_capacity() == TOP_K));
+        assert!(model_plan
+            .layer_plans()
+            .iter()
+            .all(|plan| plan.total_arena_allocation_bytes() < total_budget));
+
+        let manager = GpuNativeTieredResidencyManager::try_new(
+            executor.clone(),
+            gpu_cache.clone(),
+            NUM_LAYERS,
+            geometry,
+            total_budget,
+        )
+        .unwrap();
+        let pool = BufferPool::new(16, payload_bytes, 4);
+        let make_source = |global_id: u32, payload: &[u8]| {
+            let mut buffer = pool.try_acquire().expect("synthetic RAM slot");
+            buffer.as_mut_slice().copy_from_slice(payload);
+            let resident = Arc::new(ExpertResident::new_with_block_align(global_id, buffer, 4));
+            gpu_cache
+                .demand_admit_lru(Arc::new(GpuResident::new_with_dtype(
+                    global_id,
+                    payload.to_vec(),
+                    WeightDtype::Q4_0,
+                )))
+                .unwrap();
+            let admission = gpu_cache.current_admission(global_id).unwrap();
+            (resident, admission)
+        };
+
+        let layer1_payload_a = q4_uniform_expert(geometry, 0.004, 0.006, 0.002);
+        let layer1_payload_b = q4_uniform_expert(geometry, -0.003, 0.005, 0.001);
+        let (l1_a, l1_a_admission) = make_source(128, &layer1_payload_a);
+        let (l1_b, l1_b_admission) = make_source(129, &layer1_payload_b);
+        manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                1,
+                &[
+                    GpuNativeDemandExpert::install(128, l1_a, l1_a_admission),
+                    GpuNativeDemandExpert::install(129, l1_b, l1_b_admission),
+                ],
+            )
+            .unwrap();
+
+        let old_payload_a = q4_uniform_expert(geometry, 0.002, 0.003, 0.001);
+        let old_payload_b = q4_uniform_expert(geometry, -0.002, 0.004, 0.001);
+        let (old_a, old_a_admission) = make_source(0, &old_payload_a);
+        let (old_b, old_b_admission) = make_source(1, &old_payload_b);
+        let old_residencies = manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[
+                    GpuNativeDemandExpert::install(0, old_a, old_a_admission),
+                    GpuNativeDemandExpert::install(1, old_b, old_b_admission),
+                ],
+            )
+            .unwrap();
+        let before_replace = manager.snapshot();
+        assert_eq!(before_replace.layers[0].resident_slots, TOP_K);
+        assert_eq!(before_replace.layers[1].resident_slots, TOP_K);
+
+        let mut gate_values = vec![0.0; NUM_EXPERTS * D_MODEL];
+        gate_values[2 * D_MODEL] = 4.0;
+        gate_values[3 * D_MODEL + 1] = 3.0;
+        let gate = DenseWeight::from_f32(gate_values, NUM_EXPERTS, D_MODEL);
+        let gate_handle = executor
+            .register_dense_weight(
+                GpuNativeDenseWeightKey::try_new("test.tiered_residency.router").unwrap(),
+                &gate,
+            )
+            .unwrap();
+        let router_geometry =
+            GpuNativeRouterGeometry::try_new(D_MODEL, NUM_EXPERTS, TOP_K).unwrap();
+        let router_plan = executor
+            .create_router_plan(0, router_geometry, gate_handle)
+            .unwrap();
+        let (compare_layout, compare_pipeline) = create_test_compare_pipeline(&gpu.device);
+        let state = executor.create_token_state().unwrap();
+        let router_scratch = executor.create_router_scratch(router_geometry).unwrap();
+        let expert_scratch = executor.create_q4_expert_scratch(geometry).unwrap();
+        let hidden = vec![1.0; D_MODEL];
+        let residual = vec![0.25; D_MODEL];
+        let run = |label: &str, clear_retryable: bool, expected_hidden: &[f32], tolerance: f32| {
+            gpu.queue
+                .write_buffer(&state.hidden, 0, bytemuck::cast_slice(&hidden));
+            gpu.queue
+                .write_buffer(&state.residual, 0, bytemuck::cast_slice(&residual));
+            let expected_buffer = create_test_expected_buffer(
+                &gpu.device,
+                &gpu.queue,
+                &format!("{label}_expected_hidden"),
+                expected_hidden,
+            );
+            let comparison_status = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("{label}_comparison_status")),
+                size: GPU_NATIVE_STATUS_BYTES,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            gpu.queue.write_buffer(&comparison_status, 0, &[0; 4]);
+            let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: READBACK_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+            if clear_retryable {
+                executor
+                    .encode_clear_retryable_status(&mut encoder, &state)
+                    .unwrap();
+            }
+            executor
+                .encode_router(&mut encoder, &router_plan, &state, &router_scratch)
+                .unwrap();
+            executor
+                .encode_q4_expert_arena_combine(
+                    &mut encoder,
+                    &router_plan,
+                    &router_scratch,
+                    manager.arena(0).unwrap(),
+                    &state,
+                    &expert_scratch,
+                )
+                .unwrap();
+            encode_test_compare(
+                &gpu.device,
+                &mut encoder,
+                &compare_layout,
+                &compare_pipeline,
+                &state.hidden,
+                &expected_buffer,
+                &comparison_status,
+                D_MODEL,
+                tolerance,
+            );
+            encoder.copy_buffer_to_buffer(&state.status, 0, &staging, 0, GPU_NATIVE_STATUS_BYTES);
+            encoder.copy_buffer_to_buffer(
+                &comparison_status,
+                0,
+                &staging,
+                GPU_NATIVE_STATUS_BYTES,
+                GPU_NATIVE_STATUS_BYTES,
+            );
+            gpu.queue.submit(Some(encoder.finish()));
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            gpu.device.poll(wgpu::Maintain::Wait);
+            rx.recv()
+                .expect("tiered residency map callback must be drained")
+                .expect("tiered residency staging must map");
+            let mapped = slice.get_mapped_range();
+            let request_status = u32::from_le_bytes(
+                mapped[..GPU_NATIVE_STATUS_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            let comparison_status = u32::from_le_bytes(
+                mapped[GPU_NATIVE_STATUS_BYTES as usize
+                    ..GPU_NATIVE_STATUS_BYTES as usize + GPU_NATIVE_STATUS_BYTES as usize]
+                    .try_into()
+                    .unwrap(),
+            );
+            drop(mapped);
+            staging.unmap();
+            (request_status, comparison_status)
+        };
+
+        gpu.queue.write_buffer(&state.status, 0, &[0; 4]);
+        let (miss_request_status, miss_comparison_status) =
+            run("gpu_native_tiered_residency_miss", false, &residual, 0.0);
+        assert_eq!(miss_comparison_status, 0);
+        assert_eq!(
+            miss_request_status & GPU_NATIVE_STATUS_RETRYABLE_MASK,
+            GPU_NATIVE_STATUS_RETRYABLE_MASK
+        );
+        assert_eq!(miss_request_status & GPU_NATIVE_STATUS_FATAL_MASK, 0);
+
+        let payload_a = q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
+        let payload_b = q4_uniform_expert(geometry, -0.012, 0.018, 0.004);
+        let (resident_a, admission_a) = make_source(2, &payload_a);
+        let stale_admission_a = admission_a.clone();
+        let stale_resident_a = resident_a.clone();
+        let (resident_b, admission_b) = make_source(3, &payload_b);
+        let new_residencies = manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[
+                    GpuNativeDemandExpert::install(2, resident_a, admission_a),
+                    GpuNativeDemandExpert::install(3, resident_b, admission_b),
+                ],
+            )
+            .unwrap();
+        assert!(new_residencies.iter().all(|new| old_residencies
+            .iter()
+            .filter(|old| old.location() == new.location())
+            .all(|old| old.slot_epoch() != new.slot_epoch())));
+        let after_replace = manager.snapshot();
+        assert_eq!(after_replace.layers[0].physical_evictions, 2);
+        assert_eq!(after_replace.layers[1].resident_slots, TOP_K);
+        assert!(manager.has_current_for_demand(128).unwrap());
+        assert!(manager.has_current_for_demand(129).unwrap());
+
+        let logits = gate.matvec(&hidden);
+        let (selected_ids, selected_weights, failed) = router_topk_mirror(&logits, TOP_K);
+        assert!(!failed);
+        assert_eq!(selected_ids, vec![2, 3]);
+        let expert_outputs = [
+            q4_expert_mirror(&payload_a, geometry, &hidden),
+            q4_expert_mirror(&payload_b, geometry, &hidden),
+        ];
+        let expected = residual_add_mirror(
+            &residual,
+            &weighted_expert_combine_mirror(&expert_outputs, &selected_weights),
+        );
+        assert!(expected.iter().all(|value| value.is_finite()));
+        assert!(expected
+            .iter()
+            .zip(&residual)
+            .any(|(expected, residual)| expected != residual));
+
+        let (replay_request_status, replay_comparison_status) =
+            run("gpu_native_tiered_residency_replay", true, &expected, 5e-4);
+        assert_eq!(replay_request_status, 0);
+        assert_eq!(replay_comparison_status, 0);
+
+        // Evict and re-admit logical id 2 to obtain a strictly newer real
+        // generation, then prove the saved stale requester cannot disturb it.
+        for id in 4..11u32 {
+            let payload = q4_uniform_expert(geometry, 0.001 * id as f32, 0.002, 0.001);
+            let _ = make_source(id, &payload);
+        }
+        let (newer_resident_a, newer_admission_a) = make_source(2, &payload_a);
+        assert!(newer_admission_a.generation() > stale_admission_a.generation());
+        let newest = manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[GpuNativeDemandExpert::install(
+                    2,
+                    newer_resident_a,
+                    newer_admission_a,
+                )],
+            )
+            .unwrap()[0];
+        let before_stale = manager.snapshot();
+        assert!(matches!(
+            manager.ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[GpuNativeDemandExpert::install(
+                    2,
+                    stale_resident_a,
+                    stale_admission_a,
+                )],
+            ),
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale { .. })
+        ));
+        let after_stale = manager.snapshot();
+        assert_eq!(after_stale.layers, before_stale.layers);
+        assert_eq!(
+            after_stale.stale_generation_rejections,
+            before_stale.stale_generation_rejections + 1
+        );
+        assert!(manager.has_current_for_demand(2).unwrap());
+        assert_eq!(
+            manager
+                .ensure_demand_set(
+                    GpuNativeResidencyPriority::Demand,
+                    0,
+                    &[GpuNativeDemandExpert::current(2)],
+                )
+                .unwrap()[0],
+            newest
+        );
     }
 
     /// Requires an actual NVIDIA L4. Three isolated requests prove a finite
