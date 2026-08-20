@@ -948,7 +948,7 @@ impl GpuNativeTokenLoop {
         let logits_scratch = self
             .executor
             .create_scratch(self.model_geometry.vocab_size)?;
-        let sampled_token_buf = self.executor.create_scratch(1)?;
+        let sampled_token_buf = self.executor.create_boundary_result_scratch(1)?;
 
         let gpu = self.executor.authoritative_gpu()?;
         let staging_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1867,6 +1867,48 @@ pub(crate) mod tests {
         assert!(!usage.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!usage.contains(wgpu::BufferUsages::MAP_READ));
         assert!(!usage.contains(wgpu::BufferUsages::MAP_WRITE));
+    }
+
+    #[test]
+    fn buffer_usage_boundary_isolation_contract() {
+        use crate::backend::gpu_native::{
+            GpuNativeRouterScratchLayout, GpuNativeScratchLayout, GpuNativeTokenStateLayout,
+        };
+
+        // 1. Generic scratch (hidden, residual, logits, attention/expert scratch):
+        // STORAGE | COPY_DST, strictly no COPY_SRC, no MAP_READ, no MAP_WRITE
+        let generic_scratch = GpuNativeScratchLayout::usage();
+        assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!generic_scratch
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        // 2. Specialized boundary result scratch (sampled_token_buf):
+        // STORAGE | COPY_SRC, strictly no MAP_READ, no MAP_WRITE
+        let boundary_scratch = GpuNativeScratchLayout::boundary_result_usage();
+        assert!(boundary_scratch.contains(wgpu::BufferUsages::STORAGE));
+        assert!(boundary_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!boundary_scratch.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!boundary_scratch
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        // 3. Status buffer:
+        // STORAGE | COPY_DST | COPY_SRC, strictly no MAP_READ, no MAP_WRITE
+        let status = GpuNativeTokenStateLayout::status_usage();
+        assert!(status.contains(wgpu::BufferUsages::STORAGE));
+        assert!(status.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(status.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!status.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        // 4. Router selected-ids result:
+        // STORAGE | COPY_SRC, strictly no MAP_READ, no MAP_WRITE
+        let router_result = GpuNativeRouterScratchLayout::result_usage();
+        assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(
+            !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
+        );
     }
 
     #[test]

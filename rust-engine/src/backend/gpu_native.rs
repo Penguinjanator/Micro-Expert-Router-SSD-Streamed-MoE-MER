@@ -3639,12 +3639,29 @@ impl GpuNativeScratchLayout {
         self.bytes
     }
 
-    fn usage() -> wgpu::BufferUsages {
+    pub(crate) fn usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+    }
+
+    pub(crate) fn boundary_result_usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
 
     fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
         super::validate_startup_buffer("gpu_native_scratch", self.bytes, Self::usage(), limits)?;
+        Ok(())
+    }
+
+    fn validate_for_boundary_result_limits(
+        self,
+        limits: &wgpu::Limits,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_boundary_result_scratch",
+            self.bytes,
+            Self::boundary_result_usage(),
+            limits,
+        )?;
         Ok(())
     }
 }
@@ -3740,11 +3757,11 @@ impl GpuNativeRouterScratchLayout {
         })
     }
 
-    fn logits_usage() -> wgpu::BufferUsages {
+    pub(crate) fn logits_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE
     }
 
-    fn result_usage() -> wgpu::BufferUsages {
+    pub(crate) fn result_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
 
@@ -6111,6 +6128,28 @@ impl GpuNativeExecutorContext {
             &format!("gpu_native_scratch_{scratch_id}"),
             layout.bytes,
             GpuNativeScratchLayout::usage(),
+        )?;
+        Ok(GpuNativeScratch::from_buffer(
+            self.context_id,
+            scratch_id,
+            layout,
+            buffer,
+        ))
+    }
+
+    pub(crate) fn create_boundary_result_scratch(
+        &self,
+        elements: usize,
+    ) -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeScratchLayout::try_new(elements)?;
+        layout.validate_for_boundary_result_limits(&gpu.device.limits())?;
+        let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "boundary result scratch");
+        let buffer = create_startup_buffer(
+            &gpu.device,
+            &format!("gpu_native_boundary_result_scratch_{scratch_id}"),
+            layout.bytes,
+            GpuNativeScratchLayout::boundary_result_usage(),
         )?;
         Ok(GpuNativeScratch::from_buffer(
             self.context_id,
@@ -14099,8 +14138,28 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(status.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!status.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
+        let generic_scratch = GpuNativeScratchLayout::usage();
+        assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!generic_scratch
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        let boundary_result = GpuNativeScratchLayout::boundary_result_usage();
+        assert!(boundary_result.contains(wgpu::BufferUsages::STORAGE));
+        assert!(boundary_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(!boundary_result.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(!boundary_result
+            .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+
+        let router_result = GpuNativeRouterScratchLayout::result_usage();
+        assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(
+            !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
+        );
+
         for usage in [
-            GpuNativeScratchLayout::usage(),
             GpuNativeDenseWeightLayout::usage(),
             GpuNativeKvLayout::usage(),
         ] {
