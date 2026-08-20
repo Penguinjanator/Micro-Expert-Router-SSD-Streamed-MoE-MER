@@ -1606,6 +1606,21 @@ fn parse_autotune_probe_output(
     None
 }
 
+fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
+    match cmd {
+        Cmd::Serve { config }
+        | Cmd::BenchReal { config, .. }
+        | Cmd::QualifyHybridQ4 { config, .. }
+        | Cmd::QualifyHybridQ4Parity { config, .. }
+        | Cmd::QualifyHybridQ4GreedyParity { config, .. }
+        | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
+        | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
+        | Cmd::GreedyParityHybridWorkerInternal { config }
+        | Cmd::GreedyParityLogitWorkerInternal { config } => Some(config.as_path()),
+        _ => None,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = Cli::parse();
@@ -1620,18 +1635,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // runtime controls before CPU placement / Rayon exist. The command
     // handlers still own their normal config reconciliation and runtime
     // construction below.
-    let mut startup_config = match &cli.cmd {
-        Cmd::Serve { config }
-        | Cmd::BenchReal { config, .. }
-        | Cmd::QualifyHybridQ4 { config, .. }
-        | Cmd::QualifyHybridQ4Parity { config, .. }
-        | Cmd::QualifyHybridQ4GreedyParity { config, .. }
-        | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
-        | Cmd::GreedyParityHybridWorkerInternal { config }
-        | Cmd::GreedyParityLogitWorkerInternal { config } => {
-            Some(crate::config::Config::from_file(config)?)
-        }
-        _ => None,
+    let mut startup_config = match startup_config_path(&cli.cmd) {
+        Some(path) => Some(crate::config::Config::from_file(path)?),
+        None => None,
     };
 
     let config_cpu_mask = startup_config
@@ -12582,20 +12588,43 @@ mod tests {
         ])
         .unwrap();
 
-        match cli.cmd {
+        match &cli.cmd {
             Cmd::DiagnoseGpuNativeQ4FirstDivergence {
                 config,
                 expected_adapter_name,
                 case,
                 report_out,
             } => {
-                assert_eq!(config, PathBuf::from("config.toml"));
+                assert_eq!(config, &PathBuf::from("config.toml"));
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(case, "json-transformation");
-                assert_eq!(report_out, Some(PathBuf::from("report.json")));
+                assert_eq!(report_out, &Some(PathBuf::from("report.json")));
             }
             _ => panic!("unexpected command variant"),
         }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
     }
 
+    #[test]
+    fn startup_config_path_resolves_gpu_native_first_divergence() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-q4-first-divergence",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--case",
+            "json-transformation",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
+    }
 }
