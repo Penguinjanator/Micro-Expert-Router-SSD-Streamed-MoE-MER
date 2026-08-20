@@ -545,6 +545,29 @@ pub enum GenerateError {
     KvStateLost(String),
 }
 
+pub(crate) fn map_gpu_native_token_loop_error(
+    err: crate::gpu_native_token_loop::GpuNativeTokenLoopError,
+) -> GenerateError {
+    use crate::gpu_native_token_loop::GpuNativeTokenLoopError;
+    match err {
+        GpuNativeTokenLoopError::ContextLimitExceeded { .. }
+        | GpuNativeTokenLoopError::UnsupportedSampling { .. } => {
+            GenerateError::InvalidRequest(err.to_string())
+        }
+        GpuNativeTokenLoopError::IncompatibleModel(_)
+        | GpuNativeTokenLoopError::AttemptBoundExceeded { .. }
+        | GpuNativeTokenLoopError::NoProgress { .. }
+        | GpuNativeTokenLoopError::FatalNumericalFailure { .. }
+        | GpuNativeTokenLoopError::ResidencyServiceFailed(_)
+        | GpuNativeTokenLoopError::Bootstrap(_)
+        | GpuNativeTokenLoopError::InvalidBoundaryReport { .. }
+        | GpuNativeTokenLoopError::InvalidSelectedExpertId { .. }
+        | GpuNativeTokenLoopError::DuplicateSelectedExpertId { .. }
+        | GpuNativeTokenLoopError::InvalidTopKCount { .. }
+        | GpuNativeTokenLoopError::MapFailed(_) => GenerateError::Inference(err.to_string()),
+    }
+}
+
 impl std::fmt::Display for GenerateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -762,7 +785,7 @@ async fn generate(
         }
         let mut req_state = gpu_native_loop
             .create_request_state()
-            .map_err(|e| GenerateError::Inference(e.to_string()))?;
+            .map_err(map_gpu_native_token_loop_error)?;
         let pre_hits = state.engine.report().hits;
         let pre_misses = state.engine.report().misses;
         completion_ids = gpu_native_loop
@@ -774,7 +797,7 @@ async fn generate(
                 &params,
             )
             .await
-            .map_err(|e| GenerateError::Inference(e.to_string()))?;
+            .map_err(map_gpu_native_token_loop_error)?;
         hits_total = state.engine.report().hits.saturating_sub(pre_hits);
         misses_total = state.engine.report().misses.saturating_sub(pre_misses);
     } else if let Some(model) = state.real_model.as_ref() {
@@ -3781,5 +3804,63 @@ mod tests {
                 "chat={chat}: metrics must count only successfully emitted tokens"
             );
         }
+    }
+
+    #[test]
+    fn gpu_native_error_mapping_to_http_status_codes() {
+        use crate::gpu_native_token_loop::GpuNativeTokenLoopError;
+        use axum::http::StatusCode;
+
+        // 1. Client/Request errors map to GenerateError::InvalidRequest -> HTTP 400 (invalid_request_error)
+        let context_limit_err = GpuNativeTokenLoopError::ContextLimitExceeded {
+            requested_position: 9,
+            max_seq_len: 8,
+        };
+        let gen_err1 = map_gpu_native_token_loop_error(context_limit_err);
+        assert!(matches!(gen_err1, GenerateError::InvalidRequest(_)));
+        let resp1 = error_response(gen_err1);
+        assert_eq!(resp1.status(), StatusCode::BAD_REQUEST);
+
+        let unsupported_sampling_err = GpuNativeTokenLoopError::UnsupportedSampling {
+            reason: "temperature must be 0.0".into(),
+        };
+        let gen_err2 = map_gpu_native_token_loop_error(unsupported_sampling_err);
+        assert!(matches!(gen_err2, GenerateError::InvalidRequest(_)));
+        let resp2 = error_response(gen_err2);
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+
+        // 2. Runtime / GPU execution errors map to GenerateError::Inference -> HTTP 500 (server_error)
+        let fatal_err = GpuNativeTokenLoopError::FatalNumericalFailure {
+            layer_index: Some(0),
+            status_bits: 0x1,
+        };
+        let gen_err3 = map_gpu_native_token_loop_error(fatal_err);
+        assert!(matches!(gen_err3, GenerateError::Inference(_)));
+        let resp3 = error_response(gen_err3);
+        assert_eq!(resp3.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let map_failed_err = GpuNativeTokenLoopError::MapFailed("device lost".into());
+        let gen_err4 = map_gpu_native_token_loop_error(map_failed_err);
+        assert!(matches!(gen_err4, GenerateError::Inference(_)));
+        let resp4 = error_response(gen_err4);
+        assert_eq!(resp4.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let no_progress_err = GpuNativeTokenLoopError::NoProgress {
+            layer_index: 1,
+            selected_ids: vec![0, 1],
+        };
+        let gen_err5 = map_gpu_native_token_loop_error(no_progress_err);
+        assert!(matches!(gen_err5, GenerateError::Inference(_)));
+        let resp5 = error_response(gen_err5);
+        assert_eq!(resp5.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let attempt_bound_err = GpuNativeTokenLoopError::AttemptBoundExceeded {
+            attempts: 4,
+            max_attempts: 3,
+        };
+        let gen_err6 = map_gpu_native_token_loop_error(attempt_bound_err);
+        assert!(matches!(gen_err6, GenerateError::Inference(_)));
+        let resp6 = error_response(gen_err6);
+        assert_eq!(resp6.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

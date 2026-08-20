@@ -926,6 +926,27 @@ impl GpuNativeTokenLoop {
         })
     }
 
+    /// Calculate the required context capacity for a prompt of length `prompt_len`
+    /// and `max_tokens` completion tokens, starting from `committed_position`.
+    ///
+    /// For `max_tokens == 0`, zero completion tokens are generated and zero additional positions are consumed.
+    /// For `max_tokens > 0`, the full autoregressive forward count (and final committed position) is:
+    /// `committed_position + prompt_len + max_tokens - 1`
+    /// because the forward evaluation of the final prompt token produces completion token 0.
+    pub fn calculate_required_context_len(
+        committed_position: usize,
+        prompt_len: usize,
+        max_tokens: usize,
+    ) -> Option<usize> {
+        if max_tokens == 0 {
+            return Some(committed_position);
+        }
+        committed_position
+            .checked_add(prompt_len)
+            .and_then(|sum| sum.checked_add(max_tokens))
+            .and_then(|sum| sum.checked_sub(1))
+    }
+
     /// Ingest a multi-token prompt, commit KV positions, and generate up to `max_tokens` completion tokens.
     pub async fn ingest_prompt_and_generate(
         self: &Arc<Self>,
@@ -945,12 +966,20 @@ impl GpuNativeTokenLoop {
                 reason: "only greedy sampling (temperature=0.0) is supported in gpu_native mode in this slice".into(),
             });
         }
-        let total_required_len = prompt_ids.len().checked_add(max_tokens).ok_or_else(|| {
-            GpuNativeTokenLoopError::ContextLimitExceeded {
-                requested_position: usize::MAX,
-                max_seq_len: request.max_seq_len,
-            }
+        if max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+
+        let total_required_len = Self::calculate_required_context_len(
+            request.committed_position,
+            prompt_ids.len(),
+            max_tokens,
+        )
+        .ok_or_else(|| GpuNativeTokenLoopError::ContextLimitExceeded {
+            requested_position: usize::MAX,
+            max_seq_len: request.max_seq_len,
         })?;
+
         if total_required_len > request.max_seq_len {
             return Err(GpuNativeTokenLoopError::ContextLimitExceeded {
                 requested_position: total_required_len,
@@ -1162,13 +1191,6 @@ impl GpuNativeTokenLoop {
         }
 
         self.counters.token_attempts.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .queue_submissions
-            .fetch_add(1, Ordering::Relaxed);
-        self.counters.boundary_maps.fetch_add(1, Ordering::Relaxed);
-        self.counters
-            .boundary_readbacks
-            .fetch_add(1, Ordering::Relaxed);
         if replay {
             self.counters
                 .replay_attempts
@@ -1336,6 +1358,9 @@ impl GpuNativeTokenLoop {
 
         // ONE submission
         gpu.queue.submit(Some(encoder.finish()));
+        self.counters
+            .queue_submissions
+            .fetch_add(1, Ordering::Relaxed);
 
         // ONE map/readback
         let slice = request
@@ -1345,6 +1370,8 @@ impl GpuNativeTokenLoop {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
+        self.counters.boundary_maps.fetch_add(1, Ordering::Relaxed);
+
         gpu.device.poll(wgpu::Maintain::Wait);
         rx.recv()
             .map_err(|e| GpuNativeTokenLoopError::MapFailed(e.to_string()))?
@@ -1354,6 +1381,10 @@ impl GpuNativeTokenLoop {
         let report = self.report_layout.parse(&mapped)?;
         drop(mapped);
         request.staging_buffer.unmap();
+
+        self.counters
+            .boundary_readbacks
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(report)
     }
@@ -1854,6 +1885,90 @@ pub(crate) mod tests {
             .map(|&loc| 1 * num_experts + loc)
             .collect();
         assert_eq!(layer_1_globals, vec![4, 7]);
+    }
+
+    #[test]
+    fn context_capacity_accounting_boundary_and_overflow() {
+        let max_seq_len = 8usize;
+
+        // 1. P + C - 1 == max_seq_len -> accepted by preflight
+        // Prompt of 4 tokens + 5 completion tokens -> 4 + 5 - 1 = 8 evaluations (positions 0..=7)
+        let req_len = GpuNativeTokenLoop::calculate_required_context_len(0, 4, 5);
+        assert_eq!(req_len, Some(8));
+        assert!(req_len.unwrap() <= max_seq_len);
+
+        // 2. P + C - 1 > max_seq_len -> rejected
+        // Prompt of 4 tokens + 6 completion tokens -> 4 + 6 - 1 = 9 evaluations
+        let req_len_overflow = GpuNativeTokenLoop::calculate_required_context_len(0, 4, 6);
+        assert_eq!(req_len_overflow, Some(9));
+        assert!(req_len_overflow.unwrap() > max_seq_len);
+
+        // 3. Arithmetic overflow -> returns None (fail-closed)
+        let req_overflow = GpuNativeTokenLoop::calculate_required_context_len(0, usize::MAX, 2);
+        assert_eq!(req_overflow, None);
+        let req_overflow2 =
+            GpuNativeTokenLoop::calculate_required_context_len(usize::MAX - 1, 2, 2);
+        assert_eq!(req_overflow2, None);
+
+        // 4. Ordinary shorter request -> unchanged / accepted
+        let req_len_short = GpuNativeTokenLoop::calculate_required_context_len(0, 2, 2);
+        assert_eq!(req_len_short, Some(3));
+        assert!(req_len_short.unwrap() <= max_seq_len);
+
+        // 5. max_tokens == 0 -> zero completion tokens, consumes zero additional capacity
+        let req_zero = GpuNativeTokenLoop::calculate_required_context_len(0, 5, 0);
+        assert_eq!(req_zero, Some(0));
+
+        // 6. Non-zero starting committed position
+        let req_with_offset = GpuNativeTokenLoop::calculate_required_context_len(2, 3, 4);
+        assert_eq!(req_with_offset, Some(8)); // 2 + 3 + 4 - 1 = 8
+    }
+
+    #[test]
+    fn token_loop_counters_track_actual_operations_only() {
+        let counters = GpuNativeTokenLoopCounters::default();
+        let snap0 = counters.snapshot();
+        assert_eq!(snap0.token_attempts, 0);
+        assert_eq!(snap0.queue_submissions, 0);
+        assert_eq!(snap0.boundary_maps, 0);
+        assert_eq!(snap0.boundary_readbacks, 0);
+        assert_eq!(snap0.replay_attempts, 0);
+
+        // Simulate an attempt starting: token_attempts is incremented
+        counters.token_attempts.fetch_add(1, Ordering::Relaxed);
+        let snap1 = counters.snapshot();
+        assert_eq!(snap1.token_attempts, 1);
+        // An encode-time failure before submission leaves queue_submissions, boundary_maps,
+        // and boundary_readbacks at 0
+        assert_eq!(snap1.queue_submissions, 0);
+        assert_eq!(snap1.boundary_maps, 0);
+        assert_eq!(snap1.boundary_readbacks, 0);
+
+        // When queue.submit actually occurs:
+        counters.queue_submissions.fetch_add(1, Ordering::Relaxed);
+        let snap2 = counters.snapshot();
+        assert_eq!(snap2.queue_submissions, 1);
+        assert_eq!(snap2.boundary_maps, 0);
+        assert_eq!(snap2.boundary_readbacks, 0);
+
+        // When map_async actually initiates:
+        counters.boundary_maps.fetch_add(1, Ordering::Relaxed);
+        let snap3 = counters.snapshot();
+        assert_eq!(snap3.boundary_maps, 1);
+        assert_eq!(snap3.boundary_readbacks, 0);
+
+        // When map succeeds and report is parsed:
+        counters.boundary_readbacks.fetch_add(1, Ordering::Relaxed);
+        let snap4 = counters.snapshot();
+        assert_eq!(snap4.boundary_readbacks, 1);
+
+        // Replay attempt increments replay_attempts and token_attempts
+        counters.token_attempts.fetch_add(1, Ordering::Relaxed);
+        counters.replay_attempts.fetch_add(1, Ordering::Relaxed);
+        let snap5 = counters.snapshot();
+        assert_eq!(snap5.token_attempts, 2);
+        assert_eq!(snap5.replay_attempts, 1);
+        assert_eq!(snap5.queue_submissions, 1);
     }
 
     #[test]
