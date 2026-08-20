@@ -13,8 +13,12 @@ struct ControlPushConstants {
 var<push_constant> pc: ControlPushConstants;
 
 @group(0) @binding(0) var<storage, read> SELECTED_IDS: array<u32>;
-@group(0) @binding(1) var<storage, read> MAPPING: array<u32>;
-@group(0) @binding(2) var<storage, read_write> RESOLVED_LOCATIONS: array<u32>;
+struct ExpertRoute {
+    location: u32,
+    slot_epoch: u32,
+};
+@group(0) @binding(1) var<storage, read> MAPPING: array<ExpertRoute>;
+@group(0) @binding(2) var<storage, read_write> RESOLVED_LOCATIONS: array<ExpertRoute>;
 struct ResolveStatus {
     bits: atomic<u32>,
 };
@@ -24,6 +28,8 @@ const LOCATION_BANK_SHIFT: u32 = 30u;
 const LOCATION_SLOT_MASK: u32 = 0x3fffffffu;
 const UNMAPPED: u32 = 0xffffffffu;
 const EXPERT_RESIDENCY_MISS: u32 = 4u;
+const FATAL_STATUS_MASK: u32 = 11u;
+const RETRYABLE_STATUS_MASK: u32 = EXPERT_RESIDENCY_MISS;
 
 fn bank_capacity(bank: u32) -> u32 {
     switch bank {
@@ -40,11 +46,16 @@ fn expert_route_resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (route_slot >= pc.top_k) {
         return;
     }
-    RESOLVED_LOCATIONS[route_slot] = UNMAPPED;
+    RESOLVED_LOCATIONS[route_slot].location = UNMAPPED;
+    RESOLVED_LOCATIONS[route_slot].slot_epoch = 0u;
 
-    // A previous attention/router failure owns containment. In particular,
-    // Slice 6's sanitized logical id 0 must never become a real expert here.
-    if (atomicLoad(&RESOLVE_STATUS.bits) != 0u) {
+    // A prior fatal failure owns containment without inventing a residency
+    // miss. A previously latched retryable miss also keeps later expert work
+    // containment-only until a future scheduler establishes a retry boundary.
+    let prior_status = atomicLoad(&RESOLVE_STATUS.bits);
+    if ((prior_status & FATAL_STATUS_MASK) != 0u
+        || (prior_status & RETRYABLE_STATUS_MASK) != 0u
+        || prior_status != 0u) {
         return;
     }
     let logical_id = SELECTED_IDS[route_slot];
@@ -52,8 +63,9 @@ fn expert_route_resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicOr(&RESOLVE_STATUS.bits, EXPERT_RESIDENCY_MISS);
         return;
     }
-    let location = MAPPING[logical_id];
-    if (location == UNMAPPED) {
+    let mapping = MAPPING[logical_id];
+    let location = mapping.location;
+    if (location == UNMAPPED || mapping.slot_epoch == 0u) {
         atomicOr(&RESOLVE_STATUS.bits, EXPERT_RESIDENCY_MISS);
         return;
     }
@@ -63,11 +75,11 @@ fn expert_route_resolve_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicOr(&RESOLVE_STATUS.bits, EXPERT_RESIDENCY_MISS);
         return;
     }
-    RESOLVED_LOCATIONS[route_slot] = location;
+    RESOLVED_LOCATIONS[route_slot] = mapping;
 }
 
 @group(1) @binding(0) var<storage, read> SELECTED_WEIGHTS: array<f32>;
-@group(1) @binding(1) var<storage, read> COMBINE_LOCATIONS: array<u32>;
+@group(1) @binding(1) var<storage, read> COMBINE_LOCATIONS: array<ExpertRoute>;
 @group(1) @binding(2) var<storage, read> ROUTE_OUTPUTS: array<f32>;
 @group(1) @binding(3) var<storage, read_write> COMBINED: array<f32>;
 struct CombineStatus {
@@ -91,7 +103,8 @@ fn expert_validate_main() {
     }
     var selected_weight_sum = 0.0;
     for (var route = 0u; route < pc.top_k; route += 1u) {
-        if (COMBINE_LOCATIONS[route] == UNMAPPED) {
+        if (COMBINE_LOCATIONS[route].location == UNMAPPED
+            || COMBINE_LOCATIONS[route].slot_epoch == 0u) {
             atomicOr(&COMBINE_STATUS.bits, EXPERT_RESIDENCY_MISS);
             return;
         }

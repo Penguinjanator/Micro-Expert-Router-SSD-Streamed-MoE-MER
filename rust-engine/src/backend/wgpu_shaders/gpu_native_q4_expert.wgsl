@@ -22,7 +22,11 @@ var<push_constant> pc: PushConstants;
 @group(0) @binding(2) var<storage, read> W2: array<u32>;
 @group(0) @binding(3) var<storage, read> W3: array<u32>;
 @group(0) @binding(4) var<storage, read> INPUT: array<f32>;
-@group(0) @binding(5) var<storage, read> RESOLVED_LOCATIONS: array<u32>;
+struct ExpertRoute {
+    location: u32,
+    slot_epoch: u32,
+};
+@group(0) @binding(5) var<storage, read> RESOLVED_LOCATIONS: array<ExpertRoute>;
 @group(0) @binding(6) var<storage, read_write> OUTPUT: array<f32>;
 struct Status {
     bits: atomic<u32>,
@@ -34,6 +38,7 @@ const BLOCK_ELEMS: u32 = 32u;
 const LOCATION_BANK_SHIFT: u32 = 30u;
 const LOCATION_SLOT_MASK: u32 = 0x3fffffffu;
 const UNMAPPED: u32 = 0xffffffffu;
+const EXPERT_RESIDENCY_MISS: u32 = 4u;
 const EXPERT_NUMERICAL_FAILURE: u32 = 8u;
 const MAX_FINITE_F32: f32 = 3.402823e+38;
 
@@ -41,15 +46,19 @@ fn is_finite(value: f32) -> bool {
     return value == value && abs(value) <= MAX_FINITE_F32;
 }
 
+fn read_bank_word(bank: u32, word: u32) -> u32 {
+    switch bank {
+        case 0u: { return W0[word]; }
+        case 1u: { return W1[word]; }
+        case 2u: { return W2[word]; }
+        default: { return W3[word]; }
+    }
+}
+
 fn read_bank_byte(bank: u32, byte_offset: u32) -> u32 {
     let word = byte_offset >> 2u;
     let shift = (byte_offset & 3u) * 8u;
-    switch bank {
-        case 0u: { return (W0[word] >> shift) & 0xffu; }
-        case 1u: { return (W1[word] >> shift) & 0xffu; }
-        case 2u: { return (W2[word] >> shift) & 0xffu; }
-        default: { return (W3[word] >> shift) & 0xffu; }
-    }
+    return (read_bank_word(bank, word) >> shift) & 0xffu;
 }
 
 fn q4_dot(
@@ -77,9 +86,9 @@ fn q4_dot(
     return sum;
 }
 
-fn resolved_route() -> u32 {
+fn resolved_route() -> ExpertRoute {
     if (pc.route_slot >= pc.top_k || atomicLoad(&STATUS.bits) != 0u) {
-        return UNMAPPED;
+        return ExpertRoute(UNMAPPED, 0u);
     }
     return RESOLVED_LOCATIONS[pc.route_slot];
 }
@@ -90,7 +99,8 @@ fn q4_expert_gate_up_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (row >= pc.d_ff) {
         return;
     }
-    let location = resolved_route();
+    let route = resolved_route();
+    let location = route.location;
     if (location == UNMAPPED) {
         OUTPUT[row] = 0.0;
         return;
@@ -98,12 +108,19 @@ fn q4_expert_gate_up_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bank = location >> LOCATION_BANK_SHIFT;
     let slot = location & LOCATION_SLOT_MASK;
     let slot_base = slot * pc.slot_stride_bytes;
+    let current_slot_epoch = read_bank_word(bank, slot_base >> 2u);
+    if (current_slot_epoch == 0u || current_slot_epoch != route.slot_epoch) {
+        atomicOr(&STATUS.bits, EXPERT_RESIDENCY_MISS);
+        OUTPUT[row] = 0.0;
+        return;
+    }
+    let payload_base = slot_base + 4u;
     let blocks_per_row = pc.d_model / BLOCK_ELEMS;
     let row_block = row * blocks_per_row;
-    let gate = q4_dot(bank, slot_base, row_block, blocks_per_row, 0u);
+    let gate = q4_dot(bank, payload_base, row_block, blocks_per_row, 0u);
     let up = q4_dot(
         bank,
-        slot_base,
+        payload_base,
         pc.blocks_per_projection + row_block,
         blocks_per_row,
         0u,
@@ -130,7 +147,8 @@ fn q4_expert_down_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let route_output = pc.route_slot * pc.d_model + row;
-    let location = resolved_route();
+    let route = resolved_route();
+    let location = route.location;
     if (location == UNMAPPED) {
         OUTPUT[route_output] = 0.0;
         return;
@@ -138,9 +156,16 @@ fn q4_expert_down_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bank = location >> LOCATION_BANK_SHIFT;
     let slot = location & LOCATION_SLOT_MASK;
     let slot_base = slot * pc.slot_stride_bytes;
+    let current_slot_epoch = read_bank_word(bank, slot_base >> 2u);
+    if (current_slot_epoch == 0u || current_slot_epoch != route.slot_epoch) {
+        atomicOr(&STATUS.bits, EXPERT_RESIDENCY_MISS);
+        OUTPUT[route_output] = 0.0;
+        return;
+    }
+    let payload_base = slot_base + 4u;
     let blocks_per_row = pc.d_ff / BLOCK_ELEMS;
     let first_block = 2u * pc.blocks_per_projection + row * blocks_per_row;
-    let value = q4_dot(bank, slot_base, first_block, blocks_per_row, 0u);
+    let value = q4_dot(bank, payload_base, first_block, blocks_per_row, 0u);
     if (!is_finite(value)) {
         atomicOr(&STATUS.bits, EXPERT_NUMERICAL_FAILURE);
         OUTPUT[route_output] = 0.0;
