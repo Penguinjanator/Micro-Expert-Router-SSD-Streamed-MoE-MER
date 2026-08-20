@@ -269,6 +269,11 @@ pub enum GpuNativeModelCompatibilityError {
         tensor: String,
         dtype: String,
     },
+    InconsistentRopeDimension {
+        layer_index: usize,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for GpuNativeModelCompatibilityError {
@@ -349,6 +354,14 @@ impl fmt::Display for GpuNativeModelCompatibilityError {
             Self::UnsupportedDenseDtype { tensor, dtype } => write!(
                 f,
                 "tensor {tensor} has unsupported dense dtype {dtype}; only F32 and Q8_0 are supported"
+            ),
+            Self::InconsistentRopeDimension {
+                layer_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "layer {layer_index} has rope_dim {actual}, expected uniform rope_dim {expected}"
             ),
         }
     }
@@ -539,6 +552,7 @@ pub struct GpuNativeModelGeometry {
     pub num_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    pub rope_dim: usize,
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub rms_eps: f32,
@@ -602,7 +616,18 @@ impl GpuNativeTokenLoop {
                 dtype: model.lm_head.weights.dtype_name().into(),
             });
         }
+        let expected_rope_dim = model.layers.first().map(|l| l.attn.rope_dim).unwrap_or(0);
+
         for (layer_idx, layer) in model.layers.iter().enumerate() {
+            if layer.attn.rope_dim != expected_rope_dim {
+                return Err(
+                    GpuNativeModelCompatibilityError::InconsistentRopeDimension {
+                        layer_index: layer_idx,
+                        expected: expected_rope_dim,
+                        actual: layer.attn.rope_dim,
+                    },
+                );
+            }
             if layer.dense_ffn.is_some() {
                 return Err(GpuNativeModelCompatibilityError::DenseLayerUnsupported {
                     layer_index: layer_idx,
@@ -718,6 +743,11 @@ impl GpuNativeTokenLoop {
         let num_heads = model.config.num_heads;
         let num_kv_heads = model.config.num_kv_heads;
         let head_dim = model.config.head_dim;
+        let rope_dim = model
+            .layers
+            .first()
+            .map(|l| l.attn.rope_dim)
+            .unwrap_or(head_dim);
         let vocab_size = model.config.vocab_size;
         let rms_eps = model.config.rms_eps;
         let rope_base = model.config.rope_base;
@@ -738,6 +768,7 @@ impl GpuNativeTokenLoop {
             num_heads,
             num_kv_heads,
             head_dim,
+            rope_dim,
             vocab_size,
             max_seq_len,
             rms_eps,
@@ -758,7 +789,7 @@ impl GpuNativeTokenLoop {
             num_heads,
             num_kv_heads,
             head_dim,
-            max_seq_len,
+            rope_dim,
         )?;
 
         for (l, layer) in model.layers.iter().enumerate() {
@@ -868,6 +899,10 @@ impl GpuNativeTokenLoop {
         self.model_geometry
     }
 
+    pub fn rope_dim(&self) -> usize {
+        self.model_geometry.rope_dim
+    }
+
     pub fn max_seq_len(&self) -> usize {
         self.model_geometry.max_seq_len
     }
@@ -891,7 +926,7 @@ impl GpuNativeTokenLoop {
             self.model_geometry.num_heads,
             self.model_geometry.num_kv_heads,
             self.model_geometry.head_dim,
-            self.model_geometry.max_seq_len,
+            self.model_geometry.rope_dim,
         )?;
         let attn_scratch = self.executor.create_attention_scratch(attn_geom)?;
 
@@ -1666,6 +1701,71 @@ pub(crate) mod tests {
             GpuNativeTokenLoop::validate_model_compatibility(&model4),
             Err(GpuNativeModelCompatibilityError::RoutedScalingFactorUnsupported { .. })
         ));
+    }
+
+    #[test]
+    fn compatibility_validation_validates_rope_dim_uniformity() {
+        let cfg = make_test_qwen3_moe_config();
+        let mut model = make_test_qwen3_moe_model(cfg);
+        // Valid uniform rope_dim
+        assert_eq!(model.layers[0].attn.rope_dim, 16);
+        assert_eq!(model.layers[1].attn.rope_dim, 16);
+        assert!(GpuNativeTokenLoop::validate_model_compatibility(&model).is_ok());
+
+        // Inconsistent rope_dim across layers fails closed
+        model.layers[1].attn.rope_dim = 8;
+        let err = GpuNativeTokenLoop::validate_model_compatibility(&model).unwrap_err();
+        assert_eq!(
+            err,
+            GpuNativeModelCompatibilityError::InconsistentRopeDimension {
+                layer_index: 1,
+                expected: 16,
+                actual: 8,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("layer 1 has rope_dim 8, expected uniform rope_dim 16"));
+    }
+
+    #[test]
+    fn model_rope_dim_is_derived_independently_from_max_seq_len() {
+        let cfg = make_test_qwen3_moe_config();
+        let model = make_test_qwen3_moe_model(cfg);
+        assert_eq!(model.layers[0].attn.rope_dim, 16);
+
+        // max_seq_len (e.g. 8) and rope_dim (16) must remain distinct and independent
+        let max_seq_len = 8usize;
+        let rope_dim = model.layers[0].attn.rope_dim;
+        assert_ne!(rope_dim, max_seq_len);
+
+        let geom = GpuNativeModelGeometry {
+            num_layers: model.config.num_layers,
+            d_model: model.config.d_model,
+            d_ff: model.config.d_ff,
+            num_experts: model.config.num_experts,
+            top_k: model.config.top_k,
+            num_heads: model.config.num_heads,
+            num_kv_heads: model.config.num_kv_heads,
+            head_dim: model.config.head_dim,
+            rope_dim,
+            vocab_size: model.config.vocab_size,
+            max_seq_len,
+            rms_eps: model.config.rms_eps,
+            rope_base: model.config.rope_base,
+        };
+        assert_eq!(geom.rope_dim, 16);
+        assert_eq!(geom.max_seq_len, 8);
+
+        // Attention geometry construction must accept rope_dim=16, not max_seq_len=8
+        let attn_geom = GpuNativeAttentionGeometry::try_new(
+            geom.d_model,
+            geom.num_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
+            geom.rope_dim,
+        )
+        .unwrap();
+        assert_eq!(attn_geom.rope_dim(), 16);
     }
 
     #[test]
