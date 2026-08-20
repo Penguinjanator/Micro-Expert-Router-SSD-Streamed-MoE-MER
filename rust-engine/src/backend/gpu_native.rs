@@ -3844,6 +3844,14 @@ impl<B> GpuNativeRouterScratch<B> {
     pub(crate) fn selected_ids_buffer(&self) -> &B {
         &self.selected_ids
     }
+
+    pub(crate) fn selected_weights_buffer(&self) -> &B {
+        &self.selected_weights
+    }
+
+    pub(crate) fn logits_buffer(&self) -> &B {
+        &self.logits
+    }
 }
 
 impl<B> fmt::Debug for GpuNativeRouterScratch<B> {
@@ -4160,6 +4168,14 @@ impl<B> GpuNativeTokenState<B> {
 
     pub(crate) fn status_buffer(&self) -> &B {
         &self.status
+    }
+
+    pub(crate) fn hidden_buffer(&self) -> &B {
+        &self.hidden
+    }
+
+    pub(crate) fn residual_buffer(&self) -> &B {
+        &self.residual
     }
 }
 

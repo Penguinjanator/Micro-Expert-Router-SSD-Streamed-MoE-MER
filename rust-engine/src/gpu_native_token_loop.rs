@@ -3,6 +3,7 @@
 //! Owns the execution of the entire forward transformer pass on GPU:
 //! Embedding lookup -> Layer (Attention RMSNorm -> QKV/RoPE/KV -> Causal Attention/O -> MoE RMSNorm -> Router -> Q4 Expert Combine) -> Final RMSNorm -> LM Head -> GPU Greedy Argmax.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +27,7 @@ use crate::model::RealModel;
 use crate::sampling::SamplingParams;
 
 /// Structured summary of runtime counters across the GPU-native token loop.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuNativeTokenLoopSnapshot {
     pub token_attempts: u64,
     pub tokens_completed: u64,
@@ -542,7 +543,7 @@ pub struct GpuNativeLayerPlan {
     pub router_plan: GpuNativeRouterPlan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpuNativeModelGeometry {
     pub num_layers: usize,
     pub d_model: usize,
@@ -557,6 +558,23 @@ pub struct GpuNativeModelGeometry {
     pub max_seq_len: usize,
     pub rms_eps: f32,
     pub rope_base: f32,
+}
+
+/// Diagnostic trace sink for capturing intermediate layer states during an attempt.
+pub struct GpuNativeDiagnosticSink<'a> {
+    pub layout: &'a crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+    pub staging_buffer: &'a wgpu::Buffer,
+}
+
+struct GpuNativeAttemptOutput {
+    boundary_report: GpuNativeBoundaryReport,
+    diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
+}
+
+struct GpuNativeStepOutput {
+    sampled_token: Option<u32>,
+    attempts: usize,
+    diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
 }
 
 /// Persistent, model-scoped owner of the GPU-native token loop.
@@ -1084,13 +1102,85 @@ impl GpuNativeTokenLoop {
         position: usize,
         sample: bool,
     ) -> Result<Option<u32>, GpuNativeTokenLoopError> {
-        let mut attempt = 0;
-        let mut last_miss_sig: Option<(usize, Vec<u32>)> = None;
+        let out = self
+            .step_token_unified(engine, request, token_id, position, sample, None)
+            .await?;
+        Ok(out.sampled_token)
+    }
+
+    /// Diagnostic variant of step_token that captures intermediate activation traces on the final attempt.
+    pub async fn step_token_diagnostic(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        trace_layout: &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+        diagnostic_staging_buffer: &wgpu::Buffer,
+    ) -> Result<
+        (
+            crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace,
+            usize,
+        ),
+        GpuNativeTokenLoopError,
+    > {
+        let out = self
+            .step_token_unified(
+                engine,
+                request,
+                token_id,
+                position,
+                sample,
+                Some((trace_layout, diagnostic_staging_buffer)),
+            )
+            .await?;
+        let trace =
+            out.diagnostic_trace
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "diagnostic trace was not collected".into(),
+                })?;
+        Ok((trace, out.attempts))
+    }
+
+    /// Allocate a device-resident staging buffer for diagnostic trace readbacks.
+    pub fn create_diagnostic_staging_buffer(
+        &self,
+        trace_layout: &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+    ) -> Result<wgpu::Buffer, GpuNativeTokenLoopError> {
+        let gpu = self.executor.authoritative_gpu()?;
+        let staging_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_diagnostic_staging"),
+            size: trace_layout.total_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(staging_buffer)
+    }
+
+    /// Authoritative internal loop for stepping a token with bounded retries and demand residency service.
+    async fn step_token_unified(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        diagnostic_sink: Option<(
+            &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+            &wgpu::Buffer,
+        )>,
+    ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
+        let _guard = self.execution_guard.lock().await;
+
         let max_attempts = self.layers.len() + 1;
+        let mut attempt = 0usize;
+        let mut last_miss_sig: Option<(usize, Vec<u32>)> = None;
         let mut is_warm = true;
 
         loop {
             if attempt >= max_attempts {
+                self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
                 return Err(GpuNativeTokenLoopError::AttemptBoundExceeded {
                     attempts: attempt,
                     max_attempts,
@@ -1098,7 +1188,19 @@ impl GpuNativeTokenLoop {
             }
 
             let replay = attempt > 0;
-            let report = self.execute_token_attempt(request, token_id, position, sample, replay)?;
+            let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
+                layout,
+                staging_buffer: buf,
+            });
+            let output = self.execute_token_attempt_unified(
+                request,
+                token_id,
+                position,
+                sample,
+                replay,
+                sink.as_ref(),
+            )?;
+            let report = output.boundary_report;
 
             if let Some(fail_layer) = report.first_failure_layer() {
                 let layer_status = report.layer_statuses[fail_layer];
@@ -1204,13 +1306,27 @@ impl GpuNativeTokenLoop {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
+            request.committed_position += 1;
+            self.counters
+                .tokens_completed
+                .fetch_add(1, Ordering::Relaxed);
+            if is_warm {
+                self.counters
+                    .warm_tokens_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+
             engine.record_gpu_native_actual_routes(&report.selected_ids);
 
-            if sample {
-                return Ok(Some(report.sampled_token));
-            } else {
-                return Ok(None);
-            }
+            return Ok(GpuNativeStepOutput {
+                sampled_token: if sample {
+                    Some(report.sampled_token)
+                } else {
+                    None
+                },
+                attempts: attempt + 1,
+                diagnostic_trace: output.diagnostic_trace,
+            });
         }
     }
 
@@ -1223,6 +1339,52 @@ impl GpuNativeTokenLoop {
         sample: bool,
         replay: bool,
     ) -> Result<GpuNativeBoundaryReport, GpuNativeTokenLoopError> {
+        let output =
+            self.execute_token_attempt_unified(request, token_id, position, sample, replay, None)?;
+        Ok(output.boundary_report)
+    }
+
+    /// Diagnostic variant of execute_token_attempt that additionally records full activation traces.
+    pub fn execute_token_attempt_diagnostic(
+        &self,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        replay: bool,
+        trace_layout: &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+        diagnostic_staging_buffer: &wgpu::Buffer,
+    ) -> Result<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace, GpuNativeTokenLoopError>
+    {
+        let sink = GpuNativeDiagnosticSink {
+            layout: trace_layout,
+            staging_buffer: diagnostic_staging_buffer,
+        };
+        let output = self.execute_token_attempt_unified(
+            request,
+            token_id,
+            position,
+            sample,
+            replay,
+            Some(&sink),
+        )?;
+        output
+            .diagnostic_trace
+            .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "diagnostic trace was not collected".into(),
+            })
+    }
+
+    /// Single authoritative internal forward attempt encoder and executor.
+    fn execute_token_attempt_unified(
+        &self,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        replay: bool,
+        diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
+    ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
         if position != request.committed_position {
             return Err(GpuNativeTokenLoopError::PositionMismatch {
                 requested_position: position,
@@ -1247,7 +1409,11 @@ impl GpuNativeTokenLoop {
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("gpu_native_token_attempt"),
+                label: Some(if diagnostic_sink.is_some() {
+                    "gpu_native_token_attempt_diagnostic"
+                } else {
+                    "gpu_native_token_attempt"
+                }),
             });
 
         if replay {
@@ -1261,6 +1427,16 @@ impl GpuNativeTokenLoop {
             token_id,
             &request.token_state,
         )?;
+
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                request.token_state.hidden_buffer(),
+                0,
+                sink.staging_buffer,
+                sink.layout.embedding_offset as u64,
+                sink.layout.embedding_bytes as u64,
+            );
+        }
 
         let num_layers = self.layers.len();
         let top_k = self.model_geometry.top_k;
@@ -1295,6 +1471,16 @@ impl GpuNativeTokenLoop {
                 position + 1,
             )?;
 
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_post_attn_offset(layer_idx),
+                    (self.model_geometry.d_model * 4) as u64,
+                );
+            }
+
             // 4. MoE Pre-Norm
             self.executor.encode_rms_norm_state_in_place(
                 &mut encoder,
@@ -1303,6 +1489,16 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
             )?;
 
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_router_input_offset(layer_idx),
+                    (self.model_geometry.d_model * 4) as u64,
+                );
+            }
+
             // 5. Router
             self.executor.encode_router(
                 &mut encoder,
@@ -1310,6 +1506,23 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
                 &request.router_scratch,
             )?;
+
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_ids_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_selected_ids_offset(layer_idx),
+                    (top_k * 4) as u64,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_weights_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_selected_weights_offset(layer_idx),
+                    (top_k * 4) as u64,
+                );
+            }
 
             // 6. Expert Combine
             let arena = self.residency_manager.arena(layer_idx).ok_or_else(|| {
@@ -1325,6 +1538,23 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
                 &request.expert_scratch,
             )?;
+
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_post_moe_offset(layer_idx),
+                    (self.model_geometry.d_model * 4) as u64,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.status_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.layer_status_offset(layer_idx),
+                    4,
+                );
+            }
 
             // Copy layer status to staging
             let status_offset = (layer_idx * 4) as u64;
@@ -1356,6 +1586,16 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
             )?;
 
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.final_norm_offset as u64,
+                    sink.layout.final_norm_bytes as u64,
+                );
+            }
+
             // LM Head GEMV
             self.executor.encode_dense_gemv_hidden_to_scratch(
                 &mut encoder,
@@ -1363,6 +1603,16 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
                 &request.logits_scratch,
             )?;
+
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.logits_scratch.buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.logits_offset as u64,
+                    sink.layout.logits_bytes as u64,
+                );
+            }
 
             // GPU Greedy Argmax
             self.executor.encode_greedy_argmax(
@@ -1373,7 +1623,24 @@ impl GpuNativeTokenLoop {
                 self.model_geometry.vocab_size,
             )?;
 
-            // Copy final status and sampled token
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.sampled_token_buf.buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.sampled_token_offset as u64,
+                    4,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.status_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.final_status_offset as u64,
+                    4,
+                );
+            }
+
+            // Copy final status and sampled token to production staging
             let final_status_offset = (num_layers * 4 + num_layers * top_k * 4) as u64;
             encoder.copy_buffer_to_buffer(
                 request.token_state.status_buffer(),
@@ -1391,7 +1658,7 @@ impl GpuNativeTokenLoop {
                 4,
             );
         } else {
-            // Ingest-only: copy final status to staging
+            // Ingest-only: copy final status to production staging
             let final_status_offset = (num_layers * 4 + num_layers * top_k * 4) as u64;
             encoder.copy_buffer_to_buffer(
                 request.token_state.status_buffer(),
@@ -1400,6 +1667,15 @@ impl GpuNativeTokenLoop {
                 final_status_offset,
                 4,
             );
+            if let Some(sink) = diagnostic_sink {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.status_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.final_status_offset as u64,
+                    4,
+                );
+            }
         }
 
         // ONE submission
@@ -1408,7 +1684,7 @@ impl GpuNativeTokenLoop {
             .queue_submissions
             .fetch_add(1, Ordering::Relaxed);
 
-        // ONE map/readback
+        // ONE map/readback for production boundary report
         let slice = request
             .staging_buffer
             .slice(..self.report_layout.total_bytes);
@@ -1432,7 +1708,29 @@ impl GpuNativeTokenLoop {
             .boundary_readbacks
             .fetch_add(1, Ordering::Relaxed);
 
-        Ok(report)
+        let diagnostic_trace = if let Some(sink) = diagnostic_sink {
+            let diag_slice = sink.staging_buffer.slice(..sink.layout.total_bytes);
+            let (tx_d, rx_d) = std::sync::mpsc::sync_channel(1);
+            diag_slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx_d.send(res);
+            });
+            gpu.device.poll(wgpu::Maintain::Wait);
+            rx_d.recv()
+                .map_err(|e| GpuNativeTokenLoopError::MapFailed(e.to_string()))?
+                .map_err(|e| GpuNativeTokenLoopError::MapFailed(format!("{e:?}")))?;
+            let diag_mapped = diag_slice.get_mapped_range();
+            let trace = sink.layout.parse(&diag_mapped)?;
+            drop(diag_mapped);
+            sink.staging_buffer.unmap();
+            Some(trace)
+        } else {
+            None
+        };
+
+        Ok(GpuNativeAttemptOutput {
+            boundary_report: report,
+            diagnostic_trace,
+        })
     }
 }
 
