@@ -20,6 +20,12 @@ use crate::expert_cache::{
     ExpertResident, GpuExpertCache, GpuHotPromotionOutcome, GpuResident,
 };
 use crate::gating::Router;
+use crate::gpu_native_residency::{
+    global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
+    GpuNativeResidencyPriority, GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe,
+    GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
+    GpuNativeTieredResidencySnapshot,
+};
 use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
@@ -368,6 +374,68 @@ impl std::fmt::Display for ExpertReadError {
 }
 
 impl std::error::Error for ExpertReadError {}
+
+#[derive(Debug)]
+pub(crate) enum GpuNativeDemandResidencyError {
+    ManagerNotInstalled,
+    ExpertRead(ExpertReadError),
+    LogicalAdmission(crate::backend::GpuExpertDispatchError),
+    Tiered(GpuNativeTieredResidencyError),
+}
+
+impl std::fmt::Display for GpuNativeDemandResidencyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ManagerNotInstalled => {
+                f.write_str("GPU-native tiered residency manager is not installed")
+            }
+            Self::ExpertRead(error) => write!(f, "tiered residency fetch failed: {error}"),
+            Self::LogicalAdmission(error) => {
+                write!(f, "tiered residency logical admission failed: {error}")
+            }
+            Self::Tiered(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for GpuNativeDemandResidencyError {}
+
+impl From<ExpertReadError> for GpuNativeDemandResidencyError {
+    fn from(value: ExpertReadError) -> Self {
+        Self::ExpertRead(value)
+    }
+}
+
+impl From<GpuNativeTieredResidencyError> for GpuNativeDemandResidencyError {
+    fn from(value: GpuNativeTieredResidencyError) -> Self {
+        Self::Tiered(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GpuNativeResidencyInstallError {
+    LegacyPhysicalExpertPlaneActive,
+    LogicalCacheMismatch,
+    AlreadyInstalled,
+}
+
+impl std::fmt::Display for GpuNativeResidencyInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyPhysicalExpertPlaneActive => f.write_str(
+                "GPU-native residency cannot be installed while the legacy routed-expert GPU plane is active",
+            ),
+            Self::LogicalCacheMismatch => f.write_str(
+                "GPU-native residency manager does not share the execution context's logical GpuExpertCache",
+            ),
+            Self::AlreadyInstalled => {
+                f.write_str("GPU-native tiered residency manager is already installed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuNativeResidencyInstallError {}
 
 /// RAII guard that ensures the in-flight singleflight slot for an
 /// expert id is freed (and any waiters notified) when the leader's
@@ -1126,6 +1194,10 @@ pub(crate) struct EngineCore {
     /// first probes logical admission; misses fall through to the RAM
     /// `MultiLayerExpertCache` and then to NVMe.
     pub(super) gpu_cache: Option<Arc<GpuExpertCache>>,
+    /// Optional future-token-loop physical residency plane. It is never
+    /// installed from the legacy GPU mode. When absent, every existing
+    /// demand and speculative path remains unchanged.
+    pub(super) gpu_native_residency: Option<Arc<GpuNativeTieredResidencyManager>>,
     /// One-shot sender that feeds background RAM → logical-GPU-admission
     /// promotion task. The receiver lives on a dedicated Tokio task
     /// spawned by [`Engine::install_gpu_cache`]; the inference hot
@@ -1446,6 +1518,7 @@ impl EngineCore {
             shape,
             options,
             gpu_cache: None,
+            gpu_native_residency: None,
             gpu_promotion_tx: None,
             in_flight: Arc::new(DashMap::new()),
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(prefetch_permits)),
@@ -2390,6 +2463,74 @@ impl Engine {
             }
         }
         outcome
+    }
+
+    /// Apply the existing non-evicting speculative logical-admission policy
+    /// and return its current generation. The historical `GpuResident`
+    /// payload copy remains compatibility debt; physical upload still reads
+    /// directly from `ExpertResident::data()` and this helper adds no further
+    /// persistent host copy.
+    fn ensure_speculative_gpu_admission(
+        &self,
+        resident: &Arc<ExpertResident>,
+    ) -> Option<crate::expert_cache::GpuAdmission> {
+        let gpu = self.core.execution_context.gpu_expert_cache();
+        if let Some(admission) = gpu.current_admission(resident.id) {
+            return Some(admission);
+        }
+        let bytes = resident.data().len();
+        if (gpu.used_bytes() as usize).saturating_add(bytes) > gpu.capacity_bytes() {
+            return None;
+        }
+        let gpu_resident = Arc::new(GpuResident::new_with_dtype(
+            resident.id,
+            resident.data().to_vec(),
+            self.core.options.dtype,
+        ));
+        if gpu.try_promote_lru_no_evict(gpu_resident) {
+            if let Some(prom) = self.metrics.prom.as_ref() {
+                prom.record_promotions(1);
+                prom.set_vram_used_bytes(gpu.used_bytes());
+            }
+        }
+        gpu.current_admission(resident.id)
+    }
+
+    /// Explicit future bootstrap seam for the GPU-native physical plane.
+    ///
+    /// The manager must retain the exact logical cache owned by this engine's
+    /// authoritative execution context. Slice 9 also rejects simultaneous
+    /// activation of the legacy routed-expert GPU registry: Slice 10 may
+    /// compose the GPU-native token loop, but it must never double-consume one
+    /// request's configured expert capacity across both physical planes.
+    pub(crate) fn install_gpu_native_residency_manager(
+        &mut self,
+        manager: Arc<GpuNativeTieredResidencyManager>,
+    ) -> Result<(), GpuNativeResidencyInstallError> {
+        if self.core.gpu_native_residency.is_some() {
+            return Err(GpuNativeResidencyInstallError::AlreadyInstalled);
+        }
+        if self.core.execution_context.plan().routed_experts()
+            == crate::backend::ExecutionPlane::Gpu
+        {
+            return Err(GpuNativeResidencyInstallError::LegacyPhysicalExpertPlaneActive);
+        }
+        if !Arc::ptr_eq(
+            manager.gpu_cache(),
+            self.core.execution_context.gpu_expert_cache(),
+        ) {
+            return Err(GpuNativeResidencyInstallError::LogicalCacheMismatch);
+        }
+        self.core.gpu_cache = Some(manager.gpu_cache().clone());
+        self.core.gpu_native_residency = Some(manager);
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_residency_snapshot(&self) -> Option<GpuNativeTieredResidencySnapshot> {
+        self.core
+            .gpu_native_residency
+            .as_ref()
+            .map(|manager| manager.snapshot())
     }
 
     /// Attach the logical GPU-admission cache — Phase 2 hierarchy policy.
@@ -3379,6 +3520,77 @@ impl Engine {
         })
     }
 
+    /// Future GPU-native retry service. Physical hits never touch RAM or
+    /// storage. RAM misses use the exact existing `fetch_with_retry`
+    /// singleflight path, then the existing logical demand-admission policy,
+    /// before Slice 8 receives `ExpertResident::data()` for physical upload.
+    /// Demand never consults the speculative governor or semaphore.
+    pub(crate) async fn ensure_gpu_native_demand_residency(
+        self: &Arc<Self>,
+        layer_index: usize,
+        global_ids: &[u32],
+    ) -> Result<
+        Vec<crate::backend::gpu_native::GpuNativeQ4ExpertResidency>,
+        GpuNativeDemandResidencyError,
+    > {
+        let manager = self
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .cloned()
+            .ok_or(GpuNativeDemandResidencyError::ManagerNotInstalled)?;
+        let num_layers = manager.plan().num_layers();
+        let experts_per_layer = manager.plan().geometry().num_experts() as u32;
+        let mut seen = HashSet::with_capacity(global_ids.len());
+        for &global_id in global_ids {
+            if !seen.insert(global_id) {
+                return Err(
+                    GpuNativeTieredResidencyError::DuplicateDemandExpert { global_id }.into(),
+                );
+            }
+            let identity =
+                gpu_native_global_to_layer_local(global_id, num_layers, experts_per_layer)?;
+            if identity.layer_index != layer_index {
+                return Err(GpuNativeTieredResidencyError::DemandLayerMismatch {
+                    requested_layer: layer_index,
+                    global_id,
+                    actual_layer: identity.layer_index,
+                }
+                .into());
+            }
+        }
+
+        let mut demands = Vec::with_capacity(global_ids.len());
+        for &global_id in global_ids {
+            if manager.has_current_for_demand(global_id)? {
+                demands.push(GpuNativeDemandExpert::current(global_id));
+                continue;
+            }
+            let resident = match self.core.cache.get(global_id) {
+                Some(resident) => resident,
+                None => self.fetch_with_retry(global_id).await?,
+            };
+            self.demand_admit_resident_to_gpu(layer_index as u32, resident.as_ref())
+                .map_err(GpuNativeDemandResidencyError::LogicalAdmission)?;
+            let admission = self
+                .core
+                .execution_context
+                .gpu_expert_cache()
+                .current_admission(global_id)
+                .ok_or_else(|| {
+                    GpuNativeDemandResidencyError::Tiered(
+                        GpuNativeTieredResidencyError::DemandSourceMissing { global_id },
+                    )
+                })?;
+            demands.push(GpuNativeDemandExpert::install(
+                global_id, resident, admission,
+            ));
+        }
+        manager
+            .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands)
+            .map_err(Into::into)
+    }
+
     /// One single fetch attempt. Acquires a buffer (yielding briefly
     /// if the pool is under pressure), issues the read, and either
     /// installs the resident in the cache or surfaces the I/O error
@@ -3463,7 +3675,84 @@ impl Engine {
         }
     }
 
+    fn spawn_gpu_native_ram_to_vram_prefetch(
+        self: &Arc<Self>,
+        manager: Arc<GpuNativeTieredResidencyManager>,
+        resident: Arc<ExpertResident>,
+        p: f64,
+    ) {
+        let id = resident.id;
+        // This is the prediction's one and only governor decision. A PCIe
+        // write does not call `record_completed`; that denominator remains
+        // tied to speculative RAM/NVMe prefetch usefulness.
+        if !self.core.governor.admit(p) {
+            self.metrics
+                .counters
+                .prefetch_dropped_governor
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let permit = match self.core.prefetch_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics
+                    .counters
+                    .prefetch_dropped_concurrency
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(admission) = me.ensure_speculative_gpu_admission(&resident) else {
+                return;
+            };
+            match manager.ensure_speculative_resident(
+                id,
+                &resident,
+                &admission,
+                GpuNativeResidencyPriority::Speculative { score: p },
+            ) {
+                Ok(
+                    GpuNativeSpeculativeInstall::Hit(_)
+                    | GpuNativeSpeculativeInstall::Installed(_)
+                    | GpuNativeSpeculativeInstall::DroppedCapacityOrPressure
+                    | GpuNativeSpeculativeInstall::StaleLogicalGeneration,
+                ) => {}
+                Err(error) => debug!(
+                    expert = id,
+                    error = %error,
+                    "RAM-to-VRAM speculative residency was dropped"
+                ),
+            }
+        });
+    }
+
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        if let Some(manager) = self.core.gpu_native_residency.as_ref().cloned() {
+            match manager.probe_speculative(
+                id,
+                GpuNativeResidencyPriority::Speculative { score: p },
+            ) {
+                Ok(GpuNativeSpeculativeProbe::Hit(_))
+                | Ok(GpuNativeSpeculativeProbe::DroppedPressure) => return,
+                Ok(GpuNativeSpeculativeProbe::Miss) => {
+                    if let Some(resident) = self.core.cache.get(id) {
+                        self.spawn_gpu_native_ram_to_vram_prefetch(manager, resident, p);
+                        return;
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        expert = id,
+                        error = %error,
+                        "dropping invalid GPU-native speculative residency request"
+                    );
+                    return;
+                }
+            }
+        }
         // **Dedup before spending a permit.** `union_prefetch` and
         // `speculate_layer_ahead` can both nominate the same id for one
         // token; without this pre-check each duplicate consumed a
@@ -3655,16 +3944,35 @@ impl Engine {
                         );
                         return;
                     }
-                    // **Eager logical GPU admission.** A speculative prefetch is
-                    // a strong "about to be routed" signal, so try to
-                    // stage the host bytes into the admission LRU *now* instead
-                    // of waiting for `promote_after_hits` RAM hits — the
-                    // lazy path can leave a predicted expert on the CPU
-                    // fallback path for its first few activations.
-                    // Only attempt eager admission when the logical cache has room;
-                    // otherwise we would copy ~expert_size bytes into a Vec only to have the
-                    // non-evicting promotion path immediately reject it.
-                    if let Some(gpu) = me.core.gpu_cache.as_ref() {
+                    // With the optional Slice 9 plane, the same prediction and
+                    // semaphore permit continue through logical admission and
+                    // RAM -> VRAM. There is no second governor decision and no
+                    // second prefetch scheduler.
+                    if let Some(manager) = me.core.gpu_native_residency.as_ref().cloned() {
+                        if let Some(admission) = me.ensure_speculative_gpu_admission(&resident) {
+                            if let Err(error) = manager.ensure_speculative_resident(
+                                id,
+                                &resident,
+                                &admission,
+                                GpuNativeResidencyPriority::Speculative { score: p },
+                            ) {
+                                debug!(
+                                    expert = id,
+                                    error = %error,
+                                    "cold prefetch landed in RAM but GPU-native speculation was dropped"
+                                );
+                            }
+                        }
+                    } else if let Some(gpu) = me.core.gpu_cache.as_ref() {
+                        // **Eager logical GPU admission.** A speculative prefetch is
+                        // a strong "about to be routed" signal, so try to
+                        // stage the host bytes into the admission LRU *now* instead
+                        // of waiting for `promote_after_hits` RAM hits — the
+                        // lazy path can leave a predicted expert on the CPU
+                        // fallback path for its first few activations.
+                        // Only attempt eager admission when the logical cache has room;
+                        // otherwise we would copy ~expert_size bytes into a Vec only to have the
+                        // non-evicting promotion path immediately reject it.
                         let bytes = resident.data().len();
                         if (gpu.used_bytes() as usize).saturating_add(bytes) <= gpu.capacity_bytes()
                         {
@@ -6034,6 +6342,14 @@ mod tests {
                 hidden_seed: seed,
             },
         ))
+    }
+
+    #[test]
+    fn gpu_native_tiered_residency_is_strictly_opt_in() {
+        let dir = TempDir::new("gpu-native-residency-opt-in");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        assert!(engine.core.gpu_native_residency.is_none());
+        assert!(engine.gpu_native_residency_snapshot().is_none());
     }
 
     fn rebuild_with_speculator(
