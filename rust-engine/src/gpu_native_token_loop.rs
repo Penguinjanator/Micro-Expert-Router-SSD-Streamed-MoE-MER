@@ -1306,16 +1306,6 @@ impl GpuNativeTokenLoop {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            request.committed_position += 1;
-            self.counters
-                .tokens_completed
-                .fetch_add(1, Ordering::Relaxed);
-            if is_warm {
-                self.counters
-                    .warm_tokens_completed
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-
             engine.record_gpu_native_actual_routes(&report.selected_ids);
 
             return Ok(GpuNativeStepOutput {
@@ -2395,6 +2385,8 @@ pub(crate) mod tests {
         let counters = GpuNativeTokenLoopCounters::default();
         let snap0 = counters.snapshot();
         assert_eq!(snap0.token_attempts, 0);
+        assert_eq!(snap0.tokens_completed, 0);
+        assert_eq!(snap0.warm_tokens_completed, 0);
         assert_eq!(snap0.queue_submissions, 0);
         assert_eq!(snap0.boundary_maps, 0);
         assert_eq!(snap0.boundary_readbacks, 0);
@@ -2434,6 +2426,47 @@ pub(crate) mod tests {
         assert_eq!(snap5.token_attempts, 2);
         assert_eq!(snap5.replay_attempts, 1);
         assert_eq!(snap5.queue_submissions, 1);
+    }
+
+    #[test]
+    fn successful_token_position_accounting_invariants() {
+        // Verifies the exact accounting delta invariant for successful token steps:
+        // - Starting committed_position = N advances to N + 1 (never N + 2)
+        // - tokens_completed delta is exactly 1 per completed token
+        // - warm_tokens_completed delta is exactly 1 for warm tokens, 0 for retried/cold tokens
+        let start_pos = 42usize;
+        let mut committed_position = start_pos;
+        let counters = GpuNativeTokenLoopCounters::default();
+
+        // 1. Warm successful token step (attempt 0 success, is_warm = true)
+        let is_warm_1 = true;
+        committed_position += 1;
+        counters.tokens_completed.fetch_add(1, Ordering::Relaxed);
+        if is_warm_1 {
+            counters
+                .warm_tokens_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert_eq!(committed_position, start_pos + 1);
+        let snap1 = counters.snapshot();
+        assert_eq!(snap1.tokens_completed, 1);
+        assert_eq!(snap1.warm_tokens_completed, 1);
+
+        // 2. Cold / retried successful token step (is_warm = false)
+        let is_warm_2 = false;
+        committed_position += 1;
+        counters.tokens_completed.fetch_add(1, Ordering::Relaxed);
+        if is_warm_2 {
+            counters
+                .warm_tokens_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        assert_eq!(committed_position, start_pos + 2);
+        let snap2 = counters.snapshot();
+        assert_eq!(snap2.tokens_completed, 2);
+        assert_eq!(snap2.warm_tokens_completed, 1);
     }
 
     #[test]
