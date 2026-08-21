@@ -5390,10 +5390,10 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
 
     let mut gpu_spec = resolve_real_cli_spec_from_config(
         cfg.clone(),
-        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
     )?;
     gpu_spec.cfg.real_transformer.gpu_native = true;
-    gpu_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Hybrid;
+    gpu_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Gpu;
     gpu_spec.cfg.real_transformer.strict_weights = true;
     gpu_spec.cfg.real_transformer.allow_degraded_experts = false;
     gpu_spec.cfg.real_transformer.allow_seeded_fallback = false;
@@ -5405,6 +5405,7 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
         cfg.clone(),
         RealCliRuntimeMode::IsolatedGreedyParityCpu,
     )?;
+    ref_spec.cfg.real_transformer.gpu_native = false;
     ref_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Cpu;
     ref_spec.cfg.real_transformer.strict_weights = true;
     ref_spec.cfg.real_transformer.allow_degraded_experts = false;
@@ -5451,11 +5452,11 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
 
     // 2. GPU-Native Phase
     let gpu_context =
-        resolve_isolated_real_cli_context(&gpu_spec, crate::backend::ComputeOffload::Hybrid)?;
+        resolve_isolated_real_cli_context(&gpu_spec, crate::backend::ComputeOffload::Gpu)?;
 
     let gpu_runtime = build_real_cli_runtime_from_spec(
         &gpu_spec,
-        RealCliRuntimeMode::IsolatedGreedyParityHybrid,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
         gpu_context,
         None,
     )
@@ -6981,20 +6982,25 @@ enum RealCliRuntimeMode {
     StrictHybridQualification,
     IsolatedGreedyParityCpu,
     IsolatedGreedyParityHybrid,
+    IsolatedGpuNativeDiagnostic,
 }
 
 impl RealCliRuntimeMode {
     fn is_isolated(self) -> bool {
         matches!(
             self,
-            Self::IsolatedGreedyParityCpu | Self::IsolatedGreedyParityHybrid
+            Self::IsolatedGreedyParityCpu
+                | Self::IsolatedGreedyParityHybrid
+                | Self::IsolatedGpuNativeDiagnostic
         )
     }
 
     fn installs_logical_gpu_cache(self) -> bool {
         matches!(
             self,
-            Self::StrictHybridQualification | Self::IsolatedGreedyParityHybrid
+            Self::StrictHybridQualification
+                | Self::IsolatedGreedyParityHybrid
+                | Self::IsolatedGpuNativeDiagnostic
         )
     }
 
@@ -7005,6 +7011,7 @@ impl RealCliRuntimeMode {
             Self::IsolatedGreedyParityCpu | Self::IsolatedGreedyParityHybrid => {
                 "qualify-hybrid-q4-greedy-parity"
             }
+            Self::IsolatedGpuNativeDiagnostic => "diagnose-gpu-native-q4-first-divergence",
         }
     }
 }
@@ -7079,7 +7086,8 @@ async fn build_real_cli_runtime(
             context
         }
         RealCliRuntimeMode::IsolatedGreedyParityCpu
-        | RealCliRuntimeMode::IsolatedGreedyParityHybrid => {
+        | RealCliRuntimeMode::IsolatedGreedyParityHybrid
+        | RealCliRuntimeMode::IsolatedGpuNativeDiagnostic => {
             return Err("isolated qualification runtimes must use the private isolated factory".into());
         }
     };
@@ -7113,35 +7121,72 @@ fn resolve_real_cli_spec_from_config(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IsolatedExecutionContextContract {
+    CpuReference,
+    HybridRoutedExperts,
+    GpuNativeAuthoritative,
+}
+
+fn isolated_execution_context_contract(
+    spec: &ResolvedRealCliSpec,
+    requested: crate::backend::ComputeOffload,
+) -> IsolatedExecutionContextContract {
+    if spec.cfg.real_transformer.gpu_native {
+        IsolatedExecutionContextContract::GpuNativeAuthoritative
+    } else if requested == crate::backend::ComputeOffload::Hybrid {
+        IsolatedExecutionContextContract::HybridRoutedExperts
+    } else {
+        IsolatedExecutionContextContract::CpuReference
+    }
+}
+
 fn resolve_isolated_real_cli_context(
     spec: &ResolvedRealCliSpec,
     requested: crate::backend::ComputeOffload,
 ) -> Result<Arc<crate::backend::ExecutionContext>, Box<dyn std::error::Error>> {
     let cfg = &spec.cfg;
-    let capacity_bytes = if requested == crate::backend::ComputeOffload::Hybrid {
-        cfg.gpu_cache
+    let contract = isolated_execution_context_contract(spec, requested);
+    let capacity_bytes = match contract {
+        IsolatedExecutionContextContract::HybridRoutedExperts
+        | IsolatedExecutionContextContract::GpuNativeAuthoritative => cfg
+            .gpu_cache
             .vram_capacity_mb
             .checked_mul(1024 * 1024)
-            .ok_or("gpu_cache.vram_capacity_mb overflows usize")?
-    } else {
-        0
+            .ok_or("gpu_cache.vram_capacity_mb overflows usize")?,
+        IsolatedExecutionContextContract::CpuReference => 0,
     };
     let gpu_cache = Arc::new(crate::expert_cache::GpuExpertCache::new(
         capacity_bytes,
         cfg.gpu_cache.vram_anchor_ratio,
         cfg.gpu_cache.promote_after_hits,
     ));
-    Ok(crate::backend::resolve_execution_context(
-        requested,
-        true,
-        strict_hybrid_gpu_geometry(cfg, &spec.advanced),
-        crate::backend::RoutedExpertGpuSpec {
-            dtype: cfg.model.dtype,
-            d_model: cfg.model.d_model,
-            d_ff: cfg.model.d_ff,
-        },
-        gpu_cache,
-    )?)
+    match contract {
+        IsolatedExecutionContextContract::GpuNativeAuthoritative => {
+            let mut geometry = strict_hybrid_gpu_geometry(cfg, &spec.advanced);
+            if cfg.real_transformer.gpu_native_max_seq_len > 0 {
+                geometry.max_seq_len = cfg.real_transformer.gpu_native_max_seq_len;
+            }
+            Ok(crate::backend::resolve_execution_context_for_gpu_native(
+                geometry,
+                gpu_cache,
+            )?)
+        }
+        IsolatedExecutionContextContract::HybridRoutedExperts
+        | IsolatedExecutionContextContract::CpuReference => {
+            Ok(crate::backend::resolve_execution_context(
+                requested,
+                true,
+                strict_hybrid_gpu_geometry(cfg, &spec.advanced),
+                crate::backend::RoutedExpertGpuSpec {
+                    dtype: cfg.model.dtype,
+                    d_model: cfg.model.d_model,
+                    d_ff: cfg.model.d_ff,
+                },
+                gpu_cache,
+            )?)
+        }
+    }
 }
 
 fn resolved_real_cli_spec_sha256(
@@ -7180,6 +7225,9 @@ async fn build_isolated_greedy_runtime(
         RealCliRuntimeMode::IsolatedGreedyParityCpu => crate::backend::ComputeOffload::Cpu,
         RealCliRuntimeMode::IsolatedGreedyParityHybrid => {
             crate::backend::ComputeOffload::Hybrid
+        }
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic => {
+            crate::backend::ComputeOffload::Gpu
         }
         _ => return Err("non-isolated runtime mode passed to isolated factory".into()),
     };
@@ -12625,6 +12673,59 @@ mod tests {
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("config.toml"))
+        );
+    }
+
+    #[test]
+    fn isolated_execution_context_contract_selects_expected_planes() {
+        let mut cfg = minimal_bench_cfg();
+        cfg.real_transformer.enabled = true;
+        cfg.real_transformer.gpu_native = true;
+        cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Gpu;
+        let gpu_spec = ResolvedRealCliSpec {
+            cfg: cfg.clone(),
+            architecture: crate::architecture::Architecture::Qwen3Moe,
+            first_k_dense_replace: 0,
+            advanced: crate::model::AdvancedConfig::default(),
+        };
+        assert_eq!(
+            isolated_execution_context_contract(&gpu_spec, crate::backend::ComputeOffload::Gpu),
+            IsolatedExecutionContextContract::GpuNativeAuthoritative
+        );
+
+        let mut cpu_cfg = cfg.clone();
+        cpu_cfg.real_transformer.gpu_native = false;
+        cpu_cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Cpu;
+        let ref_spec = ResolvedRealCliSpec {
+            cfg: cpu_cfg,
+            architecture: crate::architecture::Architecture::Qwen3Moe,
+            first_k_dense_replace: 0,
+            advanced: crate::model::AdvancedConfig::default(),
+        };
+        assert_eq!(
+            isolated_execution_context_contract(&ref_spec, crate::backend::ComputeOffload::Cpu),
+            IsolatedExecutionContextContract::CpuReference
+        );
+
+        let mut hybrid_cfg = cfg.clone();
+        hybrid_cfg.real_transformer.gpu_native = false;
+        hybrid_cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Hybrid;
+        let hybrid_spec = ResolvedRealCliSpec {
+            cfg: hybrid_cfg,
+            architecture: crate::architecture::Architecture::Qwen3Moe,
+            first_k_dense_replace: 0,
+            advanced: crate::model::AdvancedConfig::default(),
+        };
+        assert_eq!(
+            isolated_execution_context_contract(&hybrid_spec, crate::backend::ComputeOffload::Hybrid),
+            IsolatedExecutionContextContract::HybridRoutedExperts
+        );
+
+        assert!(RealCliRuntimeMode::IsolatedGpuNativeDiagnostic.is_isolated());
+        assert!(RealCliRuntimeMode::IsolatedGpuNativeDiagnostic.installs_logical_gpu_cache());
+        assert_eq!(
+            RealCliRuntimeMode::IsolatedGpuNativeDiagnostic.tokenizer_command(),
+            "diagnose-gpu-native-q4-first-divergence"
         );
     }
 }
