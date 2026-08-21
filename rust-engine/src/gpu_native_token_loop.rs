@@ -1161,6 +1161,167 @@ impl GpuNativeTokenLoop {
         });
         Ok(staging_buffer)
     }
+    /// Diagnostic variant for layer-0 attention only. Bypasses router, MoE, and later layers.
+    /// Executes one prompt position and captures all layer-0 attention intermediates.
+    pub async fn step_layer0_attention_diagnostic(
+        &self,
+        _engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        trace_layout: &crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout,
+        diagnostic_staging_buffer: &wgpu::Buffer,
+    ) -> Result<
+        crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTrace,
+        GpuNativeTokenLoopError,
+    > {
+        let _guard = self.execution_guard.lock().await;
+
+        if position != request.committed_position {
+            return Err(GpuNativeTokenLoopError::PositionMismatch {
+                requested_position: position,
+                committed_position: request.committed_position,
+            });
+        }
+        if position >= request.max_seq_len {
+            return Err(GpuNativeTokenLoopError::ContextLimitExceeded {
+                requested_position: position,
+                max_seq_len: request.max_seq_len,
+            });
+        }
+
+        if self.layers.is_empty() {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "no layers available in token loop".into(),
+            });
+        }
+
+        let gpu = self.executor.authoritative_gpu()?;
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu_native_layer0_attention_diagnostic"),
+            });
+
+        let layer_0 = &self.layers[0];
+        let sink = crate::backend::gpu_native::Layer0AttentionGpuDiagnosticSink {
+            layout: trace_layout,
+            staging_buffer: diagnostic_staging_buffer,
+        };
+
+        // 1. Embedding lookup
+        self.executor.encode_embedding_lookup(
+            &mut encoder,
+            &self.embedding_handle,
+            token_id,
+            &request.token_state,
+        )?;
+        encoder.copy_buffer_to_buffer(
+            request.token_state.hidden_buffer(),
+            0,
+            diagnostic_staging_buffer,
+            trace_layout.embedding_offset as u64,
+            trace_layout.embedding_bytes as u64,
+        );
+
+        // 2. Attention Pre-Norm
+        self.executor.encode_rms_norm_state_in_place(
+            &mut encoder,
+            &layer_0.rms_attn_handle,
+            self.model_geometry.rms_eps,
+            &request.token_state,
+        )?;
+        encoder.copy_buffer_to_buffer(
+            request.token_state.hidden_buffer(),
+            0,
+            diagnostic_staging_buffer,
+            trace_layout.attention_pre_norm_offset as u64,
+            trace_layout.attention_pre_norm_bytes as u64,
+        );
+
+        // 3. Attention Prepare (Q, K, V, QK-Norm, RoPE, KV Append)
+        self.executor.encode_attention_prepare_layer0_diagnostic(
+            &mut encoder,
+            &layer_0.attn_plan,
+            &request.token_state,
+            &request.attn_scratch,
+            &request.kv_state,
+            position,
+            &sink,
+        )?;
+
+        // 4. Attention Complete (Causal Attention, O Projection, Residual Add)
+        self.executor.encode_attention_complete_layer0_diagnostic(
+            &mut encoder,
+            &layer_0.attn_plan,
+            &request.token_state,
+            &request.attn_scratch,
+            &request.kv_state,
+            position + 1,
+            &sink,
+        )?;
+
+        // 5. Post-Attention Residual & Status copy
+        encoder.copy_buffer_to_buffer(
+            request.token_state.hidden_buffer(),
+            0,
+            diagnostic_staging_buffer,
+            trace_layout.post_attention_residual_offset as u64,
+            trace_layout.post_attention_residual_bytes as u64,
+        );
+        encoder.copy_buffer_to_buffer(
+            request.token_state.status_buffer(),
+            0,
+            diagnostic_staging_buffer,
+            trace_layout.status_offset as u64,
+            4,
+        );
+
+        gpu.queue.submit(Some(encoder.finish()));
+
+        // Map and parse diagnostic trace
+        let slice = diagnostic_staging_buffer.slice(..trace_layout.total_bytes);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        gpu.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuNativeTokenLoopError::MapFailed(e.to_string()))?
+            .map_err(|e| GpuNativeTokenLoopError::MapFailed(format!("{e:?}")))?;
+
+        let mapped = slice.get_mapped_range();
+        let trace = trace_layout
+            .parse(&mapped)
+            .map_err(|e| GpuNativeTokenLoopError::InvalidBoundaryReport { detail: e })?;
+        drop(mapped);
+        diagnostic_staging_buffer.unmap();
+
+        if (trace.status & GPU_NATIVE_STATUS_FATAL_MASK) != 0 {
+            return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+                layer_index: Some(0),
+                status_bits: trace.status,
+            });
+        }
+
+        request.committed_position += 1;
+        Ok(trace)
+    }
+
+    /// Allocate a device-resident staging buffer for Layer-0 diagnostic trace readbacks.
+    pub fn create_layer0_diagnostic_staging_buffer(
+        &self,
+        trace_layout: &crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout,
+    ) -> Result<wgpu::Buffer, GpuNativeTokenLoopError> {
+        let gpu = self.executor.authoritative_gpu()?;
+        let staging_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_layer0_diagnostic_staging"),
+            size: trace_layout.total_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Ok(staging_buffer)
+    }
 
     /// Authoritative internal loop for stepping a token with bounded retries and demand residency service.
     /// Caller MUST hold self.execution_guard for the duration of the step or generation request.
@@ -2896,5 +3057,82 @@ pub(crate) mod tests {
         assert_eq!(completion.len(), 1);
         assert!(completion[0] < LIVE_L4_VOCAB_SIZE as u32);
         assert_eq!(request_state.committed_position, 2);
+
+        #[test]
+        #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+        fn live_l4_gpu_native_layer0_attention_diagnostic_smoke() {
+            let harness = setup_live_l4_harness("layer0_smoke");
+            let mut request_state = harness.token_loop.create_request_state().unwrap();
+
+            let geom = harness.token_loop.model_geometry();
+            let q_width = geom.num_heads * geom.head_dim;
+            let kv_width = geom.num_kv_heads * geom.head_dim;
+
+            let trace_layout = crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout::try_new(
+            geom.d_model,
+            q_width,
+            kv_width,
+        )
+        .unwrap();
+
+            let staging_buffer = harness
+                .token_loop
+                .create_layer0_diagnostic_staging_buffer(&trace_layout)
+                .unwrap();
+
+            // 1. Position 0
+            let trace0 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
+                &harness.engine,
+                &mut request_state,
+                1,
+                0,
+                &trace_layout,
+                &staging_buffer,
+            ))
+            .expect("layer-0 diagnostic step 0 must succeed");
+
+            assert_eq!(trace0.embedding.len(), geom.d_model);
+            assert_eq!(trace0.attention_pre_norm.len(), geom.d_model);
+            assert_eq!(trace0.q_raw.len(), q_width);
+            assert_eq!(trace0.k_raw.len(), kv_width);
+            assert_eq!(trace0.v_raw.len(), kv_width);
+            assert_eq!(trace0.q_after_norm.len(), q_width);
+            assert_eq!(trace0.k_after_norm.len(), kv_width);
+            assert_eq!(trace0.q_after_rope.len(), q_width);
+            assert_eq!(trace0.k_after_rope.len(), kv_width);
+            assert_eq!(trace0.attention_context.len(), q_width);
+            assert_eq!(trace0.o_projection.len(), geom.d_model);
+            assert_eq!(trace0.post_attention_residual.len(), geom.d_model);
+            assert_eq!(trace0.status, 0);
+            assert_eq!(request_state.committed_position, 1);
+
+            assert!(trace0.embedding.iter().all(|v| v.is_finite()));
+            assert!(trace0.attention_pre_norm.iter().all(|v| v.is_finite()));
+            assert!(trace0.q_raw.iter().all(|v| v.is_finite()));
+            assert!(trace0.k_raw.iter().all(|v| v.is_finite()));
+            assert!(trace0.v_raw.iter().all(|v| v.is_finite()));
+            assert!(trace0.q_after_norm.iter().all(|v| v.is_finite()));
+            assert!(trace0.k_after_norm.iter().all(|v| v.is_finite()));
+            assert!(trace0.q_after_rope.iter().all(|v| v.is_finite()));
+            assert!(trace0.k_after_rope.iter().all(|v| v.is_finite()));
+            assert!(trace0.attention_context.iter().all(|v| v.is_finite()));
+            assert!(trace0.o_projection.iter().all(|v| v.is_finite()));
+            assert!(trace0.post_attention_residual.iter().all(|v| v.is_finite()));
+
+            // 2. Position 1 (persisting KV across positions)
+            let trace1 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
+                &harness.engine,
+                &mut request_state,
+                2,
+                1,
+                &trace_layout,
+                &staging_buffer,
+            ))
+            .expect("layer-0 diagnostic step 1 must succeed");
+
+            assert_eq!(trace1.status, 0);
+            assert_eq!(request_state.committed_position, 2);
+            assert!(trace1.post_attention_residual.iter().all(|v| v.is_finite()));
+        }
     }
 }

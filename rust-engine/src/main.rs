@@ -141,6 +141,7 @@ mod gguf;
 mod gguf_loader;
 mod gpu_native_residency;
 pub(crate) mod gpu_native_diagnostics;
+pub(crate) mod gpu_native_layer0_diagnostics;
 
 pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
@@ -943,6 +944,25 @@ enum Cmd {
         #[arg(long)]
         report_out: Option<PathBuf>,
     },
+    /// Diagnose first internal mathematical divergence inside layer-0 attention between CPU reference and GPU-native execution.
+    #[command(name = "diagnose-gpu-native-layer0-attention-first-divergence")]
+    DiagnoseGpuNativeLayer0AttentionFirstDivergence {
+        /// Strict GPU-native Q4 configuration.
+        #[arg(long)]
+        config: PathBuf,
+        /// Expected GPU adapter name (e.g. "NVIDIA L4").
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Target case (e.g. "json-transformation").
+        #[arg(long, default_value = "json-transformation")]
+        case: String,
+        /// Optional typed diagnostic report output path.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+        /// Optional Slice 11B report path to cross-check final-position layer-0 post-attention evidence.
+        #[arg(long)]
+        slice11b_report: Option<PathBuf>,
+    },
 
 
 
@@ -1615,6 +1635,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
+        | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence { config, .. }
         | Cmd::GreedyParityHybridWorkerInternal { config }
         | Cmd::GreedyParityLogitWorkerInternal { config } => Some(config.as_path()),
         _ => None,
@@ -2122,6 +2143,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
+            config: _,
+            expected_adapter_name,
+            case,
+            report_out,
+            slice11b_report,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_diagnose_gpu_native_layer0_attention_first_divergence(
+                DiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("diagnose-gpu-native-layer0-attention-first-divergence startup config was not parsed")?,
+                    expected_adapter_name,
+                    case,
+                    report_out,
+                    slice11b_report,
+                    progress_watchdog,
+                },
+            ))
+        }
 
         Cmd::MatvecMicrobench {
             backend,
@@ -2378,6 +2422,15 @@ struct DiagnoseGpuNativeQ4FirstDivergenceArgs {
     expected_adapter_name: String,
     case: String,
     report_out: Option<PathBuf>,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct DiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs {
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    case: String,
+    report_out: Option<PathBuf>,
+    slice11b_report: Option<PathBuf>,
     progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
 }
 
@@ -5615,6 +5668,359 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
 
     emit_gpu_native_first_divergence_report(&report, args.report_out.as_deref())
 }
+
+fn emit_layer0_attention_first_divergence_report(
+    report: &crate::gpu_native_layer0_diagnostics::Layer0AttentionFirstDivergenceReport,
+    out_path: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(report)?;
+    if let Some(path) = out_path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        info!(
+            report = %path.display(),
+            "GPU-native layer-0 attention first-divergence diagnostic report written"
+        );
+    } else {
+        println!("{json}");
+    }
+    if let Some(ref failure) = report.failure {
+        Err(failure.clone().into())
+    } else {
+        Ok(())
+    }
+}
+
+fn fail_layer0_attention_first_divergence(
+    mut report: crate::gpu_native_layer0_diagnostics::Layer0AttentionFirstDivergenceReport,
+    reason: String,
+    out_path: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    report.fail(reason);
+    emit_layer0_attention_first_divergence_report(&report, out_path)
+}
+
+async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
+    args: DiagnoseGpuNativeLayer0AttentionFirstDivergenceArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::BuildProvenance;
+
+    let provenance = BuildProvenance::embedded();
+    let build_git_sha = provenance
+        .git_sha
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let (_, executable_sha256) = current_executable_identity()?;
+
+    let cfg = args.parsed_config.clone();
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let expert_metadata = crate::qualification::read_expert_metadata(&metadata_path)
+        .map_err(|e| format!("failed to read expert metadata: {e}"))?;
+
+    let fixed_case = crate::greedy_parity::fixed_case(&args.case).ok_or_else(|| {
+        format!(
+            "unknown corpus case: {}; expected one of: rust-generation, rust-debugging, json-transformation, multilingual-spanish",
+            args.case
+        )
+    })?;
+
+    let prompt_sha256 = crate::greedy_parity::sha256_hex(fixed_case.prompt.as_bytes());
+
+    let mut gpu_spec = resolve_real_cli_spec_from_config(
+        cfg.clone(),
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+    )?;
+    gpu_spec.cfg.real_transformer.gpu_native = true;
+    gpu_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Gpu;
+    gpu_spec.cfg.real_transformer.strict_weights = true;
+    gpu_spec.cfg.real_transformer.allow_degraded_experts = false;
+    gpu_spec.cfg.real_transformer.allow_seeded_fallback = false;
+
+    let resolved_config_sha256 = resolved_real_cli_spec_sha256(&gpu_spec)?;
+
+    // 1. Reference Phase (CPU with strict weights)
+    let mut ref_spec = resolve_real_cli_spec_from_config(
+        cfg.clone(),
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+    )?;
+    ref_spec.cfg.real_transformer.gpu_native = false;
+    ref_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Cpu;
+    ref_spec.cfg.real_transformer.strict_weights = true;
+    ref_spec.cfg.real_transformer.allow_degraded_experts = false;
+    ref_spec.cfg.real_transformer.allow_seeded_fallback = false;
+
+    let ref_context =
+        resolve_isolated_real_cli_context(&ref_spec, crate::backend::ComputeOffload::Cpu)?;
+
+    let ref_runtime = build_real_cli_runtime_from_spec(
+        &ref_spec,
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+        ref_context,
+        None,
+    )
+    .await?;
+
+    let prompt_token_ids = ref_runtime.tokenizer.encode(fixed_case.prompt)?;
+    if prompt_token_ids.is_empty() {
+        return Err("prompt tokenized to zero tokens".into());
+    }
+
+    // 2. GPU-Native Phase
+    let gpu_context =
+        resolve_isolated_real_cli_context(&gpu_spec, crate::backend::ComputeOffload::Gpu)?;
+
+    let gpu_runtime = build_real_cli_runtime_from_spec(
+        &gpu_spec,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+        gpu_context,
+        None,
+    )
+    .await?;
+
+    let device = gpu_runtime
+        .engine
+        .execution_context()
+        .gpu_device_identity()
+        .ok_or("GPU execution context has no active device identity")?;
+
+    let gpu_native_token_loop = gpu_runtime
+        .gpu_native_token_loop
+        .clone()
+        .ok_or("GPU-native token loop was not initialized on GPU runtime")?;
+
+    let model_geometry = gpu_native_token_loop.model_geometry();
+
+    let case_evidence = crate::gpu_native_diagnostics::CaseEvidence {
+        case_name: fixed_case.name.to_string(),
+        prompt_sha256,
+        prompt_token_count: prompt_token_ids.len(),
+    };
+
+    let mut report = crate::gpu_native_layer0_diagnostics::Layer0AttentionFirstDivergenceReport::new(
+        provenance,
+        build_git_sha,
+        executable_sha256,
+        resolved_config_sha256.clone(),
+        model_geometry,
+        expert_metadata,
+        case_evidence,
+        crate::greedy_parity::token_ids_sha256(&prompt_token_ids),
+        prompt_token_ids.clone(),
+        args.expected_adapter_name.clone(),
+    );
+
+    if device.name != args.expected_adapter_name {
+        return fail_layer0_attention_first_divergence(
+            report,
+            format!(
+                "adapter mismatch: runtime has {:?}, expected {:?}",
+                device.name, args.expected_adapter_name
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    report.actual_adapter = Some(device);
+
+    let q_width = model_geometry.num_heads * model_geometry.head_dim;
+    let kv_width = model_geometry.num_kv_heads * model_geometry.head_dim;
+
+    let trace_layout = match crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout::try_new(
+        model_geometry.d_model,
+        q_width,
+        kv_width,
+    ) {
+        Ok(layout) => layout,
+        Err(e) => {
+            return fail_layer0_attention_first_divergence(
+                report,
+                format!("failed to construct Layer0 trace layout: {e}"),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
+    let staging_buffer = match gpu_native_token_loop
+        .create_layer0_diagnostic_staging_buffer(&trace_layout)
+    {
+        Ok(buf) => buf,
+        Err(e) => {
+            return fail_layer0_attention_first_divergence(
+                report,
+                format!("failed to create Layer0 diagnostic staging buffer: {e}"),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
+    let mut req_state = match gpu_native_token_loop.create_request_state() {
+        Ok(state) => state,
+        Err(e) => {
+            return fail_layer0_attention_first_divergence(
+                report,
+                format!("failed to create request state: {e}"),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
+    if ref_runtime.model.layers.is_empty() {
+        return fail_layer0_attention_first_divergence(
+            report,
+            "reference model has zero layers".to_string(),
+            args.report_out.as_deref(),
+        );
+    }
+
+    let ref_layer0 = &ref_runtime.model.layers[0];
+    let mut ref_kv = crate::transformer::KvCache::new(ref_layer0.attn.kv_dim());
+    let ref_backend = ref_runtime.engine.execution_context().attention_backend();
+
+    let mut position_comparisons = Vec::with_capacity(prompt_token_ids.len());
+    let mut earliest_divergent_position: Option<usize> = None;
+    let mut first_internal_divergence: Option<crate::gpu_native_layer0_diagnostics::Layer0AttentionFirstDivergenceEvidence> = None;
+    let mut final_position_post_attention: Option<crate::gpu_native_layer0_diagnostics::Layer0AttentionStageComparison> = None;
+
+    let mut ref_scratch = crate::transformer::TransformerLayerScratch::new();
+    let mut ref_out = Vec::with_capacity(model_geometry.d_model);
+
+    for (pos, &tid) in prompt_token_ids.iter().enumerate() {
+        // 1. CPU Reference Execution for Layer 0
+        let emb = match ref_runtime.model.try_embed(tid) {
+            Ok(v) => v,
+            Err(e) => {
+                return fail_layer0_attention_first_divergence(
+                    report,
+                    format!("CPU reference embedding failed at pos {pos} (token {tid}): {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+
+        let mut cpu_sink = crate::transformer::Layer0AttentionCpuDiagnosticSink {
+            embedding: Some(emb.clone()),
+            ..Default::default()
+        };
+
+        ref_out.clear();
+        if let Err(e) = ref_layer0.try_attn_block_into_layer0_diagnostic(
+            &emb,
+            pos,
+            0,
+            &mut ref_kv,
+            &**ref_backend,
+            &mut ref_scratch,
+            &mut ref_out,
+            None,
+            &mut cpu_sink,
+        ) {
+            return fail_layer0_attention_first_divergence(
+                report,
+                format!("CPU reference layer-0 attention failed at pos {pos} (token {tid}): {e:?}"),
+                args.report_out.as_deref(),
+            );
+        }
+
+        // 2. GPU-Native Execution for Layer 0
+        let gpu_trace = match gpu_native_token_loop
+            .step_layer0_attention_diagnostic(
+                &gpu_runtime.engine,
+                &mut req_state,
+                tid,
+                pos,
+                &trace_layout,
+                &staging_buffer,
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                return fail_layer0_attention_first_divergence(
+                    report,
+                    format!("GPU layer-0 diagnostic step failed at pos {pos} (token {tid}): {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+
+        // 3. Comparison
+        let pos_comp = match crate::gpu_native_layer0_diagnostics::compare_layer0_attention_traces(
+            pos,
+            tid,
+            &cpu_sink,
+            &gpu_trace,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return fail_layer0_attention_first_divergence(
+                    report,
+                    format!("comparison failed at pos {pos} (token {tid}): {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+
+        if !pos_comp.exact_match && earliest_divergent_position.is_none() {
+            earliest_divergent_position = Some(pos);
+            first_internal_divergence = pos_comp.first_divergence.clone();
+        }
+
+        if pos == prompt_token_ids.len() - 1 {
+            final_position_post_attention = pos_comp
+                .stages
+                .iter()
+                .find(|s| s.stage == crate::gpu_native_layer0_diagnostics::Layer0AttentionStage::PostAttentionResidual)
+                .cloned();
+        }
+
+        position_comparisons.push(pos_comp);
+    }
+
+    drop(req_state);
+    drop(staging_buffer);
+    let _ = ref_runtime.shutdown_isolated().await;
+    let _ = gpu_runtime.shutdown_isolated().await;
+
+    // 4. Optional Slice 11B Cross-Check
+    let slice11b_cross_check = if let Some(ref path) = args.slice11b_report {
+        let final_stage = final_position_post_attention.as_ref().ok_or("no final position post-attention evidence recorded")?;
+        let check = match crate::gpu_native_layer0_diagnostics::cross_check_slice11b_report(path, final_stage) {
+            Ok(c) => c,
+            Err(e) => {
+                return fail_layer0_attention_first_divergence(
+                    report,
+                    format!("Slice 11B report cross-check failed: {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        if check.cross_check_status != "verified_match" {
+            let disc = check.discrepancy.clone().unwrap_or_default();
+            report.slice11b_cross_check = Some(check);
+            return fail_layer0_attention_first_divergence(
+                report,
+                format!("Slice 11B layer-0 replay cross-check mismatch: {disc}"),
+                args.report_out.as_deref(),
+            );
+        }
+        Some(check)
+    } else {
+        None
+    };
+
+    report.earliest_divergent_position = earliest_divergent_position;
+    report.first_internal_divergence = first_internal_divergence;
+    report.position_comparisons = position_comparisons;
+    report.final_position_post_attention = final_position_post_attention;
+    report.slice11b_cross_check = slice11b_cross_check;
+    report.diagnostic_complete = true;
+    report.qualification_pass = false;
+
+    emit_layer0_attention_first_divergence_report(&report, args.report_out.as_deref())
+}
+
+
 
 
 
@@ -12733,6 +13139,67 @@ mod tests {
             Some(Path::new("config.toml"))
         );
     }
+
+    #[test]
+    fn gpu_native_layer0_attention_first_divergence_cli_parses_expected_flags() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-layer0-attention-first-divergence",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--case",
+            "json-transformation",
+            "--report-out",
+            "layer0_report.json",
+            "--slice11b-report",
+            "slice11b.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
+                config,
+                expected_adapter_name,
+                case,
+                report_out,
+                slice11b_report,
+            } => {
+                assert_eq!(config, &PathBuf::from("config.toml"));
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(case, "json-transformation");
+                assert_eq!(report_out, &Some(PathBuf::from("layer0_report.json")));
+                assert_eq!(slice11b_report, &Some(PathBuf::from("slice11b.json")));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
+    }
+
+    #[test]
+    fn startup_config_path_resolves_gpu_native_layer0_attention_first_divergence() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-layer0-attention-first-divergence",
+            "--config",
+            "config.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--case",
+            "json-transformation",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
+        );
+    }
+
 
     #[test]
     fn isolated_execution_context_contract_selects_expected_planes() {

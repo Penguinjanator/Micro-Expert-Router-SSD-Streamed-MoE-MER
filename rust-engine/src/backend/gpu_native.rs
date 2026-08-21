@@ -4023,6 +4023,11 @@ impl<B> fmt::Debug for GpuNativeQ4ExpertScratch<B> {
 /// Request-scoped, non-mappable F32 attention intermediates with geometry
 /// attached, preventing projection, context, and output buffers from being
 /// interchanged at the composed API.
+pub struct Layer0AttentionGpuDiagnosticSink<'a> {
+    pub layout: &'a crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout,
+    pub staging_buffer: &'a wgpu::Buffer,
+}
+
 pub(crate) struct GpuNativeAttentionScratch<B = wgpu::Buffer> {
     context_id: u64,
     geometry: GpuNativeAttentionGeometry,
@@ -7502,6 +7507,42 @@ impl GpuNativeExecutorContext {
         kv: &GpuNativeKvState,
         position: usize,
     ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_prepare_impl(encoder, plan, state, scratch, kv, position, None)
+    }
+
+    /// Diagnostic variant of [`Self::encode_attention_prepare`] that captures intermediate
+    /// Q/K/V activations before and after norm and RoPE into `diagnostic_sink`.
+    pub(crate) fn encode_attention_prepare_layer0_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: &Layer0AttentionGpuDiagnosticSink<'_>,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_prepare_impl(
+            encoder,
+            plan,
+            state,
+            scratch,
+            kv,
+            position,
+            Some(diagnostic_sink),
+        )
+    }
+
+    fn encode_attention_prepare_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: Option<&Layer0AttentionGpuDiagnosticSink<'_>>,
+    ) -> Result<(), GpuNativeBootstrapError> {
         let gpu = self.authoritative_gpu()?;
         self.validate_attention_plan(plan)?;
         validate_token_state_owner(self.context_id, state.context_id)?;
@@ -7522,8 +7563,35 @@ impl GpuNativeExecutorContext {
         self.validate_attention_dispatch_limits(plan, &gpu.device.limits())?;
 
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.q_projection, state, &scratch.q)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_raw_offset as u64,
+                sink.layout.q_raw_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.k_projection, state, &scratch.k)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_raw_offset as u64,
+                sink.layout.k_raw_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.v_projection, state, &scratch.v)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.v.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.v_raw_offset as u64,
+                sink.layout.v_raw_bytes as u64,
+            );
+        }
         if let Some(norm) = &plan.q_norm {
             self.encode_rms_norm_scratch_in_place(
                 encoder,
@@ -7533,6 +7601,15 @@ impl GpuNativeExecutorContext {
                 plan.geometry.num_heads,
                 plan.geometry.head_dim,
             )?;
+        }
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_after_norm_offset as u64,
+                sink.layout.q_after_norm_bytes as u64,
+            );
         }
         if let Some(norm) = &plan.k_norm {
             self.encode_rms_norm_scratch_in_place(
@@ -7544,6 +7621,15 @@ impl GpuNativeExecutorContext {
                 plan.geometry.head_dim,
             )?;
         }
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_after_norm_offset as u64,
+                sink.layout.k_after_norm_bytes as u64,
+            );
+        }
         self.encode_rope_scratch_in_place(
             encoder,
             &plan.rope,
@@ -7553,6 +7639,15 @@ impl GpuNativeExecutorContext {
             plan.geometry.head_dim,
             position,
         )?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_after_rope_offset as u64,
+                sink.layout.q_after_rope_bytes as u64,
+            );
+        }
         self.encode_rope_scratch_in_place(
             encoder,
             &plan.rope,
@@ -7562,6 +7657,15 @@ impl GpuNativeExecutorContext {
             plan.geometry.head_dim,
             position,
         )?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_after_rope_offset as u64,
+                sink.layout.k_after_rope_bytes as u64,
+            );
+        }
         self.encode_kv_append(
             encoder,
             &scratch.k,
@@ -7643,6 +7747,42 @@ impl GpuNativeExecutorContext {
         kv: &GpuNativeKvState,
         position: usize,
     ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_complete_impl(encoder, plan, state, scratch, kv, position, None)
+    }
+
+    /// Diagnostic variant of [`Self::encode_attention_complete`] that captures intermediate
+    /// causal attention context and O-projection activations into `diagnostic_sink`.
+    pub(crate) fn encode_attention_complete_layer0_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: &Layer0AttentionGpuDiagnosticSink<'_>,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_complete_impl(
+            encoder,
+            plan,
+            state,
+            scratch,
+            kv,
+            position,
+            Some(diagnostic_sink),
+        )
+    }
+
+    fn encode_attention_complete_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: Option<&Layer0AttentionGpuDiagnosticSink<'_>>,
+    ) -> Result<(), GpuNativeBootstrapError> {
         let gpu = self.authoritative_gpu()?;
         self.validate_attention_plan(plan)?;
         validate_token_state_owner(self.context_id, state.context_id)?;
@@ -7697,6 +7837,15 @@ impl GpuNativeExecutorContext {
             self.checked_workgroups(state.layout.d_model, &gpu.device.limits())?;
 
         self.encode_causal_attention_pass(gpu, encoder, plan, state, scratch, kv, seq_len);
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.context.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.attention_context_offset as u64,
+                sink.layout.attention_context_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_resolved(
             gpu,
             encoder,
@@ -7705,6 +7854,15 @@ impl GpuNativeExecutorContext {
             &scratch.projected.buffer,
             &o_workgroups,
         );
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.projected.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.o_projection_offset as u64,
+                sink.layout.o_projection_bytes as u64,
+            );
+        }
         self.encode_residual_add_pass(gpu, encoder, state, &scratch.projected, residual_workgroups);
         self.counters.record_attention_complete_dispatch();
         Ok(())
