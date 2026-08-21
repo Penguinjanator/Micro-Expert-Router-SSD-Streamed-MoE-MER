@@ -1057,7 +1057,7 @@ impl GpuNativeTokenLoop {
         let prefix_count = prompt_ids.len().saturating_sub(1);
         for &token_id in &prompt_ids[..prefix_count] {
             let pos = request.committed_position;
-            self.step_token(engine, request, token_id, pos, false)
+            self.step_token_unified_inner(engine, request, token_id, pos, false, None)
                 .await?;
         }
 
@@ -1065,8 +1065,9 @@ impl GpuNativeTokenLoop {
         let final_prompt = *prompt_ids.last().expect("checked non-empty");
         let final_prompt_pos = request.committed_position;
         let first_completion = self
-            .step_token(engine, request, final_prompt, final_prompt_pos, true)
+            .step_token_unified_inner(engine, request, final_prompt, final_prompt_pos, true, None)
             .await?
+            .sampled_token
             .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
                 detail: "final prompt step produced no sampled token".into(),
             })?;
@@ -1081,8 +1082,9 @@ impl GpuNativeTokenLoop {
                 break;
             }
             let next_token = self
-                .step_token(engine, request, last_token, pos, true)
+                .step_token_unified_inner(engine, request, last_token, pos, true, None)
                 .await?
+                .sampled_token
                 .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
                     detail: "decode step produced no sampled token".into(),
                 })?;
@@ -1102,8 +1104,9 @@ impl GpuNativeTokenLoop {
         position: usize,
         sample: bool,
     ) -> Result<Option<u32>, GpuNativeTokenLoopError> {
+        let _guard = self.execution_guard.lock().await;
         let out = self
-            .step_token_unified(engine, request, token_id, position, sample, None)
+            .step_token_unified_inner(engine, request, token_id, position, sample, None)
             .await?;
         Ok(out.sampled_token)
     }
@@ -1125,8 +1128,9 @@ impl GpuNativeTokenLoop {
         ),
         GpuNativeTokenLoopError,
     > {
+        let _guard = self.execution_guard.lock().await;
         let out = self
-            .step_token_unified(
+            .step_token_unified_inner(
                 engine,
                 request,
                 token_id,
@@ -1159,7 +1163,8 @@ impl GpuNativeTokenLoop {
     }
 
     /// Authoritative internal loop for stepping a token with bounded retries and demand residency service.
-    async fn step_token_unified(
+    /// Caller MUST hold self.execution_guard for the duration of the step or generation request.
+    async fn step_token_unified_inner(
         &self,
         engine: &Arc<Engine>,
         request: &mut GpuNativeRequestState,
@@ -1171,8 +1176,6 @@ impl GpuNativeTokenLoop {
             &wgpu::Buffer,
         )>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
-        let _guard = self.execution_guard.lock().await;
-
         let max_attempts = self.layers.len() + 1;
         let mut attempt = 0usize;
         let mut last_miss_sig: Option<(usize, Vec<u32>)> = None;
@@ -2150,9 +2153,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gpu_native_token_state_hidden_and_residual_have_no_copy_src() {
+    fn gpu_native_token_state_hidden_and_residual_have_copy_src_and_no_map() {
         let usage = crate::backend::gpu_native::GpuNativeTokenStateLayout::tensor_usage();
-        assert!(!usage.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(usage.contains(wgpu::BufferUsages::STORAGE));
+        assert!(usage.contains(wgpu::BufferUsages::COPY_DST));
+        assert!(usage.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!usage.contains(wgpu::BufferUsages::MAP_READ));
         assert!(!usage.contains(wgpu::BufferUsages::MAP_WRITE));
     }
@@ -2164,11 +2169,11 @@ pub(crate) mod tests {
         };
 
         // 1. Generic scratch (hidden, residual, logits, attention/expert scratch):
-        // STORAGE | COPY_DST, strictly no COPY_SRC, no MAP_READ, no MAP_WRITE
+        // STORAGE | COPY_DST | COPY_SRC, strictly no MAP_READ, no MAP_WRITE
         let generic_scratch = GpuNativeScratchLayout::usage();
         assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
         assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
-        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!generic_scratch
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
@@ -2429,47 +2434,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn successful_token_position_accounting_invariants() {
-        // Verifies the exact accounting delta invariant for successful token steps:
-        // - Starting committed_position = N advances to N + 1 (never N + 2)
-        // - tokens_completed delta is exactly 1 per completed token
-        // - warm_tokens_completed delta is exactly 1 for warm tokens, 0 for retried/cold tokens
-        let start_pos = 42usize;
-        let mut committed_position = start_pos;
-        let counters = GpuNativeTokenLoopCounters::default();
-
-        // 1. Warm successful token step (attempt 0 success, is_warm = true)
-        let is_warm_1 = true;
-        committed_position += 1;
-        counters.tokens_completed.fetch_add(1, Ordering::Relaxed);
-        if is_warm_1 {
-            counters
-                .warm_tokens_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        assert_eq!(committed_position, start_pos + 1);
-        let snap1 = counters.snapshot();
-        assert_eq!(snap1.tokens_completed, 1);
-        assert_eq!(snap1.warm_tokens_completed, 1);
-
-        // 2. Cold / retried successful token step (is_warm = false)
-        let is_warm_2 = false;
-        committed_position += 1;
-        counters.tokens_completed.fetch_add(1, Ordering::Relaxed);
-        if is_warm_2 {
-            counters
-                .warm_tokens_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        assert_eq!(committed_position, start_pos + 2);
-        let snap2 = counters.snapshot();
-        assert_eq!(snap2.tokens_completed, 2);
-        assert_eq!(snap2.warm_tokens_completed, 1);
-    }
-
-    #[test]
     fn disabled_mode_preserves_legacy_state() {
         let toml_str = r#"
             [model]
@@ -2569,23 +2533,35 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
-    fn live_l4_gpu_native_full_token_loop_retry() {
+    struct LiveL4Harness {
+        _temp_dir: TempDir,
+        engine: Arc<Engine>,
+        token_loop: Arc<GpuNativeTokenLoop>,
+        ram_cache: Arc<crate::multi_layer_cache::MultiLayerExpertCache>,
+        gpu_cache: Arc<crate::expert_cache::GpuExpertCache>,
+        residency_manager: Arc<GpuNativeTieredResidencyManager>,
+    }
+
+    const LIVE_L4_D_MODEL: usize = 32;
+    const LIVE_L4_D_FF: usize = 32;
+    const LIVE_L4_NUM_EXPERTS: usize = 4;
+    const LIVE_L4_TOP_K: usize = 2;
+    const LIVE_L4_NUM_LAYERS: usize = 2;
+    const LIVE_L4_VOCAB_SIZE: usize = 32;
+    const LIVE_L4_MAX_SEQ_LEN: usize = 8;
+
+    fn setup_live_l4_harness(tag: &str) -> LiveL4Harness {
         use crate::backend::{resolve_execution_context_for_gpu_native, GpuBackendGeometry};
         use crate::buffer_pool::BufferPool;
         use crate::expert_cache::{ExpertResident, GpuExpertCache, GpuResident};
 
-        const D_MODEL: usize = 32;
-        const D_FF: usize = 32;
-        const NUM_EXPERTS: usize = 4;
-        const TOP_K: usize = 2;
-        const NUM_LAYERS: usize = 2;
-        const VOCAB_SIZE: usize = 32;
-        const MAX_SEQ_LEN: usize = 8;
-
-        let geometry =
-            GpuNativeQ4ExpertGeometry::try_new(D_MODEL, D_FF, NUM_EXPERTS, TOP_K).unwrap();
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(
+            LIVE_L4_D_MODEL,
+            LIVE_L4_D_FF,
+            LIVE_L4_NUM_EXPERTS,
+            LIVE_L4_TOP_K,
+        )
+        .unwrap();
         let payload_template =
             crate::backend::gpu_native::tests::q4_uniform_expert(geometry, 0.01, 0.02, 0.005);
         let payload_bytes = payload_template.len();
@@ -2594,8 +2570,8 @@ pub(crate) mod tests {
 
         let execution = resolve_execution_context_for_gpu_native(
             GpuBackendGeometry {
-                num_layers: NUM_LAYERS,
-                max_seq_len: MAX_SEQ_LEN,
+                num_layers: LIVE_L4_NUM_LAYERS,
+                max_seq_len: LIVE_L4_MAX_SEQ_LEN,
                 num_heads: 2,
                 num_kv_heads: 2,
                 head_dim: 16,
@@ -2608,7 +2584,7 @@ pub(crate) mod tests {
 
         let executor = Arc::new(
             execution
-                .create_gpu_native_executor_context(D_MODEL)
+                .create_gpu_native_executor_context(LIVE_L4_D_MODEL)
                 .expect("GPU-native executor must retain the authoritative backend"),
         );
         assert_eq!(executor.device_identity().vendor_id, 0x10de);
@@ -2618,47 +2594,48 @@ pub(crate) mod tests {
             executor.device_identity().name
         );
 
-        let total_budget = (payload_bytes as u64) * (TOP_K as u64) * (NUM_LAYERS as u64) * 2;
+        let total_budget =
+            (payload_bytes as u64) * (LIVE_L4_TOP_K as u64) * (LIVE_L4_NUM_LAYERS as u64) * 2;
         let residency_manager = Arc::new(
             GpuNativeTieredResidencyManager::try_new(
                 executor.clone(),
                 gpu_cache.clone(),
-                NUM_LAYERS,
+                LIVE_L4_NUM_LAYERS,
                 geometry,
                 total_budget,
             )
             .unwrap(),
         );
 
-        let temp_dir = TempDir::new("full_token_loop");
+        let temp_dir = TempDir::new(tag);
         let storage = Arc::new(
             crate::io_provider::NvmeStorage::new(crate::io_provider::StorageConfig {
                 base_path: temp_dir.path.clone(),
                 expert_size: payload_bytes,
                 block_align: 4,
                 use_direct_io: false,
-                num_experts_per_layer: Some(NUM_EXPERTS as u32),
+                num_experts_per_layer: Some(LIVE_L4_NUM_EXPERTS as u32),
             })
             .unwrap(),
         );
 
         let router = crate::gating::Router::Markov(Arc::new(crate::router::TopKRouter::new(
-            (NUM_EXPERTS * NUM_LAYERS) as u32,
-            TOP_K,
+            (LIVE_L4_NUM_EXPERTS * LIVE_L4_NUM_LAYERS) as u32,
+            LIVE_L4_TOP_K,
             0xC0FFEE,
         )));
         let predictor = Arc::new(crate::router::PredictiveLoader::new(
-            (NUM_EXPERTS * NUM_LAYERS) as u32,
-            TOP_K,
+            (LIVE_L4_NUM_EXPERTS * LIVE_L4_NUM_LAYERS) as u32,
+            LIVE_L4_TOP_K,
             0.0,
             42,
         ));
 
         let ram_cache = Arc::new(
             crate::multi_layer_cache::MultiLayerExpertCache::with_uniform_capacity(
-                NUM_LAYERS,
+                LIVE_L4_NUM_LAYERS,
                 16,
-                NUM_EXPERTS as u32,
+                LIVE_L4_NUM_EXPERTS as u32,
             ),
         );
 
@@ -2669,8 +2646,8 @@ pub(crate) mod tests {
             router,
             predictor,
             crate::engine::ModelShape {
-                d_model: D_MODEL,
-                d_ff: D_FF,
+                d_model: LIVE_L4_D_MODEL,
+                d_ff: LIVE_L4_D_FF,
                 hidden_seed: 0xC0FFEE,
             },
             crate::engine::EngineOptions {
@@ -2698,15 +2675,15 @@ pub(crate) mod tests {
         let engine = Arc::new(engine_builder);
 
         let cfg = RealModelConfig {
-            d_model: D_MODEL,
-            d_ff: D_FF,
+            d_model: LIVE_L4_D_MODEL,
+            d_ff: LIVE_L4_D_FF,
             num_heads: 2,
             num_kv_heads: 2,
             head_dim: 16,
-            vocab_size: VOCAB_SIZE,
-            num_layers: NUM_LAYERS,
-            num_experts: NUM_EXPERTS,
-            top_k: TOP_K,
+            vocab_size: LIVE_L4_VOCAB_SIZE,
+            num_layers: LIVE_L4_NUM_LAYERS,
+            num_experts: LIVE_L4_NUM_EXPERTS,
+            top_k: LIVE_L4_TOP_K,
             rope_base: 10_000.0,
             rms_eps: 1e-5,
             window_size: None,
@@ -2720,16 +2697,14 @@ pub(crate) mod tests {
             executor.clone(),
             residency_manager.clone(),
             &model,
-            MAX_SEQ_LEN,
+            LIVE_L4_MAX_SEQ_LEN,
         )
         .unwrap();
 
-        let mut request_state = token_loop.create_request_state().unwrap();
-
         let pool = BufferPool::new(16, payload_bytes, 4);
-        for layer_idx in 0..NUM_LAYERS {
-            for local_id in 0..NUM_EXPERTS as u32 {
-                let global_id = layer_idx as u32 * NUM_EXPERTS as u32 + local_id;
+        for layer_idx in 0..LIVE_L4_NUM_LAYERS {
+            for local_id in 0..LIVE_L4_NUM_EXPERTS as u32 {
+                let global_id = layer_idx as u32 * LIVE_L4_NUM_EXPERTS as u32 + local_id;
                 let payload = crate::backend::gpu_native::tests::q4_uniform_expert(
                     geometry,
                     0.01 * (global_id + 1) as f32,
@@ -2755,33 +2730,57 @@ pub(crate) mod tests {
             }
         }
 
+        LiveL4Harness {
+            _temp_dir: temp_dir,
+            engine,
+            token_loop,
+            ram_cache,
+            gpu_cache,
+            residency_manager,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_full_token_loop_retry() {
+        let harness = setup_live_l4_harness("full_token_loop");
+        let mut request_state = harness.token_loop.create_request_state().unwrap();
+
         // Precondition assertions: RAM warm, logical GPU admissions present, physical VRAM cold.
-        for layer_idx in 0..NUM_LAYERS {
-            for local_id in 0..NUM_EXPERTS as u32 {
-                let global_id = layer_idx as u32 * NUM_EXPERTS as u32 + local_id;
+        for layer_idx in 0..LIVE_L4_NUM_LAYERS {
+            for local_id in 0..LIVE_L4_NUM_EXPERTS as u32 {
+                let global_id = layer_idx as u32 * LIVE_L4_NUM_EXPERTS as u32 + local_id;
                 assert!(
-                    ram_cache.contains(global_id),
+                    harness.ram_cache.contains(global_id),
                     "RAM cache must contain global_id {global_id}"
                 );
                 assert!(
-                    gpu_cache.current_admission(global_id).is_some(),
+                    harness.gpu_cache.current_admission(global_id).is_some(),
                     "gpu_cache must contain logical admission for global_id {global_id}"
                 );
                 assert_eq!(
-                    residency_manager.has_current_for_demand(global_id).unwrap(),
+                    harness
+                        .residency_manager
+                        .has_current_for_demand(global_id)
+                        .unwrap(),
                     false,
                     "physical residency manager must initially be cold for global_id {global_id}"
                 );
             }
         }
 
-        let first_token =
-            pollster::block_on(token_loop.step_token(&engine, &mut request_state, 1, 0, true))
-                .unwrap()
-                .expect("cold token 0 must succeed after retries");
+        let first_token = pollster::block_on(harness.token_loop.step_token(
+            &harness.engine,
+            &mut request_state,
+            1,
+            0,
+            true,
+        ))
+        .unwrap()
+        .expect("cold token 0 must succeed after retries");
 
         assert_eq!(request_state.committed_position, 1);
-        let snap1 = token_loop.snapshot();
+        let snap1 = harness.token_loop.snapshot();
         assert_eq!(snap1.tokens_completed, 1);
         assert_eq!(snap1.token_attempts, 3);
         assert_eq!(snap1.residency_miss_attempts, 2);
@@ -2789,8 +2788,8 @@ pub(crate) mod tests {
         assert_eq!(snap1.residency_services, 2);
         assert_eq!(snap1.fatal_failures, 0);
 
-        let _second_token = pollster::block_on(token_loop.step_token(
-            &engine,
+        let _second_token = pollster::block_on(harness.token_loop.step_token(
+            &harness.engine,
             &mut request_state,
             first_token,
             1,
@@ -2800,7 +2799,7 @@ pub(crate) mod tests {
         .expect("warm token 1 must succeed directly");
 
         assert_eq!(request_state.committed_position, 2);
-        let snap2 = token_loop.snapshot();
+        let snap2 = harness.token_loop.snapshot();
         assert_eq!(snap2.tokens_completed, 2);
         assert_eq!(snap2.warm_tokens_completed, 1);
         assert_eq!(snap2.token_attempts, 4);
@@ -2811,9 +2810,91 @@ pub(crate) mod tests {
         assert_eq!(snap2.fatal_failures, 0);
 
         assert_eq!(
-            engine.report().bytes_read,
+            harness.engine.report().bytes_read,
             0,
             "pure RAM->VRAM qualification must not fall back to storage reads"
         );
+    }
+
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_diagnostic_smoke() {
+        let harness = setup_live_l4_harness("diag_smoke");
+        let mut request_state = harness.token_loop.create_request_state().unwrap();
+
+        let trace_layout = crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
+            LIVE_L4_NUM_LAYERS,
+            LIVE_L4_D_MODEL,
+            LIVE_L4_TOP_K,
+            LIVE_L4_VOCAB_SIZE,
+        )
+        .unwrap();
+
+        let staging_buffer = harness
+            .token_loop
+            .create_diagnostic_staging_buffer(&trace_layout)
+            .unwrap();
+
+        let (trace, attempts) = pollster::block_on(harness.token_loop.step_token_diagnostic(
+            &harness.engine,
+            &mut request_state,
+            1,
+            0,
+            true,
+            &trace_layout,
+            &staging_buffer,
+        ))
+        .expect("diagnostic step on L4 must succeed");
+
+        assert_eq!(trace.embedding.len(), LIVE_L4_D_MODEL);
+        assert_eq!(trace.layer_post_attn.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_router_input.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_selected_ids.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_selected_weights.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_post_moe.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.layer_statuses.len(), LIVE_L4_NUM_LAYERS);
+        assert_eq!(trace.final_norm.len(), LIVE_L4_D_MODEL);
+        assert_eq!(trace.logits.len(), LIVE_L4_VOCAB_SIZE);
+        assert!(trace.sampled_token < LIVE_L4_VOCAB_SIZE as u32);
+        assert_eq!(trace.final_status, 0);
+        assert_eq!(request_state.committed_position, 1);
+        assert!(attempts > 0);
+
+        for l in 0..LIVE_L4_NUM_LAYERS {
+            assert_eq!(trace.layer_selected_ids[l].len(), LIVE_L4_TOP_K);
+            assert_eq!(trace.layer_selected_weights[l].len(), LIVE_L4_TOP_K);
+            assert_eq!(trace.layer_statuses[l], 0);
+            assert!(trace.layer_post_attn[l].iter().all(|v| v.is_finite()));
+            assert!(trace.layer_router_input[l].iter().all(|v| v.is_finite()));
+            assert!(trace.layer_selected_weights[l]
+                .iter()
+                .all(|v| v.is_finite()));
+            assert!(trace.layer_post_moe[l].iter().all(|v| v.is_finite()));
+        }
+
+        assert!(trace.embedding.iter().all(|v| v.is_finite()));
+        assert!(trace.final_norm.iter().all(|v| v.is_finite()));
+        assert!(trace.logits.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_ingest_no_deadlock() {
+        let harness = setup_live_l4_harness("ingest_deadlock");
+        let mut request_state = harness.token_loop.create_request_state().unwrap();
+
+        let prompt_ids = [1u32, 2u32];
+        let completion = pollster::block_on(harness.token_loop.ingest_prompt_and_generate(
+            &harness.engine,
+            &mut request_state,
+            &prompt_ids,
+            1,
+            &SamplingParams::greedy(),
+        ))
+        .expect("ingest_prompt_and_generate must succeed without deadlock");
+
+        assert_eq!(completion.len(), 1);
+        assert!(completion[0] < LIVE_L4_VOCAB_SIZE as u32);
+        assert_eq!(request_state.committed_position, 2);
     }
 }

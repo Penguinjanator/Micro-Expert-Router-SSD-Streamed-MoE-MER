@@ -788,7 +788,7 @@ pub fn compare_diagnostic_traces(
             Some(l),
             &reference.layer_post_attn[l],
             &gpu_native.layer_post_attn[l],
-            Some(RAW_PROJECTION_TOLERANCE),
+            None,
         )?;
 
         comparator.record_vector_stage(
@@ -796,7 +796,7 @@ pub fn compare_diagnostic_traces(
             Some(l),
             &reference.layer_router_input[l],
             &gpu_native.layer_router_input[l],
-            Some(RAW_PROJECTION_TOLERANCE),
+            None,
         )?;
 
         comparator.record_discrete_stage(
@@ -811,7 +811,7 @@ pub fn compare_diagnostic_traces(
             Some(l),
             &reference.layer_selected_weights[l],
             &gpu_native.layer_selected_weights[l],
-            Some(RAW_PROJECTION_TOLERANCE),
+            None,
         )?;
 
         comparator.record_vector_stage(
@@ -819,7 +819,7 @@ pub fn compare_diagnostic_traces(
             Some(l),
             &reference.layer_post_moe[l],
             &gpu_native.layer_post_moe[l],
-            Some(Q4_EXPERT_F16_BOUNDARY_TOLERANCE),
+            None,
         )?;
     }
 
@@ -829,7 +829,7 @@ pub fn compare_diagnostic_traces(
         None,
         &reference.final_norm,
         &gpu_native.final_norm,
-        Some(RAW_PROJECTION_TOLERANCE),
+        None,
     )?;
 
     // 4. Logits
@@ -838,7 +838,7 @@ pub fn compare_diagnostic_traces(
         None,
         &reference.logits,
         &gpu_native.logits,
-        Some(Q4_EXPERT_F16_BOUNDARY_TOLERANCE),
+        None,
     )?;
 
     // 5. Sampled Token: exact discrete match
@@ -1201,5 +1201,69 @@ mod tests {
         assert!(!report.qualification_pass);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"qualification_pass\":false"));
+    }
+
+    #[test]
+    fn small_delta_on_cumulative_stage_flags_first_divergence_with_no_tolerance() {
+        // A small delta (1e-4) on layer_post_moe would have satisfied the old
+        // Q4_EXPERT_F16_BOUNDARY_TOLERANCE (abs=2e-3, rel=5e-3). With tolerance=None,
+        // it must now immediately flag first divergence and exact divergence.
+        let reference = sample_trace(2, 4, 2, 8);
+        let mut gpu = model_to_gpu_trace(&reference);
+        gpu.layer_post_moe[0][0] = 4.0 + 1e-4;
+
+        let (first_exact, first_div, stages) = compare_diagnostic_traces(&reference, &gpu).unwrap();
+
+        assert!(first_exact.is_some());
+        assert_eq!(
+            first_exact.unwrap().stage,
+            DiagnosticStage::LayerPostMoe { layer: 0 }
+        );
+
+        assert!(first_div.is_some());
+        let div = first_div.unwrap();
+        assert_eq!(div.stage, DiagnosticStage::LayerPostMoe { layer: 0 });
+        assert_eq!(div.layer, Some(0));
+
+        let moe_stage = stages
+            .iter()
+            .find(|s| s.stage == DiagnosticStage::LayerPostMoe { layer: 0 })
+            .unwrap();
+        assert!(!moe_stage.exact_match);
+        assert!(!moe_stage.tolerance_pass);
+
+        // Same for small delta on Logits (1e-4)
+        let mut gpu_logits = model_to_gpu_trace(&reference);
+        gpu_logits.logits[0] = 6.0 + 1e-4;
+        let (first_exact_l, first_div_l, stages_l) =
+            compare_diagnostic_traces(&reference, &gpu_logits).unwrap();
+        assert_eq!(first_exact_l.unwrap().stage, DiagnosticStage::Logits);
+        assert_eq!(first_div_l.unwrap().stage, DiagnosticStage::Logits);
+        let logits_stage = stages_l
+            .iter()
+            .find(|s| s.stage == DiagnosticStage::Logits)
+            .unwrap();
+        assert!(!logits_stage.exact_match);
+        assert!(!logits_stage.tolerance_pass);
+
+        // Same for small delta on LayerPostAttention (1e-6, which satisfied RAW_PROJECTION_TOLERANCE)
+        let mut gpu_attn = model_to_gpu_trace(&reference);
+        gpu_attn.layer_post_attn[0][0] = 2.0 + 1e-6;
+        let (first_exact_a, first_div_a, stages_a) =
+            compare_diagnostic_traces(&reference, &gpu_attn).unwrap();
+        assert_eq!(
+            first_exact_a.unwrap().stage,
+            DiagnosticStage::LayerPostAttention { layer: 0 }
+        );
+        assert_eq!(
+            first_div_a.unwrap().stage,
+            DiagnosticStage::LayerPostAttention { layer: 0 }
+        );
+        let attn_stage = stages_a
+            .iter()
+            .find(|s| s.stage == DiagnosticStage::LayerPostAttention { layer: 0 })
+            .unwrap();
+        assert!(!attn_stage.exact_match);
+        assert!(!attn_stage.tolerance_pass);
     }
 }

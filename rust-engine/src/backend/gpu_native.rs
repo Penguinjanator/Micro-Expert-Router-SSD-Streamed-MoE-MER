@@ -3579,7 +3579,7 @@ impl GpuNativeTokenStateLayout {
     }
 
     pub(crate) fn tensor_usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
     }
 
     pub(crate) fn status_usage() -> wgpu::BufferUsages {
@@ -3640,7 +3640,7 @@ impl GpuNativeScratchLayout {
     }
 
     pub(crate) fn usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
     }
 
     pub(crate) fn boundary_result_usage() -> wgpu::BufferUsages {
@@ -14145,7 +14145,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let tensor = GpuNativeTokenStateLayout::tensor_usage();
         assert!(tensor.contains(wgpu::BufferUsages::STORAGE));
         assert!(tensor.contains(wgpu::BufferUsages::COPY_DST));
-        assert!(!tensor.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(tensor.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!tensor.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
         let status = GpuNativeTokenStateLayout::status_usage();
@@ -14157,7 +14157,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let generic_scratch = GpuNativeScratchLayout::usage();
         assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
         assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
-        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!generic_scratch
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 

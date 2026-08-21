@@ -5505,25 +5505,62 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
     }
     report.actual_adapter = Some(device);
 
-    let mut req_state = gpu_native_token_loop.create_request_state()?;
+    let mut req_state = match gpu_native_token_loop.create_request_state() {
+        Ok(state) => state,
+        Err(e) => {
+            return fail_gpu_native_first_divergence(
+                report,
+                format!("failed to create request state: {e}"),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
     for (pos, &tid) in prompt_token_ids[..prompt_token_ids.len() - 1]
         .iter()
         .enumerate()
     {
-        gpu_native_token_loop
+        if let Err(e) = gpu_native_token_loop
             .step_token(&gpu_runtime.engine, &mut req_state, tid, pos, false)
-            .await?;
+            .await
+        {
+            return fail_gpu_native_first_divergence(
+                report,
+                format!("prefix prompt step failed at position {pos} (token {tid}): {e}"),
+                args.report_out.as_deref(),
+            );
+        }
     }
 
-    let trace_layout = crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
-        cfg.model.num_layers,
-        cfg.model.d_model,
-        cfg.model.top_k,
-        cfg.real_transformer.vocab_size,
-    )?;
-    let staging_buffer = gpu_native_token_loop.create_diagnostic_staging_buffer(&trace_layout)?;
+    let trace_layout = match crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
+        model_geometry.num_layers,
+        model_geometry.d_model,
+        model_geometry.top_k,
+        model_geometry.vocab_size,
+    ) {
+        Ok(layout) => layout,
+        Err(e) => {
+            return fail_gpu_native_first_divergence(
+                report,
+                format!("failed to construct trace layout: {e}"),
+                args.report_out.as_deref(),
+            );
+        }
+    };
 
-    let (gpu_trace, attempts) = gpu_native_token_loop
+    let staging_buffer =
+        match gpu_native_token_loop.create_diagnostic_staging_buffer(&trace_layout) {
+            Ok(buf) => buf,
+            Err(e) => {
+                return fail_gpu_native_first_divergence(
+                    report,
+                    format!("failed to create diagnostic staging buffer: {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+
+    let (gpu_trace, attempts) = match gpu_native_token_loop
         .step_token_diagnostic(
             &gpu_runtime.engine,
             &mut req_state,
@@ -5533,7 +5570,19 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
             &trace_layout,
             &staging_buffer,
         )
-        .await?;
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            return fail_gpu_native_first_divergence(
+                report,
+                format!(
+                    "diagnostic step failed at final position {final_pos} (token {final_tid}): {e}"
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
 
     let counters_delta = gpu_native_token_loop.snapshot();
     drop(req_state);
@@ -5542,7 +5591,16 @@ async fn cmd_diagnose_gpu_native_q4_first_divergence(
 
     // 3. Comparison
     let (first_exact_divergence, first_divergence, stages) =
-        crate::gpu_native_diagnostics::compare_diagnostic_traces(&ref_trace, &gpu_trace)?;
+        match crate::gpu_native_diagnostics::compare_diagnostic_traces(&ref_trace, &gpu_trace) {
+            Ok(res) => res,
+            Err(e) => {
+                return fail_gpu_native_first_divergence(
+                    report,
+                    format!("failed to compare diagnostic traces: {e}"),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
 
     report.reference_sampled_token_id = Some(ref_trace.sampled_token);
     report.gpu_native_sampled_token_id = Some(gpu_trace.sampled_token);
