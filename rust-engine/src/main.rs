@@ -5970,20 +5970,31 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
         position_comparisons.push(pos_comp);
     }
 
-    let (earliest_divergent_position, first_internal_divergence) =
-        crate::gpu_native_layer0_diagnostics::first_layer0_divergence_across_positions(
-            &position_comparisons,
-        );
-
     drop(req_state);
     drop(staging_buffer);
     let _ = ref_runtime.shutdown_isolated().await;
     let _ = gpu_runtime.shutdown_isolated().await;
 
+    report.record_completed_position_evidence(position_comparisons, final_position_post_attention);
+
     // 4. Optional Slice 11B Cross-Check
     let slice11b_cross_check = if let Some(ref path) = args.slice11b_report {
-        let final_stage = final_position_post_attention.as_ref().ok_or("no final position post-attention evidence recorded")?;
-        let check = match crate::gpu_native_layer0_diagnostics::cross_check_slice11b_report(path, &report, final_stage) {
+        if report.final_position_post_attention.is_none() {
+            return fail_layer0_attention_first_divergence(
+                report,
+                "no final position post-attention evidence recorded".to_string(),
+                args.report_out.as_deref(),
+            );
+        }
+        let final_stage = report
+            .final_position_post_attention
+            .as_ref()
+            .expect("final position post-attention evidence checked above");
+        let check = match crate::gpu_native_layer0_diagnostics::cross_check_slice11b_report(
+            path,
+            &report,
+            final_stage,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 return fail_layer0_attention_first_divergence(
@@ -6007,10 +6018,6 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
         None
     };
 
-    report.earliest_divergent_position = earliest_divergent_position;
-    report.first_internal_divergence = first_internal_divergence;
-    report.position_comparisons = position_comparisons;
-    report.final_position_post_attention = final_position_post_attention;
     report.slice11b_cross_check = slice11b_cross_check;
     report.diagnostic_complete = true;
     report.qualification_pass = false;

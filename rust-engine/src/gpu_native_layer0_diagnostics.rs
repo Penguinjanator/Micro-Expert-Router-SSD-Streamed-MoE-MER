@@ -585,6 +585,26 @@ impl Layer0AttentionFirstDivergenceReport {
         self.qualification_pass = false;
         self.failure = Some(reason);
     }
+
+    pub fn record_completed_position_evidence(
+        &mut self,
+        position_comparisons: Vec<Layer0AttentionPositionComparison>,
+        final_position_post_attention: Option<Layer0AttentionStageComparison>,
+    ) {
+        let (earliest_divergent_position, first_internal_divergence) =
+            first_layer0_divergence_across_positions(&position_comparisons);
+        self.earliest_divergent_position = earliest_divergent_position;
+        self.first_internal_divergence = first_internal_divergence;
+        self.position_comparisons = position_comparisons;
+        self.final_position_post_attention = final_position_post_attention;
+    }
+}
+
+fn canonical_serialized_json_value<T: Serialize>(value: &T) -> Result<serde_json::Value, String> {
+    let serialized =
+        serde_json::to_string(value).map_err(|e| format!("failed to serialize JSON value: {e}"))?;
+    serde_json::from_str(&serialized)
+        .map_err(|e| format!("failed to parse serialized JSON value: {e}"))
 }
 
 pub fn cross_check_slice11b_report(
@@ -687,19 +707,23 @@ pub fn cross_check_slice11b_report(
             "Slice11B expected_adapter_name mismatch: expected {:?}, got {:?}",
             current_report.expected_adapter_name, expected_adapter_name
         ));
-    } else {
-        let current_geom_val =
-            serde_json::to_value(&current_report.model_geometry).map_err(|e| e.to_string())?;
-        if let Some(old_geom) = val.get("model_geometry") {
-            if old_geom != &current_geom_val {
+    } else if let Some(old_geom) = val.get("model_geometry") {
+        match serde_json::from_value::<GpuNativeModelGeometry>(old_geom.clone()) {
+            Ok(old_geometry) if old_geometry != current_report.model_geometry => {
                 identity_discrepancy = Some(format!(
-                    "Slice11B model_geometry mismatch: expected {}, got {}",
-                    current_geom_val, old_geom
+                    "Slice11B model_geometry mismatch: expected {:?}, got {:?}",
+                    current_report.model_geometry, old_geometry
                 ));
             }
-        } else {
-            identity_discrepancy = Some("Slice11B report missing 'model_geometry'".to_string());
+            Ok(_) => {}
+            Err(e) => {
+                identity_discrepancy = Some(format!(
+                    "failed to deserialize Slice11B model_geometry: {e}"
+                ));
+            }
         }
+    } else {
+        identity_discrepancy = Some("Slice11B report missing 'model_geometry'".to_string());
     }
 
     let identity_match = identity_discrepancy.is_none();
@@ -765,8 +789,8 @@ pub fn cross_check_slice11b_report(
         .unwrap_or(false);
     let c_exact_match = final_post_attn.exact_match;
 
-    let current_comp_val = serde_json::to_value(&final_post_attn.vector_comparison)
-        .map_err(|e| format!("failed to serialize Slice11C vector_comparison: {e}"))?;
+    let current_comp_val = canonical_serialized_json_value(&final_post_attn.vector_comparison)
+        .map_err(|e| format!("failed to canonicalize Slice11C vector_comparison: {e}"))?;
 
     let mut stage_evidence_discrepancy = None;
     if b_exact_match != c_exact_match {
@@ -1002,6 +1026,36 @@ mod tests {
         assert_eq!(div.stage, Layer0AttentionStage::KRaw);
     }
 
+    #[test]
+    fn completed_position_evidence_survives_later_qualification_failure() {
+        let (mut report, _) = sample_test_evidence();
+        let cpu = sample_cpu_sink(4, 8, 2);
+        let mut gpu = cpu_sink_to_gpu_trace(&cpu);
+        gpu.post_attention_residual[0] += 1e-4;
+        let position_comparison = compare_layer0_attention_traces(0, 10, &cpu, &gpu).unwrap();
+        let final_position_post_attention = position_comparison
+            .stages
+            .iter()
+            .find(|stage| stage.stage == Layer0AttentionStage::PostAttentionResidual)
+            .cloned();
+
+        report.record_completed_position_evidence(
+            vec![position_comparison],
+            final_position_post_attention,
+        );
+        report.fail("later qualification gate failed".to_string());
+
+        assert!(report.diagnostic_complete);
+        assert!(!report.qualification_pass);
+        assert_eq!(report.earliest_divergent_position, Some(0));
+        assert_eq!(
+            report.first_internal_divergence.as_ref().unwrap().stage,
+            Layer0AttentionStage::PostAttentionResidual
+        );
+        assert_eq!(report.position_comparisons.len(), 1);
+        assert!(report.final_position_post_attention.is_some());
+    }
+
     struct TempFile {
         path: std::path::PathBuf,
     }
@@ -1089,34 +1143,100 @@ mod tests {
         geom: &GpuNativeModelGeometry,
         comp: &VectorComparisonEvidence,
     ) -> String {
-        serde_json::json!({
-            "schema_version": "mer.gpu-native-q4-first-divergence-diagnostic.v1",
-            "mode": "diagnose-gpu-native-q4-first-divergence",
-            "diagnostic_complete": true,
-            "qualification_pass": false,
-            "failure": null,
-            "case": {
-                "case_name": case_name,
-                "prompt_sha256": "prompt_hash_123",
-                "prompt_token_count": 4
+        #[derive(serde::Serialize)]
+        struct FrozenCase<'a> {
+            case_name: &'a str,
+            prompt_sha256: &'static str,
+            prompt_token_count: usize,
+        }
+
+        #[derive(serde::Serialize)]
+        struct FrozenStageName {
+            stage: &'static str,
+            layer: usize,
+        }
+
+        #[derive(serde::Serialize)]
+        struct FrozenStage<'a> {
+            stage: FrozenStageName,
+            exact_match: bool,
+            tolerance_pass: bool,
+            vector_comparison: &'a VectorComparisonEvidence,
+        }
+
+        #[derive(serde::Serialize)]
+        struct FrozenReport<'a> {
+            schema_version: &'static str,
+            mode: &'static str,
+            diagnostic_complete: bool,
+            qualification_pass: bool,
+            failure: Option<&'static str>,
+            case: FrozenCase<'a>,
+            prompt_token_ids_sha256: &'a str,
+            resolved_config_sha256: &'static str,
+            model_geometry: &'a GpuNativeModelGeometry,
+            expected_adapter_name: &'static str,
+            stages: [FrozenStage<'a>; 1],
+        }
+
+        serde_json::to_string(&FrozenReport {
+            schema_version: "mer.gpu-native-q4-first-divergence-diagnostic.v1",
+            mode: "diagnose-gpu-native-q4-first-divergence",
+            diagnostic_complete: true,
+            qualification_pass: false,
+            failure: None,
+            case: FrozenCase {
+                case_name,
+                prompt_sha256: "prompt_hash_123",
+                prompt_token_count: 4,
             },
-            "prompt_token_ids_sha256": prompt_token_ids_sha256,
-            "resolved_config_sha256": "resolved_cfg_hash_123",
-            "model_geometry": geom,
-            "expected_adapter_name": "NVIDIA L4",
-            "stages": [
-                {
-                    "stage": {
-                        "stage": "layer_post_attention",
-                        "layer": 0
-                    },
-                    "exact_match": comp.exact_f32_bits,
-                    "tolerance_pass": false,
-                    "vector_comparison": comp
-                }
-            ]
+            prompt_token_ids_sha256,
+            resolved_config_sha256: "resolved_cfg_hash_123",
+            model_geometry: geom,
+            expected_adapter_name: "NVIDIA L4",
+            stages: [FrozenStage {
+                stage: FrozenStageName {
+                    stage: "layer_post_attention",
+                    layer: 0,
+                },
+                exact_match: comp.exact_f32_bits,
+                tolerance_pass: false,
+                vector_comparison: comp,
+            }],
         })
-        .to_string()
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_check_equivalent_1e_minus_6_f32_geometry_serialization_passes() {
+        let (report, _) = sample_test_evidence();
+        assert_eq!(report.model_geometry.rms_eps, 1e-6_f32);
+        let exact_comp = crate::numerical_diagnostics::compare_vectors(&[1.0], &[1.0]).unwrap();
+        let stage_comp = Layer0AttentionStageComparison {
+            stage: Layer0AttentionStage::PostAttentionResidual,
+            exact_match: true,
+            vector_comparison: exact_comp,
+        };
+        let normally_serialized = sample_slice11b_report_json(
+            &report.case.case_name,
+            &report.prompt_token_ids_sha256,
+            &report.model_geometry,
+            &stage_comp.vector_comparison,
+        );
+        let mut frozen_value: serde_json::Value =
+            serde_json::from_str(&normally_serialized).unwrap();
+        frozen_value["model_geometry"]["rms_eps"] = serde_json::Value::from(1e-6_f64);
+        let json_str = serde_json::to_string(&frozen_value).unwrap();
+        assert!(json_str.contains("\"rms_eps\":1e-6"), "{json_str}");
+
+        let widened_current = serde_json::to_value(report.model_geometry).unwrap();
+        assert_ne!(frozen_value["model_geometry"], widened_current);
+
+        let temp = TempFile::new("equivalent_f32_geometry", &json_str);
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "verified_match");
+        assert!(res.identity_match);
+        assert!(res.stage_evidence_match);
     }
 
     #[test]
@@ -1172,10 +1292,10 @@ mod tests {
     }
 
     #[test]
-    fn cross_check_wrong_model_geometry_fails() {
+    fn cross_check_genuinely_different_f32_geometry_fails() {
         let (report, stage_comp) = sample_test_evidence();
         let mut wrong_geom = report.model_geometry;
-        wrong_geom.num_layers = 24; // differs from 48
+        wrong_geom.rms_eps = 2e-6_f32;
         let json_str = sample_slice11b_report_json(
             &report.case.case_name,
             &report.prompt_token_ids_sha256,
@@ -1188,6 +1308,44 @@ mod tests {
         assert_eq!(res.cross_check_status, "mismatch");
         assert!(!res.identity_match);
         assert!(res.discrepancy.unwrap().contains("model_geometry"));
+    }
+
+    #[test]
+    fn cross_check_exact_nontrivial_f32_vector_evidence_serialization_passes() {
+        let (mut report, _) = sample_test_evidence();
+        report.model_geometry.rms_eps = 0.5;
+        report.model_geometry.rope_base = 16.0;
+        let comp =
+            crate::numerical_diagnostics::compare_vectors(&[-1.1858244_f32], &[-1.1846353_f32])
+                .unwrap();
+        assert_eq!(comp.max_absolute_error, Some(0.0011891127_f32));
+        let stage_comp = Layer0AttentionStageComparison {
+            stage: Layer0AttentionStage::PostAttentionResidual,
+            exact_match: false,
+            vector_comparison: comp,
+        };
+        let json_str = sample_slice11b_report_json(
+            &report.case.case_name,
+            &report.prompt_token_ids_sha256,
+            &report.model_geometry,
+            &stage_comp.vector_comparison,
+        );
+        assert!(json_str.contains("\"max_absolute_error\":0.0011891127"));
+        assert!(json_str.contains("\"value\":-1.1858244"));
+        assert!(json_str.contains("\"value\":-1.1846353"));
+
+        let frozen_value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let widened_current = serde_json::to_value(&stage_comp.vector_comparison).unwrap();
+        assert_ne!(
+            frozen_value["stages"][0]["vector_comparison"],
+            widened_current
+        );
+
+        let temp = TempFile::new("equivalent_f32_vector", &json_str);
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "verified_match");
+        assert!(res.identity_match);
+        assert!(res.stage_evidence_match);
     }
 
     #[test]
