@@ -3057,82 +3057,83 @@ pub(crate) mod tests {
         assert_eq!(completion.len(), 1);
         assert!(completion[0] < LIVE_L4_VOCAB_SIZE as u32);
         assert_eq!(request_state.committed_position, 2);
+    }
 
-        #[test]
-        #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
-        fn live_l4_gpu_native_layer0_attention_diagnostic_smoke() {
-            let harness = setup_live_l4_harness("layer0_smoke");
-            let mut request_state = harness.token_loop.create_request_state().unwrap();
+    #[test]
+    #[ignore = "requires authoritative NVIDIA L4 WGPU validation hardware"]
+    fn live_l4_gpu_native_layer0_attention_diagnostic_smoke() {
+        let harness = setup_live_l4_harness("layer0_smoke");
+        let mut request_state = harness.token_loop.create_request_state().unwrap();
 
-            let geom = harness.token_loop.model_geometry();
-            let q_width = geom.num_heads * geom.head_dim;
-            let kv_width = geom.num_kv_heads * geom.head_dim;
+        let geom = harness.token_loop.model_geometry();
+        let q_width = geom.num_heads * geom.head_dim;
+        let kv_width = geom.num_kv_heads * geom.head_dim;
 
-            let trace_layout = crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout::try_new(
-            geom.d_model,
-            q_width,
-            kv_width,
-        )
-        .unwrap();
+        let trace_layout =
+            crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout::try_new(
+                geom.d_model,
+                q_width,
+                kv_width,
+            )
+            .unwrap();
 
-            let staging_buffer = harness
-                .token_loop
-                .create_layer0_diagnostic_staging_buffer(&trace_layout)
-                .unwrap();
+        let staging_buffer = harness
+            .token_loop
+            .create_layer0_diagnostic_staging_buffer(&trace_layout)
+            .unwrap();
 
-            // 1. Position 0
-            let trace0 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
-                &harness.engine,
-                &mut request_state,
-                1,
-                0,
-                &trace_layout,
-                &staging_buffer,
-            ))
-            .expect("layer-0 diagnostic step 0 must succeed");
+        // 1. Position 0
+        let trace0 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
+            &harness.engine,
+            &mut request_state,
+            1,
+            0,
+            &trace_layout,
+            &staging_buffer,
+        ))
+        .expect("layer-0 diagnostic step 0 must succeed");
 
-            assert_eq!(trace0.embedding.len(), geom.d_model);
-            assert_eq!(trace0.attention_pre_norm.len(), geom.d_model);
-            assert_eq!(trace0.q_raw.len(), q_width);
-            assert_eq!(trace0.k_raw.len(), kv_width);
-            assert_eq!(trace0.v_raw.len(), kv_width);
-            assert_eq!(trace0.q_after_norm.len(), q_width);
-            assert_eq!(trace0.k_after_norm.len(), kv_width);
-            assert_eq!(trace0.q_after_rope.len(), q_width);
-            assert_eq!(trace0.k_after_rope.len(), kv_width);
-            assert_eq!(trace0.attention_context.len(), q_width);
-            assert_eq!(trace0.o_projection.len(), geom.d_model);
-            assert_eq!(trace0.post_attention_residual.len(), geom.d_model);
-            assert_eq!(trace0.status, 0);
-            assert_eq!(request_state.committed_position, 1);
+        assert_eq!(trace0.embedding.len(), geom.d_model);
+        assert_eq!(trace0.attention_pre_norm.len(), geom.d_model);
+        assert_eq!(trace0.q_raw.len(), q_width);
+        assert_eq!(trace0.k_raw.len(), kv_width);
+        assert_eq!(trace0.v_raw.len(), kv_width);
+        assert_eq!(trace0.q_after_norm.len(), q_width);
+        assert_eq!(trace0.k_after_norm.len(), kv_width);
+        assert_eq!(trace0.q_after_rope.len(), q_width);
+        assert_eq!(trace0.k_after_rope.len(), kv_width);
+        assert_eq!(trace0.attention_context.len(), q_width);
+        assert_eq!(trace0.o_projection.len(), geom.d_model);
+        assert_eq!(trace0.post_attention_residual.len(), geom.d_model);
+        assert_eq!(trace0.status, 0);
+        assert_eq!(request_state.committed_position, 1);
 
-            assert!(trace0.embedding.iter().all(|v| v.is_finite()));
-            assert!(trace0.attention_pre_norm.iter().all(|v| v.is_finite()));
-            assert!(trace0.q_raw.iter().all(|v| v.is_finite()));
-            assert!(trace0.k_raw.iter().all(|v| v.is_finite()));
-            assert!(trace0.v_raw.iter().all(|v| v.is_finite()));
-            assert!(trace0.q_after_norm.iter().all(|v| v.is_finite()));
-            assert!(trace0.k_after_norm.iter().all(|v| v.is_finite()));
-            assert!(trace0.q_after_rope.iter().all(|v| v.is_finite()));
-            assert!(trace0.k_after_rope.iter().all(|v| v.is_finite()));
-            assert!(trace0.attention_context.iter().all(|v| v.is_finite()));
-            assert!(trace0.o_projection.iter().all(|v| v.is_finite()));
-            assert!(trace0.post_attention_residual.iter().all(|v| v.is_finite()));
+        assert!(trace0.embedding.iter().all(|v| v.is_finite()));
+        assert!(trace0.attention_pre_norm.iter().all(|v| v.is_finite()));
+        assert!(trace0.q_raw.iter().all(|v| v.is_finite()));
+        assert!(trace0.k_raw.iter().all(|v| v.is_finite()));
+        assert!(trace0.v_raw.iter().all(|v| v.is_finite()));
+        assert!(trace0.q_after_norm.iter().all(|v| v.is_finite()));
+        assert!(trace0.k_after_norm.iter().all(|v| v.is_finite()));
+        assert!(trace0.q_after_rope.iter().all(|v| v.is_finite()));
+        assert!(trace0.k_after_rope.iter().all(|v| v.is_finite()));
+        assert!(trace0.attention_context.iter().all(|v| v.is_finite()));
+        assert!(trace0.o_projection.iter().all(|v| v.is_finite()));
+        assert!(trace0.post_attention_residual.iter().all(|v| v.is_finite()));
 
-            // 2. Position 1 (persisting KV across positions)
-            let trace1 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
-                &harness.engine,
-                &mut request_state,
-                2,
-                1,
-                &trace_layout,
-                &staging_buffer,
-            ))
-            .expect("layer-0 diagnostic step 1 must succeed");
+        // 2. Position 1 (persisting KV across positions)
+        let trace1 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
+            &harness.engine,
+            &mut request_state,
+            2,
+            1,
+            &trace_layout,
+            &staging_buffer,
+        ))
+        .expect("layer-0 diagnostic step 1 must succeed");
 
-            assert_eq!(trace1.status, 0);
-            assert_eq!(request_state.committed_position, 2);
-            assert!(trace1.post_attention_residual.iter().all(|v| v.is_finite()));
-        }
+        assert_eq!(trace1.status, 0);
+        assert_eq!(request_state.committed_position, 2);
+        assert!(trace1.post_attention_residual.iter().all(|v| v.is_finite()));
     }
 }

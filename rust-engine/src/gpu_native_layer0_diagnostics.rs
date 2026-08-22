@@ -479,11 +479,36 @@ pub fn compare_layer0_attention_traces(
 pub struct Slice11bCrossCheckEvidence {
     pub report_path: String,
     pub cross_check_status: String,
+    pub identity_match: bool,
+    pub stage_evidence_match: bool,
+    pub slice11b_schema: Option<String>,
+    pub slice11b_mode: Option<String>,
+    pub case_name: Option<String>,
+    pub prompt_sha256: Option<String>,
+    pub prompt_token_ids_sha256: Option<String>,
+    pub resolved_config_sha256: Option<String>,
+    pub expected_adapter_name: Option<String>,
     pub slice11b_layer0_post_attn_max_abs: Option<f32>,
     pub slice11b_layer0_post_attn_rms: Option<f64>,
     pub slice11c_layer0_post_attn_max_abs: Option<f32>,
     pub slice11c_layer0_post_attn_rms: Option<f64>,
     pub discrepancy: Option<String>,
+}
+
+pub fn first_layer0_divergence_across_positions(
+    position_comparisons: &[Layer0AttentionPositionComparison],
+) -> (
+    Option<usize>,
+    Option<Layer0AttentionFirstDivergenceEvidence>,
+) {
+    for pos_comp in position_comparisons {
+        if !pos_comp.exact_match {
+            if let Some(ref div) = pos_comp.first_divergence {
+                return (Some(pos_comp.position), Some(div.clone()));
+            }
+        }
+    }
+    (None, None)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -564,6 +589,7 @@ impl Layer0AttentionFirstDivergenceReport {
 
 pub fn cross_check_slice11b_report(
     slice11b_path: &Path,
+    current_report: &Layer0AttentionFirstDivergenceReport,
     final_post_attn: &Layer0AttentionStageComparison,
 ) -> Result<Slice11bCrossCheckEvidence, String> {
     let file_str = std::fs::read_to_string(slice11b_path).map_err(|e| {
@@ -575,26 +601,154 @@ pub fn cross_check_slice11b_report(
     let val: serde_json::Value = serde_json::from_str(&file_str)
         .map_err(|e| format!("failed to parse Slice11B report JSON: {e}"))?;
 
+    let slice11b_schema = val
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let slice11b_mode = val
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let case_name = val
+        .get("case")
+        .and_then(|c| c.get("case_name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let prompt_sha256 = val
+        .get("case")
+        .and_then(|c| c.get("prompt_sha256"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let prompt_token_count = val
+        .get("case")
+        .and_then(|c| c.get("prompt_token_count"))
+        .and_then(|v| v.as_u64())
+        .map(|u| u as usize);
+    let prompt_token_ids_sha256 = val
+        .get("prompt_token_ids_sha256")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let resolved_config_sha256 = val
+        .get("resolved_config_sha256")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let expected_adapter_name = val
+        .get("expected_adapter_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let diagnostic_complete = val.get("diagnostic_complete").and_then(|v| v.as_bool());
+    let failure = val.get("failure");
+
+    let mut identity_discrepancy = None;
+    if slice11b_schema.as_deref() != Some("mer.gpu-native-q4-first-divergence-diagnostic.v1") {
+        identity_discrepancy = Some(format!(
+            "Slice11B schema_version mismatch: expected 'mer.gpu-native-q4-first-divergence-diagnostic.v1', got {:?}",
+            slice11b_schema
+        ));
+    } else if slice11b_mode.as_deref() != Some("diagnose-gpu-native-q4-first-divergence") {
+        identity_discrepancy = Some(format!(
+            "Slice11B mode mismatch: expected 'diagnose-gpu-native-q4-first-divergence', got {:?}",
+            slice11b_mode
+        ));
+    } else if diagnostic_complete != Some(true) {
+        identity_discrepancy = Some(format!(
+            "Slice11B diagnostic_complete mismatch: expected true, got {:?}",
+            diagnostic_complete
+        ));
+    } else if failure.is_some() && !failure.unwrap().is_null() {
+        identity_discrepancy = Some(format!("Slice11B report recorded a failure: {:?}", failure));
+    } else if case_name.as_deref() != Some(&current_report.case.case_name) {
+        identity_discrepancy = Some(format!(
+            "Slice11B case.case_name mismatch: expected {:?}, got {:?}",
+            current_report.case.case_name, case_name
+        ));
+    } else if prompt_sha256.as_deref() != Some(&current_report.case.prompt_sha256) {
+        identity_discrepancy = Some(format!(
+            "Slice11B case.prompt_sha256 mismatch: expected {:?}, got {:?}",
+            current_report.case.prompt_sha256, prompt_sha256
+        ));
+    } else if prompt_token_count != Some(current_report.case.prompt_token_count) {
+        identity_discrepancy = Some(format!(
+            "Slice11B case.prompt_token_count mismatch: expected {:?}, got {:?}",
+            current_report.case.prompt_token_count, prompt_token_count
+        ));
+    } else if prompt_token_ids_sha256.as_deref() != Some(&current_report.prompt_token_ids_sha256) {
+        identity_discrepancy = Some(format!(
+            "Slice11B prompt_token_ids_sha256 mismatch: expected {:?}, got {:?}",
+            current_report.prompt_token_ids_sha256, prompt_token_ids_sha256
+        ));
+    } else if resolved_config_sha256.as_deref() != Some(&current_report.resolved_config_sha256) {
+        identity_discrepancy = Some(format!(
+            "Slice11B resolved_config_sha256 mismatch: expected {:?}, got {:?}",
+            current_report.resolved_config_sha256, resolved_config_sha256
+        ));
+    } else if expected_adapter_name.as_deref() != Some(&current_report.expected_adapter_name) {
+        identity_discrepancy = Some(format!(
+            "Slice11B expected_adapter_name mismatch: expected {:?}, got {:?}",
+            current_report.expected_adapter_name, expected_adapter_name
+        ));
+    } else {
+        let current_geom_val =
+            serde_json::to_value(&current_report.model_geometry).map_err(|e| e.to_string())?;
+        if let Some(old_geom) = val.get("model_geometry") {
+            if old_geom != &current_geom_val {
+                identity_discrepancy = Some(format!(
+                    "Slice11B model_geometry mismatch: expected {}, got {}",
+                    current_geom_val, old_geom
+                ));
+            }
+        } else {
+            identity_discrepancy = Some("Slice11B report missing 'model_geometry'".to_string());
+        }
+    }
+
+    let identity_match = identity_discrepancy.is_none();
+
     let stages = val
         .get("stages")
         .and_then(|s| s.as_array())
         .ok_or_else(|| "Slice11B report missing 'stages' array".to_string())?;
 
-    let mut slice11b_l0_comp: Option<&serde_json::Value> = None;
+    let mut matched_stages: Vec<&serde_json::Value> = Vec::new();
     for s in stages {
         if let Some(stage_val) = s.get("stage") {
             if stage_val.get("stage").and_then(|v| v.as_str()) == Some("layer_post_attention")
                 && stage_val.get("layer").and_then(|l| l.as_u64()) == Some(0)
             {
-                slice11b_l0_comp = s.get("vector_comparison");
-                break;
+                matched_stages.push(s);
             }
         }
     }
 
-    let slice11b_comp = slice11b_l0_comp.ok_or_else(|| {
-        "Slice11B report has no LayerPostAttention { layer: 0 } stage evidence".to_string()
-    })?;
+    if matched_stages.len() != 1 {
+        let msg = format!(
+            "Slice11B report must contain exactly 1 LayerPostAttention {{ layer: 0 }} stage, found {}",
+            matched_stages.len()
+        );
+        return Ok(Slice11bCrossCheckEvidence {
+            report_path: slice11b_path.display().to_string(),
+            cross_check_status: "mismatch".to_string(),
+            identity_match,
+            stage_evidence_match: false,
+            slice11b_schema,
+            slice11b_mode,
+            case_name,
+            prompt_sha256,
+            prompt_token_ids_sha256,
+            resolved_config_sha256,
+            expected_adapter_name,
+            slice11b_layer0_post_attn_max_abs: None,
+            slice11b_layer0_post_attn_rms: None,
+            slice11c_layer0_post_attn_max_abs: final_post_attn.vector_comparison.max_absolute_error,
+            slice11c_layer0_post_attn_rms: final_post_attn.vector_comparison.rms_error,
+            discrepancy: Some(identity_discrepancy.unwrap_or(msg)),
+        });
+    }
+
+    let slice11b_stage = matched_stages[0];
+    let slice11b_comp = slice11b_stage
+        .get("vector_comparison")
+        .ok_or_else(|| "Slice11B layer 0 stage missing 'vector_comparison'".to_string())?;
 
     let b_max_abs = slice11b_comp
         .get("max_absolute_error")
@@ -605,34 +759,48 @@ pub fn cross_check_slice11b_report(
     let c_max_abs = final_post_attn.vector_comparison.max_absolute_error;
     let c_rms = final_post_attn.vector_comparison.rms_error;
 
-    let mut discrepancy = None;
-    let matches = match (b_max_abs, c_max_abs, b_rms, c_rms) {
-        (Some(b_a), Some(c_a), Some(b_r), Some(c_r)) => {
-            let max_diff = (b_a - c_a).abs();
-            let rms_diff = (b_r - c_r).abs();
-            if max_diff > 1e-5 || rms_diff > 1e-6 {
-                discrepancy = Some(format!(
-                    "Slice11B max_abs={b_a}, Slice11C max_abs={c_a} (diff={max_diff}); Slice11B rms={b_r}, Slice11C rms={c_r} (diff={rms_diff})"
-                ));
-                false
-            } else {
-                true
-            }
-        }
-        _ => {
-            discrepancy =
-                Some("missing numerical evidence fields in Slice11B or Slice11C".to_string());
-            false
-        }
-    };
+    let b_exact_match = slice11b_stage
+        .get("exact_match")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let c_exact_match = final_post_attn.exact_match;
+
+    let current_comp_val = serde_json::to_value(&final_post_attn.vector_comparison)
+        .map_err(|e| format!("failed to serialize Slice11C vector_comparison: {e}"))?;
+
+    let mut stage_evidence_discrepancy = None;
+    if b_exact_match != c_exact_match {
+        stage_evidence_discrepancy = Some(format!(
+            "exact_match mismatch: Slice11B={}, Slice11C={}",
+            b_exact_match, c_exact_match
+        ));
+    } else if slice11b_comp != &current_comp_val {
+        stage_evidence_discrepancy = Some(format!(
+            "vector_comparison JSON mismatch: Slice11B={}, Slice11C={}",
+            slice11b_comp, current_comp_val
+        ));
+    }
+
+    let stage_evidence_match = stage_evidence_discrepancy.is_none();
+    let discrepancy = identity_discrepancy.or(stage_evidence_discrepancy);
+    let verified = identity_match && stage_evidence_match;
 
     Ok(Slice11bCrossCheckEvidence {
         report_path: slice11b_path.display().to_string(),
-        cross_check_status: if matches {
+        cross_check_status: if verified {
             "verified_match".to_string()
         } else {
             "mismatch".to_string()
         },
+        identity_match,
+        stage_evidence_match,
+        slice11b_schema,
+        slice11b_mode,
+        case_name,
+        prompt_sha256,
+        prompt_token_ids_sha256,
+        resolved_config_sha256,
+        expected_adapter_name,
         slice11b_layer0_post_attn_max_abs: b_max_abs,
         slice11b_layer0_post_attn_rms: b_rms,
         slice11c_layer0_post_attn_max_abs: c_max_abs,
@@ -792,5 +960,262 @@ mod tests {
         let div = pos_comp.first_divergence.unwrap();
         assert_eq!(div.position, 1);
         assert_eq!(div.stage, Layer0AttentionStage::AttentionContext);
+    }
+
+    #[test]
+    fn position_order_position_0_exact_position_1_divergent_selects_pos_1() {
+        let cpu = sample_cpu_sink(4, 8, 2);
+        let gpu0 = cpu_sink_to_gpu_trace(&cpu);
+        let mut gpu1 = cpu_sink_to_gpu_trace(&cpu);
+        gpu1.q_after_norm[0] += 1e-4;
+        let mut gpu2 = cpu_sink_to_gpu_trace(&cpu);
+        gpu2.q_raw[0] += 1e-3;
+
+        let comp0 = compare_layer0_attention_traces(0, 10, &cpu, &gpu0).unwrap();
+        let comp1 = compare_layer0_attention_traces(1, 11, &cpu, &gpu1).unwrap();
+        let comp2 = compare_layer0_attention_traces(2, 12, &cpu, &gpu2).unwrap();
+
+        let (pos, div) = first_layer0_divergence_across_positions(&[comp0, comp1, comp2]);
+        assert_eq!(pos, Some(1));
+        assert!(div.is_some());
+        let div = div.unwrap();
+        assert_eq!(div.position, 1);
+        assert_eq!(div.stage, Layer0AttentionStage::QAfterNorm);
+    }
+
+    #[test]
+    fn position_order_position_0_divergent_and_later_divergent_preserves_pos_0() {
+        let cpu = sample_cpu_sink(4, 8, 2);
+        let mut gpu0 = cpu_sink_to_gpu_trace(&cpu);
+        gpu0.k_raw[0] += 1e-4;
+        let mut gpu1 = cpu_sink_to_gpu_trace(&cpu);
+        gpu1.attention_pre_norm[0] += 1e-3;
+
+        let comp0 = compare_layer0_attention_traces(0, 10, &cpu, &gpu0).unwrap();
+        let comp1 = compare_layer0_attention_traces(1, 11, &cpu, &gpu1).unwrap();
+
+        let (pos, div) = first_layer0_divergence_across_positions(&[comp0, comp1]);
+        assert_eq!(pos, Some(0));
+        assert!(div.is_some());
+        let div = div.unwrap();
+        assert_eq!(div.position, 0);
+        assert_eq!(div.stage, Layer0AttentionStage::KRaw);
+    }
+
+    struct TempFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TempFile {
+        fn new(name: &str, content: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mer-test-slice11c-{name}-{id}-{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, content).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn sample_test_evidence() -> (
+        Layer0AttentionFirstDivergenceReport,
+        Layer0AttentionStageComparison,
+    ) {
+        let geom = GpuNativeModelGeometry {
+            num_layers: 48,
+            d_model: 2048,
+            d_ff: 768,
+            num_experts: 128,
+            top_k: 8,
+            num_heads: 32,
+            num_kv_heads: 4,
+            head_dim: 128,
+            rope_dim: 128,
+            vocab_size: 151936,
+            max_seq_len: 2048,
+            rms_eps: 1e-6,
+            rope_base: 10000000.0,
+        };
+        let report = Layer0AttentionFirstDivergenceReport::new(
+            BuildProvenance::embedded(),
+            "git_sha_123".to_string(),
+            "exec_sha_123".to_string(),
+            "resolved_cfg_hash_123".to_string(),
+            geom,
+            ExpertMetadataEvidence {
+                dtype: Some("q4_0".to_string()),
+                q4_0_layout: Some("canonical".to_string()),
+                conversion_mode: Some("native".to_string()),
+                source: Some("checkpoint".to_string()),
+                explicitly_synthetic: false,
+            },
+            CaseEvidence {
+                case_name: "json-transformation".to_string(),
+                prompt_sha256: "prompt_hash_123".to_string(),
+                prompt_token_count: 4,
+            },
+            "prompt_token_ids_hash_123".to_string(),
+            vec![1, 2, 3, 4],
+            "NVIDIA L4".to_string(),
+        );
+
+        let comp = crate::numerical_diagnostics::compare_vectors(
+            &[1.0, 2.0, 3.0, 4.0],
+            &[1.001, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+
+        let stage_comp = Layer0AttentionStageComparison {
+            stage: Layer0AttentionStage::PostAttentionResidual,
+            exact_match: false,
+            vector_comparison: comp,
+        };
+
+        (report, stage_comp)
+    }
+
+    fn sample_slice11b_report_json(
+        case_name: &str,
+        prompt_token_ids_sha256: &str,
+        geom: &GpuNativeModelGeometry,
+        comp: &VectorComparisonEvidence,
+    ) -> String {
+        serde_json::json!({
+            "schema_version": "mer.gpu-native-q4-first-divergence-diagnostic.v1",
+            "mode": "diagnose-gpu-native-q4-first-divergence",
+            "diagnostic_complete": true,
+            "qualification_pass": false,
+            "failure": null,
+            "case": {
+                "case_name": case_name,
+                "prompt_sha256": "prompt_hash_123",
+                "prompt_token_count": 4
+            },
+            "prompt_token_ids_sha256": prompt_token_ids_sha256,
+            "resolved_config_sha256": "resolved_cfg_hash_123",
+            "model_geometry": geom,
+            "expected_adapter_name": "NVIDIA L4",
+            "stages": [
+                {
+                    "stage": {
+                        "stage": "layer_post_attention",
+                        "layer": 0
+                    },
+                    "exact_match": comp.exact_f32_bits,
+                    "tolerance_pass": false,
+                    "vector_comparison": comp
+                }
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn cross_check_exact_matching_slice11b_identity_and_evidence_passes() {
+        let (report, stage_comp) = sample_test_evidence();
+        let json_str = sample_slice11b_report_json(
+            &report.case.case_name,
+            &report.prompt_token_ids_sha256,
+            &report.model_geometry,
+            &stage_comp.vector_comparison,
+        );
+        let temp = TempFile::new("exact_match", &json_str);
+
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "verified_match");
+        assert!(res.identity_match);
+        assert!(res.stage_evidence_match);
+        assert!(res.discrepancy.is_none());
+    }
+
+    #[test]
+    fn cross_check_wrong_case_name_fails() {
+        let (report, stage_comp) = sample_test_evidence();
+        let json_str = sample_slice11b_report_json(
+            "rust-generation",
+            &report.prompt_token_ids_sha256,
+            &report.model_geometry,
+            &stage_comp.vector_comparison,
+        );
+        let temp = TempFile::new("wrong_case", &json_str);
+
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "mismatch");
+        assert!(!res.identity_match);
+        assert!(res.discrepancy.unwrap().contains("case.case_name"));
+    }
+
+    #[test]
+    fn cross_check_wrong_prompt_token_hash_fails() {
+        let (report, stage_comp) = sample_test_evidence();
+        let json_str = sample_slice11b_report_json(
+            &report.case.case_name,
+            "wrong_prompt_hash",
+            &report.model_geometry,
+            &stage_comp.vector_comparison,
+        );
+        let temp = TempFile::new("wrong_prompt_hash", &json_str);
+
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "mismatch");
+        assert!(!res.identity_match);
+        assert!(res.discrepancy.unwrap().contains("prompt_token_ids_sha256"));
+    }
+
+    #[test]
+    fn cross_check_wrong_model_geometry_fails() {
+        let (report, stage_comp) = sample_test_evidence();
+        let mut wrong_geom = report.model_geometry;
+        wrong_geom.num_layers = 24; // differs from 48
+        let json_str = sample_slice11b_report_json(
+            &report.case.case_name,
+            &report.prompt_token_ids_sha256,
+            &wrong_geom,
+            &stage_comp.vector_comparison,
+        );
+        let temp = TempFile::new("wrong_geom", &json_str);
+
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "mismatch");
+        assert!(!res.identity_match);
+        assert!(res.discrepancy.unwrap().contains("model_geometry"));
+    }
+
+    #[test]
+    fn cross_check_same_aggregates_different_vector_evidence_fails() {
+        let (report, stage_comp) = sample_test_evidence();
+
+        // Build comp2 with identical max_abs (0.001) but different worst-error index and bits
+        let comp2 = crate::numerical_diagnostics::compare_vectors(
+            &[1.0, 2.0, 3.0, 4.0],
+            &[1.0, 2.0, 3.0, 4.001], // error at index 3 instead of index 0
+        )
+        .unwrap();
+
+        let json_str = sample_slice11b_report_json(
+            &report.case.case_name,
+            &report.prompt_token_ids_sha256,
+            &report.model_geometry,
+            &comp2,
+        );
+        let temp = TempFile::new("different_vector", &json_str);
+
+        let res = cross_check_slice11b_report(&temp.path, &report, &stage_comp).unwrap();
+        assert_eq!(res.cross_check_status, "mismatch");
+        assert!(res.identity_match);
+        assert!(!res.stage_evidence_match);
+        assert!(res
+            .discrepancy
+            .unwrap()
+            .contains("vector_comparison JSON mismatch"));
     }
 }

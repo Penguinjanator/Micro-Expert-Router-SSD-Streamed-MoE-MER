@@ -5878,8 +5878,6 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
     let ref_backend = ref_runtime.engine.execution_context().attention_backend();
 
     let mut position_comparisons = Vec::with_capacity(prompt_token_ids.len());
-    let mut earliest_divergent_position: Option<usize> = None;
-    let mut first_internal_divergence: Option<crate::gpu_native_layer0_diagnostics::Layer0AttentionFirstDivergenceEvidence> = None;
     let mut final_position_post_attention: Option<crate::gpu_native_layer0_diagnostics::Layer0AttentionStageComparison> = None;
 
     let mut ref_scratch = crate::transformer::TransformerLayerScratch::new();
@@ -5961,11 +5959,6 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
             }
         };
 
-        if !pos_comp.exact_match && earliest_divergent_position.is_none() {
-            earliest_divergent_position = Some(pos);
-            first_internal_divergence = pos_comp.first_divergence.clone();
-        }
-
         if pos == prompt_token_ids.len() - 1 {
             final_position_post_attention = pos_comp
                 .stages
@@ -5977,6 +5970,11 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
         position_comparisons.push(pos_comp);
     }
 
+    let (earliest_divergent_position, first_internal_divergence) =
+        crate::gpu_native_layer0_diagnostics::first_layer0_divergence_across_positions(
+            &position_comparisons,
+        );
+
     drop(req_state);
     drop(staging_buffer);
     let _ = ref_runtime.shutdown_isolated().await;
@@ -5985,7 +5983,7 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
     // 4. Optional Slice 11B Cross-Check
     let slice11b_cross_check = if let Some(ref path) = args.slice11b_report {
         let final_stage = final_position_post_attention.as_ref().ok_or("no final position post-attention evidence recorded")?;
-        let check = match crate::gpu_native_layer0_diagnostics::cross_check_slice11b_report(path, final_stage) {
+        let check = match crate::gpu_native_layer0_diagnostics::cross_check_slice11b_report(path, &report, final_stage) {
             Ok(c) => c,
             Err(e) => {
                 return fail_layer0_attention_first_divergence(
