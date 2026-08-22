@@ -141,6 +141,7 @@ mod gguf;
 mod gguf_loader;
 mod gpu_native_residency;
 pub(crate) mod gpu_native_diagnostics;
+pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 
 pub(crate) mod gpu_native_token_loop;
@@ -916,6 +917,21 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Strictly compare 16 greedy tokens across the fixed four-case corpus
+    /// between the authoritative Hybrid-boundary CPU reference and the full
+    /// production GPU-native Q4 token loop.
+    QualifyGpuNativeQ4GreedyParity {
+        /// Path to the strict GPU-native Q4 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for every GPU-native corpus case.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the versioned typed JSON report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+    },
+
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
     DiagnoseHybridQ4GreedyDivergence {
@@ -1633,6 +1649,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
+        | Cmd::QualifyGpuNativeQ4GreedyParity { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence { config, .. }
@@ -1779,6 +1796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Cmd::QualifyHybridQ4 { .. }
             | Cmd::QualifyHybridQ4Parity { .. }
             | Cmd::QualifyHybridQ4GreedyParity { .. }
+            | Cmd::QualifyGpuNativeQ4GreedyParity { .. }
             | Cmd::DiagnoseHybridQ4GreedyDivergence { .. }
             | Cmd::GreedyParityHybridWorkerInternal { .. }
             | Cmd::GreedyParityLogitWorkerInternal { .. }
@@ -2070,6 +2088,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parsed_config: startup_config
                         .take()
                         .ok_or("greedy parity startup config was not parsed")?,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::QualifyGpuNativeQ4GreedyParity {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cmd_qualify_gpu_native_q4_greedy_parity(
+                QualifyGpuNativeQ4GreedyParityArgs {
+                    config,
+                    parsed_config: startup_config
+                        .take()
+                        .ok_or("GPU-native greedy parity startup config was not parsed")?,
                     expected_adapter_name,
                     report_out,
                     progress_watchdog,
@@ -2397,6 +2435,14 @@ struct QualifyHybridQ4ParityArgs {
 }
 
 struct QualifyHybridQ4GreedyParityArgs {
+    config: PathBuf,
+    parsed_config: crate::config::Config,
+    expected_adapter_name: String,
+    report_out: Option<PathBuf>,
+    progress_watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+}
+
+struct QualifyGpuNativeQ4GreedyParityArgs {
     config: PathBuf,
     parsed_config: crate::config::Config,
     expected_adapter_name: String,
@@ -6025,9 +6071,803 @@ async fn cmd_diagnose_gpu_native_layer0_attention_first_divergence(
     emit_layer0_attention_first_divergence_report(&report, args.report_out.as_deref())
 }
 
+struct ReferenceRoutingCapture {
+    generation: crate::greedy_parity::GenerationEvidence,
+    routes: Vec<Vec<Vec<u32>>>,
+    background_shutdown: crate::greedy_parity::BackgroundShutdownEvidence,
+}
 
+struct GpuNativeQualificationCapture {
+    evidence: crate::gpu_native_greedy_parity::GpuCandidateCaseEvidence,
+    device: crate::backend::GpuDeviceIdentity,
+    model_geometry: crate::gpu_native_token_loop::GpuNativeModelGeometry,
+}
 
+fn emit_gpu_native_greedy_parity_report(
+    report: &crate::gpu_native_greedy_parity::GpuNativeGreedyParityReport,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = serde_json::to_vec_pretty(report)?;
+    json.push(b'\n');
+    if let Some(path) = report_out {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        eprintln!(
+            "GPU-native greedy-token parity report written to {}",
+            path.display()
+        );
+    } else {
+        use std::io::Write as _;
+        std::io::stdout().write_all(&json)?;
+    }
+    Ok(())
+}
 
+fn fail_gpu_native_greedy_parity(
+    mut report: crate::gpu_native_greedy_parity::GpuNativeGreedyParityReport,
+    failure: crate::qualification::QualificationFailure,
+    report_out: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = format!("{}: {}", failure.code, failure.detail);
+    report.fail(failure);
+    match emit_gpu_native_greedy_parity_report(&report, report_out) {
+        Ok(()) => Err(summary.into()),
+        Err(emit_error) => Err(format!(
+            "{summary}; additionally failed to emit GPU-native greedy-parity report: {emit_error}"
+        )
+        .into()),
+    }
+}
+
+fn gpu_native_generation_evidence(
+    tokenizer: &crate::tokenizer::Tokenizer,
+    prompt_token_ids_sha256: &str,
+    generated_token_ids: Vec<u32>,
+) -> Result<crate::greedy_parity::GenerationEvidence, Box<dyn std::error::Error>> {
+    let generated_text = tokenizer.decode(&generated_token_ids)?;
+    Ok(crate::greedy_parity::GenerationEvidence {
+        prompt_token_ids_sha256: prompt_token_ids_sha256.to_string(),
+        generated_token_ids_sha256: crate::greedy_parity::token_ids_sha256(&generated_token_ids),
+        generated_text_sha256: crate::greedy_parity::sha256_hex(generated_text.as_bytes()),
+        generated_token_count: generated_token_ids.len(),
+        generated_token_ids,
+        termination_reason: crate::greedy_parity::TerminationReason::LengthLimit,
+    })
+}
+
+async fn execute_gpu_native_reference_routing_replay(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+) -> Result<ReferenceRoutingCapture, Box<dyn std::error::Error>> {
+    let runtime = build_isolated_greedy_runtime(
+        spec,
+        RealCliRuntimeMode::IsolatedGreedyParityCpu,
+        tokenizer.clone(),
+    )
+    .await?;
+    let attempt = async {
+        runtime.engine.enable_cpu_q4_boundary_emulation()?;
+        let observed_config_sha256 = resolved_real_runtime_identity_sha256(
+            &runtime.cfg,
+            runtime.model.config.architecture,
+            runtime.model.config.first_k_dense_replace,
+            &runtime.model.config.advanced,
+        )?;
+        if observed_config_sha256 != resolved_config_sha256 {
+            return Err(format!(
+                "reference routing replay identity {observed_config_sha256} drifted from {resolved_config_sha256}"
+            )
+            .into());
+        }
+        let boundary_before = runtime.engine.cpu_q4_boundary_emulation_snapshot();
+        if !boundary_before.enabled || boundary_before.routed_expert_dispatches != 0 {
+            return Err("reference routing replay boundary emulation did not start clean".into());
+        }
+        let routed_before = runtime.engine.routed_expert_execution_snapshot();
+        let attention_fallbacks_before = crate::transformer::nonfinite_softmax_fallbacks();
+        let (generated_token_ids, routes) = with_progress_timeout(
+            format!("GPU-native greedy parity {case_name} reference routing replay"),
+            watchdog,
+            async {
+                let mut kv = runtime.model.fresh_kv_caches();
+                let prefix_count = prompt_token_ids.len().saturating_sub(1);
+                for (position, &token_id) in prompt_token_ids[..prefix_count].iter().enumerate() {
+                    runtime
+                        .model
+                        .forward_token_hidden(&runtime.engine, token_id, position, &mut kv)
+                        .await?;
+                }
+                let mut input_token = *prompt_token_ids
+                    .last()
+                    .ok_or("reference routing replay prompt is empty")?;
+                let mut position = prefix_count;
+                let mut generated_token_ids =
+                    Vec::with_capacity(crate::greedy_parity::OUTPUT_TOKEN_LIMIT);
+                let mut routes = Vec::with_capacity(crate::greedy_parity::OUTPUT_TOKEN_LIMIT);
+                while generated_token_ids.len() < crate::greedy_parity::OUTPUT_TOKEN_LIMIT {
+                    let trace = runtime
+                        .model
+                        .forward_token_diagnostic_trace(
+                            &runtime.engine,
+                            input_token,
+                            position,
+                            &mut kv,
+                            None,
+                        )
+                        .await?;
+                    input_token = trace.sampled_token;
+                    generated_token_ids.push(trace.sampled_token);
+                    routes.push(trace.layer_selected_ids);
+                    position = position
+                        .checked_add(1)
+                        .ok_or("reference routing replay position overflowed")?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>((generated_token_ids, routes))
+            },
+        )
+        .await?;
+        let boundary_after = runtime.engine.cpu_q4_boundary_emulation_snapshot();
+        if !boundary_after.enabled || boundary_after.routed_expert_dispatches == 0 {
+            return Err("reference routing replay did not exercise the Hybrid F16 boundary".into());
+        }
+        let routed_delta = crate::qualification::routed_execution_delta(
+            routed_before,
+            runtime.engine.routed_expert_execution_snapshot(),
+        )
+        .map_err(|failure| failure.detail)?;
+        if routed_delta.degraded_expert_substitutions != 0 {
+            return Err("reference routing replay recorded degraded expert execution".into());
+        }
+        let attention_fallbacks = crate::transformer::nonfinite_softmax_fallbacks()
+            .saturating_sub(attention_fallbacks_before);
+        if attention_fallbacks != 0 {
+            return Err(format!(
+                "reference routing replay recorded {attention_fallbacks} nonfinite attention fallbacks"
+            )
+            .into());
+        }
+        let generation = gpu_native_generation_evidence(
+            &tokenizer,
+            prompt_token_ids_sha256,
+            generated_token_ids,
+        )?;
+        Ok::<_, Box<dyn std::error::Error>>(ReferenceRoutingCapture {
+            generation,
+            routes,
+            background_shutdown: crate::greedy_parity::BackgroundShutdownEvidence::default(),
+        })
+    }
+    .await;
+    let shutdown = runtime.shutdown_isolated().await;
+    match (attempt, shutdown) {
+        (Ok(mut capture), Ok(shutdown)) => {
+            capture.background_shutdown = shutdown;
+            Ok(capture)
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
+        (Err(error), Err(shutdown_error)) => Err(format!(
+            "{error}; reference routing replay shutdown also failed: {shutdown_error}"
+        )
+        .into()),
+    }
+}
+
+async fn execute_gpu_native_qualification_case(
+    spec: &ResolvedRealCliSpec,
+    tokenizer: Arc<crate::tokenizer::Tokenizer>,
+    prompt_token_ids: &[u32],
+    prompt_token_ids_sha256: &str,
+    resolved_config_sha256: &str,
+    expected_adapter_name: &str,
+    watchdog: crate::rayon_autotune::ProgressWatchdogConfig,
+    case_name: &str,
+) -> Result<GpuNativeQualificationCapture, Box<dyn std::error::Error>> {
+    let runtime = build_isolated_greedy_runtime(
+        spec,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+        tokenizer.clone(),
+    )
+    .await?;
+    let attempt = async {
+        let observed_config_sha256 = resolved_real_runtime_identity_sha256(
+            &runtime.cfg,
+            runtime.model.config.architecture,
+            runtime.model.config.first_k_dense_replace,
+            &runtime.model.config.advanced,
+        )?;
+        if observed_config_sha256 != resolved_config_sha256 {
+            return Err(format!(
+                "GPU-native runtime identity {observed_config_sha256} drifted from {resolved_config_sha256}"
+            )
+            .into());
+        }
+        let device = runtime
+            .engine
+            .gpu_device_identity()
+            .ok_or("GPU-native runtime has no authoritative adapter identity")?;
+        if device.name != expected_adapter_name {
+            return Err(format!(
+                "GPU-native runtime selected adapter {:?}, expected exact name {:?}",
+                device.name, expected_adapter_name
+            )
+            .into());
+        }
+        if device.software_adapter || device.device_type.eq_ignore_ascii_case("cpu") {
+            return Err(format!(
+                "GPU-native runtime selected software adapter {:?}",
+                device.name
+            )
+            .into());
+        }
+        let token_loop = runtime
+            .gpu_native_token_loop
+            .as_ref()
+            .ok_or("GPU-native token loop was not initialized")?;
+        let model_geometry = token_loop.model_geometry();
+        let counters_before = token_loop.snapshot();
+        if counters_before != crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot::default() {
+            return Err("GPU-native token-loop counters did not start at zero".into());
+        }
+        let routed_before = runtime.engine.routed_expert_execution_snapshot();
+        let attention_fallbacks_before = crate::transformer::nonfinite_softmax_fallbacks();
+        let mut request = token_loop.create_request_state()?;
+        let trace_layout =
+            crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
+                model_geometry.num_layers,
+                model_geometry.d_model,
+                model_geometry.top_k,
+                model_geometry.vocab_size,
+            )?;
+        let staging = token_loop.create_diagnostic_staging_buffer(&trace_layout)?;
+        let (generated_token_ids, routes) = with_progress_timeout(
+            format!("GPU-native greedy parity {case_name} candidate"),
+            watchdog,
+            async {
+                let prefix_count = prompt_token_ids.len().saturating_sub(1);
+                for (position, &token_id) in prompt_token_ids[..prefix_count].iter().enumerate() {
+                    token_loop
+                        .step_token(&runtime.engine, &mut request, token_id, position, false)
+                        .await?;
+                }
+                let mut input_token = *prompt_token_ids
+                    .last()
+                    .ok_or("GPU-native qualification prompt is empty")?;
+                let mut position = prefix_count;
+                let mut generated_token_ids =
+                    Vec::with_capacity(crate::greedy_parity::OUTPUT_TOKEN_LIMIT);
+                let mut routes = Vec::with_capacity(crate::greedy_parity::OUTPUT_TOKEN_LIMIT);
+                while generated_token_ids.len() < crate::greedy_parity::OUTPUT_TOKEN_LIMIT {
+                    let (trace, _) = token_loop
+                        .step_token_diagnostic(
+                            &runtime.engine,
+                            &mut request,
+                            input_token,
+                            position,
+                            true,
+                            &trace_layout,
+                            &staging,
+                        )
+                        .await?;
+                    if trace.final_status != 0
+                        || trace.layer_statuses.iter().any(|&status| status != 0)
+                    {
+                        return Err(format!(
+                            "GPU-native diagnostic returned nonzero numerical status at generated position {}",
+                            generated_token_ids.len()
+                        )
+                        .into());
+                    }
+                    input_token = trace.sampled_token;
+                    generated_token_ids.push(trace.sampled_token);
+                    routes.push(trace.layer_selected_ids);
+                    position = position
+                        .checked_add(1)
+                        .ok_or("GPU-native qualification position overflowed")?;
+                }
+                Ok::<_, Box<dyn std::error::Error>>((generated_token_ids, routes))
+            },
+        )
+        .await?;
+        let expected_completed = prompt_token_ids
+            .len()
+            .saturating_sub(1)
+            .checked_add(crate::greedy_parity::OUTPUT_TOKEN_LIMIT)
+            .ok_or("GPU-native expected completion count overflowed")?;
+        let request_completed_expected_tokens = request.committed_position() == expected_completed;
+        if !request_completed_expected_tokens {
+            return Err(format!(
+                "GPU-native request retired early at committed position {}, expected {expected_completed}",
+                request.committed_position()
+            )
+            .into());
+        }
+        let token_loop_counters_delta = token_loop.snapshot();
+        if token_loop_counters_delta.tokens_completed != expected_completed as u64 {
+            return Err(format!(
+                "GPU-native token counter recorded {} completions, expected {expected_completed}",
+                token_loop_counters_delta.tokens_completed
+            )
+            .into());
+        }
+        if token_loop_counters_delta.fatal_failures != 0
+            || token_loop_counters_delta.no_progress_failures != 0
+        {
+            return Err("GPU-native token loop recorded fatal or NoProgress failures".into());
+        }
+        let routed_execution_delta = crate::qualification::routed_execution_delta(
+            routed_before,
+            runtime.engine.routed_expert_execution_snapshot(),
+        )
+        .map_err(|failure| failure.detail)?;
+        if routed_execution_delta.degraded_expert_substitutions != 0
+            || routed_execution_delta.gpu_cpu_fallbacks != 0
+        {
+            return Err("GPU-native runtime recorded degraded or CPU-fallback expert execution".into());
+        }
+        let attention_softmax_nonfinite_fallbacks =
+            crate::transformer::nonfinite_softmax_fallbacks()
+                .saturating_sub(attention_fallbacks_before);
+        if attention_softmax_nonfinite_fallbacks != 0 {
+            return Err(format!(
+                "GPU-native runtime recorded {attention_softmax_nonfinite_fallbacks} nonfinite attention fallbacks"
+            )
+            .into());
+        }
+        let generation = gpu_native_generation_evidence(
+            &tokenizer,
+            prompt_token_ids_sha256,
+            generated_token_ids,
+        )?;
+        drop(request);
+        drop(staging);
+        Ok::<_, Box<dyn std::error::Error>>(GpuNativeQualificationCapture {
+            evidence: crate::gpu_native_greedy_parity::GpuCandidateCaseEvidence {
+                generation,
+                model_load: greedy_parity_model_load(&runtime),
+                selected_expert_ids_by_generated_position_layer: routes,
+                token_loop_counters_delta,
+                routed_execution_delta,
+                attention_softmax_nonfinite_fallbacks,
+                request_completed_expected_tokens,
+                background_shutdown:
+                    crate::greedy_parity::BackgroundShutdownEvidence::default(),
+            },
+            device,
+            model_geometry,
+        })
+    }
+    .await;
+    let shutdown = runtime.shutdown_isolated().await;
+    match (attempt, shutdown) {
+        (Ok(mut capture), Ok(shutdown)) => {
+            capture.evidence.background_shutdown = shutdown;
+            Ok(capture)
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
+        (Err(error), Err(shutdown_error)) => Err(format!(
+            "{error}; GPU-native qualification shutdown also failed: {shutdown_error}"
+        )
+        .into()),
+    }
+}
+
+async fn cmd_qualify_gpu_native_q4_greedy_parity(
+    args: QualifyGpuNativeQ4GreedyParityArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::qualification::{BuildProvenance, FailureStage, QualificationFailure};
+
+    let cfg = args.parsed_config;
+    let provenance = BuildProvenance::embedded();
+    let (artifacts, artifact_errors) = qualification_artifacts(&args.config, &cfg);
+    let metadata_path = cfg.model.data_dir.join("metadata.json");
+    let metadata_result = crate::qualification::read_expert_metadata(&metadata_path);
+    let metadata = metadata_result.clone().ok();
+    let capacity_bytes = cfg
+        .gpu_cache
+        .vram_capacity_mb
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(0);
+    let source_config = crate::gpu_native_greedy_parity::SourceConfigEvidence {
+        real_transformer_enabled: cfg.real_transformer.enabled,
+        gpu_native_enabled: cfg.real_transformer.gpu_native,
+        weights_dir_configured: cfg.real_transformer.weights_dir.is_some(),
+        strict_weights: cfg.real_transformer.strict_weights,
+        allow_seeded_fallback: cfg.real_transformer.allow_seeded_fallback,
+        allow_degraded_experts: cfg.real_transformer.allow_degraded_experts,
+        allow_nonfinite_attention_fallback: cfg.real_transformer.allow_nonfinite_attention_fallback,
+        allow_truncated_expert_payloads: cfg.real_transformer.allow_truncated_expert_payloads,
+        distributed_enabled: cfg.distributed.enabled,
+        gpu_cache_enabled: cfg.gpu_cache.enabled,
+        gpu_expert_capacity_bytes: capacity_bytes,
+        routed_expert_dtype: cfg.model.dtype.as_str().to_string(),
+    };
+    let mut report = crate::gpu_native_greedy_parity::GpuNativeGreedyParityReport::new(
+        provenance.clone(),
+        artifacts,
+        metadata.clone(),
+        args.expected_adapter_name.clone(),
+        source_config,
+    );
+
+    let preflight_failure = if args.expected_adapter_name.is_empty() {
+        Some(QualificationFailure::new(
+            FailureStage::Preflight,
+            "expected-adapter-name-empty",
+            "--expected-adapter-name must be a non-empty exact adapter name",
+        ))
+    } else if args.progress_watchdog.timeout.is_none() {
+        Some(QualificationFailure::new(
+            FailureStage::Preflight,
+            "progress-watchdog-required",
+            "GPU-native greedy parity requires a positive progress timeout",
+        ))
+    } else if !artifact_errors.is_empty() {
+        Some(qualification_artifact_failure(&artifact_errors))
+    } else if metadata_result.is_err() {
+        Some(qualification_metadata_failure(
+            metadata_result.err().unwrap(),
+        ))
+    } else if !report.source_config.is_strict() {
+        Some(QualificationFailure::new(
+            FailureStage::Preflight,
+            "non-strict-gpu-native-config",
+            "qualification requires GPU-native Q4, strict real weights, no seeded/degraded/nonfinite/truncated fallback, no distributed mode, and a positive GPU cache budget",
+        ))
+    } else if provenance.dirty != Some(false)
+        || provenance
+            .git_sha
+            .as_deref()
+            .is_none_or(|sha| sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        Some(QualificationFailure::new(
+            FailureStage::Preflight,
+            "clean-build-provenance-required",
+            "qualification requires an embedded clean 40-hex Git build identity",
+        ))
+    } else if metadata.as_ref().is_none_or(|metadata| {
+        metadata.q4_0_layout.as_deref() != Some(crate::inference::Q4_0_LAYOUT_STANDARD_V1)
+            || metadata.explicitly_synthetic
+    }) {
+        Some(QualificationFailure::new(
+            FailureStage::Preflight,
+            "noncanonical-expert-metadata",
+            "qualification requires canonical, nonsynthetic Q4_0 expert metadata",
+        ))
+    } else {
+        None
+    };
+    if let Some(failure) = preflight_failure {
+        return fail_gpu_native_greedy_parity(report, failure, args.report_out.as_deref());
+    }
+
+    let mut gpu_spec = match resolve_real_cli_spec_from_config(
+        cfg,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "configuration-reconciliation-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    gpu_spec.cfg.real_transformer.gpu_native = true;
+    gpu_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Gpu;
+    let identity = greedy_parity_model_identity(&gpu_spec);
+    if !identity.is_qwen3_coder_30b_a3b_q4_0() {
+        return fail_gpu_native_greedy_parity(
+            report,
+            QualificationFailure::new(
+                FailureStage::Preflight,
+                "unexpected-model-identity",
+                "fixed corpus is qualified only for Qwen3-Coder 30B-A3B Q4_0 geometry",
+            ),
+            args.report_out.as_deref(),
+        );
+    }
+    let resolved_config_sha256 = match resolved_real_cli_spec_sha256(&gpu_spec) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "resolved-config-hash-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.resolved_config_sha256 = Some(resolved_config_sha256.clone());
+    let mut reference_spec = gpu_spec.clone();
+    reference_spec.cfg.real_transformer.gpu_native = false;
+    reference_spec.cfg.real_transformer.compute_offload = crate::backend::ComputeOffload::Cpu;
+    let reference_resolved_config_sha256 = match resolved_real_cli_spec_sha256(&reference_spec) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Preflight,
+                    "reference-config-hash-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+    report.reference_resolved_config_sha256 = Some(reference_resolved_config_sha256.clone());
+    let tokenizer = match load_real_cli_tokenizer(
+        &gpu_spec.cfg,
+        RealCliRuntimeMode::IsolatedGpuNativeDiagnostic,
+    ) {
+        Ok(tokenizer) => tokenizer,
+        Err(error) => {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Startup,
+                    "tokenizer-load-failed",
+                    error.to_string(),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+    };
+
+    for fixed in crate::greedy_parity::FIXED_CORPUS {
+        let prompt_token_ids = match tokenizer.encode(fixed.prompt) {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "prompt-tokenization-empty",
+                        format!("fixed case {} encoded to zero tokens", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+            Err(error) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "prompt-tokenization-failed",
+                        format!("fixed case {}: {error}", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        let prompt_token_ids_sha256 = crate::greedy_parity::token_ids_sha256(&prompt_token_ids);
+        let authoritative_reference = match execute_greedy_parity_boundary_reference_plane(
+            &reference_spec,
+            tokenizer.clone(),
+            &prompt_token_ids,
+            &prompt_token_ids_sha256,
+            &reference_resolved_config_sha256,
+            &args.expected_adapter_name,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "authoritative-reference-failed",
+                        format!("fixed case {}: {error}", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        if !authoritative_reference.cpu_q4_boundary_emulation.enabled
+            || authoritative_reference
+                .cpu_q4_boundary_emulation
+                .routed_expert_dispatches
+                == 0
+        {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "authoritative-reference-boundary-missing",
+                    format!(
+                        "fixed case {} did not exercise the production Hybrid F16 boundary",
+                        fixed.name
+                    ),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+        let reference_routing = match execute_gpu_native_reference_routing_replay(
+            &reference_spec,
+            tokenizer.clone(),
+            &prompt_token_ids,
+            &prompt_token_ids_sha256,
+            &reference_resolved_config_sha256,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "reference-routing-replay-failed",
+                        format!("fixed case {}: {error}", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        let reference_routing_matches = reference_routing.generation.generated_token_ids
+            == authoritative_reference.generation.generated_token_ids;
+        if !reference_routing_matches {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "reference-routing-replay-token-mismatch",
+                    format!(
+                        "fixed case {} diagnostic routing replay drifted from the authoritative reference",
+                        fixed.name
+                    ),
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+        let gpu_native = match execute_gpu_native_qualification_case(
+            &gpu_spec,
+            tokenizer.clone(),
+            &prompt_token_ids,
+            &prompt_token_ids_sha256,
+            &resolved_config_sha256,
+            &args.expected_adapter_name,
+            args.progress_watchdog,
+            fixed.name,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Inference,
+                        "gpu-native-candidate-failed",
+                        format!("fixed case {}: {error}", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        if let Some(observed) = &report.actual_adapter {
+            if observed != &gpu_native.device {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Postcondition,
+                        "adapter-identity-drift",
+                        format!("fixed case {} selected a different adapter", fixed.name),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        } else {
+            report.actual_adapter = Some(gpu_native.device.clone());
+        }
+        if let Some(observed) = report.model_geometry {
+            if observed != gpu_native.model_geometry {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Postcondition,
+                        "model-geometry-drift",
+                        format!(
+                            "fixed case {} observed different model geometry",
+                            fixed.name
+                        ),
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        } else {
+            report.model_geometry = Some(gpu_native.model_geometry);
+        }
+        let comparison = match crate::gpu_native_greedy_parity::compare_case_outputs(
+            fixed.name,
+            &prompt_token_ids,
+            &authoritative_reference.generation.generated_token_ids,
+            &gpu_native.evidence.generation.generated_token_ids,
+            &reference_routing.routes,
+            &gpu_native
+                .evidence
+                .selected_expert_ids_by_generated_position_layer,
+            crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
+            gpu_native.model_geometry.num_layers,
+            gpu_native.model_geometry.top_k,
+        ) {
+            Ok(comparison) => comparison,
+            Err(detail) => {
+                return fail_gpu_native_greedy_parity(
+                    report,
+                    QualificationFailure::new(
+                        FailureStage::Postcondition,
+                        "comparison-evidence-invalid",
+                        detail,
+                    ),
+                    args.report_out.as_deref(),
+                );
+            }
+        };
+        let case = crate::gpu_native_greedy_parity::CaseReport {
+            name: fixed.name.to_string(),
+            behavior: fixed.behavior.to_string(),
+            prompt: fixed.prompt.to_string(),
+            prompt_sha256: crate::greedy_parity::sha256_hex(fixed.prompt.as_bytes()),
+            prompt_token_ids,
+            prompt_token_ids_sha256,
+            tokens_per_case: crate::greedy_parity::OUTPUT_TOKEN_LIMIT,
+            authoritative_reference,
+            reference_routing_replay:
+                crate::gpu_native_greedy_parity::ReferenceRoutingReplayEvidence {
+                    generation: reference_routing.generation,
+                    matches_authoritative_reference: reference_routing_matches,
+                    routing_positions_captured: reference_routing.routes.len(),
+                    routed_layers_per_position: gpu_native.model_geometry.num_layers,
+                    selected_expert_ids_by_generated_position_layer: reference_routing.routes,
+                    background_shutdown: reference_routing.background_shutdown,
+                },
+            gpu_native: gpu_native.evidence,
+            comparison,
+        };
+        if let Err(detail) = report.record_case(case) {
+            return fail_gpu_native_greedy_parity(
+                report,
+                QualificationFailure::new(
+                    FailureStage::Postcondition,
+                    "report-accounting-failed",
+                    detail,
+                ),
+                args.report_out.as_deref(),
+            );
+        }
+        if let Some(failure) = report.semantic_failure() {
+            return fail_gpu_native_greedy_parity(report, failure, args.report_out.as_deref());
+        }
+    }
+    if let Err(failure) = report.finalize() {
+        return fail_gpu_native_greedy_parity(report, failure, args.report_out.as_deref());
+    }
+    emit_gpu_native_greedy_parity_report(&report, args.report_out.as_deref())
+}
 
 async fn cmd_qualify_hybrid_q4_greedy_parity(
     args: QualifyHybridQ4GreedyParityArgs,
@@ -12350,6 +13190,32 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("--cpu-config"));
+    }
+
+    #[test]
+    fn gpu_native_greedy_parity_cli_has_the_strict_minimum_surface() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-q4-greedy-parity",
+            "--config",
+            "strict-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "gpu-native-report.json",
+        ])
+        .unwrap();
+        let Cmd::QualifyGpuNativeQ4GreedyParity {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = cli.cmd
+        else {
+            panic!("expected qualify-gpu-native-q4-greedy-parity command");
+        };
+        assert_eq!(config, PathBuf::from("strict-gpu-native.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, Some(PathBuf::from("gpu-native-report.json")));
     }
 
     #[test]
