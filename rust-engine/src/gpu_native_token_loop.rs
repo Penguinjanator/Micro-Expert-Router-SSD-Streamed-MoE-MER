@@ -1251,13 +1251,14 @@ impl GpuNativeTokenLoop {
         )?;
 
         // 4. Attention Complete (Causal Attention, O Projection, Residual Add)
+        // The backend expects the absolute current position and derives seq_len internally.
         self.executor.encode_attention_complete_layer0_diagnostic(
             &mut encoder,
             &layer_0.attn_plan,
             &request.token_state,
             &request.attn_scratch,
             &request.kv_state,
-            position + 1,
+            position,
             &sink,
         )?;
 
@@ -1616,13 +1617,14 @@ impl GpuNativeTokenLoop {
             )?;
 
             // 3. Attention Complete
+            // The backend expects the absolute current position and derives seq_len internally.
             self.executor.encode_attention_complete(
                 &mut encoder,
                 &layer_plan.attn_plan,
                 &request.token_state,
                 &request.attn_scratch,
                 &request.kv_state,
-                position + 1,
+                position,
             )?;
 
             if let Some(sink) = diagnostic_sink {
@@ -3120,6 +3122,24 @@ pub(crate) mod tests {
         assert!(trace0.attention_context.iter().all(|v| v.is_finite()));
         assert!(trace0.o_projection.iter().all(|v| v.is_finite()));
         assert!(trace0.post_attention_residual.iter().all(|v| v.is_finite()));
+
+        let queries_per_kv_head = geom.num_heads / geom.num_kv_heads;
+        for query_head in 0..geom.num_heads {
+            let kv_head = query_head / queries_per_kv_head;
+            for channel in 0..geom.head_dim {
+                let context_index = query_head * geom.head_dim + channel;
+                let v_index = kv_head * geom.head_dim + channel;
+                let context = trace0.attention_context[context_index];
+                let expected_v = trace0.v_raw[v_index];
+                assert_eq!(
+                    context.to_bits(),
+                    expected_v.to_bits(),
+                    "position-0 context/V identity failed: query_head={query_head}, kv_head={kv_head}, channel={channel}, expected_v={expected_v}, expected_v_bits=0x{:08x}, context={context}, context_bits=0x{:08x}",
+                    expected_v.to_bits(),
+                    context.to_bits(),
+                );
+            }
+        }
 
         // 2. Position 1 (persisting KV across positions)
         let trace1 = pollster::block_on(harness.token_loop.step_layer0_attention_diagnostic(
