@@ -2818,6 +2818,7 @@ impl RealModel {
         let mut layer_router_input = Vec::with_capacity(self.layers.len());
         let mut layer_selected_ids = Vec::with_capacity(self.layers.len());
         let mut layer_selected_weights = Vec::with_capacity(self.layers.len());
+        let mut layer_routed_moe_output = Vec::with_capacity(self.layers.len());
         let mut layer_post_moe = Vec::with_capacity(self.layers.len());
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -2890,6 +2891,7 @@ impl RealModel {
                     timings,
                 )
                 .await?;
+            layer_routed_moe_output.push(layer_scratch.moe_accum.clone());
             layer.moe_accumulated_into_with_timing(
                 &x,
                 &layer_scratch.moe_accum,
@@ -2943,6 +2945,7 @@ impl RealModel {
             layer_router_input,
             layer_selected_ids,
             layer_selected_weights,
+            layer_routed_moe_output,
             layer_post_moe,
             final_norm,
             logits,

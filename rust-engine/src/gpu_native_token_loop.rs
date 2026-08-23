@@ -572,10 +572,17 @@ pub struct GpuNativeRouterRankDiagnosticSink<'a> {
     pub staging_buffer: &'a wgpu::Buffer,
 }
 
+/// Target-layer-only sink used exclusively by the expert-permutation semantic diagnostic.
+pub struct GpuNativeExpertPermutationSemanticSink<'a> {
+    pub layout: &'a crate::gpu_native_expert_permutation_semantic_parity::SemanticTraceLayout,
+    pub staging_buffer: &'a wgpu::Buffer,
+}
+
 struct GpuNativeAttemptOutput {
     boundary_report: GpuNativeBoundaryReport,
     diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
     router_rank_trace: Option<crate::gpu_native_router_rank_diagnostics::RouterRankGpuTrace>,
+    semantic_trace: Option<crate::gpu_native_expert_permutation_semantic_parity::SemanticGpuTrace>,
 }
 
 struct GpuNativeStepOutput {
@@ -583,6 +590,7 @@ struct GpuNativeStepOutput {
     attempts: usize,
     diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
     router_rank_trace: Option<crate::gpu_native_router_rank_diagnostics::RouterRankGpuTrace>,
+    semantic_trace: Option<crate::gpu_native_expert_permutation_semantic_parity::SemanticGpuTrace>,
 }
 
 /// Persistent, model-scoped owner of the GPU-native token loop.
@@ -939,7 +947,7 @@ impl GpuNativeTokenLoop {
 
     /// Allocate request-local device resources for one GPU-native sequence.
     pub fn create_request_state(&self) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
-        self.create_request_state_inner(false)
+        self.create_request_state_inner(false, false)
     }
 
     /// Allocate request-local resources with copyable raw router logits for
@@ -947,12 +955,21 @@ impl GpuNativeTokenLoop {
     pub fn create_router_rank_diagnostic_request_state(
         &self,
     ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
-        self.create_request_state_inner(true)
+        self.create_request_state_inner(true, false)
+    }
+
+    /// Allocate request-local copy-capable router/expert scratch only for the
+    /// explicit expert-permutation semantic witness.
+    pub fn create_expert_permutation_semantic_diagnostic_request_state(
+        &self,
+    ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
+        self.create_request_state_inner(true, true)
     }
 
     fn create_request_state_inner(
         &self,
         router_rank_diagnostic: bool,
+        semantic_diagnostic: bool,
     ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
         let token_state = self.executor.create_token_state()?;
         let kv_width = self.model_geometry.num_kv_heads * self.model_geometry.head_dim;
@@ -989,7 +1006,12 @@ impl GpuNativeTokenLoop {
             self.model_geometry.num_experts,
             self.model_geometry.top_k,
         )?;
-        let expert_scratch = self.executor.create_q4_expert_scratch(expert_geom)?;
+        let expert_scratch = if semantic_diagnostic {
+            self.executor
+                .create_q4_expert_semantic_diagnostic_scratch(expert_geom)?
+        } else {
+            self.executor.create_q4_expert_scratch(expert_geom)?
+        };
 
         let logits_scratch = self
             .executor
@@ -1085,7 +1107,7 @@ impl GpuNativeTokenLoop {
         let prefix_count = prompt_ids.len().saturating_sub(1);
         for &token_id in &prompt_ids[..prefix_count] {
             let pos = request.committed_position;
-            self.step_token_unified_inner(engine, request, token_id, pos, false, None, None)
+            self.step_token_unified_inner(engine, request, token_id, pos, false, None, None, None)
                 .await?;
         }
 
@@ -1099,6 +1121,7 @@ impl GpuNativeTokenLoop {
                 final_prompt,
                 final_prompt_pos,
                 true,
+                None,
                 None,
                 None,
             )
@@ -1118,7 +1141,7 @@ impl GpuNativeTokenLoop {
                 break;
             }
             let next_token = self
-                .step_token_unified_inner(engine, request, last_token, pos, true, None, None)
+                .step_token_unified_inner(engine, request, last_token, pos, true, None, None, None)
                 .await?
                 .sampled_token
                 .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
@@ -1142,7 +1165,9 @@ impl GpuNativeTokenLoop {
     ) -> Result<Option<u32>, GpuNativeTokenLoopError> {
         let _guard = self.execution_guard.lock().await;
         let out = self
-            .step_token_unified_inner(engine, request, token_id, position, sample, None, None)
+            .step_token_unified_inner(
+                engine, request, token_id, position, sample, None, None, None,
+            )
             .await?;
         Ok(out.sampled_token)
     }
@@ -1173,6 +1198,7 @@ impl GpuNativeTokenLoop {
                 position,
                 sample,
                 Some((trace_layout, diagnostic_staging_buffer)),
+                None,
                 None,
             )
             .await?;
@@ -1212,6 +1238,7 @@ impl GpuNativeTokenLoop {
                 true,
                 None,
                 Some((trace_layout, diagnostic_staging_buffer)),
+                None,
             )
             .await?;
         let trace = out.router_rank_trace.ok_or_else(|| {
@@ -1223,6 +1250,51 @@ impl GpuNativeTokenLoop {
             out.sampled_token
                 .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
                     detail: "router-rank diagnostic step produced no sampled token".into(),
+                })?;
+        Ok((trace, sampled_token, out.attempts))
+    }
+
+    /// Diagnostic-only token step that captures the exact target-layer router
+    /// evidence, every per-route GPU expert output, and the production GPU
+    /// routed-MoE combined vector without changing the encoded math.
+    pub async fn step_token_expert_permutation_semantic_diagnostic(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        trace_layout: &crate::gpu_native_expert_permutation_semantic_parity::SemanticTraceLayout,
+        diagnostic_staging_buffer: &wgpu::Buffer,
+    ) -> Result<
+        (
+            crate::gpu_native_expert_permutation_semantic_parity::SemanticGpuTrace,
+            u32,
+            usize,
+        ),
+        GpuNativeTokenLoopError,
+    > {
+        let _guard = self.execution_guard.lock().await;
+        let out = self
+            .step_token_unified_inner(
+                engine,
+                request,
+                token_id,
+                position,
+                true,
+                None,
+                None,
+                Some((trace_layout, diagnostic_staging_buffer)),
+            )
+            .await?;
+        let trace =
+            out.semantic_trace
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "expert-permutation semantic trace was not collected".into(),
+                })?;
+        let sampled_token =
+            out.sampled_token
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "expert-permutation semantic step produced no sampled token".into(),
                 })?;
         Ok((trace, sampled_token, out.attempts))
     }
@@ -1250,6 +1322,20 @@ impl GpuNativeTokenLoop {
         let gpu = self.executor.authoritative_gpu()?;
         Ok(gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu_native_router_rank_diagnostic_staging"),
+            size: trace_layout.total_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }))
+    }
+
+    /// Allocate the target-layer-only expert-permutation semantic readback buffer.
+    pub fn create_expert_permutation_semantic_diagnostic_staging_buffer(
+        &self,
+        trace_layout: &crate::gpu_native_expert_permutation_semantic_parity::SemanticTraceLayout,
+    ) -> Result<wgpu::Buffer, GpuNativeTokenLoopError> {
+        let gpu = self.executor.authoritative_gpu()?;
+        Ok(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_expert_permutation_semantic_diagnostic_staging"),
             size: trace_layout.total_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -1435,6 +1521,10 @@ impl GpuNativeTokenLoop {
             &crate::gpu_native_router_rank_diagnostics::RouterRankTraceLayout,
             &wgpu::Buffer,
         )>,
+        semantic_sink: Option<(
+            &crate::gpu_native_expert_permutation_semantic_parity::SemanticTraceLayout,
+            &wgpu::Buffer,
+        )>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
         let max_attempts = self.layers.len() + 1;
         let mut attempt = 0usize;
@@ -1460,6 +1550,11 @@ impl GpuNativeTokenLoop {
                     layout,
                     staging_buffer: buf,
                 });
+            let semantic_sink =
+                semantic_sink.map(|(layout, buf)| GpuNativeExpertPermutationSemanticSink {
+                    layout,
+                    staging_buffer: buf,
+                });
             let output = self.execute_token_attempt_unified(
                 request,
                 token_id,
@@ -1468,6 +1563,7 @@ impl GpuNativeTokenLoop {
                 replay,
                 sink.as_ref(),
                 router_rank_sink.as_ref(),
+                semantic_sink.as_ref(),
             )?;
             let report = output.boundary_report;
 
@@ -1586,6 +1682,7 @@ impl GpuNativeTokenLoop {
                 attempts: attempt + 1,
                 diagnostic_trace: output.diagnostic_trace,
                 router_rank_trace: output.router_rank_trace,
+                semantic_trace: output.semantic_trace,
             });
         }
     }
@@ -1600,7 +1697,7 @@ impl GpuNativeTokenLoop {
         replay: bool,
     ) -> Result<GpuNativeBoundaryReport, GpuNativeTokenLoopError> {
         let output = self.execute_token_attempt_unified(
-            request, token_id, position, sample, replay, None, None,
+            request, token_id, position, sample, replay, None, None, None,
         )?;
         Ok(output.boundary_report)
     }
@@ -1629,6 +1726,7 @@ impl GpuNativeTokenLoop {
             replay,
             Some(&sink),
             None,
+            None,
         )?;
         output
             .diagnostic_trace
@@ -1647,6 +1745,7 @@ impl GpuNativeTokenLoop {
         replay: bool,
         diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
         router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
+        semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
     ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
         if position != request.committed_position {
             return Err(GpuNativeTokenLoopError::PositionMismatch {
@@ -1676,6 +1775,8 @@ impl GpuNativeTokenLoop {
                     "gpu_native_token_attempt_diagnostic"
                 } else if router_rank_sink.is_some() {
                     "gpu_native_router_rank_diagnostic"
+                } else if semantic_sink.is_some() {
+                    "gpu_native_expert_permutation_semantic_diagnostic"
                 } else {
                     "gpu_native_token_attempt"
                 }),
@@ -1825,6 +1926,36 @@ impl GpuNativeTokenLoop {
                     sink.layout.selected_weights_bytes,
                 );
             }
+            if let Some(sink) = semantic_sink.filter(|sink| sink.layout.target_layer == layer_idx) {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.router_input_offset,
+                    sink.layout.router_input_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.logits_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.raw_logits_offset,
+                    sink.layout.raw_logits_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_ids_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.selected_ids_offset,
+                    sink.layout.selected_ids_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_weights_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.selected_weights_offset,
+                    sink.layout.selected_weights_bytes,
+                );
+            }
 
             // 6. Expert Combine
             let arena = self.residency_manager.arena(layer_idx).ok_or_else(|| {
@@ -1840,6 +1971,23 @@ impl GpuNativeTokenLoop {
                 &request.token_state,
                 &request.expert_scratch,
             )?;
+
+            if let Some(sink) = semantic_sink.filter(|sink| sink.layout.target_layer == layer_idx) {
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.route_outputs_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.route_outputs_offset,
+                    sink.layout.route_outputs_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.combined_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.routed_moe_output_offset,
+                    sink.layout.routed_moe_output_bytes,
+                );
+            }
 
             if let Some(sink) = diagnostic_sink {
                 encoder.copy_buffer_to_buffer(
@@ -2052,10 +2200,34 @@ impl GpuNativeTokenLoop {
             None
         };
 
+        let semantic_trace = if let Some(sink) = semantic_sink {
+            let semantic_slice = sink.staging_buffer.slice(..sink.layout.total_bytes);
+            let (tx_semantic, rx_semantic) = std::sync::mpsc::sync_channel(1);
+            semantic_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx_semantic.send(result);
+            });
+            gpu.device.poll(wgpu::Maintain::Wait);
+            rx_semantic
+                .recv()
+                .map_err(|error| GpuNativeTokenLoopError::MapFailed(error.to_string()))?
+                .map_err(|error| GpuNativeTokenLoopError::MapFailed(format!("{error:?}")))?;
+            let mapped = semantic_slice.get_mapped_range();
+            let trace = sink
+                .layout
+                .parse(&mapped)
+                .map_err(|detail| GpuNativeTokenLoopError::InvalidBoundaryReport { detail })?;
+            drop(mapped);
+            sink.staging_buffer.unmap();
+            Some(trace)
+        } else {
+            None
+        };
+
         Ok(GpuNativeAttemptOutput {
             boundary_report: report,
             diagnostic_trace,
             router_rank_trace,
+            semantic_trace,
         })
     }
 }

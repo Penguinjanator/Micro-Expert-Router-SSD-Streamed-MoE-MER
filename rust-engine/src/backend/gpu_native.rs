@@ -4013,6 +4013,14 @@ impl<B> GpuNativeQ4ExpertScratch<B> {
     pub(crate) const fn layout(&self) -> GpuNativeQ4ExpertScratchLayout {
         self.layout
     }
+
+    pub(crate) fn route_outputs_buffer(&self) -> &B {
+        &self.route_outputs.buffer
+    }
+
+    pub(crate) fn combined_buffer(&self) -> &B {
+        &self.combined.buffer
+    }
 }
 
 impl<B> fmt::Debug for GpuNativeQ4ExpertScratch<B> {
@@ -6410,6 +6418,24 @@ impl GpuNativeExecutorContext {
         &self,
         geometry: GpuNativeQ4ExpertGeometry,
     ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
+        self.create_q4_expert_scratch_inner(geometry, false)
+    }
+
+    /// Allocate request-local expert scratch whose completed route outputs and
+    /// combined vector are copyable only for the explicit semantic diagnostic.
+    /// Normal production requests continue to use storage-only expert tensors.
+    pub(crate) fn create_q4_expert_semantic_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+    ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
+        self.create_q4_expert_scratch_inner(geometry, true)
+    }
+
+    fn create_q4_expert_scratch_inner(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+        semantic_diagnostic: bool,
+    ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
         if geometry.d_model != self.layout.d_model {
             return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
                 expected: self.layout.d_model,
@@ -6428,31 +6454,36 @@ impl GpuNativeExecutorContext {
             GpuNativeQ4ExpertScratchLayout::resolved_usage(),
         )?;
         let create_tensor = |label: &str,
-                             tensor_layout: GpuNativeScratchLayout|
+                             tensor_layout: GpuNativeScratchLayout,
+                             copy_src: bool|
          -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+            let usage = GpuNativeQ4ExpertScratchLayout::tensor_usage()
+                | if copy_src {
+                    wgpu::BufferUsages::COPY_SRC
+                } else {
+                    wgpu::BufferUsages::empty()
+                };
             Ok(GpuNativeScratch::from_buffer(
                 self.context_id,
                 next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "expert tensor scratch"),
                 tensor_layout,
-                create_startup_buffer(
-                    &gpu.device,
-                    label,
-                    tensor_layout.bytes,
-                    GpuNativeQ4ExpertScratchLayout::tensor_usage(),
-                )?,
+                create_startup_buffer(&gpu.device, label, tensor_layout.bytes, usage)?,
             ))
         };
         let activation = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_activation"),
             layout.activation,
+            false,
         )?;
         let route_outputs = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_route_outputs"),
             layout.route_outputs,
+            semantic_diagnostic,
         )?;
         let combined = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_combined"),
             layout.combined,
+            semantic_diagnostic,
         )?;
         Ok(GpuNativeQ4ExpertScratch::from_buffers(
             self.context_id,

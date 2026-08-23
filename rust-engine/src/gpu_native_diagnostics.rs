@@ -428,6 +428,9 @@ pub struct ModelDiagnosticTrace {
     pub layer_router_input: Vec<Vec<f32>>,
     pub layer_selected_ids: Vec<Vec<u32>>,
     pub layer_selected_weights: Vec<Vec<f32>>,
+    /// Exact pre-residual routed-expert weighted accumulation from the
+    /// authoritative CPU reference implementation.
+    pub layer_routed_moe_output: Vec<Vec<f32>>,
     pub layer_post_moe: Vec<Vec<f32>>,
     pub final_norm: Vec<f32>,
     pub logits: Vec<f32>,
@@ -983,6 +986,7 @@ mod tests {
             layer_router_input: vec![vec![3.0; d_model]; layers],
             layer_selected_ids: vec![vec![0; top_k]; layers],
             layer_selected_weights: vec![vec![0.5; top_k]; layers],
+            layer_routed_moe_output: vec![vec![0.25; d_model]; layers],
             layer_post_moe: vec![vec![4.0; d_model]; layers],
             final_norm: vec![5.0; d_model],
             logits: vec![6.0; vocab],
