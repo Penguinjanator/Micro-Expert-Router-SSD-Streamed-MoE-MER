@@ -44,9 +44,10 @@ use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -1585,6 +1586,144 @@ impl EngineMetrics {
     }
 }
 
+/// Explicit lifecycle for asynchronous work owned by an [`Engine`].
+///
+/// Background promotion and speculative-prefetch tasks used to be detached
+/// `tokio::spawn` calls. Several of those futures own an `Arc<Engine>`, so
+/// dropping the caller's last runtime handle was not sufficient to retire the
+/// engine or any resource family reachable through it. This controller stops
+/// new admissions, cooperatively cancels every registered future, and retains
+/// abort handles only as a bounded fallback for work that does not yield
+/// promptly. It never owns a task future or an `Arc<Engine>` itself.
+struct EngineBackgroundTasks {
+    shutdown_requested: AtomicBool,
+    active: AtomicUsize,
+    state: parking_lot::Mutex<EngineBackgroundTaskState>,
+    shutdown_notify: Notify,
+    idle_notify: Notify,
+}
+
+#[derive(Default)]
+struct EngineBackgroundTaskState {
+    abort_handles: Vec<tokio::task::AbortHandle>,
+}
+
+struct EngineBackgroundTaskGuard {
+    owner: Arc<EngineBackgroundTasks>,
+}
+
+impl Drop for EngineBackgroundTaskGuard {
+    fn drop(&mut self) {
+        if self.owner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.owner.idle_notify.notify_waiters();
+        }
+    }
+}
+
+impl EngineBackgroundTasks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shutdown_requested: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new(EngineBackgroundTaskState::default()),
+            shutdown_notify: Notify::new(),
+            idle_notify: Notify::new(),
+        })
+    }
+
+    #[inline]
+    fn accepts_work(&self) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    /// Register and detach one runtime-owned background future.
+    ///
+    /// The state lock makes the admission check and handle registration atomic
+    /// with respect to `shutdown`: once shutdown flips the flag while holding
+    /// the same lock, no later task can escape registration.
+    fn spawn<F>(self: &Arc<Self>, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock();
+        if !self.accepts_work() {
+            return false;
+        }
+        state.abort_handles.retain(|handle| !handle.is_finished());
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let owner = self.clone();
+        let cancellation = self.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = EngineBackgroundTaskGuard { owner };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                _ = future => {}
+            }
+        });
+        state.abort_handles.push(handle.abort_handle());
+        true
+    }
+
+    async fn cancelled(&self) {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.shutdown_notify.notified();
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    async fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.idle_notify.notified();
+                if self.active.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        const COOPERATIVE_GRACE: Duration = Duration::from_secs(1);
+        const ABORT_GRACE: Duration = Duration::from_secs(4);
+
+        let abort_handles = {
+            let mut state = self.state.lock();
+            self.shutdown_requested.store(true, Ordering::Release);
+            state.abort_handles.retain(|handle| !handle.is_finished());
+            state.abort_handles.clone()
+        };
+        self.shutdown_notify.notify_waiters();
+
+        if self.wait_for_idle(COOPERATIVE_GRACE).await {
+            self.state.lock().abort_handles.clear();
+            return Ok(());
+        }
+
+        // Speculation and logical-GPU promotion are best-effort background
+        // work. Aborting their futures is resource-safe: buffer, semaphore,
+        // singleflight, and promotion claims all have drop/error cleanup.
+        for handle in abort_handles {
+            handle.abort();
+        }
+        if self.wait_for_idle(ABORT_GRACE).await {
+            self.state.lock().abort_handles.clear();
+            Ok(())
+        } else {
+            Err(format!(
+                "engine background tasks remained active after controlled shutdown: active={}",
+                self.active.load(Ordering::Acquire)
+            ))
+        }
+    }
+}
+
 /// Top-level façade: composes [`EngineCore`] (MoE/IO), [`EngineSpeculation`]
 /// (aliasing, locality, neural speculator) and [`EngineMetrics`]
 /// (histograms, counters, Prometheus / trace sinks).
@@ -1596,6 +1735,7 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    background_tasks: Arc<EngineBackgroundTasks>,
     diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool,
     diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
@@ -1953,6 +2093,7 @@ impl Engine {
             ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            background_tasks: EngineBackgroundTasks::new(),
             diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool::new(false),
             diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
@@ -2639,7 +2780,7 @@ impl Engine {
         if let Some(p) = prom_for_task.as_ref() {
             p.set_vram_capacity_bytes(gpu.capacity_bytes() as u64);
         }
-        tokio::spawn(async move {
+        let spawned = self.background_tasks.spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
                 // Existing LRU admissions graduate atomically without a host
                 // payload copy. Absent ids copy outside the cache mutex and
@@ -2653,8 +2794,20 @@ impl Engine {
                 );
             }
         });
+        debug_assert!(
+            spawned,
+            "a newly built engine must accept GPU promotion work"
+        );
         self.core.gpu_cache = Some(gpu.clone());
         self.core.gpu_promotion_tx = Some(tx);
+    }
+
+    /// Stop admission and deterministically retire every anonymous async task
+    /// owned by this engine. Isolated qualification runtimes call this before
+    /// dropping their strong engine handle; ordinary steady-state serving is
+    /// unchanged until a caller explicitly requests shutdown.
+    pub(crate) async fn shutdown_background_tasks(&self) -> Result<(), String> {
+        self.background_tasks.shutdown().await
     }
 
     /// **Test-only** wiring of the GPU promotion channel without
@@ -3059,14 +3212,16 @@ impl Engine {
                 // the (previously dead) `prefetch_used` counter so the
                 // run summary can report end-to-end prefetch precision.
                 self.credit_prefetch_use(&r, new_hits);
-                if let (Some(gpu), Some(tx)) = (
-                    self.core.gpu_cache.as_ref(),
-                    self.core.gpu_promotion_tx.as_ref(),
-                ) {
-                    if gpu.claim_promotion(id, new_hits)
-                        && tx.send((id, r.clone())).is_err()
-                    {
-                        gpu.cancel_promotion(id);
+                if self.background_tasks.accepts_work() {
+                    if let (Some(gpu), Some(tx)) = (
+                        self.core.gpu_cache.as_ref(),
+                        self.core.gpu_promotion_tx.as_ref(),
+                    ) {
+                        if gpu.claim_promotion(id, new_hits)
+                            && tx.send((id, r.clone())).is_err()
+                        {
+                            gpu.cancel_promotion(id);
+                        }
                     }
                 }
                 residents[i] = Some(r);
@@ -3759,6 +3914,9 @@ impl Engine {
         resident: Arc<ExpertResident>,
         p: f64,
     ) {
+        if !self.background_tasks.accepts_work() {
+            return;
+        }
         let id = resident.id;
         // This is the prediction's one and only governor decision. A PCIe
         // write does not call `record_completed`; that denominator remains
@@ -3781,7 +3939,7 @@ impl Engine {
             }
         };
         let me = self.clone();
-        tokio::spawn(async move {
+        self.background_tasks.spawn(async move {
             let _permit = permit;
             let Some(admission) = me.ensure_speculative_gpu_admission(&resident) else {
                 return;
@@ -3808,6 +3966,9 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        if !self.background_tasks.accepts_work() {
+            return;
+        }
         if let Some(manager) = self.core.gpu_native_residency.as_ref().cloned() {
             match manager.probe_speculative(
                 id,
@@ -3885,7 +4046,7 @@ impl Engine {
             }
         };
         let me = self.clone();
-        tokio::spawn(async move {
+        self.background_tasks.spawn(async move {
             // Permit released on task completion (drop). Holding it
             // across the I/O is what enforces the bound.
             let _permit = permit;
@@ -5351,18 +5512,20 @@ impl Engine {
                 // first hit on a shadow-backed resident is a prefetch
                 // that paid off. No-op when the governor is disabled.
                 self.credit_prefetch_use(&r, new_hits);
-                if let (Some(gpu), Some(tx)) = (
-                    self.core.gpu_cache.as_ref(),
-                    self.core.gpu_promotion_tx.as_ref(),
-                ) {
-                    // One outstanding claim prevents queue flooding while
-                    // allowing a new request after logical eviction, even
-                    // though the RAM resident's hit count no longer has a
-                    // fresh threshold-crossing edge.
-                    if gpu.claim_promotion(id, new_hits)
-                        && tx.send((id, r.clone())).is_err()
-                    {
-                        gpu.cancel_promotion(id);
+                if self.background_tasks.accepts_work() {
+                    if let (Some(gpu), Some(tx)) = (
+                        self.core.gpu_cache.as_ref(),
+                        self.core.gpu_promotion_tx.as_ref(),
+                    ) {
+                        // One outstanding claim prevents queue flooding while
+                        // allowing a new request after logical eviction, even
+                        // though the RAM resident's hit count no longer has a
+                        // fresh threshold-crossing edge.
+                        if gpu.claim_promotion(id, new_hits)
+                            && tx.send((id, r.clone())).is_err()
+                        {
+                            gpu.cancel_promotion(id);
+                        }
                     }
                 }
                 residents[i] = Some(r);
@@ -8200,6 +8363,72 @@ mod tests {
         );
         // Sanity: the report surface mirrors the counter.
         assert_eq!(engine.report().prefetch_dropped_concurrency, dropped);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_shutdown_cancels_in_flight_engine_owned_background_work() {
+        let dir = TempDir::new("controlled-background-shutdown");
+        let engine = build_engine(&dir.path, 4, 16, 32, 2, 1, 1, 0x5A17);
+        let weak_engine = Arc::downgrade(&engine);
+
+        // Test seam with the exact ownership shape of spawn_prefetch: the
+        // detached future owns Arc<Engine> and otherwise cannot finish. The
+        // old untracked spawn design would keep the full engine graph alive.
+        let task_engine = engine.clone();
+        assert!(engine.background_tasks.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(task_engine);
+        }));
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 1);
+        assert!(weak_engine.strong_count() >= 2);
+
+        engine.shutdown_background_tasks().await.unwrap();
+        assert!(!engine.background_tasks.accepts_work());
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 0);
+
+        // Shutdown is an admission boundary: neither direct tracker users nor
+        // the real speculative-prefetch producer may create later work.
+        assert!(!engine.background_tasks.spawn(std::future::pending::<()>()));
+        engine.spawn_prefetch(0, 0.5);
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 0);
+
+        drop(engine);
+        assert!(weak_engine.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_shutdown_prevents_cross_engine_cache_and_counter_contamination() {
+        let first_dir = TempDir::new("isolated-runtime-a");
+        let first = build_engine(&first_dir.path, 4, 16, 32, 2, 1, 1, 0xA11CE);
+        first.warm_with(&[0]).await.unwrap();
+        let _ = first.generate(0).await.unwrap();
+        assert!(first.core.cache.len() > 0);
+        assert!(first.report().tokens_processed > 0);
+
+        // Include work in flight so this is not merely a clean empty-engine
+        // drop. It retains the same Arc<Engine> graph as speculation.
+        let task_engine = first.clone();
+        assert!(first.background_tasks.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(task_engine);
+        }));
+        first.shutdown_background_tasks().await.unwrap();
+        drop(first);
+
+        let second_dir = TempDir::new("isolated-runtime-b");
+        let second = build_engine(&second_dir.path, 4, 16, 32, 2, 1, 1, 0xB0B);
+        let report = second.report();
+        assert_eq!(second.core.cache.len(), 0);
+        assert_eq!(report.tokens_processed, 0);
+        assert_eq!(report.hits, 0);
+        assert_eq!(report.misses, 0);
+        assert_eq!(report.bytes_read, 0);
+        assert_eq!(
+            second.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot::default()
+        );
+        assert!(second.gpu_expert_io_snapshot().is_none());
+        second.shutdown_background_tasks().await.unwrap();
     }
 
     /// Regression test for the post-`predict_min_prob` panic:

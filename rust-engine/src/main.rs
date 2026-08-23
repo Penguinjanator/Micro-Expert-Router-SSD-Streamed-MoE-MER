@@ -2620,23 +2620,91 @@ struct IsolatedRuntimeShutdownWitness {
     affinity: Option<std::sync::Weak<LayeredExpertAffinity>>,
 }
 
+/// Point-in-time strong-owner counts for every isolated mutable resource
+/// family. `Weak::strong_count` observes ownership without upgrading the weak
+/// reference, so polling this diagnostic never keeps a resource alive.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct IsolatedRuntimeLiveResources {
+    engine: usize,
+    model: usize,
+    cache: usize,
+    storage: usize,
+    predictor: usize,
+    execution_context: usize,
+    gpu_cache: usize,
+    speculator: Option<usize>,
+    affinity: Option<usize>,
+}
+
+#[derive(Debug)]
+struct IsolatedRuntimeShutdownError {
+    detail: String,
+}
+
+impl IsolatedRuntimeShutdownError {
+    fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for IsolatedRuntimeShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for IsolatedRuntimeShutdownError {}
+
+impl IsolatedRuntimeLiveResources {
+    fn all_released(self) -> bool {
+        self.engine == 0
+            && self.model == 0
+            && self.cache == 0
+            && self.storage == 0
+            && self.predictor == 0
+            && self.execution_context == 0
+            && self.gpu_cache == 0
+            && self.speculator.is_none_or(|count| count == 0)
+            && self.affinity.is_none_or(|count| count == 0)
+    }
+}
+
+impl std::fmt::Display for IsolatedRuntimeLiveResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn optional_count(value: Option<usize>) -> String {
+            value.map_or_else(|| "disabled".to_string(), |count| count.to_string())
+        }
+        write!(
+            f,
+            "engine={} model={} cache={} storage={} predictor={} execution_context={} gpu_cache={} speculator={} affinity={}",
+            self.engine,
+            self.model,
+            self.cache,
+            self.storage,
+            self.predictor,
+            self.execution_context,
+            self.gpu_cache,
+            optional_count(self.speculator),
+            optional_count(self.affinity),
+        )
+    }
+}
+
 impl IsolatedRuntimeShutdownWitness {
-    fn all_released(&self) -> bool {
-        self.engine.upgrade().is_none()
-            && self.model.upgrade().is_none()
-            && self.cache.upgrade().is_none()
-            && self.storage.upgrade().is_none()
-            && self.predictor.upgrade().is_none()
-            && self.execution_context.upgrade().is_none()
-            && self.gpu_cache.upgrade().is_none()
-            && self
-                .speculator
-                .as_ref()
-                .map_or(true, |weak| weak.upgrade().is_none())
-            && self
-                .affinity
-                .as_ref()
-                .map_or(true, |weak| weak.upgrade().is_none())
+    fn live_resources(&self) -> IsolatedRuntimeLiveResources {
+        IsolatedRuntimeLiveResources {
+            engine: self.engine.strong_count(),
+            model: self.model.strong_count(),
+            cache: self.cache.strong_count(),
+            storage: self.storage.strong_count(),
+            predictor: self.predictor.strong_count(),
+            execution_context: self.execution_context.strong_count(),
+            gpu_cache: self.gpu_cache.strong_count(),
+            speculator: self.speculator.as_ref().map(std::sync::Weak::strong_count),
+            affinity: self.affinity.as_ref().map(std::sync::Weak::strong_count),
+        }
     }
 
     async fn wait_for_release(
@@ -2644,28 +2712,24 @@ impl IsolatedRuntimeShutdownWitness {
     ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String> {
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
         const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        wait_for_isolated_release(
-            || self.all_released(),
-            POLL_INTERVAL,
-            SHUTDOWN_TIMEOUT,
-        )
-        .await
+        wait_for_isolated_release(|| self.live_resources(), POLL_INTERVAL, SHUTDOWN_TIMEOUT).await
     }
 }
 
 async fn wait_for_isolated_release<F>(
-    mut all_released: F,
+    mut live_resources: F,
     poll_interval: std::time::Duration,
     shutdown_timeout: std::time::Duration,
 ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> IsolatedRuntimeLiveResources,
 {
     let started = Instant::now();
     let mut poll_iterations = 0u32;
     loop {
         poll_iterations = poll_iterations.saturating_add(1);
-        if all_released() {
+        let live = live_resources();
+        if live.all_released() {
             return Ok(crate::greedy_parity::BackgroundShutdownEvidence {
                 controlled_shutdown_requested: true,
                 all_runtime_resources_released: true,
@@ -2674,8 +2738,8 @@ where
         }
         if started.elapsed() >= shutdown_timeout {
             return Err(format!(
-                "isolated runtime background resources remained live after {}s",
-                shutdown_timeout.as_secs_f64()
+                "isolated runtime background resources remained live after {}s: {live}",
+                shutdown_timeout.as_secs_f64(),
             ));
         }
         tokio::time::sleep(poll_interval).await;
@@ -2685,18 +2749,32 @@ where
 impl BenchRealRuntime {
     async fn shutdown_isolated(
         mut self,
-    ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, String> {
-        let witness = self
-            .isolated_shutdown
-            .take()
-            .ok_or_else(|| "runtime was not constructed by the isolated qualification factory".to_string())?;
-        // Dropping the Engine closes the GPU-promotion and neural-speculator
-        // producer channels. Affinity's owned handle joins its worker in Drop;
-        // outstanding prefetch work releases cache/storage/predictor Arcs when
-        // it completes. The weak witness below proves all of those resource
-        // families are gone before another case/plane is constructed.
+    ) -> Result<crate::greedy_parity::BackgroundShutdownEvidence, IsolatedRuntimeShutdownError>
+    {
+        let witness = self.isolated_shutdown.take().ok_or_else(|| {
+            IsolatedRuntimeShutdownError::new(
+                "runtime was not constructed by the isolated qualification factory",
+            )
+        })?;
+        // Stop producers and cancel/drain every engine-owned async background
+        // task before dropping the runtime's strong references. Affinity's
+        // owned thread handle is joined in Engine drop; the neural-speculator
+        // worker owns only a Weak and exits when its producer disappears. The
+        // witness remains an independent postcondition proving every mutable
+        // resource family is gone before another isolated runtime is built.
+        let controlled_shutdown = self.engine.shutdown_background_tasks().await;
         drop(self);
-        witness.wait_for_release().await
+        let released = witness.wait_for_release().await;
+        match (controlled_shutdown, released) {
+            (Ok(()), Ok(evidence)) => Ok(evidence),
+            (Err(error), Ok(_)) => Err(IsolatedRuntimeShutdownError::new(error)),
+            (Ok(()), Err(error)) => Err(IsolatedRuntimeShutdownError::new(error)),
+            (Err(controlled_error), Err(release_error)) => {
+                Err(IsolatedRuntimeShutdownError::new(format!(
+                    "{controlled_error}; weak release postcondition also failed: {release_error}"
+                )))
+            }
+        }
     }
 }
 
@@ -4185,9 +4263,10 @@ async fn execute_greedy_parity_plane_internal(
         }
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
-        (Err(error), Err(shutdown_error)) => {
-            Err(format!("{error}; isolated shutdown also failed: {shutdown_error}").into())
-        }
+        (Err(error), Err(shutdown_error)) => Err(IsolatedRuntimeShutdownError::new(format!(
+            "{error}; isolated shutdown also failed: {shutdown_error}"
+        ))
+        .into()),
     }
 }
 
@@ -6115,10 +6194,31 @@ fn fail_gpu_native_greedy_parity(
     match emit_gpu_native_greedy_parity_report(&report, report_out) {
         Ok(()) => Err(summary.into()),
         Err(emit_error) => Err(format!(
-            "{summary}; additionally failed to emit GPU-native greedy-parity report: {emit_error}"
+            "{summary}; GPU-native greedy-parity report emission failed: {emit_error}"
         )
         .into()),
     }
+}
+
+fn gpu_native_case_execution_failure(
+    default_code: &'static str,
+    case_name: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> crate::qualification::QualificationFailure {
+    let isolated_shutdown = error.is::<IsolatedRuntimeShutdownError>();
+    crate::qualification::QualificationFailure::new(
+        if isolated_shutdown {
+            crate::qualification::FailureStage::Postcondition
+        } else {
+            crate::qualification::FailureStage::Inference
+        },
+        if isolated_shutdown {
+            "isolated-runtime-shutdown-failed"
+        } else {
+            default_code
+        },
+        format!("fixed case {case_name}: {error}"),
+    )
 }
 
 fn gpu_native_generation_evidence(
@@ -6253,9 +6353,9 @@ async fn execute_gpu_native_reference_routing_replay(
         }
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
-        (Err(error), Err(shutdown_error)) => Err(format!(
+        (Err(error), Err(shutdown_error)) => Err(IsolatedRuntimeShutdownError::new(format!(
             "{error}; reference routing replay shutdown also failed: {shutdown_error}"
-        )
+        ))
         .into()),
     }
 }
@@ -6453,9 +6553,9 @@ async fn execute_gpu_native_qualification_case(
         }
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(shutdown_error)) => Err(shutdown_error.into()),
-        (Err(error), Err(shutdown_error)) => Err(format!(
+        (Err(error), Err(shutdown_error)) => Err(IsolatedRuntimeShutdownError::new(format!(
             "{error}; GPU-native qualification shutdown also failed: {shutdown_error}"
-        )
+        ))
         .into()),
     }
 }
@@ -6675,10 +6775,10 @@ async fn cmd_qualify_gpu_native_q4_greedy_parity(
             Err(error) => {
                 return fail_gpu_native_greedy_parity(
                     report,
-                    QualificationFailure::new(
-                        FailureStage::Inference,
+                    gpu_native_case_execution_failure(
                         "authoritative-reference-failed",
-                        format!("fixed case {}: {error}", fixed.name),
+                        fixed.name,
+                        error.as_ref(),
                     ),
                     args.report_out.as_deref(),
                 );
@@ -6718,10 +6818,10 @@ async fn cmd_qualify_gpu_native_q4_greedy_parity(
             Err(error) => {
                 return fail_gpu_native_greedy_parity(
                     report,
-                    QualificationFailure::new(
-                        FailureStage::Inference,
+                    gpu_native_case_execution_failure(
                         "reference-routing-replay-failed",
-                        format!("fixed case {}: {error}", fixed.name),
+                        fixed.name,
+                        error.as_ref(),
                     ),
                     args.report_out.as_deref(),
                 );
@@ -6759,10 +6859,10 @@ async fn cmd_qualify_gpu_native_q4_greedy_parity(
             Err(error) => {
                 return fail_gpu_native_greedy_parity(
                     report,
-                    QualificationFailure::new(
-                        FailureStage::Inference,
+                    gpu_native_case_execution_failure(
                         "gpu-native-candidate-failed",
-                        format!("fixed case {}: {error}", fixed.name),
+                        fixed.name,
+                        error.as_ref(),
                     ),
                     args.report_out.as_deref(),
                 );
@@ -13282,6 +13382,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn gpu_native_greedy_parity_test_report(
+    ) -> crate::gpu_native_greedy_parity::GpuNativeGreedyParityReport {
+        crate::gpu_native_greedy_parity::GpuNativeGreedyParityReport::new(
+            crate::qualification::BuildProvenance {
+                git_sha: Some("0".repeat(40)),
+                dirty: Some(false),
+                package_version: "test".to_string(),
+            },
+            crate::qualification::QualificationArtifacts::default(),
+            None,
+            "NVIDIA L4".to_string(),
+            crate::gpu_native_greedy_parity::SourceConfigEvidence {
+                real_transformer_enabled: true,
+                gpu_native_enabled: true,
+                weights_dir_configured: true,
+                strict_weights: true,
+                allow_seeded_fallback: false,
+                allow_degraded_experts: false,
+                allow_nonfinite_attention_fallback: false,
+                allow_truncated_expert_payloads: false,
+                distributed_enabled: false,
+                gpu_cache_enabled: true,
+                gpu_expert_capacity_bytes: 1,
+                routed_expert_dtype: "q4_0".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn gpu_native_isolated_shutdown_failure_report_is_durable_and_nonzero() {
+        let dir = tempdir_unique("gpu-native-shutdown-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let teardown_error = IsolatedRuntimeShutdownError::new(
+            "isolated runtime background resources remained live after 30s: engine=1 storage=1",
+        );
+        let failure = gpu_native_case_execution_failure(
+            "gpu-native-candidate-failed",
+            "test-case",
+            &teardown_error,
+        );
+        let error = fail_gpu_native_greedy_parity(
+            gpu_native_greedy_parity_test_report(),
+            failure,
+            Some(&path),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("isolated-runtime-shutdown-failed"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["qualification_pass"], false);
+        assert_eq!(json["failure"]["code"], "isolated-runtime-shutdown-failed");
+        assert!(json["failure"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("engine=1 storage=1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gpu_native_report_write_failure_remains_nonzero_and_explicit() {
+        let dir = tempdir_unique("gpu-native-report-write-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let failure = crate::qualification::QualificationFailure::new(
+            crate::qualification::FailureStage::Postcondition,
+            "isolated-runtime-shutdown-failed",
+            "forced teardown failure",
+        );
+        let error = fail_gpu_native_greedy_parity(
+            gpu_native_greedy_parity_test_report(),
+            failure,
+            Some(&dir),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("report emission failed"), "{error}");
+        assert!(
+            error.contains("isolated-runtime-shutdown-failed"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn greedy_parity_isolated_contexts_are_distinct_and_cpu_exact() {
         let global_before = crate::backend::current_execution_context();
@@ -13333,7 +13517,10 @@ mod tests {
             drop(owner);
         });
         let evidence = wait_for_isolated_release(
-            || weak.upgrade().is_none(),
+            || IsolatedRuntimeLiveResources {
+                engine: weak.strong_count(),
+                ..IsolatedRuntimeLiveResources::default()
+            },
             std::time::Duration::from_millis(1),
             std::time::Duration::from_secs(1),
         )
@@ -13347,14 +13534,23 @@ mod tests {
 
     #[tokio::test]
     async fn greedy_parity_shutdown_timeout_fails_closed() {
+        let retained = Arc::new(());
+        let weak = Arc::downgrade(&retained);
         let error = wait_for_isolated_release(
-            || false,
+            || IsolatedRuntimeLiveResources {
+                storage: weak.strong_count(),
+                ..IsolatedRuntimeLiveResources::default()
+            },
             std::time::Duration::from_millis(1),
             std::time::Duration::from_millis(5),
         )
         .await
         .unwrap_err();
         assert!(error.contains("background resources remained live"));
+        assert!(error.contains("storage=1"), "{error}");
+        assert!(error.contains("engine=0"), "{error}");
+        assert!(error.contains("gpu_cache=0"), "{error}");
+        drop(retained);
     }
 
     #[test]
