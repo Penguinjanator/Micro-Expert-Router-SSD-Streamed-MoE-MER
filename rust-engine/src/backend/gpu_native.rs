@@ -3761,6 +3761,10 @@ impl GpuNativeRouterScratchLayout {
         wgpu::BufferUsages::STORAGE
     }
 
+    pub(crate) fn diagnostic_logits_usage() -> wgpu::BufferUsages {
+        Self::logits_usage() | wgpu::BufferUsages::COPY_SRC
+    }
+
     pub(crate) fn result_usage() -> wgpu::BufferUsages {
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
     }
@@ -6184,6 +6188,23 @@ impl GpuNativeExecutorContext {
         &self,
         geometry: GpuNativeRouterGeometry,
     ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_inner(geometry, false)
+    }
+
+    /// Router scratch whose exact GEMV logits may be copied by an explicitly
+    /// active diagnostic. Ordinary request allocation uses `create_router_scratch`.
+    pub(crate) fn create_router_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_inner(geometry, true)
+    }
+
+    fn create_router_scratch_inner(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+        diagnostic_logits_copy: bool,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
         if geometry.d_model != self.layout.d_model {
             return Err(GpuNativeBootstrapError::RouterDModelMismatch {
                 expected: self.layout.d_model,
@@ -6195,11 +6216,22 @@ impl GpuNativeExecutorContext {
         layout.validate_for_limits(&gpu.device.limits())?;
         validate_router_dispatch(&gpu.device.limits())?;
         let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "router scratch");
+        let logits_usage = if diagnostic_logits_copy {
+            GpuNativeRouterScratchLayout::diagnostic_logits_usage()
+        } else {
+            GpuNativeRouterScratchLayout::logits_usage()
+        };
+        super::validate_startup_buffer(
+            "gpu_native_router_logits",
+            layout.logits_bytes,
+            logits_usage,
+            &gpu.device.limits(),
+        )?;
         let logits = create_startup_buffer(
             &gpu.device,
             &format!("gpu_native_router_scratch_{scratch_id}_logits"),
             layout.logits_bytes,
-            GpuNativeRouterScratchLayout::logits_usage(),
+            logits_usage,
         )?;
         let selected_ids = create_startup_buffer(
             &gpu.device,
@@ -9905,6 +9937,11 @@ pub(crate) mod tests {
         assert_eq!(layout.total_bytes(), 576);
         assert!(!GpuNativeRouterScratchLayout::logits_usage()
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(
+            !GpuNativeRouterScratchLayout::logits_usage().contains(wgpu::BufferUsages::COPY_SRC)
+        );
+        assert!(GpuNativeRouterScratchLayout::diagnostic_logits_usage()
+            .contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!GpuNativeRouterScratchLayout::result_usage()
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
         assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_SRC));

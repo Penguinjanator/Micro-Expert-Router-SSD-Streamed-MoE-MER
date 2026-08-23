@@ -566,15 +566,23 @@ pub struct GpuNativeDiagnosticSink<'a> {
     pub staging_buffer: &'a wgpu::Buffer,
 }
 
+/// Target-layer-only sink used exclusively by the router-rank diagnostic.
+pub struct GpuNativeRouterRankDiagnosticSink<'a> {
+    pub layout: &'a crate::gpu_native_router_rank_diagnostics::RouterRankTraceLayout,
+    pub staging_buffer: &'a wgpu::Buffer,
+}
+
 struct GpuNativeAttemptOutput {
     boundary_report: GpuNativeBoundaryReport,
     diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
+    router_rank_trace: Option<crate::gpu_native_router_rank_diagnostics::RouterRankGpuTrace>,
 }
 
 struct GpuNativeStepOutput {
     sampled_token: Option<u32>,
     attempts: usize,
     diagnostic_trace: Option<crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace>,
+    router_rank_trace: Option<crate::gpu_native_router_rank_diagnostics::RouterRankGpuTrace>,
 }
 
 /// Persistent, model-scoped owner of the GPU-native token loop.
@@ -931,6 +939,21 @@ impl GpuNativeTokenLoop {
 
     /// Allocate request-local device resources for one GPU-native sequence.
     pub fn create_request_state(&self) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
+        self.create_request_state_inner(false)
+    }
+
+    /// Allocate request-local resources with copyable raw router logits for
+    /// the explicit router-rank diagnostic only.
+    pub fn create_router_rank_diagnostic_request_state(
+        &self,
+    ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
+        self.create_request_state_inner(true)
+    }
+
+    fn create_request_state_inner(
+        &self,
+        router_rank_diagnostic: bool,
+    ) -> Result<GpuNativeRequestState, GpuNativeTokenLoopError> {
         let token_state = self.executor.create_token_state()?;
         let kv_width = self.model_geometry.num_kv_heads * self.model_geometry.head_dim;
         let kv_state = self.executor.create_kv_state(
@@ -953,7 +976,12 @@ impl GpuNativeTokenLoop {
             self.model_geometry.num_experts,
             self.model_geometry.top_k,
         )?;
-        let router_scratch = self.executor.create_router_scratch(router_geom)?;
+        let router_scratch = if router_rank_diagnostic {
+            self.executor
+                .create_router_diagnostic_scratch(router_geom)?
+        } else {
+            self.executor.create_router_scratch(router_geom)?
+        };
 
         let expert_geom = GpuNativeQ4ExpertGeometry::try_new(
             self.model_geometry.d_model,
@@ -1057,7 +1085,7 @@ impl GpuNativeTokenLoop {
         let prefix_count = prompt_ids.len().saturating_sub(1);
         for &token_id in &prompt_ids[..prefix_count] {
             let pos = request.committed_position;
-            self.step_token_unified_inner(engine, request, token_id, pos, false, None)
+            self.step_token_unified_inner(engine, request, token_id, pos, false, None, None)
                 .await?;
         }
 
@@ -1065,7 +1093,15 @@ impl GpuNativeTokenLoop {
         let final_prompt = *prompt_ids.last().expect("checked non-empty");
         let final_prompt_pos = request.committed_position;
         let first_completion = self
-            .step_token_unified_inner(engine, request, final_prompt, final_prompt_pos, true, None)
+            .step_token_unified_inner(
+                engine,
+                request,
+                final_prompt,
+                final_prompt_pos,
+                true,
+                None,
+                None,
+            )
             .await?
             .sampled_token
             .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
@@ -1082,7 +1118,7 @@ impl GpuNativeTokenLoop {
                 break;
             }
             let next_token = self
-                .step_token_unified_inner(engine, request, last_token, pos, true, None)
+                .step_token_unified_inner(engine, request, last_token, pos, true, None, None)
                 .await?
                 .sampled_token
                 .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
@@ -1106,7 +1142,7 @@ impl GpuNativeTokenLoop {
     ) -> Result<Option<u32>, GpuNativeTokenLoopError> {
         let _guard = self.execution_guard.lock().await;
         let out = self
-            .step_token_unified_inner(engine, request, token_id, position, sample, None)
+            .step_token_unified_inner(engine, request, token_id, position, sample, None, None)
             .await?;
         Ok(out.sampled_token)
     }
@@ -1137,6 +1173,7 @@ impl GpuNativeTokenLoop {
                 position,
                 sample,
                 Some((trace_layout, diagnostic_staging_buffer)),
+                None,
             )
             .await?;
         let trace =
@@ -1145,6 +1182,49 @@ impl GpuNativeTokenLoop {
                     detail: "diagnostic trace was not collected".into(),
                 })?;
         Ok((trace, out.attempts))
+    }
+
+    /// Diagnostic-only token step that captures the exact production router
+    /// input, dense-GEMV logits, and selected outputs at one target layer.
+    pub async fn step_token_router_rank_diagnostic(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        trace_layout: &crate::gpu_native_router_rank_diagnostics::RouterRankTraceLayout,
+        diagnostic_staging_buffer: &wgpu::Buffer,
+    ) -> Result<
+        (
+            crate::gpu_native_router_rank_diagnostics::RouterRankGpuTrace,
+            u32,
+            usize,
+        ),
+        GpuNativeTokenLoopError,
+    > {
+        let _guard = self.execution_guard.lock().await;
+        let out = self
+            .step_token_unified_inner(
+                engine,
+                request,
+                token_id,
+                position,
+                true,
+                None,
+                Some((trace_layout, diagnostic_staging_buffer)),
+            )
+            .await?;
+        let trace = out.router_rank_trace.ok_or_else(|| {
+            GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "router-rank diagnostic trace was not collected".into(),
+            }
+        })?;
+        let sampled_token =
+            out.sampled_token
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "router-rank diagnostic step produced no sampled token".into(),
+                })?;
+        Ok((trace, sampled_token, out.attempts))
     }
 
     /// Allocate a device-resident staging buffer for diagnostic trace readbacks.
@@ -1160,6 +1240,20 @@ impl GpuNativeTokenLoop {
             mapped_at_creation: false,
         });
         Ok(staging_buffer)
+    }
+
+    /// Allocate the target-layer-only router-rank readback buffer.
+    pub fn create_router_rank_diagnostic_staging_buffer(
+        &self,
+        trace_layout: &crate::gpu_native_router_rank_diagnostics::RouterRankTraceLayout,
+    ) -> Result<wgpu::Buffer, GpuNativeTokenLoopError> {
+        let gpu = self.executor.authoritative_gpu()?;
+        Ok(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_native_router_rank_diagnostic_staging"),
+            size: trace_layout.total_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }))
     }
     /// Diagnostic variant for layer-0 attention only. Bypasses router, MoE, and later layers.
     /// Executes one prompt position and captures all layer-0 attention intermediates.
@@ -1337,6 +1431,10 @@ impl GpuNativeTokenLoop {
             &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
             &wgpu::Buffer,
         )>,
+        router_rank_sink: Option<(
+            &crate::gpu_native_router_rank_diagnostics::RouterRankTraceLayout,
+            &wgpu::Buffer,
+        )>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
         let max_attempts = self.layers.len() + 1;
         let mut attempt = 0usize;
@@ -1357,6 +1455,11 @@ impl GpuNativeTokenLoop {
                 layout,
                 staging_buffer: buf,
             });
+            let router_rank_sink =
+                router_rank_sink.map(|(layout, buf)| GpuNativeRouterRankDiagnosticSink {
+                    layout,
+                    staging_buffer: buf,
+                });
             let output = self.execute_token_attempt_unified(
                 request,
                 token_id,
@@ -1364,6 +1467,7 @@ impl GpuNativeTokenLoop {
                 sample,
                 replay,
                 sink.as_ref(),
+                router_rank_sink.as_ref(),
             )?;
             let report = output.boundary_report;
 
@@ -1481,6 +1585,7 @@ impl GpuNativeTokenLoop {
                 },
                 attempts: attempt + 1,
                 diagnostic_trace: output.diagnostic_trace,
+                router_rank_trace: output.router_rank_trace,
             });
         }
     }
@@ -1494,8 +1599,9 @@ impl GpuNativeTokenLoop {
         sample: bool,
         replay: bool,
     ) -> Result<GpuNativeBoundaryReport, GpuNativeTokenLoopError> {
-        let output =
-            self.execute_token_attempt_unified(request, token_id, position, sample, replay, None)?;
+        let output = self.execute_token_attempt_unified(
+            request, token_id, position, sample, replay, None, None,
+        )?;
         Ok(output.boundary_report)
     }
 
@@ -1522,6 +1628,7 @@ impl GpuNativeTokenLoop {
             sample,
             replay,
             Some(&sink),
+            None,
         )?;
         output
             .diagnostic_trace
@@ -1539,6 +1646,7 @@ impl GpuNativeTokenLoop {
         sample: bool,
         replay: bool,
         diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
+        router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
     ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
         if position != request.committed_position {
             return Err(GpuNativeTokenLoopError::PositionMismatch {
@@ -1566,6 +1674,8 @@ impl GpuNativeTokenLoop {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some(if diagnostic_sink.is_some() {
                     "gpu_native_token_attempt_diagnostic"
+                } else if router_rank_sink.is_some() {
+                    "gpu_native_router_rank_diagnostic"
                 } else {
                     "gpu_native_token_attempt"
                 }),
@@ -1654,6 +1764,17 @@ impl GpuNativeTokenLoop {
                     (self.model_geometry.d_model * 4) as u64,
                 );
             }
+            if let Some(sink) =
+                router_rank_sink.filter(|sink| sink.layout.target_layer == layer_idx)
+            {
+                encoder.copy_buffer_to_buffer(
+                    request.token_state.hidden_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.router_input_offset,
+                    sink.layout.router_input_bytes,
+                );
+            }
 
             // 5. Router
             self.executor.encode_router(
@@ -1677,6 +1798,31 @@ impl GpuNativeTokenLoop {
                     sink.staging_buffer,
                     sink.layout.layer_selected_weights_offset(layer_idx),
                     (top_k * 4) as u64,
+                );
+            }
+            if let Some(sink) =
+                router_rank_sink.filter(|sink| sink.layout.target_layer == layer_idx)
+            {
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.logits_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.raw_logits_offset,
+                    sink.layout.raw_logits_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_ids_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.selected_ids_offset,
+                    sink.layout.selected_ids_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.router_scratch.selected_weights_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    sink.layout.selected_weights_offset,
+                    sink.layout.selected_weights_bytes,
                 );
             }
 
@@ -1883,9 +2029,33 @@ impl GpuNativeTokenLoop {
             None
         };
 
+        let router_rank_trace = if let Some(sink) = router_rank_sink {
+            let rank_slice = sink.staging_buffer.slice(..sink.layout.total_bytes);
+            let (tx_rank, rx_rank) = std::sync::mpsc::sync_channel(1);
+            rank_slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx_rank.send(res);
+            });
+            gpu.device.poll(wgpu::Maintain::Wait);
+            rx_rank
+                .recv()
+                .map_err(|e| GpuNativeTokenLoopError::MapFailed(e.to_string()))?
+                .map_err(|e| GpuNativeTokenLoopError::MapFailed(format!("{e:?}")))?;
+            let rank_mapped = rank_slice.get_mapped_range();
+            let trace = sink
+                .layout
+                .parse(&rank_mapped)
+                .map_err(|detail| GpuNativeTokenLoopError::InvalidBoundaryReport { detail })?;
+            drop(rank_mapped);
+            sink.staging_buffer.unmap();
+            Some(trace)
+        } else {
+            None
+        };
+
         Ok(GpuNativeAttemptOutput {
             boundary_report: report,
             diagnostic_trace,
+            router_rank_trace,
         })
     }
 }
