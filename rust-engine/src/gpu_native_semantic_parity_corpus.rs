@@ -28,6 +28,8 @@ pub const EXACT_ORDER_SAMPLING_RULE: &str =
     "first-exact-order-event-per-layer-in-frozen-corpus-order";
 pub const PERCENTILE_CONVENTION: &str =
     "nearest-rank: sort ascending; rank=max(1,ceil(p*n)); select rank-1";
+pub const POST_GENERATED_TOKEN_DIVERGENCE_INVALID_REASON: &str =
+    "post-generated-token-divergence-noncomparable";
 
 /// Full-layer staging layout used only by the corpus semantic diagnostic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,8 +431,7 @@ impl TokenCaseEvidence {
             .count();
         let mismatch_count = compared.saturating_sub(exact_match_count)
             + reference.len().max(gpu.len()).saturating_sub(compared);
-        let first_mismatch_position = (0..reference.len().max(gpu.len()))
-            .find(|&index| reference.get(index) != gpu.get(index));
+        let first_mismatch_position = first_generated_token_mismatch_position(&reference, &gpu);
         Self {
             case: case.into(),
             reference_generated_token_ids: reference,
@@ -440,6 +441,19 @@ impl TokenCaseEvidence {
             first_mismatch_position,
         }
     }
+}
+
+pub fn first_generated_token_mismatch_position(reference: &[u32], gpu: &[u32]) -> Option<usize> {
+    (0..reference.len().max(gpu.len())).find(|&index| reference.get(index) != gpu.get(index))
+}
+
+fn post_generated_token_divergence_invalid_reason(
+    first_mismatch_position: Option<usize>,
+    generated_position: usize,
+) -> Option<&'static str> {
+    first_mismatch_position
+        .is_some_and(|mismatch_position| generated_position > mismatch_position)
+        .then_some(POST_GENERATED_TOKEN_DIVERGENCE_INVALID_REASON)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -617,6 +631,7 @@ fn common_selected_score_deltas(
 pub struct RoutingEventEvidence {
     pub location: EventLocation,
     pub classification: RoutingClassification,
+    pub invalid_reason: Option<&'static str>,
     pub selected_membership_equal: Option<bool>,
     pub reference_selected_ids: Vec<u32>,
     pub gpu_selected_ids: Vec<u32>,
@@ -1294,6 +1309,17 @@ fn update_boundary_minimum(
     }
 }
 
+fn update_boundary_minimum_if_comparable(
+    current: &mut Option<(f32, FloatEvidence, EventLocation)>,
+    margin: &FloatEvidence,
+    location: &EventLocation,
+    semantically_comparable: bool,
+) {
+    if semantically_comparable {
+        update_boundary_minimum(current, margin, location);
+    }
+}
+
 fn plan_events(
     reference_cases: &[ReferenceCaseCapture],
     gpu: &GpuCapture,
@@ -1327,7 +1353,16 @@ fn plan_events(
         {
             return Err(format!("semantic corpus case {} coverage drifted", fixed.name).into());
         }
+        let first_mismatch_position = first_generated_token_mismatch_position(
+            &reference_case.generated_token_ids,
+            &gpu_case.generated_token_ids,
+        );
         for generated_position in 0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT {
+            let invalid_reason = post_generated_token_divergence_invalid_reason(
+                first_mismatch_position,
+                generated_position,
+            );
+            let semantically_comparable = invalid_reason.is_none();
             let reference_trace = &reference_case.traces[generated_position];
             let gpu_trace = &gpu_case.traces[generated_position];
             if reference_trace.layer_selected_ids.len() != gpu.model_geometry.num_layers
@@ -1374,12 +1409,16 @@ fn plan_events(
                         .iter()
                         .all(|output| output.len() == gpu.model_geometry.d_model)
                     && gpu_layer.routed_moe_output.len() == gpu.model_geometry.d_model;
-                let mut classification = classify_routing_event(
-                    reference_ids,
-                    &gpu_layer.selected_ids,
-                    gpu.model_geometry.num_experts,
-                    geometry_complete && !reference_nonfinite && !gpu_nonfinite,
-                );
+                let mut classification = if semantically_comparable {
+                    classify_routing_event(
+                        reference_ids,
+                        &gpu_layer.selected_ids,
+                        gpu.model_geometry.num_experts,
+                        geometry_complete && !reference_nonfinite && !gpu_nonfinite,
+                    )
+                } else {
+                    RoutingClassification::InvalidNonfiniteIncomplete
+                };
                 let reference_router =
                     if classification == RoutingClassification::InvalidNonfiniteIncomplete {
                         None
@@ -1421,19 +1460,23 @@ fn plan_events(
                 } else {
                     None
                 };
-                let gpu_pairing_structurally_valid = canonical_selected_weight_evidence(
-                    &gpu_layer.selected_ids,
-                    &gpu_layer.selected_weights,
-                    &gpu_layer.selected_ids,
-                    &gpu_layer.selected_weights,
-                    gpu.model_geometry.num_experts,
-                )
-                .is_ok();
-                let expert_weight_pairing_defect = !gpu_pairing_structurally_valid
-                    || actual_gpu_router
-                        .as_ref()
-                        .is_some_and(|router| !router.selected_weights_paired_with_expert_ids);
-                let displacement = rank_displacement(reference_ids, &gpu_layer.selected_ids);
+                let expert_weight_pairing_defect = semantically_comparable
+                    && (canonical_selected_weight_evidence(
+                        &gpu_layer.selected_ids,
+                        &gpu_layer.selected_weights,
+                        &gpu_layer.selected_ids,
+                        &gpu_layer.selected_weights,
+                        gpu.model_geometry.num_experts,
+                    )
+                    .is_err()
+                        || actual_gpu_router
+                            .as_ref()
+                            .is_some_and(|router| !router.selected_weights_paired_with_expert_ids));
+                let displacement = if semantically_comparable {
+                    rank_displacement(reference_ids, &gpu_layer.selected_ids)
+                } else {
+                    RankDisplacementEvidence::default()
+                };
                 let boundary = if matches!(
                     classification,
                     RoutingClassification::InternalRankPermutation
@@ -1456,17 +1499,19 @@ fn plan_events(
                     None
                 };
                 if let Some(router) = &reference_router {
-                    update_boundary_minimum(
+                    update_boundary_minimum_if_comparable(
                         &mut minimum_reference,
                         &router.cutoff_margins.rank_8_minus_rank_9_score,
                         &location,
+                        semantically_comparable,
                     );
                 }
                 if let Some(router) = &actual_gpu_router {
-                    update_boundary_minimum(
+                    update_boundary_minimum_if_comparable(
                         &mut minimum_gpu,
                         &router.cutoff_margins.rank_8_minus_rank_9_score,
                         &location,
+                        semantically_comparable,
                     );
                 }
                 let sampling = sampler.select(layer, classification);
@@ -1477,6 +1522,7 @@ fn plan_events(
                     evidence: RoutingEventEvidence {
                         location,
                         classification,
+                        invalid_reason,
                         selected_membership_equal: (classification
                             != RoutingClassification::InvalidNonfiniteIncomplete)
                             .then(|| same_membership(reference_ids, &gpu_layer.selected_ids)),
@@ -2097,9 +2143,10 @@ mod tests {
         RoutingEventEvidence {
             location: EventLocation::new(case, position, layer),
             classification,
-            selected_membership_equal: Some(
-                classification != RoutingClassification::MembershipMismatch,
-            ),
+            invalid_reason: None,
+            selected_membership_equal: (classification
+                != RoutingClassification::InvalidNonfiniteIncomplete)
+                .then_some(classification != RoutingClassification::MembershipMismatch),
             reference_selected_ids: vec![1, 2, 3],
             gpu_selected_ids: vec![1, 2, 3],
             displacement,
@@ -2109,6 +2156,134 @@ mod tests {
             numerically_selected: false,
             numerical_selection_reason: None,
         }
+    }
+
+    fn comparable_positions(reference: &[u32], gpu: &[u32]) -> Vec<bool> {
+        let first_mismatch_position = first_generated_token_mismatch_position(reference, gpu);
+        (0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT)
+            .map(|generated_position| {
+                post_generated_token_divergence_invalid_reason(
+                    first_mismatch_position,
+                    generated_position,
+                )
+                .is_none()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_token_mismatch_keeps_every_routing_position_comparable() {
+        let tokens = (0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT as u32).collect::<Vec<_>>();
+        assert_eq!(comparable_positions(&tokens, &tokens), vec![true; 16]);
+    }
+
+    #[test]
+    fn mismatch_at_zero_keeps_zero_comparable_and_invalidates_later_positions() {
+        let reference = (0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT as u32).collect::<Vec<_>>();
+        let mut gpu = reference.clone();
+        gpu[0] = 100;
+        let comparable = comparable_positions(&reference, &gpu);
+        assert!(comparable[0]);
+        assert!(comparable[1..].iter().all(|value| !value));
+    }
+
+    #[test]
+    fn interior_token_mismatch_keeps_mismatch_position_comparable() {
+        let reference = (0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT as u32).collect::<Vec<_>>();
+        let mut gpu = reference.clone();
+        gpu[5] = 100;
+        let comparable = comparable_positions(&reference, &gpu);
+        assert!(comparable[..=5].iter().all(|value| *value));
+        assert!(comparable[6..].iter().all(|value| !value));
+    }
+
+    #[test]
+    fn final_token_mismatch_keeps_all_routing_positions_comparable() {
+        let reference = (0..crate::greedy_parity::OUTPUT_TOKEN_LIMIT as u32).collect::<Vec<_>>();
+        let mut gpu = reference.clone();
+        gpu[15] = 100;
+        assert_eq!(
+            comparable_positions(&reference, &gpu),
+            vec![true; crate::greedy_parity::OUTPUT_TOKEN_LIMIT]
+        );
+    }
+
+    #[test]
+    fn post_divergence_records_remain_complete_invalid_unsampled_and_boundary_excluded() {
+        let first_mismatch_position = Some(1);
+        let mut sampler = DeterministicEventSampler::new(48);
+        let mut counters = RoutingCounters::default();
+        let mut boundary_minimum = None;
+        let mut sampled_post_divergence = 0usize;
+        let mut serialized_reason = None;
+
+        for case_index in 0..4 {
+            for generated_position in 0..16 {
+                let invalid_reason = post_generated_token_divergence_invalid_reason(
+                    first_mismatch_position,
+                    generated_position,
+                );
+                let semantically_comparable = invalid_reason.is_none();
+                for layer in 0..48 {
+                    let candidate = if generated_position == 0 {
+                        RoutingClassification::ExactOrderMatch
+                    } else {
+                        RoutingClassification::MembershipMismatch
+                    };
+                    let classification = if semantically_comparable {
+                        candidate
+                    } else {
+                        RoutingClassification::InvalidNonfiniteIncomplete
+                    };
+                    let sampling = sampler.select(layer, classification);
+                    if !semantically_comparable {
+                        sampled_post_divergence += usize::from(sampling.selected);
+                    }
+                    let mut evidence = event(
+                        &format!("case-{case_index}"),
+                        generated_position,
+                        layer,
+                        classification,
+                        RankDisplacementEvidence::default(),
+                        false,
+                    );
+                    evidence.invalid_reason = invalid_reason;
+                    evidence.numerically_selected = sampling.selected;
+                    evidence.numerical_selection_reason = sampling.reason;
+                    counters.record(&evidence, false, false);
+                    if serialized_reason.is_none() && invalid_reason.is_some() {
+                        serialized_reason = Some(serde_json::to_value(&evidence).unwrap());
+                    }
+                }
+                let margin = if generated_position == 0 {
+                    1.0
+                } else if generated_position == 1 {
+                    0.5
+                } else {
+                    -100.0
+                };
+                update_boundary_minimum_if_comparable(
+                    &mut boundary_minimum,
+                    &FloatEvidence::new(margin),
+                    &EventLocation::new(format!("case-{case_index}"), generated_position, 0),
+                    semantically_comparable,
+                );
+            }
+        }
+
+        assert_eq!(counters.total_routing_events, 4 * 16 * 48);
+        assert_eq!(counters.exact_order_match_events, 4 * 48);
+        assert_eq!(counters.membership_mismatch_events, 4 * 48);
+        assert_eq!(counters.internal_rank_permutation_events, 0);
+        assert_eq!(counters.invalid_events, 4 * 14 * 48);
+        assert_eq!(sampled_post_divergence, 0);
+        let (_, margin, event) = boundary_minimum.unwrap();
+        assert_eq!(margin.value, Some(0.5));
+        assert_eq!(event.generated_position, 1);
+        assert_eq!(
+            serialized_reason.unwrap()["invalid_reason"],
+            POST_GENERATED_TOKEN_DIVERGENCE_INVALID_REASON
+        );
     }
 
     #[test]
@@ -2307,17 +2482,18 @@ mod tests {
         assert_eq!(first.mismatch_count, 1);
         assert_eq!(first.first_mismatch_position, Some(1));
         assert_eq!(second.first_mismatch_position, Some(2));
+        assert_eq!(
+            first_generated_token_mismatch_position(&[4, 5, 6], &[4, 5]),
+            Some(2)
+        );
         let summary = summarize_tokens(&[first, second], 6);
         assert_eq!(summary.completed_generated_tokens, 5);
         assert_eq!(summary.exact_generated_token_matches, 4);
         assert_eq!(summary.generated_token_mismatches, 2);
-        assert_eq!(
-            summary
-                .first_generated_token_mismatch
-                .unwrap()
-                .generated_position,
-            1
-        );
+        let mismatch = summary.first_generated_token_mismatch.unwrap();
+        assert_eq!(mismatch.generated_position, 1);
+        assert_eq!(mismatch.reference_token_id, Some(2));
+        assert_eq!(mismatch.gpu_token_id, Some(9));
     }
 
     #[test]
