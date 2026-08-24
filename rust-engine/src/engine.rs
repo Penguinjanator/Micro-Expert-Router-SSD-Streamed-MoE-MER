@@ -2458,6 +2458,164 @@ impl Engine {
         })
     }
 
+    /// Diagnostic-only internal-stage attribution for one exact Q4_0 expert.
+    /// It fetches the canonical production payload, observes the unchanged
+    /// Candle reference sequence, and constructs host-only mixed replays. No
+    /// result from this method is admitted back into production execution.
+    pub(crate) async fn diagnose_q4_0_expert_stages(
+        self: &Arc<Self>,
+        global_expert_id: u32,
+        gpu_effective_input: &[f32],
+        actual_gpu_gate: &[f32],
+        actual_gpu_up: &[f32],
+        actual_gpu_gated: &[f32],
+    ) -> Result<crate::inference::Q4ExpertStageDiagnosticBundle, String> {
+        use sha2::{Digest, Sha256};
+
+        if self.core.options.dtype != WeightDtype::Q4_0
+            || self.execution_context().plan().routed_experts()
+                != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "Q4 stage attribution requires a strict CPU Q4_0 routed-expert plan".to_string(),
+            );
+        }
+        if gpu_effective_input.len() != self.core.shape.d_model
+            || actual_gpu_gate.len() != self.core.shape.d_ff
+            || actual_gpu_up.len() != self.core.shape.d_ff
+            || actual_gpu_gated.len() != self.core.shape.d_ff
+            || gpu_effective_input
+                .iter()
+                .chain(actual_gpu_gate)
+                .chain(actual_gpu_up)
+                .chain(actual_gpu_gated)
+                .any(|value| !value.is_finite())
+        {
+            return Err("Q4 stage attribution received nonfinite or malformed vectors".to_string());
+        }
+
+        self.core
+            .storage
+            .validate_expert_file_layout(std::iter::once(global_expert_id))
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} does not have the exact configured checkpoint file size: {error}"
+                )
+            })?;
+        let expected_payload = crate::inference::expert_weight_bytes_for(
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            WeightDtype::Q4_0,
+        );
+        let block_align = self.core.storage.config().block_align;
+        let checkpoint_payload_bytes =
+            crate::q4_parity::aligned_checkpoint_payload_bytes(expected_payload, block_align)?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| {
+                format!("failed to fetch global expert {global_expert_id}: {error}")
+            })?;
+        if resident.data().len() != checkpoint_payload_bytes {
+            return Err(format!(
+                "global expert {global_expert_id} checkpoint payload has {} bytes, expected {checkpoint_payload_bytes}",
+                resident.data().len()
+            ));
+        }
+        let (payload, padding) = resident.data().split_at(expected_payload);
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(format!(
+                "global expert {global_expert_id} has non-zero checkpoint alignment padding"
+            ));
+        }
+        let weights = crate::inference::OwnedExpertWeights::from_bytes_q4_0_with_tolerance(
+            payload,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            0,
+        )
+        .map_err(|error| format!("CPU Q4 stage weights failed: {error}"))?;
+        let cpu_boundary_input =
+            crate::numerical_diagnostics::round_trip_f16_values(gpu_effective_input)
+                .map_err(|error| format!("CPU input boundary emulation failed: {error}"))?;
+        let cpu_production = weights
+            .diagnostic_forward_stage_trace(&cpu_boundary_input)
+            .map_err(|error| format!("CPU production stage trace failed: {error}"))?;
+        let ordinary_cpu = crate::inference::q4_0_cpu_reference_forward(
+            payload,
+            &cpu_boundary_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+        )
+        .map_err(|error| format!("ordinary CPU production expert failed: {error}"))?;
+        if ordinary_cpu
+            .iter()
+            .map(|value| value.to_bits())
+            .ne(cpu_production.down.iter().map(|value| value.to_bits()))
+        {
+            return Err(
+                "CPU diagnostic stage final output differs from ordinary production output"
+                    .to_string(),
+            );
+        }
+        let cpu_effective_output =
+            crate::numerical_diagnostics::round_trip_f16_values(&cpu_production.down)
+                .map_err(|error| format!("CPU output boundary emulation failed: {error}"))?;
+        let current_gpu_emulation = crate::inference::diagnostic_q4_0_expert_arithmetic(
+            payload,
+            gpu_effective_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("current-GPU arithmetic emulation failed: {error}"))?;
+        let rejected_logical_dequant_emulation =
+            crate::inference::diagnostic_q4_0_expert_arithmetic(
+                payload,
+                gpu_effective_input,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+                crate::inference::DiagnosticQ4DotArithmetic::RejectedLogicalDequant,
+            )
+            .map_err(|error| format!("rejected logical-dequant emulation failed: {error}"))?;
+        let gpu_gate_up_through_cpu_swiglu_down = weights
+            .diagnostic_replay_gate_up(actual_gpu_gate, actual_gpu_up)
+            .map_err(|error| format!("GPU gate/up CPU replay failed: {error}"))?;
+        let gpu_gated_through_cpu_down = weights
+            .diagnostic_replay_down(actual_gpu_gated)
+            .map_err(|error| format!("GPU gated CPU-down replay failed: {error}"))?;
+        let cpu_gated_through_current_gpu_down = crate::inference::diagnostic_q4_0_down_arithmetic(
+            payload,
+            &cpu_production.gated,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("CPU gated current-GPU down replay failed: {error}"))?;
+        let gpu_gated_through_current_gpu_down = crate::inference::diagnostic_q4_0_down_arithmetic(
+            payload,
+            actual_gpu_gated,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("GPU gated current-GPU down replay failed: {error}"))?;
+
+        Ok(crate::inference::Q4ExpertStageDiagnosticBundle {
+            canonical_payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            cpu_boundary_input,
+            cpu_production,
+            cpu_effective_output,
+            current_gpu_emulation,
+            rejected_logical_dequant_emulation,
+            gpu_gate_up_through_cpu_swiglu_down,
+            gpu_gated_through_cpu_down,
+            cpu_gated_through_current_gpu_down,
+            gpu_gated_through_current_gpu_down,
+        })
+    }
+
     /// Snapshot the qualification-only real routed-expert execution counters.
     pub fn routed_expert_execution_snapshot(&self) -> RoutedExpertExecutionSnapshot {
         RoutedExpertExecutionSnapshot {

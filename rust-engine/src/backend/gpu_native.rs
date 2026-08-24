@@ -49,6 +49,8 @@ const GPU_NATIVE_KV_APPEND_SHADER: &str = include_str!("wgpu_shaders/gpu_native_
 const GPU_NATIVE_ATTENTION_SHADER: &str = include_str!("wgpu_shaders/gpu_native_attention.wgsl");
 const GPU_NATIVE_ROUTER_SHADER: &str = include_str!("wgpu_shaders/gpu_native_router.wgsl");
 const GPU_NATIVE_Q4_EXPERT_SHADER: &str = include_str!("wgpu_shaders/gpu_native_q4_expert.wgsl");
+const GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER: &str =
+    include_str!("wgpu_shaders/gpu_native_q4_expert_stage_diagnostic.wgsl");
 const GPU_NATIVE_EXPERT_CONTROL_SHADER: &str =
     include_str!("wgpu_shaders/gpu_native_expert_control.wgsl");
 const GPU_NATIVE_STATUS_CONTROL_SHADER: &str =
@@ -350,6 +352,10 @@ pub(crate) enum GpuNativeBootstrapError {
     ExpertScratchGeometry {
         expected: GpuNativeQ4ExpertGeometry,
         actual: GpuNativeQ4ExpertGeometry,
+    },
+    ExpertStageScratchElements {
+        expected: usize,
+        actual: usize,
     },
     InvalidAttentionHeadCount {
         tensor: GpuNativeAttentionTensor,
@@ -865,6 +871,10 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::ExpertScratchGeometry { expected, actual } => write!(
                 f,
                 "GPU-native expert scratch geometry {actual:?} does not match {expected:?}"
+            ),
+            Self::ExpertStageScratchElements { expected, actual } => write!(
+                f,
+                "GPU-native expert stage scratch has {actual} elements, expected {expected}"
             ),
             Self::InvalidAttentionHeadCount { tensor, heads } => write!(
                 f,
@@ -1645,6 +1655,18 @@ impl GpuNativeQ4ExpertGeometry {
 
     pub(crate) const fn top_k(self) -> usize {
         self.top_k
+    }
+
+    pub(crate) fn diagnostic_stage_elements(self) -> usize {
+        self.top_k
+            .checked_mul(self.d_ff)
+            .and_then(|elements| elements.checked_mul(3))
+            .and_then(|elements| {
+                self.top_k
+                    .checked_mul(self.d_model)
+                    .and_then(|down| elements.checked_add(down))
+            })
+            .expect("validated expert geometry must fit diagnostic stage elements")
     }
 
     pub(crate) const fn blocks_per_projection(self) -> usize {
@@ -5522,6 +5544,8 @@ struct GpuNativeQ4ExpertPipelines {
     route_resolve: wgpu::ComputePipeline,
     gate_up: wgpu::ComputePipeline,
     down: wgpu::ComputePipeline,
+    diagnostic_stage_gate_up: wgpu::ComputePipeline,
+    diagnostic_stage_down: wgpu::ComputePipeline,
     validate: wgpu::ComputePipeline,
     combine: wgpu::ComputePipeline,
     contain: wgpu::ComputePipeline,
@@ -5737,6 +5761,10 @@ impl GpuNativeQ4ExpertPipelines {
             label: Some("gpu_native_q4_expert_shader"),
             source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_Q4_EXPERT_SHADER.into()),
         });
+        let diagnostic_stage_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_q4_expert_stage_diagnostic_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER.into()),
+        });
         let control_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpu_native_expert_control_shader"),
             source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_EXPERT_CONTROL_SHADER.into()),
@@ -5772,6 +5800,18 @@ impl GpuNativeQ4ExpertPipelines {
                 &expert_pipeline_layout,
                 &expert_module,
                 "q4_expert_down_main",
+            ),
+            diagnostic_stage_gate_up: pipeline(
+                "gpu_native_q4_expert_stage_diagnostic_gate_up_pipeline",
+                &expert_pipeline_layout,
+                &diagnostic_stage_module,
+                "q4_expert_stage_gate_up_main",
+            ),
+            diagnostic_stage_down: pipeline(
+                "gpu_native_q4_expert_stage_diagnostic_down_pipeline",
+                &expert_pipeline_layout,
+                &diagnostic_stage_module,
+                "q4_expert_stage_down_main",
             ),
             validate: pipeline(
                 "gpu_native_expert_validate_pipeline",
@@ -6431,6 +6471,44 @@ impl GpuNativeExecutorContext {
         self.create_q4_expert_scratch_inner(geometry, true)
     }
 
+    /// Allocate one diagnostic-only storage vector containing raw gate, raw
+    /// up, post-SwiGLU activation, and down outputs for every selected route.
+    pub(crate) fn create_q4_expert_stage_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+    ) -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeScratchLayout::try_new(geometry.diagnostic_stage_elements())?;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        super::validate_startup_buffer(
+            "gpu_native_q4_expert_stage_diagnostic_scratch",
+            layout.bytes,
+            usage,
+            &gpu.device.limits(),
+        )?;
+        let scratch_id = next_nonzero_id(
+            &NEXT_GPU_NATIVE_SCRATCH_ID,
+            "Q4 expert stage diagnostic scratch",
+        );
+        Ok(GpuNativeScratch::from_buffer(
+            self.context_id,
+            scratch_id,
+            layout,
+            create_startup_buffer(
+                &gpu.device,
+                &format!("gpu_native_q4_expert_stage_diagnostic_{scratch_id}"),
+                layout.bytes,
+                usage,
+            )?,
+        ))
+    }
+
     fn create_q4_expert_scratch_inner(
         &self,
         geometry: GpuNativeQ4ExpertGeometry,
@@ -6817,6 +6895,160 @@ impl GpuNativeExecutorContext {
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
         self.counters.record_router_dispatch();
+        Ok(())
+    }
+
+    /// Diagnostic-only observation of raw Q4 expert stages. The method uses
+    /// the same arena, actual selected routes, push constants, byte layout,
+    /// workgroup geometry, Q4 accumulation contract, and SwiGLU expression as
+    /// production, but writes only to caller-owned diagnostic scratch.
+    pub(crate) fn encode_q4_expert_stage_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        router_plan: &GpuNativeRouterPlan,
+        router_scratch: &GpuNativeRouterScratch,
+        arena: &GpuNativeQ4ExpertArena,
+        state: &GpuNativeTokenState,
+        expert_scratch: &GpuNativeQ4ExpertScratch,
+        stage_scratch: &GpuNativeScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let limits = gpu.device.limits();
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        let _gate = validate_router_plan_with_registry(
+            self.context_id,
+            self.layout.d_model,
+            &self.dense_weights.lock(),
+            router_plan,
+        )?;
+        validate_router_scratch(self.context_id, router_plan.geometry, router_scratch)?;
+        validate_q4_expert_arena(self.context_id, arena, &limits)?;
+        validate_q4_expert_scratch(self.context_id, arena.geometry, expert_scratch, &limits)?;
+        validate_scratch_owner(self.context_id, stage_scratch.context_id)?;
+        validate_router_expert_geometry(router_plan, arena)?;
+        if stage_scratch.layout.elements() != arena.geometry.diagnostic_stage_elements() {
+            return Err(GpuNativeBootstrapError::ExpertStageScratchElements {
+                expected: arena.geometry.diagnostic_stage_elements(),
+                actual: stage_scratch.layout.elements(),
+            });
+        }
+        validate_q4_expert_pipeline_limits(&limits)?;
+        let route_workgroups = self.checked_workgroups(arena.geometry.top_k, &limits)?;
+        let gate_up_workgroups = self.checked_workgroups(arena.geometry.d_ff, &limits)?;
+        let down_workgroups = self.checked_workgroups(arena.geometry.d_model, &limits)?;
+        let bank_slots =
+            arena.plan.layout.banks.map(|bank| {
+                u32::try_from(bank.slot_capacity).expect("validated bank slot capacity")
+            });
+        let resolve_pc = GpuNativeExpertResolvePushConstants {
+            num_experts: arena.geometry.num_experts as u32,
+            top_k: arena.geometry.top_k as u32,
+            active_banks: arena.plan.layout.active_banks as u32,
+            _reserved: 0,
+            bank_slots,
+        };
+        let route_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_q4_stage_route_resolve_bind_group"),
+            layout: &self.q4_expert_pipelines.route_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: router_scratch.selected_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: arena.mapping.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_native_q4_stage_route_resolve_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.q4_expert_pipelines.route_resolve);
+            pass.set_bind_group(0, &route_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&resolve_pc));
+            pass.dispatch_workgroups(route_workgroups, 1, 1);
+        }
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_q4_expert_stage_diagnostic_bind_group"),
+            layout: &self.q4_expert_pipelines.expert_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: arena.banks[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: arena.banks[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: arena.banks[2].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: arena.banks[3].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.hidden.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: stage_scratch.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        for route_slot in 0..arena.geometry.top_k {
+            let pc = GpuNativeQ4ExpertPushConstants {
+                d_model: arena.geometry.d_model as u32,
+                d_ff: arena.geometry.d_ff as u32,
+                blocks_per_projection: arena.geometry.blocks_per_projection as u32,
+                slot_stride_bytes: arena.geometry.slot_stride_bytes as u32,
+                route_slot: route_slot as u32,
+                top_k: arena.geometry.top_k as u32,
+                swiglu_limit: crate::inference::swiglu_limit().unwrap_or(f32::INFINITY),
+                _reserved: 0,
+            };
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_stage_diagnostic_gate_up_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.diagnostic_stage_gate_up);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(gate_up_workgroups, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_stage_diagnostic_down_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.diagnostic_stage_down);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(down_workgroups, 1, 1);
+            }
+        }
         Ok(())
     }
 
@@ -11265,6 +11497,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn q4_expert_stage_shader_is_pinned_to_production_arithmetic() {
+        fn wgsl_function(source: &str, name: &str) -> String {
+            let marker = format!("fn {name}(");
+            let start = source.find(&marker).expect("WGSL function start");
+            let brace = source[start..]
+                .find('{')
+                .map(|offset| start + offset)
+                .expect("WGSL function brace");
+            let mut depth = 0usize;
+            let end = source[brace..]
+                .char_indices()
+                .find_map(|(offset, value)| {
+                    if value == '{' {
+                        depth += 1;
+                    } else if value == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(brace + offset + 1);
+                        }
+                    }
+                    None
+                })
+                .expect("WGSL function end");
+            source[start..end].to_string()
+        }
+
+        let production = wgsl_function(GPU_NATIVE_Q4_EXPERT_SHADER, "q4_dot");
+        let diagnostic_input =
+            wgsl_function(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER, "q4_dot_input")
+                .replace("q4_dot_input", "q4_dot");
+        let diagnostic_gated =
+            wgsl_function(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER, "q4_dot_gated")
+                .replace("q4_dot_gated", "q4_dot")
+                .replace("STAGES", "INPUT");
+        assert_eq!(diagnostic_input, production);
+        assert_eq!(diagnostic_gated, production);
+        let production_activation =
+            "let activation = (clamped_gate / (1.0 + exp(-clamped_gate))) * up;";
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains(production_activation));
+        assert!(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER.contains(production_activation));
+
+        use sha2::Digest as _;
+        assert_eq!(
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(GPU_NATIVE_Q4_EXPERT_SHADER.as_bytes())
+            ),
+            "54bae352aad7f25920212f596c00b8e3bac2c0a14281b9664d219d1eea212306"
+        );
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("fn q4_expert_gate_up_main"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("fn q4_expert_down_main"));
+    }
+
+    #[test]
     fn retryable_status_clear_preserves_fatal_and_unknown_bits() {
         assert_eq!(
             status_after_retryable_clear(GPU_NATIVE_STATUS_RETRYABLE_MASK),
@@ -11313,6 +11599,10 @@ pub(crate) mod tests {
             (
                 GPU_NATIVE_Q4_EXPERT_SHADER,
                 &["q4_expert_gate_up_main", "q4_expert_down_main"][..],
+            ),
+            (
+                GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER,
+                &["q4_expert_stage_gate_up_main", "q4_expert_stage_down_main"][..],
             ),
             (
                 GPU_NATIVE_EXPERT_CONTROL_SHADER,
