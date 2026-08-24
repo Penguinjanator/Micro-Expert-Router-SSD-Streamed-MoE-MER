@@ -145,6 +145,7 @@ pub(crate) mod gpu_native_expert_permutation_semantic_parity;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_router_rank_diagnostics;
+pub(crate) mod gpu_native_semantic_parity_corpus;
 
 pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
@@ -1004,6 +1005,18 @@ enum Cmd {
         #[arg(long)]
         report_out: PathBuf,
     },
+    /// Survey semantic parity across every routing event in the frozen greedy corpus without producing a qualification PASS.
+    DiagnoseGpuNativeSemanticParityCorpus {
+        /// Strict GPU-native Q4 configuration.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact required GPU adapter name (for example, "NVIDIA L4").
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required versioned diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
     /// Diagnose first internal mathematical divergence inside layer-0 attention between CPU reference and GPU-native execution.
     #[command(name = "diagnose-gpu-native-layer0-attention-first-divergence")]
     DiagnoseGpuNativeLayer0AttentionFirstDivergence {
@@ -1698,6 +1711,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeExpertPermutationSemanticParity { config, .. }
+        | Cmd::DiagnoseGpuNativeSemanticParityCorpus { config, .. }
         | Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence { config, .. }
         | Cmd::GreedyParityHybridWorkerInternal { config }
         | Cmd::GreedyParityLogitWorkerInternal { config } => Some(config.as_path()),
@@ -2279,6 +2293,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
+        }
+        Cmd::DiagnoseGpuNativeSemanticParityCorpus {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_semantic_parity_corpus::run_diagnostic(
+                    config,
+                    startup_config.take().ok_or(
+                        "diagnose-gpu-native-semantic-parity-corpus startup config was not parsed",
+                    )?,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                ),
+            )
         }
         Cmd::DiagnoseGpuNativeLayer0AttentionFirstDivergence {
             config: _,
@@ -14607,6 +14641,39 @@ mod tests {
         assert_eq!(*generated_position, 5);
         assert_eq!(*layer, 44);
         assert_eq!(report_out, &PathBuf::from("semantic-witness.json"));
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("strict-gpu-native.toml"))
+        );
+    }
+
+    #[test]
+    fn semantic_parity_corpus_diagnostic_cli_has_frozen_corpus_surface() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-semantic-parity-corpus",
+            "--config",
+            "strict-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "semantic-corpus.json",
+            "--progress-timeout-secs",
+            "300",
+        ])
+        .unwrap();
+        assert_eq!(cli.progress_timeout_secs, Some(300));
+        let Cmd::DiagnoseGpuNativeSemanticParityCorpus {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = &cli.cmd
+        else {
+            panic!("expected diagnose-gpu-native-semantic-parity-corpus command");
+        };
+        assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, &PathBuf::from("semantic-corpus.json"));
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("strict-gpu-native.toml"))
