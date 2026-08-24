@@ -1730,6 +1730,34 @@ async fn analyze_moe_outlier(
     })
 }
 
+fn enable_clean_cpu_q4_boundary_emulation_with<Enable, Snapshot>(
+    enable: Enable,
+    snapshot: Snapshot,
+) -> Result<crate::engine::CpuQ4BoundaryEmulationSnapshot, String>
+where
+    Enable: FnOnce() -> Result<(), String>,
+    Snapshot: FnOnce() -> crate::engine::CpuQ4BoundaryEmulationSnapshot,
+{
+    enable()?;
+    let boundary = snapshot();
+    if !boundary.enabled || boundary.routed_expert_dispatches != 0 {
+        return Err(format!(
+            "diagnostic CPU boundary emulation did not start clean: enabled={} routed_expert_dispatches={}",
+            boundary.enabled, boundary.routed_expert_dispatches
+        ));
+    }
+    Ok(boundary)
+}
+
+fn enable_clean_cpu_q4_boundary_emulation(
+    engine: &crate::engine::Engine,
+) -> Result<crate::engine::CpuQ4BoundaryEmulationSnapshot, String> {
+    enable_clean_cpu_q4_boundary_emulation_with(
+        || engine.enable_cpu_q4_boundary_emulation(),
+        || engine.cpu_q4_boundary_emulation_snapshot(),
+    )
+}
+
 async fn execute_reference_and_analyze(
     spec: &ResolvedRealCliSpec,
     tokenizer: Arc<crate::tokenizer::Tokenizer>,
@@ -1744,6 +1772,7 @@ async fn execute_reference_and_analyze(
     )
     .await?;
     let attempt = async {
+        let _boundary_before = enable_clean_cpu_q4_boundary_emulation(&runtime.engine)?;
         let observed_config_sha256 = crate::resolved_real_runtime_identity_sha256(
             &runtime.cfg,
             runtime.model.config.architecture,
@@ -1762,10 +1791,6 @@ async fn execute_reference_and_analyze(
             if gpu.gate_identities.get(&layer) != Some(&reference_identity) {
                 return Err(format!("diagnostic gate tensor identity differs at layer {layer}").into());
             }
-        }
-        let boundary_before = runtime.engine.cpu_q4_boundary_emulation_snapshot();
-        if !boundary_before.enabled || boundary_before.routed_expert_dispatches != 0 {
-            return Err("diagnostic CPU boundary emulation did not start clean".into());
         }
         let model_load = crate::greedy_parity_model_load(&runtime);
         let fixed = holdout_case(RUST_TARGET_CASE)?;
@@ -2110,6 +2135,7 @@ pub async fn run_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::CpuQ4BoundaryEmulationSnapshot;
 
     fn strict_model_load() -> crate::greedy_parity::ModelLoadEvidence {
         crate::greedy_parity::ModelLoadEvidence {
@@ -2196,6 +2222,88 @@ mod tests {
             offline_failure_analysis_sha256: FROZEN_OFFLINE_ANALYSIS_SHA256,
             immutable_input_verified: true,
         }
+    }
+
+    #[test]
+    fn diagnostic_cpu_q4_boundary_setup_enables_before_clean_snapshot() {
+        use std::cell::{Cell, RefCell};
+
+        let enabled = Cell::new(false);
+        let dispatches = Cell::new(0u64);
+        let calls = RefCell::new(Vec::new());
+        let boundary = enable_clean_cpu_q4_boundary_emulation_with(
+            || {
+                calls.borrow_mut().push("enable");
+                enabled.set(true);
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("snapshot");
+                CpuQ4BoundaryEmulationSnapshot {
+                    enabled: enabled.get(),
+                    routed_expert_dispatches: dispatches.get(),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*calls.borrow(), ["enable", "snapshot"]);
+        assert!(boundary.enabled);
+        assert_eq!(boundary.routed_expert_dispatches, 0);
+    }
+
+    #[test]
+    fn diagnostic_cpu_q4_boundary_setup_reports_and_preserves_nonzero_dispatches() {
+        use std::cell::Cell;
+
+        let enabled = Cell::new(false);
+        let dispatches = Cell::new(7u64);
+        let error = enable_clean_cpu_q4_boundary_emulation_with(
+            || {
+                enabled.set(true);
+                Ok(())
+            },
+            || CpuQ4BoundaryEmulationSnapshot {
+                enabled: enabled.get(),
+                routed_expert_dispatches: dispatches.get(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(dispatches.get(), 7);
+        assert_eq!(
+            error,
+            "diagnostic CPU boundary emulation did not start clean: enabled=true routed_expert_dispatches=7"
+        );
+    }
+
+    #[test]
+    fn diagnostic_cpu_q4_boundary_setup_propagates_strict_plan_enable_failure() {
+        use std::cell::Cell;
+
+        let snapshot_called = Cell::new(false);
+        let error = enable_clean_cpu_q4_boundary_emulation_with(
+            || {
+                Err(
+                    "Q4 boundary emulation requires a strict CPU Q4_0 routed-expert plan"
+                        .to_string(),
+                )
+            },
+            || {
+                snapshot_called.set(true);
+                CpuQ4BoundaryEmulationSnapshot {
+                    enabled: false,
+                    routed_expert_dispatches: 0,
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(!snapshot_called.get());
+        assert_eq!(
+            error,
+            "Q4 boundary emulation requires a strict CPU Q4_0 routed-expert plan"
+        );
     }
 
     #[test]
