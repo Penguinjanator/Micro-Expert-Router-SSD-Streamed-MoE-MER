@@ -2381,7 +2381,9 @@ impl Engine {
         let resident = self
             .fetch_with_retry(global_expert_id)
             .await
-            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
+            .map_err(|error| {
+                format!("failed to fetch global expert {global_expert_id}: {error}")
+            })?;
         if resident.data().len() != checkpoint_payload_bytes {
             return Err(format!(
                 "global expert {global_expert_id} checkpoint payload has {} bytes, expected exactly {checkpoint_payload_bytes} ({expected_payload} canonical Q4_0 bytes plus alignment padding)",
@@ -2456,6 +2458,89 @@ impl Engine {
             checkpoint_payload_sha256,
             dispatches,
         })
+    }
+
+    /// Diagnostic-only replay of one frozen exact-f32 GPU expert input through
+    /// the old boundary-emulated CPU reference, the ordinary production CPU
+    /// Q4 reference, and the existing current-GPU arithmetic emulator. The
+    /// canonical payload hash is checked before any arithmetic is performed.
+    pub(crate) async fn audit_q4_0_f32_reference_boundary(
+        self: &Arc<Self>,
+        global_expert_id: u32,
+        exact_gpu_f32_input: &[f32],
+        expected_canonical_payload_sha256: &str,
+    ) -> Result<crate::gpu_native_f32_reference_boundary_audit::Q4F32ReferenceReplayBundle, String>
+    {
+        use sha2::{Digest, Sha256};
+
+        if self.core.options.dtype != WeightDtype::Q4_0
+            || self.execution_context().plan().routed_experts()
+                != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "f32 reference-boundary audit requires a strict CPU Q4_0 routed-expert plan"
+                    .to_string(),
+            );
+        }
+        if exact_gpu_f32_input.len() != self.core.shape.d_model
+            || exact_gpu_f32_input.iter().any(|value| !value.is_finite())
+            || expected_canonical_payload_sha256.len() != 64
+            || !expected_canonical_payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "f32 reference-boundary audit received malformed input or payload identity"
+                    .to_string(),
+            );
+        }
+        self.core
+            .storage
+            .validate_expert_file_layout(std::iter::once(global_expert_id))
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} does not have the exact configured checkpoint file size: {error}"
+                )
+            })?;
+        let expected_payload = crate::inference::expert_weight_bytes_for(
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            WeightDtype::Q4_0,
+        );
+        let checkpoint_payload_bytes = crate::q4_parity::aligned_checkpoint_payload_bytes(
+            expected_payload,
+            self.core.storage.config().block_align,
+        )?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
+        if resident.data().len() != checkpoint_payload_bytes {
+            return Err(format!(
+                "global expert {global_expert_id} checkpoint payload has {} bytes, expected {checkpoint_payload_bytes}",
+                resident.data().len()
+            ));
+        }
+        let (payload, padding) = resident.data().split_at(expected_payload);
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(format!(
+                "global expert {global_expert_id} has non-zero checkpoint alignment padding"
+            ));
+        }
+        let canonical_payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        if !canonical_payload_sha256.eq_ignore_ascii_case(expected_canonical_payload_sha256) {
+            return Err(format!(
+                "global expert {global_expert_id} canonical Q4 payload SHA differs: observed {canonical_payload_sha256} expected {expected_canonical_payload_sha256}"
+            ));
+        }
+        crate::gpu_native_f32_reference_boundary_audit::audit_q4_reference_paths(
+            payload,
+            exact_gpu_f32_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            canonical_payload_sha256,
+        )
     }
 
     /// Diagnostic-only internal-stage attribution for one exact Q4_0 expert.

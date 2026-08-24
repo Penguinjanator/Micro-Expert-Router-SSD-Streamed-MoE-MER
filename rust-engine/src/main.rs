@@ -142,6 +142,7 @@ mod gguf_loader;
 mod gpu_native_residency;
 pub(crate) mod gpu_native_diagnostics;
 pub(crate) mod gpu_native_expert_permutation_semantic_parity;
+pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
@@ -992,6 +993,29 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Audit the frozen GPU-native Q4 evidence against ordinary exact-f32 CPU references.
+    #[command(name = "diagnose-gpu-native-f32-reference-boundary")]
+    DiagnoseGpuNativeF32ReferenceBoundary {
+        /// Path to the strict GPU-native Q4 TOML config used to build a CPU-only reference.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact frozen GPU-native semantic-parity v2 report.
+        #[arg(long)]
+        v2_report: PathBuf,
+        /// Required frozen SHA256 of the supplied v2 report.
+        #[arg(long)]
+        expected_v2_report_sha256: String,
+        /// Exact frozen GPU-native Q4 expert-stage attribution report.
+        #[arg(long)]
+        stage_report: PathBuf,
+        /// Required frozen SHA256 of the supplied stage report.
+        #[arg(long)]
+        expected_stage_report_sha256: String,
+        /// Required typed diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
     DiagnoseHybridQ4GreedyDivergence {
@@ -1767,6 +1791,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativeSemanticParityV2 { config, .. }
         | Cmd::DiagnoseGpuNativeV2HoldoutFailures { config, .. }
         | Cmd::DiagnoseGpuNativeQ4ExpertStages { config, .. }
+        | Cmd::DiagnoseGpuNativeF32ReferenceBoundary { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
@@ -2296,6 +2321,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     expected_adapter_name,
                     bea_report,
                     expected_bea_report_sha256,
+                    report_out,
+                    progress_watchdog,
+                ),
+            )
+        }
+        Cmd::DiagnoseGpuNativeF32ReferenceBoundary {
+            config,
+            v2_report,
+            expected_v2_report_sha256,
+            stage_report,
+            expected_stage_report_sha256,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_f32_reference_boundary_audit::run_diagnostic(
+                    config,
+                    startup_config.take().ok_or(
+                        "diagnose-gpu-native-f32-reference-boundary startup config was not parsed",
+                    )?,
+                    v2_report,
+                    expected_v2_report_sha256,
+                    stage_report,
+                    expected_stage_report_sha256,
                     report_out,
                     progress_watchdog,
                 ),
@@ -14927,6 +14978,70 @@ mod tests {
         assert_eq!(
             crate::gpu_native_q4_expert_stage_attribution::SCHEMA_VERSION,
             "mer.gpu-native-q4-expert-stage-attribution.v1"
+        );
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("strict-gpu-native.toml"))
+        );
+    }
+
+    #[test]
+    fn f32_reference_boundary_audit_cli_has_versioned_cpu_only_frozen_surface() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-f32-reference-boundary",
+            "--config",
+            "strict-gpu-native.toml",
+            "--v2-report",
+            "gpu-native-semantic-parity-v2-300448ac.json",
+            "--expected-v2-report-sha256",
+            crate::gpu_native_f32_reference_boundary_audit::FROZEN_V2_REPORT_SHA256,
+            "--stage-report",
+            "gpu-native-q4-expert-stage-attribution-987e7e4b.json",
+            "--expected-stage-report-sha256",
+            crate::gpu_native_f32_reference_boundary_audit::FROZEN_STAGE_REPORT_SHA256,
+            "--report-out",
+            "f32-reference-boundary-audit.json",
+            "--progress-timeout-secs",
+            "300",
+        ])
+        .unwrap();
+        assert_eq!(cli.progress_timeout_secs, Some(300));
+        let Cmd::DiagnoseGpuNativeF32ReferenceBoundary {
+            config,
+            v2_report,
+            expected_v2_report_sha256,
+            stage_report,
+            expected_stage_report_sha256,
+            report_out,
+        } = &cli.cmd
+        else {
+            panic!("expected diagnose-gpu-native-f32-reference-boundary command");
+        };
+        assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
+        assert_eq!(
+            v2_report,
+            &PathBuf::from("gpu-native-semantic-parity-v2-300448ac.json")
+        );
+        assert_eq!(
+            expected_v2_report_sha256,
+            crate::gpu_native_f32_reference_boundary_audit::FROZEN_V2_REPORT_SHA256
+        );
+        assert_eq!(
+            stage_report,
+            &PathBuf::from("gpu-native-q4-expert-stage-attribution-987e7e4b.json")
+        );
+        assert_eq!(
+            expected_stage_report_sha256,
+            crate::gpu_native_f32_reference_boundary_audit::FROZEN_STAGE_REPORT_SHA256
+        );
+        assert_eq!(
+            report_out,
+            &PathBuf::from("f32-reference-boundary-audit.json")
+        );
+        assert_eq!(
+            crate::gpu_native_f32_reference_boundary_audit::SCHEMA_VERSION,
+            "mer.gpu-native-f32-reference-boundary-audit.v1"
         );
         assert_eq!(
             super::startup_config_path(&cli.cmd),
