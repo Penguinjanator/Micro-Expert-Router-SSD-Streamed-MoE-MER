@@ -1044,6 +1044,46 @@ mod tests {
     }
 
     #[test]
+    fn pre_fix_foreground_admission_self_evicts_a_current_selected_source() {
+        let cache = GpuExpertCache::new(16, 0.0, 0);
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(7, vec![1; 8])))
+            .unwrap();
+        let selected_a_generation = cache.current_generation(7).unwrap();
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(99, vec![9; 8])))
+            .unwrap();
+
+        let selected_a = GpuNativeDemandExpert::current(7);
+        assert!(cache.contains_generation(7, selected_a_generation));
+
+        // This is the old engine ordering: A was classified as Current, then
+        // selected B was admitted independently. A is the logical LRU even
+        // though non-selected 99 is an eligible victim and A+B fit together.
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![2; 8])))
+            .unwrap();
+        assert!(!cache.contains_generation(7, selected_a_generation));
+        assert!(cache.contains(99));
+        assert!(cache.contains(8));
+
+        let final_resolution = if cache.contains_generation(7, selected_a_generation) {
+            Ok(())
+        } else {
+            match selected_a {
+                GpuNativeDemandExpert::Current { global_id } => {
+                    Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id })
+                }
+                GpuNativeDemandExpert::Install { .. } => unreachable!(),
+            }
+        };
+        assert_eq!(
+            final_resolution,
+            Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: 7 })
+        );
+    }
+
+    #[test]
     fn model_plan_requires_top_k_slots_per_layer_and_counts_every_arena() {
         let limits = limits();
         let geometry = geometry();
