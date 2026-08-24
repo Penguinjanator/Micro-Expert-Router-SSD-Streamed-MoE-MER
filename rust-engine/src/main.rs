@@ -146,6 +146,7 @@ pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
+pub(crate) mod gpu_native_semantic_parity_v2;
 
 pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
@@ -935,6 +936,20 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Qualify GPU-native semantic correctness over the independent frozen v2 holdout corpus.
+    #[command(name = "qualify-gpu-native-semantic-parity-v2")]
+    QualifyGpuNativeSemanticParityV2 {
+        /// Path to the strict GPU-native Q4 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for both isolated runtimes.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required versioned typed JSON qualification destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
     DiagnoseHybridQ4GreedyDivergence {
@@ -1707,6 +1722,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
         | Cmd::QualifyGpuNativeQ4GreedyParity { config, .. }
+        | Cmd::QualifyGpuNativeSemanticParityV2 { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
@@ -2173,6 +2189,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     report_out,
                     progress_watchdog,
                 },
+            ))
+        }
+        Cmd::QualifyGpuNativeSemanticParityV2 {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_semantic_parity_v2::run_qualification(
+                config,
+                startup_config
+                    .take()
+                    .ok_or("qualify-gpu-native-semantic-parity-v2 startup config was not parsed")?,
+                expected_adapter_name,
+                report_out,
+                progress_watchdog,
             ))
         }
         Cmd::DiagnoseHybridQ4GreedyDivergence {
@@ -14674,6 +14708,39 @@ mod tests {
         assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
         assert_eq!(expected_adapter_name, "NVIDIA L4");
         assert_eq!(report_out, &PathBuf::from("semantic-corpus.json"));
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("strict-gpu-native.toml"))
+        );
+    }
+
+    #[test]
+    fn semantic_parity_v2_qualifier_cli_has_versioned_strict_surface() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-semantic-parity-v2",
+            "--config",
+            "strict-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "semantic-parity-v2.json",
+            "--progress-timeout-secs",
+            "300",
+        ])
+        .unwrap();
+        assert_eq!(cli.progress_timeout_secs, Some(300));
+        let Cmd::QualifyGpuNativeSemanticParityV2 {
+            config,
+            expected_adapter_name,
+            report_out,
+        } = &cli.cmd
+        else {
+            panic!("expected qualify-gpu-native-semantic-parity-v2 command");
+        };
+        assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, &PathBuf::from("semantic-parity-v2.json"));
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("strict-gpu-native.toml"))
