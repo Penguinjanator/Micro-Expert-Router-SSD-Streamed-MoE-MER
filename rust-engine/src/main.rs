@@ -147,6 +147,7 @@ pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
+pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
 pub(crate) mod gpu_native_token_loop;
 #[cfg(feature = "grpc")]
@@ -950,6 +951,26 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Attribute the frozen first GPU-native semantic-parity v2 holdout failures.
+    #[command(name = "diagnose-gpu-native-v2-holdout-failures")]
+    DiagnoseGpuNativeV2HoldoutFailures {
+        /// Path to the strict GPU-native Q4 TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact wgpu adapter name required for the isolated GPU runtime.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Exact frozen v2 qualification report to consume as immutable evidence.
+        #[arg(long)]
+        v2_report: PathBuf,
+        /// Required frozen SHA256 of the supplied v2 report.
+        #[arg(long)]
+        expected_v2_report_sha256: String,
+        /// Required typed diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
     DiagnoseHybridQ4GreedyDivergence {
@@ -1723,6 +1744,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
         | Cmd::QualifyGpuNativeQ4GreedyParity { config, .. }
         | Cmd::QualifyGpuNativeSemanticParityV2 { config, .. }
+        | Cmd::DiagnoseGpuNativeV2HoldoutFailures { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
@@ -2208,6 +2230,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report_out,
                 progress_watchdog,
             ))
+        }
+        Cmd::DiagnoseGpuNativeV2HoldoutFailures {
+            config,
+            expected_adapter_name,
+            v2_report,
+            expected_v2_report_sha256,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_v2_holdout_failure_attribution::run_diagnostic(
+                    config,
+                    startup_config.take().ok_or(
+                        "diagnose-gpu-native-v2-holdout-failures startup config was not parsed",
+                    )?,
+                    expected_adapter_name,
+                    v2_report,
+                    expected_v2_report_sha256,
+                    report_out,
+                    progress_watchdog,
+                ),
+            )
         }
         Cmd::DiagnoseHybridQ4GreedyDivergence {
             config,
@@ -14741,6 +14787,53 @@ mod tests {
         assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
         assert_eq!(expected_adapter_name, "NVIDIA L4");
         assert_eq!(report_out, &PathBuf::from("semantic-parity-v2.json"));
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("strict-gpu-native.toml"))
+        );
+    }
+
+    #[test]
+    fn v2_holdout_failure_attribution_cli_has_frozen_input_surface() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "diagnose-gpu-native-v2-holdout-failures",
+            "--config",
+            "strict-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--v2-report",
+            "gpu-native-semantic-parity-v2-300448ac.json",
+            "--expected-v2-report-sha256",
+            crate::gpu_native_v2_holdout_failure_attribution::FROZEN_V2_REPORT_SHA256,
+            "--report-out",
+            "v2-holdout-attribution.json",
+            "--progress-timeout-secs",
+            "300",
+        ])
+        .unwrap();
+        assert_eq!(cli.progress_timeout_secs, Some(300));
+        let Cmd::DiagnoseGpuNativeV2HoldoutFailures {
+            config,
+            expected_adapter_name,
+            v2_report,
+            expected_v2_report_sha256,
+            report_out,
+        } = &cli.cmd
+        else {
+            panic!("expected diagnose-gpu-native-v2-holdout-failures command");
+        };
+        assert_eq!(config, &PathBuf::from("strict-gpu-native.toml"));
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(
+            v2_report,
+            &PathBuf::from("gpu-native-semantic-parity-v2-300448ac.json")
+        );
+        assert_eq!(
+            expected_v2_report_sha256,
+            crate::gpu_native_v2_holdout_failure_attribution::FROZEN_V2_REPORT_SHA256
+        );
+        assert_eq!(report_out, &PathBuf::from("v2-holdout-attribution.json"));
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("strict-gpu-native.toml"))

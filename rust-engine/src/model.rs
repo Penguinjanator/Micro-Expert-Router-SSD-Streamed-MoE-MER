@@ -2953,6 +2953,19 @@ impl RealModel {
         })
     }
 
+    /// Diagnostic-only replay of the production final RMSNorm on a
+    /// caller-supplied hidden vector. Ordinary inference does not call this
+    /// observation seam.
+    pub(crate) fn diagnostic_final_rms_norm(&self, hidden: &[f32]) -> Vec<f32> {
+        self.final_rms.forward(hidden)
+    }
+
+    /// Diagnostic-only full-logit view using the same per-row dot contract as
+    /// the production greedy argmax path.
+    pub(crate) fn diagnostic_greedy_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        self.lm_head.diagnostic_greedy_logits(hidden)
+    }
+
     /// Sample a next-token id from an already-computed final hidden state.
     ///
     /// Sampling is delegated to [`crate::sampling::sample`], so
