@@ -146,6 +146,7 @@ pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
+pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
@@ -866,6 +867,44 @@ enum Cmd {
         /// Output format.
         #[arg(long, value_enum, default_value_t = BenchRealOutputFormat::Human)]
         format: BenchRealOutputFormat,
+    },
+
+    /// Benchmark the ordinary production GPU-native real-model token loop.
+    ///
+    /// This is throughput evidence only. It requires strict greedy execution,
+    /// exact hardware identity, and a complete real checkpoint, and it never
+    /// invokes diagnostic token-step variants.
+    BenchGpuNativeReal {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Prompt text to tokenize once and benchmark.
+        #[arg(long, conflicts_with = "request_json")]
+        prompt: Option<String>,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`.
+        #[arg(long, conflicts_with = "prompt")]
+        request_json: Option<PathBuf>,
+        /// Exact number of generated tokens; must be at least two.
+        #[arg(long)]
+        output_tokens: Option<usize>,
+        /// Warmup requests, excluded from measured aggregates.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+        /// Measured requests retained individually in the report.
+        #[arg(long, default_value_t = 1)]
+        measured_runs: usize,
+        /// Cache/runtime reset policy.
+        #[arg(long, value_enum, default_value_t = BenchRealCacheReset::Keep)]
+        cache_reset: BenchRealCacheReset,
+        /// Required first-baseline sampling contract.
+        #[arg(long, required = true)]
+        greedy: bool,
+        /// Exact authoritative adapter name expected at runtime.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Write the typed JSON benchmark report here instead of stdout.
+        #[arg(long)]
+        report_out: Option<PathBuf>,
     },
 
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
@@ -1817,6 +1856,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
+        | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2211,6 +2251,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
                 progress_watchdog,
             }))
+        }
+        Cmd::BenchGpuNativeReal {
+            config,
+            prompt,
+            request_json,
+            output_tokens,
+            warmup_runs,
+            measured_runs,
+            cache_reset,
+            greedy,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_real_benchmark::run_command(
+                crate::gpu_native_real_benchmark::CommandArgs {
+                    config,
+                    prompt,
+                    request_json,
+                    output_tokens,
+                    warmup_runs,
+                    measured_runs,
+                    cache_reset,
+                    greedy,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
         }
         Cmd::QualifyHybridQ4 {
             config,
@@ -9881,6 +9952,7 @@ enum RealCliRuntimeMode {
     IsolatedGreedyParityCpu,
     IsolatedGreedyParityHybrid,
     IsolatedGpuNativeDiagnostic,
+    IsolatedGpuNativeBenchmark,
 }
 
 impl RealCliRuntimeMode {
@@ -9890,6 +9962,7 @@ impl RealCliRuntimeMode {
             Self::IsolatedGreedyParityCpu
                 | Self::IsolatedGreedyParityHybrid
                 | Self::IsolatedGpuNativeDiagnostic
+                | Self::IsolatedGpuNativeBenchmark
         )
     }
 
@@ -9899,6 +9972,7 @@ impl RealCliRuntimeMode {
             Self::StrictHybridQualification
                 | Self::IsolatedGreedyParityHybrid
                 | Self::IsolatedGpuNativeDiagnostic
+                | Self::IsolatedGpuNativeBenchmark
         )
     }
 
@@ -9910,6 +9984,7 @@ impl RealCliRuntimeMode {
                 "qualify-hybrid-q4-greedy-parity"
             }
             Self::IsolatedGpuNativeDiagnostic => "diagnose-gpu-native-q4-first-divergence",
+            Self::IsolatedGpuNativeBenchmark => "bench-gpu-native-real",
         }
     }
 }
@@ -9985,7 +10060,8 @@ async fn build_real_cli_runtime(
         }
         RealCliRuntimeMode::IsolatedGreedyParityCpu
         | RealCliRuntimeMode::IsolatedGreedyParityHybrid
-        | RealCliRuntimeMode::IsolatedGpuNativeDiagnostic => {
+        | RealCliRuntimeMode::IsolatedGpuNativeDiagnostic
+        | RealCliRuntimeMode::IsolatedGpuNativeBenchmark => {
             return Err("isolated qualification runtimes must use the private isolated factory".into());
         }
     };
@@ -9999,6 +10075,8 @@ fn resolve_real_cli_spec_from_config(
     crate::parallel::set_dense_matvec_backend(cfg.real_transformer.dense_matvec_backend);
     if mode == RealCliRuntimeMode::BenchReal {
         validate_bench_real_policies(&cfg)?;
+    } else if mode == RealCliRuntimeMode::IsolatedGpuNativeBenchmark {
+        crate::gpu_native_real_benchmark::validate_source_config(&cfg)?;
     }
 
     let (resolved_architecture, resolved_first_k_dense_replace, resolved_advanced) =
@@ -10127,6 +10205,7 @@ async fn build_isolated_greedy_runtime(
         RealCliRuntimeMode::IsolatedGpuNativeDiagnostic => {
             crate::backend::ComputeOffload::Gpu
         }
+        RealCliRuntimeMode::IsolatedGpuNativeBenchmark => crate::backend::ComputeOffload::Gpu,
         _ => return Err("non-isolated runtime mode passed to isolated factory".into()),
     };
     let context = resolve_isolated_real_cli_context(spec, requested)?;
