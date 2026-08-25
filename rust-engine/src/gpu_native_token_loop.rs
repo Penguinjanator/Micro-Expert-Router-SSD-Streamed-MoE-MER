@@ -3751,6 +3751,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tiny_cold_recovery_fixture_matches_warm_generated_token_sequence() {
+        const NUM_LAYERS: usize = 6;
+        const MISS_LAYER: usize = 2;
+
+        fn layer_step(hidden: u32, layer: usize) -> u32 {
+            hidden.wrapping_mul(33).wrapping_add(layer as u32 + 1) % 1_009
+        }
+
+        fn generate(cold_first_token: bool) -> (Vec<u32>, GpuNativeRecoverySnapshot) {
+            let mut input = 7u32;
+            let mut output = Vec::new();
+            let counters = GpuNativeRecoveryCounters::default();
+            for position in 0..3 {
+                let mut hidden = input.wrapping_add(position);
+                if cold_first_token && position == 0 {
+                    for layer in 0..MISS_LAYER {
+                        hidden = layer_step(hidden, layer);
+                    }
+                    let checkpoint = hidden;
+                    let mut cursor = GpuNativeRecoveryCursor::after_serviced_miss(
+                        NUM_LAYERS,
+                        recovery_miss(MISS_LAYER),
+                    )
+                    .unwrap();
+                    loop {
+                        let segment = cursor.plan(NUM_LAYERS).unwrap();
+                        if matches!(
+                            segment.attempt_start,
+                            GpuNativeAttemptStart::ResumeExpert { .. }
+                        ) {
+                            hidden = checkpoint;
+                            hidden = layer_step(hidden, MISS_LAYER);
+                            counters.resume_attempts.fetch_add(1, Ordering::Relaxed);
+                            counters.checkpoint_restores.fetch_add(1, Ordering::Relaxed);
+                        }
+                        counters.recovery_segments.fetch_add(1, Ordering::Relaxed);
+                        for layer in segment.ordinary_layers.clone() {
+                            hidden = layer_step(hidden, layer);
+                        }
+                        if cursor.record_clean_segment(&segment, NUM_LAYERS).unwrap() {
+                            break;
+                        }
+                    }
+                } else {
+                    for layer in 0..NUM_LAYERS {
+                        hidden = layer_step(hidden, layer);
+                    }
+                }
+                input = hidden;
+                output.push(hidden);
+            }
+            (output, counters.snapshot())
+        }
+
+        let (warm_tokens, warm_recovery) = generate(false);
+        let (cold_tokens, cold_recovery) = generate(true);
+        assert_eq!(cold_tokens, warm_tokens);
+        assert_eq!(warm_recovery.resume_attempts, 0);
+        assert!(cold_recovery.resume_attempts > 0);
+        assert_eq!(cold_recovery.full_token_replay_attempts, 0);
+    }
+
+    #[test]
     fn recovery_route_assembly_overwrites_only_attempted_layers() {
         let warm_routes = vec![vec![3, 1], vec![2, 0], vec![1, 3], vec![0, 2]];
         let mut assembled = warm_routes.clone();

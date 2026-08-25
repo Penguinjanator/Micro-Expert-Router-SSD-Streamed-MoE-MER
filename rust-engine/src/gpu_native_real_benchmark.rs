@@ -8,7 +8,9 @@
 use crate::backend::{GpuDeviceIdentity, GpuExpertIoSnapshot, GpuExpertMemorySnapshot};
 use crate::engine::RoutedExpertExecutionSnapshot;
 use crate::gpu_native_residency::GpuNativeTieredResidencySnapshot;
-use crate::gpu_native_token_loop::{GpuNativeModelGeometry, GpuNativeTokenLoopSnapshot};
+use crate::gpu_native_token_loop::{
+    GpuNativeModelGeometry, GpuNativeRecoverySnapshot, GpuNativeTokenLoopSnapshot,
+};
 use crate::greedy_parity::{
     BackgroundShutdownEvidence, ModelIdentityEvidence, ModelLoadEvidence, RuntimeCacheSnapshot,
 };
@@ -18,8 +20,10 @@ use crate::qualification::{
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v1";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v2";
 pub(crate) const MODE: &str = "gpu-native-real-benchmark";
+pub(crate) const OPTIMIZATION: &str = "gpu-native-resumable-recovery-pr1";
+pub(crate) const BASELINE_COMMIT: &str = "db0664159fe4a57e5b630984b9229e233fa21487";
 
 const EXPECTED_NUM_LAYERS: usize = 48;
 const EXPECTED_NUM_EXPERTS: usize = 128;
@@ -82,7 +86,7 @@ pub(crate) struct ProductionSemantics {
 }
 
 impl ProductionSemantics {
-    pub(crate) const fn baseline() -> Self {
+    pub(crate) const fn resumable_recovery_pr1() -> Self {
         Self {
             production_inference_math_changed: false,
             production_q4_changed: false,
@@ -91,7 +95,7 @@ impl ProductionSemantics {
             production_rmsnorm_changed: false,
             production_lm_head_changed: false,
             production_residency_policy_changed: false,
-            production_replay_policy_changed: false,
+            production_replay_policy_changed: true,
             production_prefetch_policy_changed: false,
             diagnostic_trace_enabled: false,
         }
@@ -460,6 +464,59 @@ impl CounterRatios {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct RecoveryRatios {
+    pub(crate) resume_attempts_per_completed_position: f64,
+    pub(crate) recovery_segments_per_completed_position: f64,
+    pub(crate) checkpoint_captures_per_completed_position: f64,
+    pub(crate) checkpoint_restores_per_completed_position: f64,
+    pub(crate) full_token_replays_per_completed_position: f64,
+    pub(crate) layers_encoded_per_completed_position: f64,
+    pub(crate) attention_layers_reexecuted_per_completed_position: f64,
+    pub(crate) expert_layers_reexecuted_per_completed_position: f64,
+    pub(crate) invalid_tail_layers_encoded_per_completed_position: f64,
+    pub(crate) residency_service_us_per_completed_position: f64,
+    pub(crate) boundary_wait_us_per_completed_position: f64,
+}
+
+impl RecoveryRatios {
+    fn from_delta(
+        delta: GpuNativeRecoverySnapshot,
+        completed_positions: u64,
+    ) -> Result<Self, BenchmarkFailure> {
+        if completed_positions == 0 {
+            return Err(BenchmarkFailure::new(
+                "postcondition",
+                "zero-completed-positions",
+                "recovery ratios require at least one completed position",
+            ));
+        }
+        let completed = completed_positions as f64;
+        Ok(Self {
+            resume_attempts_per_completed_position: delta.resume_attempts as f64 / completed,
+            recovery_segments_per_completed_position: delta.recovery_segments as f64 / completed,
+            checkpoint_captures_per_completed_position: delta.checkpoint_captures as f64
+                / completed,
+            checkpoint_restores_per_completed_position: delta.checkpoint_restores as f64
+                / completed,
+            full_token_replays_per_completed_position: delta.full_token_replay_attempts as f64
+                / completed,
+            layers_encoded_per_completed_position: delta.layers_encoded as f64 / completed,
+            attention_layers_reexecuted_per_completed_position: delta.attention_layers_reexecuted
+                as f64
+                / completed,
+            expert_layers_reexecuted_per_completed_position: delta.expert_layers_reexecuted as f64
+                / completed,
+            invalid_tail_layers_encoded_per_completed_position: delta.invalid_tail_layers_encoded
+                as f64
+                / completed,
+            residency_service_us_per_completed_position: delta.residency_service_us as f64
+                / completed,
+            boundary_wait_us_per_completed_position: delta.boundary_wait_us as f64 / completed,
+        })
+    }
+}
+
 macro_rules! checked_delta {
     ($after:expr, $before:expr, $field:ident, $label:expr) => {
         $after.$field.checked_sub($before.$field).ok_or_else(|| {
@@ -493,6 +550,45 @@ pub(crate) fn token_loop_delta(
         queue_submissions: checked_delta!(after, before, queue_submissions, "token-loop"),
         boundary_maps: checked_delta!(after, before, boundary_maps, "token-loop"),
         boundary_readbacks: checked_delta!(after, before, boundary_readbacks, "token-loop"),
+    })
+}
+
+pub(crate) fn recovery_delta(
+    before: GpuNativeRecoverySnapshot,
+    after: GpuNativeRecoverySnapshot,
+) -> Result<GpuNativeRecoverySnapshot, BenchmarkFailure> {
+    Ok(GpuNativeRecoverySnapshot {
+        resume_attempts: checked_delta!(after, before, resume_attempts, "recovery"),
+        recovery_segments: checked_delta!(after, before, recovery_segments, "recovery"),
+        checkpoint_captures: checked_delta!(after, before, checkpoint_captures, "recovery"),
+        checkpoint_restores: checked_delta!(after, before, checkpoint_restores, "recovery"),
+        full_token_replay_attempts: checked_delta!(
+            after,
+            before,
+            full_token_replay_attempts,
+            "recovery"
+        ),
+        layers_encoded: checked_delta!(after, before, layers_encoded, "recovery"),
+        attention_layers_reexecuted: checked_delta!(
+            after,
+            before,
+            attention_layers_reexecuted,
+            "recovery"
+        ),
+        expert_layers_reexecuted: checked_delta!(
+            after,
+            before,
+            expert_layers_reexecuted,
+            "recovery"
+        ),
+        invalid_tail_layers_encoded: checked_delta!(
+            after,
+            before,
+            invalid_tail_layers_encoded,
+            "recovery"
+        ),
+        residency_service_us: checked_delta!(after, before, residency_service_us, "recovery"),
+        boundary_wait_us: checked_delta!(after, before, boundary_wait_us, "recovery"),
     })
 }
 
@@ -700,6 +796,10 @@ pub(crate) struct RequestSnapshots {
     pub(crate) token_loop_after: GpuNativeTokenLoopSnapshot,
     pub(crate) token_loop_delta: GpuNativeTokenLoopSnapshot,
     pub(crate) token_loop_ratios: CounterRatios,
+    pub(crate) recovery_before: GpuNativeRecoverySnapshot,
+    pub(crate) recovery_after: GpuNativeRecoverySnapshot,
+    pub(crate) recovery_delta: GpuNativeRecoverySnapshot,
+    pub(crate) recovery_ratios: RecoveryRatios,
     pub(crate) routed_execution_before: RoutedExpertExecutionSnapshot,
     pub(crate) routed_execution_after: RoutedExpertExecutionSnapshot,
     pub(crate) routed_execution_delta: RoutedExpertExecutionSnapshot,
@@ -875,6 +975,8 @@ pub(crate) struct Aggregate {
     pub(crate) pooled_post_ttft_decode_token_latency: LatencyStatistics,
     pub(crate) counter_totals: GpuNativeTokenLoopSnapshot,
     pub(crate) counter_ratios: CounterRatios,
+    pub(crate) recovery_totals: GpuNativeRecoverySnapshot,
+    pub(crate) recovery_ratios: RecoveryRatios,
 }
 
 fn add_counter_totals(
@@ -906,6 +1008,38 @@ fn add_counter_totals(
     Ok(())
 }
 
+fn add_recovery_totals(
+    total: &mut GpuNativeRecoverySnapshot,
+    value: GpuNativeRecoverySnapshot,
+) -> Result<(), BenchmarkFailure> {
+    macro_rules! add {
+        ($field:ident) => {
+            total.$field = total.$field.checked_add(value.$field).ok_or_else(|| {
+                BenchmarkFailure::new(
+                    "postcondition",
+                    "counter-overflow",
+                    format!(
+                        "aggregate recovery counter {} overflowed",
+                        stringify!($field)
+                    ),
+                )
+            })?;
+        };
+    }
+    add!(resume_attempts);
+    add!(recovery_segments);
+    add!(checkpoint_captures);
+    add!(checkpoint_restores);
+    add!(full_token_replay_attempts);
+    add!(layers_encoded);
+    add!(attention_layers_reexecuted);
+    add!(expert_layers_reexecuted);
+    add!(invalid_tail_layers_encoded);
+    add!(residency_service_us);
+    add!(boundary_wait_us);
+    Ok(())
+}
+
 pub(crate) fn aggregate(runs: &[PerRunResult]) -> Result<Aggregate, BenchmarkFailure> {
     if runs.is_empty() {
         return Err(BenchmarkFailure::new(
@@ -929,9 +1063,11 @@ pub(crate) fn aggregate(runs: &[PerRunResult]) -> Result<Aggregate, BenchmarkFai
     ttft.sort_by(f64::total_cmp);
     let mut pooled_latencies = Vec::new();
     let mut counter_totals = GpuNativeTokenLoopSnapshot::default();
+    let mut recovery_totals = GpuNativeRecoverySnapshot::default();
     for run in runs {
         pooled_latencies.extend_from_slice(&run.timing.post_ttft_decode_token_latencies_seconds);
         add_counter_totals(&mut counter_totals, run.counters.token_loop_delta)?;
+        add_recovery_totals(&mut recovery_totals, run.counters.recovery_delta)?;
     }
     Ok(Aggregate {
         decode_tps: distribution(&decode_tps)?,
@@ -943,6 +1079,11 @@ pub(crate) fn aggregate(runs: &[PerRunResult]) -> Result<Aggregate, BenchmarkFai
         },
         pooled_post_ttft_decode_token_latency: LatencyStatistics::from_values(&pooled_latencies)?,
         counter_ratios: CounterRatios::from_delta(counter_totals)?,
+        recovery_ratios: RecoveryRatios::from_delta(
+            recovery_totals,
+            counter_totals.tokens_completed,
+        )?,
+        recovery_totals,
         counter_totals,
     })
 }
@@ -978,6 +1119,8 @@ pub(crate) struct RuntimeShutdown {
 pub(crate) struct BenchmarkReport {
     pub(crate) schema: &'static str,
     pub(crate) mode: &'static str,
+    pub(crate) optimization: &'static str,
+    pub(crate) baseline_commit: &'static str,
     pub(crate) benchmark_complete: bool,
     pub(crate) failure: Option<BenchmarkFailure>,
     pub(crate) qualification_pass: bool,
@@ -1014,6 +1157,8 @@ impl BenchmarkReport {
         Self {
             schema: SCHEMA,
             mode: MODE,
+            optimization: OPTIMIZATION,
+            baseline_commit: BASELINE_COMMIT,
             benchmark_complete: false,
             failure: None,
             qualification_pass: false,
@@ -1033,7 +1178,7 @@ impl BenchmarkReport {
             aggregate: None,
             runtime_contract: None,
             production_configuration,
-            production_semantics: ProductionSemantics::baseline(),
+            production_semantics: ProductionSemantics::resumable_recovery_pr1(),
         }
     }
 
@@ -1095,6 +1240,7 @@ pub(crate) fn validate_request_postconditions(
     requested_output_tokens: usize,
     generated_tokens: usize,
     token_loop: GpuNativeTokenLoopSnapshot,
+    recovery: GpuNativeRecoverySnapshot,
     routed: RoutedExpertExecutionSnapshot,
 ) -> Result<(), BenchmarkFailure> {
     let expected_completed = prompt_tokens
@@ -1123,6 +1269,26 @@ pub(crate) fn validate_request_postconditions(
             "token-loop-postcondition",
             format!(
                 "expected {expected_completed} completed positions and zero fatal/no-progress failures; observed {token_loop:?}"
+            ),
+        ));
+    }
+    if token_loop.replay_attempts != 0 || recovery.full_token_replay_attempts != 0 {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "full-token-replay-observed",
+            format!(
+                "PR1 requires zero full-token restarts; token_loop.replay_attempts={} recovery.full_token_replay_attempts={}",
+                token_loop.replay_attempts, recovery.full_token_replay_attempts,
+            ),
+        ));
+    }
+    if token_loop.residency_miss_attempts != 0 && recovery.resume_attempts == 0 {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "missing-resume-evidence",
+            format!(
+                "recoverable misses require resumable execution evidence; misses={} recovery={recovery:?}",
+                token_loop.residency_miss_attempts,
             ),
         ));
     }
@@ -1168,6 +1334,7 @@ fn next_ordinary_step(
 #[derive(Clone, Debug)]
 struct RequestSnapshotStart {
     token_loop: GpuNativeTokenLoopSnapshot,
+    recovery: GpuNativeRecoverySnapshot,
     routed: RoutedExpertExecutionSnapshot,
     runtime_cache: RuntimeCacheSnapshot,
     engine_storage: EngineStorageSnapshot,
@@ -1187,6 +1354,7 @@ impl RequestSnapshotStart {
         })?;
         Ok(Self {
             token_loop: token_loop.snapshot(),
+            recovery: token_loop.recovery_snapshot(),
             routed: runtime.engine.routed_expert_execution_snapshot(),
             runtime_cache: crate::greedy_parity_runtime_cache_snapshot(runtime),
             engine_storage: EngineStorageSnapshot::from_runtime(runtime),
@@ -1220,17 +1388,15 @@ impl RequestSnapshotStart {
         self,
         runtime: &crate::BenchRealRuntime,
     ) -> Result<RequestSnapshots, BenchmarkFailure> {
-        let token_loop_after = runtime
-            .gpu_native_token_loop
-            .as_ref()
-            .ok_or_else(|| {
-                BenchmarkFailure::new(
-                    "postcondition",
-                    "missing-gpu-native-token-loop",
-                    "gpu_native_token_loop disappeared after request",
-                )
-            })?
-            .snapshot();
+        let token_loop = runtime.gpu_native_token_loop.as_ref().ok_or_else(|| {
+            BenchmarkFailure::new(
+                "postcondition",
+                "missing-gpu-native-token-loop",
+                "gpu_native_token_loop disappeared after request",
+            )
+        })?;
+        let token_loop_after = token_loop.snapshot();
+        let recovery_after = token_loop.recovery_snapshot();
         let routed_after = runtime.engine.routed_expert_execution_snapshot();
         let engine_storage_after = EngineStorageSnapshot::from_runtime(runtime);
         let gpu_expert_io_after = runtime.engine.gpu_expert_io_snapshot().ok_or_else(|| {
@@ -1241,6 +1407,7 @@ impl RequestSnapshotStart {
             )
         })?;
         let token_loop_delta = token_loop_delta(self.token_loop, token_loop_after)?;
+        let recovery_delta = recovery_delta(self.recovery, recovery_after)?;
         let routed_execution_delta = routed_delta(self.routed, routed_after)?;
         let gpu_native_residency_after = runtime
             .engine
@@ -1259,6 +1426,13 @@ impl RequestSnapshotStart {
             token_loop_after,
             token_loop_delta,
             token_loop_ratios: CounterRatios::from_delta(token_loop_delta)?,
+            recovery_before: self.recovery,
+            recovery_after,
+            recovery_delta,
+            recovery_ratios: RecoveryRatios::from_delta(
+                recovery_delta,
+                token_loop_delta.tokens_completed,
+            )?,
             routed_execution_before: self.routed,
             routed_execution_after: routed_after,
             routed_execution_delta,
@@ -1415,6 +1589,7 @@ pub(crate) async fn execute_request(
         requested_output_tokens,
         generated_ids.len(),
         counters.token_loop_delta,
+        counters.recovery_delta,
         counters.routed_execution_delta,
     )?;
     let output_text = runtime.tokenizer.decode(&generated_ids)?;
@@ -1600,6 +1775,16 @@ fn validate_and_record_runtime(
             format!(
                 "fresh isolated runtime token-loop counters were not zero: {:?}",
                 token_loop.snapshot()
+            ),
+        ));
+    }
+    if token_loop.recovery_snapshot() != GpuNativeRecoverySnapshot::default() {
+        return Err(BenchmarkFailure::new(
+            "startup",
+            "nonzero-initial-recovery-counters",
+            format!(
+                "fresh isolated runtime recovery counters were not zero: {:?}",
+                token_loop.recovery_snapshot()
             ),
         ));
     }
@@ -2117,6 +2302,14 @@ mod tests {
             token_loop_after: counter,
             token_loop_delta: counter,
             token_loop_ratios: CounterRatios::from_delta(counter).unwrap(),
+            recovery_before: GpuNativeRecoverySnapshot::default(),
+            recovery_after: GpuNativeRecoverySnapshot::default(),
+            recovery_delta: GpuNativeRecoverySnapshot::default(),
+            recovery_ratios: RecoveryRatios::from_delta(
+                GpuNativeRecoverySnapshot::default(),
+                counter.tokens_completed,
+            )
+            .unwrap(),
             routed_execution_before: RoutedExpertExecutionSnapshot::default(),
             routed_execution_after: RoutedExpertExecutionSnapshot::default(),
             routed_execution_delta: RoutedExpertExecutionSnapshot::default(),
@@ -2213,6 +2406,40 @@ mod tests {
     }
 
     #[test]
+    fn recovery_delta_and_ratios_are_exact() {
+        let before = GpuNativeRecoverySnapshot {
+            resume_attempts: 2,
+            checkpoint_captures: 10,
+            layers_encoded: 10,
+            residency_service_us: 40,
+            boundary_wait_us: 50,
+            ..GpuNativeRecoverySnapshot::default()
+        };
+        let after = GpuNativeRecoverySnapshot {
+            resume_attempts: 4,
+            recovery_segments: 3,
+            checkpoint_captures: 18,
+            checkpoint_restores: 2,
+            layers_encoded: 20,
+            attention_layers_reexecuted: 2,
+            expert_layers_reexecuted: 4,
+            invalid_tail_layers_encoded: 6,
+            residency_service_us: 140,
+            boundary_wait_us: 250,
+            ..GpuNativeRecoverySnapshot::default()
+        };
+        let delta = recovery_delta(before, after).unwrap();
+        let ratios = RecoveryRatios::from_delta(delta, 2).unwrap();
+        assert_eq!(delta.resume_attempts, 2);
+        assert_eq!(delta.checkpoint_captures, 8);
+        assert_eq!(delta.full_token_replay_attempts, 0);
+        assert_eq!(ratios.resume_attempts_per_completed_position, 1.0);
+        assert_eq!(ratios.checkpoint_captures_per_completed_position, 4.0);
+        assert_eq!(ratios.residency_service_us_per_completed_position, 50.0);
+        assert_eq!(ratios.boundary_wait_us_per_completed_position, 100.0);
+    }
+
+    #[test]
     fn cache_reset_semantics_define_runtime_construction_count() {
         assert_eq!(
             expected_runtime_constructions(crate::BenchRealCacheReset::Keep, 3, 4),
@@ -2227,12 +2454,28 @@ mod tests {
     #[test]
     fn aggregate_excludes_unpassed_warmup_and_retains_each_measured_run() {
         let warmup = run(99, 100.0);
-        let measured = vec![run(0, 1.0), run(1, 2.0)];
+        let mut measured = vec![run(0, 1.0), run(1, 2.0)];
+        let recovery = GpuNativeRecoverySnapshot {
+            resume_attempts: 2,
+            recovery_segments: 3,
+            checkpoint_restores: 2,
+            ..GpuNativeRecoverySnapshot::default()
+        };
+        measured[0].counters.recovery_after = recovery;
+        measured[0].counters.recovery_delta = recovery;
+        measured[0].counters.recovery_ratios = RecoveryRatios::from_delta(recovery, 5).unwrap();
         let aggregate = aggregate(&measured).unwrap();
         assert_eq!(measured.len(), 2);
         assert_eq!(aggregate.decode_tps.mean, 0.75);
         assert_ne!(aggregate.decode_tps.mean, warmup.timing.decode_tps);
         assert_eq!(aggregate.counter_totals.tokens_completed, 10);
+        assert_eq!(aggregate.recovery_totals, recovery);
+        assert_eq!(
+            aggregate
+                .recovery_ratios
+                .resume_attempts_per_completed_position,
+            0.2
+        );
     }
 
     #[test]
@@ -2342,9 +2585,16 @@ mod tests {
             ..RoutedExpertExecutionSnapshot::default()
         };
         assert_eq!(
-            validate_request_postconditions(4, 2, 2, token_loop, routed)
-                .unwrap_err()
-                .code,
+            validate_request_postconditions(
+                4,
+                2,
+                2,
+                token_loop,
+                GpuNativeRecoverySnapshot::default(),
+                routed,
+            )
+            .unwrap_err()
+            .code,
             "fallback-or-degradation"
         );
 
@@ -2353,9 +2603,16 @@ mod tests {
             ..RoutedExpertExecutionSnapshot::default()
         };
         assert_eq!(
-            validate_request_postconditions(4, 2, 2, token_loop, cpu_dispatch)
-                .unwrap_err()
-                .code,
+            validate_request_postconditions(
+                4,
+                2,
+                2,
+                token_loop,
+                GpuNativeRecoverySnapshot::default(),
+                cpu_dispatch,
+            )
+            .unwrap_err()
+            .code,
             "fallback-or-degradation"
         );
 
@@ -2364,9 +2621,16 @@ mod tests {
             ..RoutedExpertExecutionSnapshot::default()
         };
         assert_eq!(
-            validate_request_postconditions(4, 2, 2, token_loop, degraded)
-                .unwrap_err()
-                .code,
+            validate_request_postconditions(
+                4,
+                2,
+                2,
+                token_loop,
+                GpuNativeRecoverySnapshot::default(),
+                degraded,
+            )
+            .unwrap_err()
+            .code,
             "fallback-or-degradation"
         );
     }
@@ -2384,6 +2648,7 @@ mod tests {
                 2,
                 2,
                 fatal,
+                GpuNativeRecoverySnapshot::default(),
                 RoutedExpertExecutionSnapshot::default(),
             )
             .unwrap_err()
@@ -2402,6 +2667,7 @@ mod tests {
                 2,
                 2,
                 no_progress,
+                GpuNativeRecoverySnapshot::default(),
                 RoutedExpertExecutionSnapshot::default(),
             )
             .unwrap_err()
@@ -2419,12 +2685,59 @@ mod tests {
                 2,
                 1,
                 otherwise_valid,
+                GpuNativeRecoverySnapshot::default(),
                 RoutedExpertExecutionSnapshot::default(),
             )
             .unwrap_err()
             .code,
             "incomplete-generation"
         );
+    }
+
+    #[test]
+    fn full_token_replay_is_rejected_but_resumable_miss_is_accepted() {
+        let token_loop = GpuNativeTokenLoopSnapshot {
+            tokens_completed: 5,
+            residency_miss_attempts: 1,
+            replay_attempts: 1,
+            ..GpuNativeTokenLoopSnapshot::default()
+        };
+        assert_eq!(
+            validate_request_postconditions(
+                4,
+                2,
+                2,
+                token_loop,
+                GpuNativeRecoverySnapshot {
+                    resume_attempts: 1,
+                    full_token_replay_attempts: 1,
+                    ..GpuNativeRecoverySnapshot::default()
+                },
+                RoutedExpertExecutionSnapshot::default(),
+            )
+            .unwrap_err()
+            .code,
+            "full-token-replay-observed"
+        );
+
+        let resumable = GpuNativeTokenLoopSnapshot {
+            replay_attempts: 0,
+            ..token_loop
+        };
+        assert!(validate_request_postconditions(
+            4,
+            2,
+            2,
+            resumable,
+            GpuNativeRecoverySnapshot {
+                resume_attempts: 1,
+                recovery_segments: 1,
+                checkpoint_restores: 1,
+                ..GpuNativeRecoverySnapshot::default()
+            },
+            RoutedExpertExecutionSnapshot::default(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2476,9 +2789,32 @@ mod tests {
                 .production_semantics
                 .production_inference_math_changed
         );
+        assert!(!report.production_semantics.production_q4_changed);
+        assert!(!report.production_semantics.production_router_changed);
+        assert!(!report.production_semantics.production_attention_changed);
+        assert!(!report.production_semantics.production_rmsnorm_changed);
+        assert!(!report.production_semantics.production_lm_head_changed);
+        assert!(
+            !report
+                .production_semantics
+                .production_residency_policy_changed
+        );
+        assert!(report.production_semantics.production_replay_policy_changed);
+        assert!(
+            !report
+                .production_semantics
+                .production_prefetch_policy_changed
+        );
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["qualification_pass"], false);
         assert_eq!(json["correctness_qualification_pending"], true);
+        assert_eq!(json["schema"], SCHEMA);
+        assert_eq!(json["optimization"], OPTIMIZATION);
+        assert_eq!(json["baseline_commit"], BASELINE_COMMIT);
+        assert_eq!(
+            json["production_semantics"]["production_replay_policy_changed"],
+            true
+        );
         assert_eq!(
             json["production_semantics"]["diagnostic_trace_enabled"],
             false
