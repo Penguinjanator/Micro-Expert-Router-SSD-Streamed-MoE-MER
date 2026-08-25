@@ -149,6 +149,7 @@ pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
+pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
 pub(crate) mod gpu_native_token_loop;
@@ -1016,6 +1017,38 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Attribute the frozen Spanish first generated-token divergence across isolated exact-f32 CPU, historical-f16 CPU, and GPU-native planes.
+    #[command(name = "diagnose-gpu-native-spanish-first-token-attribution")]
+    DiagnoseGpuNativeSpanishFirstTokenAttribution {
+        /// Path to the strict GPU-native Q4 TOML configuration.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact frozen GPU-native semantic-parity v2 report.
+        #[arg(long)]
+        v2_report: PathBuf,
+        /// Required frozen SHA256 of the supplied v2 report.
+        #[arg(long)]
+        expected_v2_report_sha256: String,
+        /// Exact frozen GPU-native Q4 expert-stage attribution report.
+        #[arg(long)]
+        stage_report: PathBuf,
+        /// Required frozen SHA256 of the supplied stage report.
+        #[arg(long)]
+        expected_stage_report_sha256: String,
+        /// Exact frozen f32 reference-boundary audit report.
+        #[arg(long)]
+        boundary_audit_report: PathBuf,
+        /// Required frozen SHA256 of the supplied boundary-audit report.
+        #[arg(long)]
+        expected_boundary_audit_report_sha256: String,
+        /// Exact production GPU adapter name; this diagnostic requires NVIDIA L4.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required typed diagnostic JSON destination.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Collect reproducibility and complete first-token CPU/Hybrid logit
     /// evidence for the fixed json-transformation case.
     DiagnoseHybridQ4GreedyDivergence {
@@ -1792,6 +1825,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::DiagnoseGpuNativeV2HoldoutFailures { config, .. }
         | Cmd::DiagnoseGpuNativeQ4ExpertStages { config, .. }
         | Cmd::DiagnoseGpuNativeF32ReferenceBoundary { config, .. }
+        | Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution { config, .. }
         | Cmd::DiagnoseHybridQ4GreedyDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeQ4FirstDivergence { config, .. }
         | Cmd::DiagnoseGpuNativeRouterRankDivergence { config, .. }
@@ -2347,6 +2381,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     expected_v2_report_sha256,
                     stage_report,
                     expected_stage_report_sha256,
+                    report_out,
+                    progress_watchdog,
+                ),
+            )
+        }
+        Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution {
+            config,
+            v2_report,
+            expected_v2_report_sha256,
+            stage_report,
+            expected_stage_report_sha256,
+            boundary_audit_report,
+            expected_boundary_audit_report_sha256,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_spanish_first_token_attribution::run_diagnostic(
+                    config,
+                    startup_config.take().ok_or(
+                        "diagnose-gpu-native-spanish-first-token-attribution startup config was not parsed",
+                    )?,
+                    v2_report,
+                    expected_v2_report_sha256,
+                    stage_report,
+                    expected_stage_report_sha256,
+                    boundary_audit_report,
+                    expected_boundary_audit_report_sha256,
+                    expected_adapter_name,
                     report_out,
                     progress_watchdog,
                 ),
@@ -15046,6 +15112,72 @@ mod tests {
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("strict-gpu-native.toml"))
+        );
+    }
+
+    #[test]
+    fn spanish_first_token_attribution_cli_has_three_frozen_reports_and_l4_surface() {
+        let cli = Cli::try_parse_from([
+            "micro-expert-router",
+            "--progress-timeout-secs",
+            "300",
+            "diagnose-gpu-native-spanish-first-token-attribution",
+            "--config",
+            "config.toml",
+            "--v2-report",
+            "v2.json",
+            "--expected-v2-report-sha256",
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_V2_REPORT_SHA256,
+            "--stage-report",
+            "stage.json",
+            "--expected-stage-report-sha256",
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_STAGE_REPORT_SHA256,
+            "--boundary-audit-report",
+            "boundary.json",
+            "--expected-boundary-audit-report-sha256",
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_BOUNDARY_AUDIT_REPORT_SHA256,
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "spanish-first-token.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.progress_timeout_secs, Some(300));
+        let Cmd::DiagnoseGpuNativeSpanishFirstTokenAttribution {
+            config,
+            v2_report,
+            expected_v2_report_sha256,
+            stage_report,
+            expected_stage_report_sha256,
+            boundary_audit_report,
+            expected_boundary_audit_report_sha256,
+            expected_adapter_name,
+            report_out,
+        } = &cli.cmd
+        else {
+            panic!("expected Spanish first-token attribution command");
+        };
+        assert_eq!(config, &PathBuf::from("config.toml"));
+        assert_eq!(v2_report, &PathBuf::from("v2.json"));
+        assert_eq!(
+            expected_v2_report_sha256,
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_V2_REPORT_SHA256
+        );
+        assert_eq!(stage_report, &PathBuf::from("stage.json"));
+        assert_eq!(
+            expected_stage_report_sha256,
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_STAGE_REPORT_SHA256
+        );
+        assert_eq!(boundary_audit_report, &PathBuf::from("boundary.json"));
+        assert_eq!(
+            expected_boundary_audit_report_sha256,
+            crate::gpu_native_spanish_first_token_attribution::FROZEN_BOUNDARY_AUDIT_REPORT_SHA256
+        );
+        assert_eq!(expected_adapter_name, "NVIDIA L4");
+        assert_eq!(report_out, &PathBuf::from("spanish-first-token.json"));
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new("config.toml"))
         );
     }
 

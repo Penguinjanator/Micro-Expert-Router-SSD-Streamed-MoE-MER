@@ -1429,6 +1429,65 @@ impl GpuNativeTokenLoop {
         Ok((trace, sampled_token, out.attempts))
     }
 
+    /// Diagnostic-only final-prompt step that captures both the established
+    /// full activation trace and the established semantic-corpus router/expert
+    /// trace from one unchanged production traversal. Ordinary token steps
+    /// never allocate either sink.
+    pub async fn step_token_full_and_semantic_corpus_diagnostic(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        full_trace_layout: &crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout,
+        full_trace_staging_buffer: &wgpu::Buffer,
+        semantic_trace_layout: &crate::gpu_native_semantic_parity_corpus::SemanticCorpusTraceLayout,
+        semantic_trace_staging_buffer: &wgpu::Buffer,
+    ) -> Result<
+        (
+            crate::gpu_native_diagnostics::GpuNativeDiagnosticTrace,
+            crate::gpu_native_semantic_parity_corpus::SemanticCorpusGpuTrace,
+            u32,
+            usize,
+        ),
+        GpuNativeTokenLoopError,
+    > {
+        let _guard = self.execution_guard.lock().await;
+        let out = self
+            .step_token_unified_inner(
+                engine,
+                request,
+                token_id,
+                position,
+                true,
+                Some((full_trace_layout, full_trace_staging_buffer)),
+                None,
+                Some((
+                    GpuNativeSemanticDiagnosticLayout::Corpus(semantic_trace_layout),
+                    semantic_trace_staging_buffer,
+                    None,
+                )),
+            )
+            .await?;
+        let full_trace =
+            out.diagnostic_trace
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "combined diagnostic full trace was not collected".into(),
+                })?;
+        let semantic_trace = out.semantic_corpus_trace.ok_or_else(|| {
+            GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "combined diagnostic semantic trace was not collected".into(),
+            }
+        })?;
+        let sampled_token =
+            out.sampled_token
+                .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "combined diagnostic final-prompt step produced no sampled token"
+                        .into(),
+                })?;
+        Ok((full_trace, semantic_trace, sampled_token, out.attempts))
+    }
+
     /// Diagnostic-only token step that observes raw gate, raw up,
     /// post-SwiGLU gated activation, diagnostic down, and the unchanged
     /// production down output at one or more frozen layers.
