@@ -1936,20 +1936,115 @@ fn validate_cpu_geometry(runtime: &crate::BenchRealRuntime) -> Result<(), String
     Ok(())
 }
 
-fn validate_gpu_plan(plan: &crate::qualification::ExecutionPlanEvidence) -> Result<(), String> {
+struct GpuNativeAuthoritativeRuntimeEvidence {
+    legacy_execution_context: crate::qualification::ExecutionPlanEvidence,
+    gpu_native_token_loop_geometry: Option<crate::gpu_native_token_loop::GpuNativeModelGeometry>,
+    authoritative_device: Option<crate::backend::GpuDeviceIdentity>,
+    model_load: crate::greedy_parity::ModelLoadEvidence,
+    real_transformer_gpu_native: bool,
+    compute_offload: crate::backend::ComputeOffload,
+}
+
+/// Validate the deliberately retained legacy `ExecutionContext` plane map.
+///
+/// The CPU markers in this evidence do not describe placement in the
+/// GPU-native token loop. They prove that the legacy routed-expert registry is
+/// disabled while the authoritative context still owns the Vulkan device used
+/// by the separate GPU-native full-token path.
+fn validate_gpu_native_legacy_execution_context_contract(
+    plan: &crate::qualification::ExecutionPlanEvidence,
+) -> Result<(), String> {
     if plan.requested != "gpu"
         || plan.resolved != "gpu"
-        || plan.embeddings != "gpu"
-        || plan.lm_head != "gpu"
-        || plan.dense_projections != "gpu"
+        || plan.embeddings != "cpu"
+        || plan.lm_head != "cpu"
+        || plan.dense_projections != "cpu"
         || plan.attention != "gpu"
         || plan.kv != "gpu"
-        || plan.router != "gpu"
-        || plan.routed_experts != "gpu"
+        || plan.router != "cpu"
+        || plan.routed_experts != "cpu"
         || plan.routed_expert_dtype != "q4_0"
         || plan.fallback_occurred
     {
-        return Err("GPU_NATIVE did not resolve to the exact all-GPU production plan".into());
+        return Err(format!(
+            "GPU-native authoritative runtime contract rejected legacy ExecutionPlanEvidence: \
+             observed={plan:?}; expected requested=\"gpu\", resolved=\"gpu\", \
+             embeddings=\"cpu\", lm_head=\"cpu\", dense_projections=\"cpu\", \
+             attention=\"gpu\", kv=\"gpu\", router=\"cpu\", \
+             routed_experts=\"cpu\", routed_expert_dtype=\"q4_0\", \
+             fallback_occurred=false. ExecutionPlanEvidence is legacy \
+             execution-context evidence, not GPU-native token-loop placement; \
+             gpu_native_token_loop is validated separately as the authoritative \
+             GPU-native full-token path"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gpu_native_authoritative_runtime_contract(
+    evidence: &GpuNativeAuthoritativeRuntimeEvidence,
+    expected_adapter_name: &str,
+) -> Result<(), String> {
+    validate_gpu_native_legacy_execution_context_contract(&evidence.legacy_execution_context)?;
+
+    if !evidence.real_transformer_gpu_native
+        || evidence.compute_offload != crate::backend::ComputeOffload::Gpu
+    {
+        return Err(format!(
+            "GPU-native authoritative runtime contract requires \
+             real_transformer.gpu_native=true and compute_offload=Gpu, observed \
+             gpu_native={} compute_offload={:?}",
+            evidence.real_transformer_gpu_native, evidence.compute_offload
+        ));
+    }
+
+    let device = evidence.authoritative_device.as_ref().ok_or(
+        "GPU-native authoritative runtime contract requires authoritative GPU device identity; \
+         gpu_native_token_loop is the separately validated authoritative full-token path",
+    )?;
+    if expected_adapter_name != REQUIRED_ADAPTER_NAME
+        || device.name != expected_adapter_name
+        || device.vendor_id != 0x10de
+        || device.device_type != "DiscreteGpu"
+        || device.wgpu_backend != "vulkan"
+        || device.compute_plane != "wgpu-vulkan"
+        || device.software_adapter
+    {
+        return Err(format!(
+            "GPU-native authoritative runtime contract rejected authoritative device: \
+             observed={device:?}; expected adapter={REQUIRED_ADAPTER_NAME:?}, \
+             vendor_id=0x10de, device_type=\"DiscreteGpu\", wgpu_backend=\"vulkan\", \
+             compute_plane=\"wgpu-vulkan\", software_adapter=false; \
+             expected_adapter_name argument was {expected_adapter_name:?}"
+        ));
+    }
+
+    let geometry = evidence.gpu_native_token_loop_geometry.ok_or(
+        "GPU-native authoritative runtime contract requires gpu_native_token_loop; \
+         ExecutionPlanEvidence is only legacy execution-context evidence and is not \
+         proof of the authoritative GPU-native full-token path",
+    )?;
+    if geometry.num_layers != EXPECTED_NUM_LAYERS
+        || geometry.num_experts != EXPECTED_NUM_EXPERTS
+        || geometry.top_k != EXPECTED_TOP_K
+        || geometry.d_model != EXPECTED_D_MODEL
+        || geometry.d_ff != EXPECTED_D_FF
+    {
+        return Err(format!(
+            "GPU-native authoritative runtime contract rejected gpu_native_token_loop geometry: \
+             observed={geometry:?}; expected num_layers={EXPECTED_NUM_LAYERS}, \
+             num_experts={EXPECTED_NUM_EXPERTS}, top_k={EXPECTED_TOP_K}, \
+             d_model={EXPECTED_D_MODEL}, d_ff={EXPECTED_D_FF}"
+        ));
+    }
+
+    if !model_load_is_strict(&evidence.model_load) {
+        return Err(format!(
+            "GPU-native authoritative runtime contract rejected strict real model load: \
+             observed={:?}; expected strict=true, loaded_tensors=required_tensors>0, \
+             seeded_fallback_remained=false, loader!=\"seeded\"",
+            evidence.model_load
+        ));
     }
     Ok(())
 }
@@ -2063,42 +2158,32 @@ async fn execute_gpu_plane(
         }
         let execution_plan: crate::qualification::ExecutionPlanEvidence =
             runtime.engine.execution_context().plan().into();
-        validate_gpu_plan(&execution_plan)?;
-        let device = runtime
-            .engine
-            .gpu_device_identity()
-            .ok_or("GPU_NATIVE runtime has no authoritative adapter identity")?;
-        if expected_adapter_name != REQUIRED_ADAPTER_NAME
-            || device.name != expected_adapter_name
-            || device.software_adapter
-            || device.device_type.eq_ignore_ascii_case("cpu")
-        {
-            return Err(format!(
-                "GPU_NATIVE selected adapter {:?}, required exact {:?}",
-                device.name, REQUIRED_ADAPTER_NAME
-            )
-            .into());
-        }
+        let device = runtime.engine.gpu_device_identity();
+        let model_load = crate::greedy_parity_model_load(&runtime);
+        let authoritative_runtime = GpuNativeAuthoritativeRuntimeEvidence {
+            legacy_execution_context: execution_plan.clone(),
+            gpu_native_token_loop_geometry: runtime
+                .gpu_native_token_loop
+                .as_ref()
+                .map(|token_loop| token_loop.model_geometry()),
+            authoritative_device: device.clone(),
+            model_load: model_load.clone(),
+            real_transformer_gpu_native: runtime.cfg.real_transformer.gpu_native,
+            compute_offload: runtime.cfg.real_transformer.compute_offload,
+        };
+        validate_gpu_native_authoritative_runtime_contract(
+            &authoritative_runtime,
+            expected_adapter_name,
+        )?;
+        let device = device.expect("authoritative runtime contract requires device identity");
         let token_loop = runtime
             .gpu_native_token_loop
             .as_ref()
-            .ok_or("GPU_NATIVE token loop was not constructed")?;
+            .expect("authoritative runtime contract requires gpu_native_token_loop");
         let geometry = token_loop.model_geometry();
-        if geometry.num_layers != EXPECTED_NUM_LAYERS
-            || geometry.num_experts != EXPECTED_NUM_EXPERTS
-            || geometry.top_k != EXPECTED_TOP_K
-            || geometry.d_model != EXPECTED_D_MODEL
-            || geometry.d_ff != EXPECTED_D_FF
-        {
-            return Err("GPU_NATIVE geometry differs from the frozen target".into());
-        }
         if token_loop.snapshot() != crate::gpu_native_token_loop::GpuNativeTokenLoopSnapshot::default()
         {
             return Err("GPU_NATIVE token-loop counters did not start at zero".into());
-        }
-        let model_load = crate::greedy_parity_model_load(&runtime);
-        if !model_load_is_strict(&model_load) {
-            return Err("GPU_NATIVE did not load the strict real model".into());
         }
         let full_layout = crate::gpu_native_diagnostics::GpuNativeDiagnosticTraceLayout::try_new(
             geometry.num_layers,
@@ -3076,6 +3161,79 @@ mod tests {
         }
     }
 
+    fn gpu_native_legacy_plan() -> crate::qualification::ExecutionPlanEvidence {
+        crate::qualification::ExecutionPlanEvidence {
+            context_id: "gpu-native-authoritative".into(),
+            requested: "gpu".into(),
+            resolved: "gpu".into(),
+            embeddings: "cpu".into(),
+            lm_head: "cpu".into(),
+            dense_projections: "cpu".into(),
+            attention: "gpu".into(),
+            kv: "gpu".into(),
+            router: "cpu".into(),
+            routed_experts: "cpu".into(),
+            routed_expert_dtype: "q4_0".into(),
+            fallback_occurred: false,
+            reason: None,
+        }
+    }
+
+    fn gpu_native_geometry() -> crate::gpu_native_token_loop::GpuNativeModelGeometry {
+        crate::gpu_native_token_loop::GpuNativeModelGeometry {
+            num_layers: EXPECTED_NUM_LAYERS,
+            d_model: EXPECTED_D_MODEL,
+            d_ff: EXPECTED_D_FF,
+            num_experts: EXPECTED_NUM_EXPERTS,
+            top_k: EXPECTED_TOP_K,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: EXPECTED_D_MODEL,
+            rope_dim: EXPECTED_D_MODEL,
+            vocab_size: 151_936,
+            max_seq_len: 32,
+            rms_eps: 1e-6,
+            rope_base: 10_000.0,
+        }
+    }
+
+    fn strict_model_load() -> crate::greedy_parity::ModelLoadEvidence {
+        crate::greedy_parity::ModelLoadEvidence {
+            strict: true,
+            loader: "safetensors".into(),
+            loaded_tensors: 435,
+            required_tensors: 435,
+            optional_probed: 0,
+            optional_loaded: 0,
+            seeded_fallback_remained: false,
+        }
+    }
+
+    fn nvidia_l4_device() -> crate::backend::GpuDeviceIdentity {
+        crate::backend::GpuDeviceIdentity {
+            name: REQUIRED_ADAPTER_NAME.into(),
+            vendor_id: 0x10de,
+            device_id: 0,
+            device_type: "DiscreteGpu".into(),
+            wgpu_backend: "vulkan".into(),
+            driver: "580.173.02".into(),
+            driver_info: "test".into(),
+            compute_plane: "wgpu-vulkan".into(),
+            software_adapter: false,
+        }
+    }
+
+    fn gpu_native_authoritative_runtime() -> GpuNativeAuthoritativeRuntimeEvidence {
+        GpuNativeAuthoritativeRuntimeEvidence {
+            legacy_execution_context: gpu_native_legacy_plan(),
+            gpu_native_token_loop_geometry: Some(gpu_native_geometry()),
+            authoritative_device: Some(nvidia_l4_device()),
+            model_load: strict_model_load(),
+            real_transformer_gpu_native: true,
+            compute_offload: crate::backend::ComputeOffload::Gpu,
+        }
+    }
+
     fn runtime_evidence(plane: &'static str, prompt_steps: usize) -> PlaneRuntimeEvidence {
         PlaneRuntimeEvidence {
             plane,
@@ -3120,14 +3278,225 @@ mod tests {
     }
 
     #[test]
+    fn gpu_native_authoritative_runtime_accepts_factory_legacy_plan_and_separate_token_loop() {
+        let runtime = gpu_native_authoritative_runtime();
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &runtime,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_ok());
+        assert_eq!(runtime.legacy_execution_context.embeddings, "cpu");
+        assert_eq!(runtime.legacy_execution_context.lm_head, "cpu");
+        assert_eq!(runtime.legacy_execution_context.dense_projections, "cpu");
+        assert_eq!(runtime.legacy_execution_context.router, "cpu");
+        assert_eq!(runtime.legacy_execution_context.routed_experts, "cpu");
+        assert!(runtime.gpu_native_token_loop_geometry.is_some());
+    }
+
+    #[test]
+    fn previous_all_gpu_execution_plan_assumption_is_rejected_with_observed_evidence() {
+        let mut runtime = gpu_native_authoritative_runtime();
+        runtime.legacy_execution_context.embeddings = "gpu".into();
+        runtime.legacy_execution_context.lm_head = "gpu".into();
+        runtime.legacy_execution_context.dense_projections = "gpu".into();
+        runtime.legacy_execution_context.router = "gpu".into();
+        runtime.legacy_execution_context.routed_experts = "gpu".into();
+        let error =
+            validate_gpu_native_authoritative_runtime_contract(&runtime, REQUIRED_ADAPTER_NAME)
+                .unwrap_err();
+        assert!(error.contains("observed=ExecutionPlanEvidence"));
+        assert!(error.contains("legacy execution-context evidence"));
+        assert!(error.contains("gpu_native_token_loop is validated separately"));
+    }
+
+    #[test]
+    fn gpu_native_legacy_plan_rejects_wrong_mode_and_fallback() {
+        for (requested, resolved) in [("cpu", "gpu"), ("gpu", "cpu")] {
+            let mut runtime = gpu_native_authoritative_runtime();
+            runtime.legacy_execution_context.requested = requested.into();
+            runtime.legacy_execution_context.resolved = resolved.into();
+            assert!(validate_gpu_native_authoritative_runtime_contract(
+                &runtime,
+                REQUIRED_ADAPTER_NAME
+            )
+            .is_err());
+        }
+        let mut runtime = gpu_native_authoritative_runtime();
+        runtime.legacy_execution_context.fallback_occurred = true;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &runtime,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gpu_native_legacy_plan_rejects_cpu_attention_or_kv() {
+        let mut attention = gpu_native_authoritative_runtime();
+        attention.legacy_execution_context.attention = "cpu".into();
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &attention,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut kv = gpu_native_authoritative_runtime();
+        kv.legacy_execution_context.kv = "cpu".into();
+        assert!(
+            validate_gpu_native_authoritative_runtime_contract(&kv, REQUIRED_ADAPTER_NAME).is_err()
+        );
+    }
+
+    #[test]
+    fn gpu_native_legacy_plan_rejects_wrong_dtype_or_active_legacy_expert_registry() {
+        let mut dtype = gpu_native_authoritative_runtime();
+        dtype.legacy_execution_context.routed_expert_dtype = "f16".into();
+        assert!(
+            validate_gpu_native_authoritative_runtime_contract(&dtype, REQUIRED_ADAPTER_NAME)
+                .is_err()
+        );
+
+        let mut legacy_registry = gpu_native_authoritative_runtime();
+        legacy_registry.legacy_execution_context.routed_experts = "gpu".into();
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &legacy_registry,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gpu_native_authoritative_runtime_requires_token_loop_and_exact_geometry() {
+        let mut missing = gpu_native_authoritative_runtime();
+        missing.gpu_native_token_loop_geometry = None;
+        let error =
+            validate_gpu_native_authoritative_runtime_contract(&missing, REQUIRED_ADAPTER_NAME)
+                .unwrap_err();
+        assert!(error.contains("requires gpu_native_token_loop"));
+
+        let mut wrong = gpu_native_authoritative_runtime();
+        wrong.gpu_native_token_loop_geometry.as_mut().unwrap().d_ff += 1;
+        assert!(
+            validate_gpu_native_authoritative_runtime_contract(&wrong, REQUIRED_ADAPTER_NAME)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gpu_native_authoritative_runtime_requires_exact_hardware_vulkan_identity() {
+        let mut missing = gpu_native_authoritative_runtime();
+        missing.authoritative_device = None;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &missing,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut wrong_name = gpu_native_authoritative_runtime();
+        wrong_name.authoritative_device.as_mut().unwrap().name = "other".into();
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &wrong_name,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut software = gpu_native_authoritative_runtime();
+        software
+            .authoritative_device
+            .as_mut()
+            .unwrap()
+            .software_adapter = true;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &software,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut wrong_backend = gpu_native_authoritative_runtime();
+        wrong_backend
+            .authoritative_device
+            .as_mut()
+            .unwrap()
+            .wgpu_backend = "metal".into();
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &wrong_backend,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gpu_native_authoritative_runtime_requires_gpu_native_config_and_strict_model() {
+        let mut wrong_config = gpu_native_authoritative_runtime();
+        wrong_config.real_transformer_gpu_native = false;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &wrong_config,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut wrong_offload = gpu_native_authoritative_runtime();
+        wrong_offload.compute_offload = crate::backend::ComputeOffload::Cpu;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &wrong_offload,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut non_strict = gpu_native_authoritative_runtime();
+        non_strict.model_load.strict = false;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &non_strict,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut incomplete = gpu_native_authoritative_runtime();
+        incomplete.model_load.loaded_tensors -= 1;
+        assert!(validate_gpu_native_authoritative_runtime_contract(
+            &incomplete,
+            REQUIRED_ADAPTER_NAME
+        )
+        .is_err());
+
+        let mut seeded = gpu_native_authoritative_runtime();
+        seeded.model_load.seeded_fallback_remained = true;
+        assert!(
+            validate_gpu_native_authoritative_runtime_contract(&seeded, REQUIRED_ADAPTER_NAME)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_and_historical_cpu_plane_contracts_remain_cpu_only() {
+        for plane in ["EXACT_F32_CPU", "HISTORICAL_F16_CPU"] {
+            let runtime = runtime_evidence(plane, 1);
+            assert!(crate::greedy_parity::cpu_plan_exact(
+                &runtime.execution_plan
+            ));
+            assert!(runtime.gpu_token_loop_after.is_none());
+        }
+    }
+
+    #[test]
     fn schema_mode_target_and_diagnostic_contract_are_frozen() {
         assert_eq!(
             SCHEMA_VERSION,
             "mer.gpu-native-spanish-first-token-attribution.v1"
         );
         assert_eq!(MODE, "diagnose-gpu-native-spanish-first-token-attribution");
+        assert!(ProductionSemanticsEvidence::default().diagnostic_only);
         assert!(!QUALIFICATION_PASS);
         assert_eq!(FrozenSpanishTargetIdentity::default().case, TARGET_CASE);
+        assert_eq!(FrozenSpanishTargetIdentity::default().generated_position, 0);
+        assert_eq!(
+            FrozenSpanishTargetIdentity::default().historical_f16_boundary_cpu_token,
+            HISTORICAL_F16_CPU_TOKEN
+        );
+        assert_eq!(
+            FrozenSpanishTargetIdentity::default().frozen_gpu_token,
+            FROZEN_GPU_TOKEN
+        );
         assert_eq!(
             FrozenSpanishTargetIdentity::default().corrected_exact_f32_cpu_token,
             140_003
