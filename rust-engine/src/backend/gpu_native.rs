@@ -87,6 +87,29 @@ pub(crate) enum GpuNativeBootstrapError {
     StateSizeOverflow {
         d_model: usize,
     },
+    InvalidPreExpertCheckpointGeometry {
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    },
+    PreExpertCheckpointSizeOverflow {
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    },
+    PreExpertCheckpointLayerOutOfRange {
+        layer_index: usize,
+        num_layers: usize,
+    },
+    ForeignPreExpertCheckpoints,
+    PreExpertCheckpointGeometryMismatch {
+        expected_num_layers: usize,
+        expected_d_model: usize,
+        expected_top_k: usize,
+        actual_num_layers: usize,
+        actual_d_model: usize,
+        actual_top_k: usize,
+    },
     InvalidDenseWeightKey,
     InvalidDenseWeightShape {
         rows: usize,
@@ -493,6 +516,44 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::StateSizeOverflow { d_model } => write!(
                 f,
                 "GPU-native token-state size overflows for d_model={d_model}"
+            ),
+            Self::InvalidPreExpertCheckpointGeometry {
+                num_layers,
+                d_model,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint geometry must have non-zero layers/d_model and top_k in 1..={MAX_GPU_NATIVE_ROUTER_TOP_K}, got layers={num_layers} d_model={d_model} top_k={top_k}"
+            ),
+            Self::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint layout overflows for layers={num_layers} d_model={d_model} top_k={top_k}"
+            ),
+            Self::PreExpertCheckpointLayerOutOfRange {
+                layer_index,
+                num_layers,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint layer {layer_index} is outside 0..{num_layers}"
+            ),
+            Self::ForeignPreExpertCheckpoints => write!(
+                f,
+                "GPU-native pre-expert checkpoints belong to a different executor context"
+            ),
+            Self::PreExpertCheckpointGeometryMismatch {
+                expected_num_layers,
+                expected_d_model,
+                expected_top_k,
+                actual_num_layers,
+                actual_d_model,
+                actual_top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint geometry layers={actual_num_layers} d_model={actual_d_model} top_k={actual_top_k} does not match expected layers={expected_num_layers} d_model={expected_d_model} top_k={expected_top_k}"
             ),
             Self::InvalidDenseWeightKey => {
                 write!(f, "GPU-native dense weight key must be non-empty")
@@ -3561,6 +3622,228 @@ pub(crate) struct GpuNativeTokenStateLayout {
     total_buffer_bytes: u64,
 }
 
+/// Exact byte ranges for one layer's request-local pre-expert checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativePreExpertCheckpointRegions {
+    pub(crate) hidden_offset: u64,
+    pub(crate) residual_offset: u64,
+    pub(crate) selected_ids_offset: u64,
+    pub(crate) selected_weights_offset: u64,
+}
+
+/// Checked packed layout for all pre-expert checkpoints owned by one request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativePreExpertCheckpointLayout {
+    num_layers: usize,
+    d_model: usize,
+    top_k: usize,
+    hidden_bytes: u64,
+    residual_bytes: u64,
+    selected_ids_bytes: u64,
+    selected_weights_bytes: u64,
+    layer_bytes: u64,
+    total_bytes: u64,
+}
+
+impl GpuNativePreExpertCheckpointLayout {
+    pub(crate) fn try_new(
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if num_layers == 0 || d_model == 0 || top_k == 0 || top_k > MAX_GPU_NATIVE_ROUTER_TOP_K {
+            return Err(
+                GpuNativeBootstrapError::InvalidPreExpertCheckpointGeometry {
+                    num_layers,
+                    d_model,
+                    top_k,
+                },
+            );
+        }
+
+        let checked_bytes = |elements: usize| {
+            elements
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                    num_layers,
+                    d_model,
+                    top_k,
+                })
+        };
+        let hidden_bytes = checked_bytes(d_model)?;
+        let residual_bytes = checked_bytes(d_model)?;
+        let selected_ids_bytes = checked_bytes(top_k)?;
+        let selected_weights_bytes = checked_bytes(top_k)?;
+        let layer_bytes = hidden_bytes
+            .checked_add(residual_bytes)
+            .and_then(|bytes| bytes.checked_add(selected_ids_bytes))
+            .and_then(|bytes| bytes.checked_add(selected_weights_bytes))
+            .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            })?;
+        let total_bytes = u64::try_from(num_layers)
+            .ok()
+            .and_then(|layers| layer_bytes.checked_mul(layers))
+            .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            })?;
+
+        let layout = Self {
+            num_layers,
+            d_model,
+            top_k,
+            hidden_bytes,
+            residual_bytes,
+            selected_ids_bytes,
+            selected_weights_bytes,
+            layer_bytes,
+            total_bytes,
+        };
+        debug_assert_eq!(layout.total_bytes % wgpu::COPY_BUFFER_ALIGNMENT, 0);
+        Ok(layout)
+    }
+
+    pub(crate) const fn num_layers(self) -> usize {
+        self.num_layers
+    }
+
+    pub(crate) const fn d_model(self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) const fn top_k(self) -> usize {
+        self.top_k
+    }
+
+    pub(crate) const fn hidden_bytes(self) -> u64 {
+        self.hidden_bytes
+    }
+
+    pub(crate) const fn residual_bytes(self) -> u64 {
+        self.residual_bytes
+    }
+
+    pub(crate) const fn selected_ids_bytes(self) -> u64 {
+        self.selected_ids_bytes
+    }
+
+    pub(crate) const fn selected_weights_bytes(self) -> u64 {
+        self.selected_weights_bytes
+    }
+
+    pub(crate) const fn layer_bytes(self) -> u64 {
+        self.layer_bytes
+    }
+
+    pub(crate) const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    pub(crate) fn usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+    }
+
+    pub(crate) fn regions(
+        self,
+        layer_index: usize,
+    ) -> Result<GpuNativePreExpertCheckpointRegions, GpuNativeBootstrapError> {
+        if layer_index >= self.num_layers {
+            return Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index,
+                    num_layers: self.num_layers,
+                },
+            );
+        }
+        let overflow = || GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+            num_layers: self.num_layers,
+            d_model: self.d_model,
+            top_k: self.top_k,
+        };
+        let base = self
+            .layer_bytes
+            .checked_mul(layer_index as u64)
+            .ok_or_else(overflow)?;
+        let residual_offset = base.checked_add(self.hidden_bytes).ok_or_else(overflow)?;
+        let selected_ids_offset = residual_offset
+            .checked_add(self.residual_bytes)
+            .ok_or_else(overflow)?;
+        let selected_weights_offset = selected_ids_offset
+            .checked_add(self.selected_ids_bytes)
+            .ok_or_else(overflow)?;
+        let end = selected_weights_offset
+            .checked_add(self.selected_weights_bytes)
+            .ok_or_else(overflow)?;
+        if end > self.total_bytes
+            || [
+                base,
+                residual_offset,
+                selected_ids_offset,
+                selected_weights_offset,
+                end,
+            ]
+            .into_iter()
+            .any(|offset| offset % wgpu::COPY_BUFFER_ALIGNMENT != 0)
+        {
+            return Err(overflow());
+        }
+        Ok(GpuNativePreExpertCheckpointRegions {
+            hidden_offset: base,
+            residual_offset,
+            selected_ids_offset,
+            selected_weights_offset,
+        })
+    }
+
+    fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_pre_expert_checkpoints",
+            self.total_bytes,
+            Self::usage(),
+            limits,
+        )?;
+        Ok(())
+    }
+}
+
+/// Opaque request-local, GPU-resident storage for exact pre-expert state.
+pub(crate) struct GpuNativePreExpertCheckpoints<B = wgpu::Buffer> {
+    context_id: u64,
+    layout: GpuNativePreExpertCheckpointLayout,
+    buffer: B,
+}
+
+impl<B> GpuNativePreExpertCheckpoints<B> {
+    fn from_buffer(context_id: u64, layout: GpuNativePreExpertCheckpointLayout, buffer: B) -> Self {
+        Self {
+            context_id,
+            layout,
+            buffer,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> GpuNativePreExpertCheckpointLayout {
+        self.layout
+    }
+
+    pub(crate) fn buffer(&self) -> &B {
+        &self.buffer
+    }
+}
+
+impl<B> fmt::Debug for GpuNativePreExpertCheckpoints<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativePreExpertCheckpoints")
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GpuNativeTokenStateLayout {
     pub(crate) fn try_new(d_model: usize) -> Result<Self, GpuNativeBootstrapError> {
         if d_model == 0 {
@@ -3788,7 +4071,7 @@ impl GpuNativeRouterScratchLayout {
     }
 
     pub(crate) fn result_usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
     }
 
     fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
@@ -4280,6 +4563,43 @@ fn validate_router_scratch<B>(
         });
     }
     Ok(())
+}
+
+fn validate_pre_expert_checkpoint_resources<B, C>(
+    context_id: u64,
+    checkpoints: &GpuNativePreExpertCheckpoints<C>,
+    state: &GpuNativeTokenState<B>,
+    router_scratch: &GpuNativeRouterScratch<B>,
+    layer_index: usize,
+) -> Result<GpuNativePreExpertCheckpointRegions, GpuNativeBootstrapError> {
+    if checkpoints.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignPreExpertCheckpoints);
+    }
+    validate_token_state_owner(context_id, state.context_id)?;
+    validate_router_scratch(context_id, router_scratch.layout.geometry, router_scratch)?;
+    let expected = checkpoints.layout;
+    let actual_d_model = state.layout.d_model;
+    let router_geometry = router_scratch.layout.geometry;
+    if actual_d_model != expected.d_model
+        || router_geometry.d_model != expected.d_model
+        || router_geometry.top_k != expected.top_k
+        || state.layout.vector_bytes != expected.hidden_bytes
+        || state.layout.vector_bytes != expected.residual_bytes
+        || router_scratch.layout.selected_ids_bytes != expected.selected_ids_bytes
+        || router_scratch.layout.selected_weights_bytes != expected.selected_weights_bytes
+    {
+        return Err(
+            GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch {
+                expected_num_layers: expected.num_layers,
+                expected_d_model: expected.d_model,
+                expected_top_k: expected.top_k,
+                actual_num_layers: expected.num_layers,
+                actual_d_model,
+                actual_top_k: router_geometry.top_k,
+            },
+        );
+    }
+    expected.regions(layer_index)
 }
 
 fn validate_router_plan_with_registry<B>(
@@ -5945,6 +6265,138 @@ impl GpuNativeExecutorContext {
             residual,
             status,
         ))
+    }
+
+    /// Allocate one request's exact, GPU-only pre-expert checkpoints.
+    pub(crate) fn create_pre_expert_checkpoints(
+        &self,
+        layout: GpuNativePreExpertCheckpointLayout,
+    ) -> Result<GpuNativePreExpertCheckpoints, GpuNativeBootstrapError> {
+        if layout.d_model != self.layout.d_model {
+            return Err(
+                GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch {
+                    expected_num_layers: layout.num_layers,
+                    expected_d_model: self.layout.d_model,
+                    expected_top_k: layout.top_k,
+                    actual_num_layers: layout.num_layers,
+                    actual_d_model: layout.d_model,
+                    actual_top_k: layout.top_k,
+                },
+            );
+        }
+        let gpu = self.authoritative_gpu()?;
+        layout.validate_for_limits(&gpu.device.limits())?;
+        let buffer = create_startup_buffer(
+            &gpu.device,
+            "gpu_native_pre_expert_checkpoints",
+            layout.total_bytes,
+            GpuNativePreExpertCheckpointLayout::usage(),
+        )?;
+        Ok(GpuNativePreExpertCheckpoints::from_buffer(
+            self.context_id,
+            layout,
+            buffer,
+        ))
+    }
+
+    /// Capture exact post-router, pre-expert state for one layer.
+    pub(crate) fn encode_capture_pre_expert_checkpoint(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        checkpoints: &GpuNativePreExpertCheckpoints,
+        layer_index: usize,
+        state: &GpuNativeTokenState,
+        router_scratch: &GpuNativeRouterScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.authoritative_gpu()?;
+        let regions = validate_pre_expert_checkpoint_resources(
+            self.context_id,
+            checkpoints,
+            state,
+            router_scratch,
+            layer_index,
+        )?;
+        let layout = checkpoints.layout;
+
+        encoder.copy_buffer_to_buffer(
+            &state.hidden,
+            0,
+            &checkpoints.buffer,
+            regions.hidden_offset,
+            layout.hidden_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &state.residual,
+            0,
+            &checkpoints.buffer,
+            regions.residual_offset,
+            layout.residual_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &router_scratch.selected_ids,
+            0,
+            &checkpoints.buffer,
+            regions.selected_ids_offset,
+            layout.selected_ids_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &router_scratch.selected_weights,
+            0,
+            &checkpoints.buffer,
+            regions.selected_weights_offset,
+            layout.selected_weights_bytes,
+        );
+        Ok(())
+    }
+
+    /// Restore one layer's exact post-router, pre-expert state.
+    pub(crate) fn encode_restore_pre_expert_checkpoint(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        checkpoints: &GpuNativePreExpertCheckpoints,
+        layer_index: usize,
+        state: &GpuNativeTokenState,
+        router_scratch: &GpuNativeRouterScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.authoritative_gpu()?;
+        let regions = validate_pre_expert_checkpoint_resources(
+            self.context_id,
+            checkpoints,
+            state,
+            router_scratch,
+            layer_index,
+        )?;
+        let layout = checkpoints.layout;
+
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.hidden_offset,
+            &state.hidden,
+            0,
+            layout.hidden_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.residual_offset,
+            &state.residual,
+            0,
+            layout.residual_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.selected_ids_offset,
+            &router_scratch.selected_ids,
+            0,
+            layout.selected_ids_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.selected_weights_offset,
+            &router_scratch.selected_weights,
+            0,
+            layout.selected_weights_bytes,
+        );
+        Ok(())
     }
 
     /// Record the future replay boundary into the caller-owned encoder.
@@ -10208,6 +10660,7 @@ pub(crate) mod tests {
         assert!(!GpuNativeRouterScratchLayout::result_usage()
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
         assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_DST));
 
         let scratch = GpuNativeRouterScratch::from_buffers(7, 1, layout, (), (), ());
         assert_eq!(validate_router_scratch(7, geometry, &scratch), Ok(()));
@@ -10248,6 +10701,176 @@ pub(crate) mod tests {
             validate_router_scratch(7, geometry, &wrong_weights),
             Err(GpuNativeBootstrapError::RouterSelectedWeightsLength { .. })
         ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_layout_is_exact_checked_and_aligned() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(48, 2048, 8).unwrap();
+        assert_eq!(layout.num_layers(), 48);
+        assert_eq!(layout.d_model(), 2048);
+        assert_eq!(layout.top_k(), 8);
+        assert_eq!(layout.hidden_bytes(), 8192);
+        assert_eq!(layout.residual_bytes(), 8192);
+        assert_eq!(layout.selected_ids_bytes(), 32);
+        assert_eq!(layout.selected_weights_bytes(), 32);
+        assert_eq!(layout.layer_bytes(), 16_448);
+        assert_eq!(layout.total_bytes(), 789_504);
+
+        for layer_index in 0..layout.num_layers() {
+            let regions = layout.regions(layer_index).unwrap();
+            let offsets = [
+                regions.hidden_offset,
+                regions.residual_offset,
+                regions.selected_ids_offset,
+                regions.selected_weights_offset,
+            ];
+            assert!(offsets
+                .iter()
+                .all(|offset| offset % wgpu::COPY_BUFFER_ALIGNMENT == 0));
+            assert_eq!(regions.hidden_offset, layer_index as u64 * 16_448);
+            assert_eq!(regions.residual_offset, regions.hidden_offset + 8192);
+            assert_eq!(regions.selected_ids_offset, regions.residual_offset + 8192);
+            assert_eq!(
+                regions.selected_weights_offset,
+                regions.selected_ids_offset + 32
+            );
+            assert!(regions.selected_weights_offset + 32 <= layout.total_bytes());
+        }
+        assert_eq!(
+            layout.regions(48),
+            Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index: 48,
+                    num_layers: 48,
+                }
+            )
+        );
+
+        let usage = GpuNativePreExpertCheckpointLayout::usage();
+        assert_eq!(
+            usage,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+        );
+        assert!(!usage.intersects(
+            wgpu::BufferUsages::MAP_READ
+                | wgpu::BufferUsages::MAP_WRITE
+                | wgpu::BufferUsages::STORAGE
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_layout_rejects_invalid_or_overflowing_geometry() {
+        for (num_layers, d_model, top_k) in [(0, 2048, 8), (48, 0, 8), (48, 2048, 0), (48, 2048, 9)]
+        {
+            assert_eq!(
+                GpuNativePreExpertCheckpointLayout::try_new(num_layers, d_model, top_k),
+                Err(
+                    GpuNativeBootstrapError::InvalidPreExpertCheckpointGeometry {
+                        num_layers,
+                        d_model,
+                        top_k,
+                    }
+                )
+            );
+        }
+        assert!(matches!(
+            GpuNativePreExpertCheckpointLayout::try_new(usize::MAX, usize::MAX, 8),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_ownership_and_geometry_fail_closed() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(2, 16, 4).unwrap();
+        let checkpoints = GpuNativePreExpertCheckpoints::from_buffer(7, layout, ());
+        let state_layout = GpuNativeTokenStateLayout::try_new(16).unwrap();
+        let state = GpuNativeTokenState::from_buffers(7, 1, state_layout, (), (), ());
+        let router_geometry = GpuNativeRouterGeometry::try_new(16, 8, 4).unwrap();
+        let router_layout = GpuNativeRouterScratchLayout::try_new(router_geometry).unwrap();
+        let router = GpuNativeRouterScratch::from_buffers(7, 1, router_layout, (), (), ());
+
+        assert!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &router, 1).is_ok()
+        );
+        assert_eq!(
+            validate_pre_expert_checkpoint_resources(8, &checkpoints, &state, &router, 0),
+            Err(GpuNativeBootstrapError::ForeignPreExpertCheckpoints)
+        );
+        assert_eq!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &router, 2),
+            Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index: 2,
+                    num_layers: 2,
+                }
+            )
+        );
+
+        let wrong_state_layout = GpuNativeTokenStateLayout::try_new(8).unwrap();
+        let wrong_state = GpuNativeTokenState::from_buffers(7, 2, wrong_state_layout, (), (), ());
+        assert!(matches!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &wrong_state, &router, 0),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch { .. })
+        ));
+
+        let wrong_router_geometry = GpuNativeRouterGeometry::try_new(16, 8, 2).unwrap();
+        let wrong_router_layout =
+            GpuNativeRouterScratchLayout::try_new(wrong_router_geometry).unwrap();
+        let wrong_router =
+            GpuNativeRouterScratch::from_buffers(7, 2, wrong_router_layout, (), (), ());
+        assert!(matches!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &wrong_router, 0),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_roundtrip_preserves_exact_ordered_state_bytes() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(3, 4, 3).unwrap();
+        let regions = layout.regions(1).unwrap();
+        let hidden = [1.0f32, -0.0, f32::from_bits(1), f32::INFINITY];
+        let residual = [-3.5f32, 7.25, f32::MIN_POSITIVE, f32::NEG_INFINITY];
+        let selected_ids = [7u32, 2, 5];
+        let selected_weights = [0.625f32, 0.25, 0.125];
+        let mut checkpoint = vec![0u8; layout.total_bytes() as usize];
+
+        let mut capture = |offset: u64, bytes: &[u8]| {
+            let start = offset as usize;
+            checkpoint[start..start + bytes.len()].copy_from_slice(bytes);
+        };
+        capture(regions.hidden_offset, bytemuck::cast_slice(&hidden));
+        capture(regions.residual_offset, bytemuck::cast_slice(&residual));
+        capture(
+            regions.selected_ids_offset,
+            bytemuck::cast_slice(&selected_ids),
+        );
+        capture(
+            regions.selected_weights_offset,
+            bytemuck::cast_slice(&selected_weights),
+        );
+
+        let restore = |offset: u64, bytes: u64| {
+            checkpoint[offset as usize..(offset + bytes) as usize].to_vec()
+        };
+        assert_eq!(
+            restore(regions.hidden_offset, layout.hidden_bytes()),
+            bytemuck::cast_slice::<f32, u8>(&hidden)
+        );
+        assert_eq!(
+            restore(regions.residual_offset, layout.residual_bytes()),
+            bytemuck::cast_slice::<f32, u8>(&residual)
+        );
+        assert_eq!(
+            restore(regions.selected_ids_offset, layout.selected_ids_bytes()),
+            bytemuck::cast_slice::<u32, u8>(&selected_ids)
+        );
+        assert_eq!(
+            restore(
+                regions.selected_weights_offset,
+                layout.selected_weights_bytes()
+            ),
+            bytemuck::cast_slice::<f32, u8>(&selected_weights)
+        );
     }
 
     #[test]
@@ -14687,6 +15310,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let router_result = GpuNativeRouterScratchLayout::result_usage();
         assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
         assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_DST));
         assert!(
             !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
         );

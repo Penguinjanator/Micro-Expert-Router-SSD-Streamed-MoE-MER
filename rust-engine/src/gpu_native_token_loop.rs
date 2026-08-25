@@ -14,7 +14,8 @@ use crate::architecture::Architecture;
 use crate::backend::gpu_native::{
     GpuNativeAttentionGeometry, GpuNativeAttentionNorm, GpuNativeAttentionPlan,
     GpuNativeAttentionScratch, GpuNativeBootstrapError, GpuNativeDenseWeightHandle,
-    GpuNativeDenseWeightKey, GpuNativeExecutorContext, GpuNativeKvState, GpuNativeQ4ExpertGeometry,
+    GpuNativeDenseWeightKey, GpuNativeExecutorContext, GpuNativeKvState,
+    GpuNativePreExpertCheckpointLayout, GpuNativePreExpertCheckpoints, GpuNativeQ4ExpertGeometry,
     GpuNativeQ4ExpertScratch, GpuNativeRmsNormHandle, GpuNativeRouterGeometry, GpuNativeRouterPlan,
     GpuNativeRouterScratch, GpuNativeScratch, GpuNativeTokenState, GPU_NATIVE_STATUS_FATAL_MASK,
     GPU_NATIVE_STATUS_RETRYABLE_MASK, MAX_GPU_NATIVE_ROUTER_EXPERTS, MAX_GPU_NATIVE_ROUTER_TOP_K,
@@ -1094,6 +1095,14 @@ impl GpuNativeTokenLoop {
             .executor
             .create_scratch(self.model_geometry.vocab_size)?;
         let sampled_token_buf = self.executor.create_boundary_result_scratch(1)?;
+        let checkpoint_layout = GpuNativePreExpertCheckpointLayout::try_new(
+            self.model_geometry.num_layers,
+            self.model_geometry.d_model,
+            self.model_geometry.top_k,
+        )?;
+        let pre_expert_checkpoints = self
+            .executor
+            .create_pre_expert_checkpoints(checkpoint_layout)?;
 
         let gpu = self.executor.authoritative_gpu()?;
         let staging_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1111,6 +1120,7 @@ impl GpuNativeTokenLoop {
             expert_scratch,
             logits_scratch,
             sampled_token_buf,
+            pre_expert_checkpoints,
             staging_buffer,
             committed_position: 0,
             max_seq_len: self.model_geometry.max_seq_len,
@@ -2658,6 +2668,7 @@ pub struct GpuNativeRequestState {
     pub expert_scratch: GpuNativeQ4ExpertScratch,
     pub logits_scratch: GpuNativeScratch,
     pub sampled_token_buf: GpuNativeScratch,
+    pub pre_expert_checkpoints: GpuNativePreExpertCheckpoints,
     pub staging_buffer: wgpu::Buffer,
     pub committed_position: usize,
     pub max_seq_len: usize,
