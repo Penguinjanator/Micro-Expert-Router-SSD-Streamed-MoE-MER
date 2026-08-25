@@ -559,6 +559,7 @@ pub(crate) fn map_gpu_native_token_loop_error(
         | GpuNativeTokenLoopError::AttemptBoundExceeded { .. }
         | GpuNativeTokenLoopError::NoProgress { .. }
         | GpuNativeTokenLoopError::FatalNumericalFailure { .. }
+        | GpuNativeTokenLoopError::UnknownStatusBits { .. }
         | GpuNativeTokenLoopError::ResidencyServiceFailed(_)
         | GpuNativeTokenLoopError::Bootstrap(_)
         | GpuNativeTokenLoopError::InvalidBoundaryReport { .. }
@@ -3848,6 +3849,16 @@ mod tests {
         assert!(matches!(gen_err3, GenerateError::Inference(_)));
         let resp3 = error_response(gen_err3);
         assert_eq!(resp3.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let unknown_status_err = GpuNativeTokenLoopError::UnknownStatusBits {
+            layer_index: Some(0),
+            status_bits: 1 << 31,
+            unknown_bits: 1 << 31,
+        };
+        let gen_err_unknown = map_gpu_native_token_loop_error(unknown_status_err);
+        assert!(matches!(gen_err_unknown, GenerateError::Inference(_)));
+        let resp_unknown = error_response(gen_err_unknown);
+        assert_eq!(resp_unknown.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let map_failed_err = GpuNativeTokenLoopError::MapFailed("device lost".into());
         let gen_err4 = map_gpu_native_token_loop_error(map_failed_err);

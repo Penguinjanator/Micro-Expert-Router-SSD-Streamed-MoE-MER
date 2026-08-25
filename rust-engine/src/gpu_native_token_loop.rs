@@ -6,8 +6,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::architecture::Architecture;
@@ -43,6 +45,23 @@ pub struct GpuNativeTokenLoopSnapshot {
     pub boundary_readbacks: u64,
 }
 
+/// Separate PR1 recovery accounting so frozen token-loop schemas retain their
+/// literal historical meaning.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GpuNativeRecoverySnapshot {
+    pub resume_attempts: u64,
+    pub recovery_segments: u64,
+    pub checkpoint_captures: u64,
+    pub checkpoint_restores: u64,
+    pub full_token_replay_attempts: u64,
+    pub layers_encoded: u64,
+    pub attention_layers_reexecuted: u64,
+    pub expert_layers_reexecuted: u64,
+    pub invalid_tail_layers_encoded: u64,
+    pub residency_service_us: u64,
+    pub boundary_wait_us: u64,
+}
+
 #[derive(Default)]
 struct GpuNativeTokenLoopCounters {
     token_attempts: AtomicU64,
@@ -56,6 +75,43 @@ struct GpuNativeTokenLoopCounters {
     queue_submissions: AtomicU64,
     boundary_maps: AtomicU64,
     boundary_readbacks: AtomicU64,
+}
+
+#[derive(Default)]
+struct GpuNativeRecoveryCounters {
+    resume_attempts: AtomicU64,
+    recovery_segments: AtomicU64,
+    checkpoint_captures: AtomicU64,
+    checkpoint_restores: AtomicU64,
+    full_token_replay_attempts: AtomicU64,
+    layers_encoded: AtomicU64,
+    attention_layers_reexecuted: AtomicU64,
+    expert_layers_reexecuted: AtomicU64,
+    invalid_tail_layers_encoded: AtomicU64,
+    residency_service_us: AtomicU64,
+    boundary_wait_us: AtomicU64,
+}
+
+impl GpuNativeRecoveryCounters {
+    fn snapshot(&self) -> GpuNativeRecoverySnapshot {
+        GpuNativeRecoverySnapshot {
+            resume_attempts: self.resume_attempts.load(Ordering::Relaxed),
+            recovery_segments: self.recovery_segments.load(Ordering::Relaxed),
+            checkpoint_captures: self.checkpoint_captures.load(Ordering::Relaxed),
+            checkpoint_restores: self.checkpoint_restores.load(Ordering::Relaxed),
+            full_token_replay_attempts: self.full_token_replay_attempts.load(Ordering::Relaxed),
+            layers_encoded: self.layers_encoded.load(Ordering::Relaxed),
+            attention_layers_reexecuted: self.attention_layers_reexecuted.load(Ordering::Relaxed),
+            expert_layers_reexecuted: self.expert_layers_reexecuted.load(Ordering::Relaxed),
+            invalid_tail_layers_encoded: self.invalid_tail_layers_encoded.load(Ordering::Relaxed),
+            residency_service_us: self.residency_service_us.load(Ordering::Relaxed),
+            boundary_wait_us: self.boundary_wait_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn saturating_micros(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 impl GpuNativeTokenLoopCounters {
@@ -99,6 +155,11 @@ pub enum GpuNativeTokenLoopError {
     FatalNumericalFailure {
         layer_index: Option<usize>,
         status_bits: u32,
+    },
+    UnknownStatusBits {
+        layer_index: Option<usize>,
+        status_bits: u32,
+        unknown_bits: u32,
     },
     ResidencyServiceFailed(GpuNativeDemandResidencyError),
     UnsupportedSampling {
@@ -162,6 +223,14 @@ impl fmt::Display for GpuNativeTokenLoopError {
                 f,
                 "fatal numerical failure on {:?} with status bits 0x{status_bits:08x}",
                 layer_index
+            ),
+            Self::UnknownStatusBits {
+                layer_index,
+                status_bits,
+                unknown_bits,
+            } => write!(
+                f,
+                "unknown GPU-native status bits 0x{unknown_bits:08x} on {layer_index:?} in status 0x{status_bits:08x}"
             ),
             Self::ResidencyServiceFailed(err) => write!(f, "residency service failed: {err}"),
             Self::UnsupportedSampling { reason } => write!(f, "unsupported sampling: {reason}"),
@@ -533,6 +602,247 @@ impl GpuNativeBoundaryReport {
     pub fn first_failure_layer(&self) -> Option<usize> {
         self.layer_statuses.iter().position(|&status| status != 0)
     }
+
+    /// Inspect only the layer interval encoded by the current boundary.
+    pub fn first_failure_layer_in(
+        &self,
+        attempted_layers: Range<usize>,
+    ) -> Result<Option<usize>, GpuNativeTokenLoopError> {
+        if attempted_layers.start >= attempted_layers.end
+            || attempted_layers.end > self.layer_statuses.len()
+        {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!(
+                    "attempted layer range {:?} is invalid for {} layer statuses",
+                    attempted_layers,
+                    self.layer_statuses.len()
+                ),
+            });
+        }
+        Ok(self.layer_statuses[attempted_layers.clone()]
+            .iter()
+            .position(|&status| status != 0)
+            .map(|relative| attempted_layers.start + relative))
+    }
+}
+
+const GPU_NATIVE_RECOVERY_INITIAL_WINDOW: usize = 1;
+const GPU_NATIVE_RECOVERY_MAX_WINDOW: usize = 8;
+
+fn gpu_native_attempt_bound(num_layers: usize) -> Result<usize, GpuNativeTokenLoopError> {
+    num_layers
+        .checked_mul(2)
+        .and_then(|bound| bound.checked_add(2))
+        .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+            detail: "GPU-native recovery attempt bound overflow".into(),
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuNativeAttemptStart {
+    Fresh,
+    ResumeExpert { layer_index: usize },
+    Continue { layer_index: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuNativeMissSignature {
+    layer_index: usize,
+    selected_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuNativeExecutionSegment {
+    attempt_start: GpuNativeAttemptStart,
+    ordinary_layers: Range<usize>,
+    attempted_layers: Range<usize>,
+    completes_token: bool,
+}
+
+impl GpuNativeExecutionSegment {
+    fn fresh(num_layers: usize) -> Result<Self, GpuNativeTokenLoopError> {
+        if num_layers == 0 {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "cannot encode a token with zero layers".into(),
+            });
+        }
+        Ok(Self {
+            attempt_start: GpuNativeAttemptStart::Fresh,
+            ordinary_layers: 0..num_layers,
+            attempted_layers: 0..num_layers,
+            completes_token: true,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GpuNativeRecoveryCursor {
+    next_layer: usize,
+    window_layers: usize,
+    last_miss: Option<GpuNativeMissSignature>,
+    residency_services: usize,
+    clean_segments: usize,
+    pending_resume_layer: Option<usize>,
+}
+
+impl GpuNativeRecoveryCursor {
+    fn after_serviced_miss(
+        num_layers: usize,
+        miss: GpuNativeMissSignature,
+    ) -> Result<Self, GpuNativeTokenLoopError> {
+        if miss.layer_index >= num_layers {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!(
+                    "recovery miss layer {} is outside 0..{num_layers}",
+                    miss.layer_index
+                ),
+            });
+        }
+        Ok(Self {
+            next_layer: miss.layer_index + 1,
+            window_layers: GPU_NATIVE_RECOVERY_INITIAL_WINDOW,
+            last_miss: Some(miss.clone()),
+            residency_services: 1,
+            clean_segments: 0,
+            pending_resume_layer: Some(miss.layer_index),
+        })
+    }
+
+    fn plan(
+        &self,
+        num_layers: usize,
+    ) -> Result<GpuNativeExecutionSegment, GpuNativeTokenLoopError> {
+        if num_layers == 0
+            || self.window_layers == 0
+            || self.window_layers > GPU_NATIVE_RECOVERY_MAX_WINDOW
+            || self.next_layer > num_layers
+        {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!("invalid GPU-native recovery cursor: {self:?}"),
+            });
+        }
+
+        let (attempt_start, attempted_start, ordinary_start) =
+            if let Some(layer_index) = self.pending_resume_layer {
+                if layer_index >= num_layers || self.next_layer != layer_index + 1 {
+                    return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: format!("invalid pending resume cursor: {self:?}"),
+                    });
+                }
+                (
+                    GpuNativeAttemptStart::ResumeExpert { layer_index },
+                    layer_index,
+                    self.next_layer,
+                )
+            } else {
+                if self.next_layer >= num_layers {
+                    return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: "completed recovery cursor cannot plan another segment".into(),
+                    });
+                }
+                (
+                    GpuNativeAttemptStart::Continue {
+                        layer_index: self.next_layer,
+                    },
+                    self.next_layer,
+                    self.next_layer,
+                )
+            };
+        let ordinary_end = ordinary_start
+            .saturating_add(self.window_layers)
+            .min(num_layers);
+        Ok(GpuNativeExecutionSegment {
+            attempt_start,
+            ordinary_layers: ordinary_start..ordinary_end,
+            attempted_layers: attempted_start..ordinary_end,
+            completes_token: ordinary_end == num_layers,
+        })
+    }
+
+    fn record_clean_segment(
+        &mut self,
+        segment: &GpuNativeExecutionSegment,
+        num_layers: usize,
+    ) -> Result<bool, GpuNativeTokenLoopError> {
+        if self.plan(num_layers)? != *segment {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "recovery segment does not match current cursor".into(),
+            });
+        }
+        let previous_next = self.next_layer;
+        self.next_layer = segment.ordinary_layers.end;
+        self.pending_resume_layer = None;
+        self.clean_segments = self.clean_segments.saturating_add(1);
+        self.window_layers = self
+            .window_layers
+            .saturating_mul(2)
+            .min(GPU_NATIVE_RECOVERY_MAX_WINDOW);
+        if self.next_layer <= previous_next && !segment.completes_token {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: "clean recovery segment made no forward progress".into(),
+            });
+        }
+        Ok(segment.completes_token)
+    }
+
+    fn record_serviced_miss(
+        &mut self,
+        segment: &GpuNativeExecutionSegment,
+        miss: GpuNativeMissSignature,
+    ) -> Result<(), GpuNativeTokenLoopError> {
+        if !segment.attempted_layers.contains(&miss.layer_index) {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!(
+                    "miss layer {} is outside attempted interval {:?}",
+                    miss.layer_index, segment.attempted_layers
+                ),
+            });
+        }
+        if self.last_miss.as_ref() == Some(&miss) {
+            return Err(GpuNativeTokenLoopError::NoProgress {
+                layer_index: miss.layer_index,
+                selected_ids: miss.selected_ids,
+            });
+        }
+        self.next_layer = miss.layer_index + 1;
+        self.window_layers = GPU_NATIVE_RECOVERY_INITIAL_WINDOW;
+        self.pending_resume_layer = Some(miss.layer_index);
+        self.last_miss = Some(miss);
+        self.residency_services = self.residency_services.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuNativeStatusDisposition {
+    Clean,
+    RetryableResidencyMiss,
+}
+
+fn classify_gpu_native_status(
+    status_bits: u32,
+    layer_index: Option<usize>,
+) -> Result<GpuNativeStatusDisposition, GpuNativeTokenLoopError> {
+    if (status_bits & GPU_NATIVE_STATUS_FATAL_MASK) != 0 {
+        return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+            layer_index,
+            status_bits,
+        });
+    }
+    let known_status_mask = GPU_NATIVE_STATUS_FATAL_MASK | GPU_NATIVE_STATUS_RETRYABLE_MASK;
+    let unknown_bits = status_bits & !known_status_mask;
+    if unknown_bits != 0 {
+        return Err(GpuNativeTokenLoopError::UnknownStatusBits {
+            layer_index,
+            status_bits,
+            unknown_bits,
+        });
+    }
+    if status_bits == GPU_NATIVE_STATUS_RETRYABLE_MASK {
+        Ok(GpuNativeStatusDisposition::RetryableResidencyMiss)
+    } else {
+        Ok(GpuNativeStatusDisposition::Clean)
+    }
 }
 
 /// Persistent per-layer plans and handles for one Qwen3-MoE transformer layer.
@@ -666,6 +976,7 @@ pub struct GpuNativeTokenLoop {
     layers: Vec<GpuNativeLayerPlan>,
     report_layout: GpuNativeBoundaryReportLayout,
     counters: GpuNativeTokenLoopCounters,
+    recovery_counters: GpuNativeRecoveryCounters,
     execution_guard: TokioMutex<()>,
 }
 
@@ -987,6 +1298,7 @@ impl GpuNativeTokenLoop {
             layers,
             report_layout,
             counters: GpuNativeTokenLoopCounters::default(),
+            recovery_counters: GpuNativeRecoveryCounters::default(),
             execution_guard: TokioMutex::new(()),
         }))
     }
@@ -1005,6 +1317,10 @@ impl GpuNativeTokenLoop {
 
     pub fn snapshot(&self) -> GpuNativeTokenLoopSnapshot {
         self.counters.snapshot()
+    }
+
+    pub fn recovery_snapshot(&self) -> GpuNativeRecoverySnapshot {
+        self.recovery_counters.snapshot()
     }
 
     /// Allocate request-local device resources for one GPU-native sequence.
@@ -1820,21 +2136,24 @@ impl GpuNativeTokenLoop {
             Option<&GpuNativeScratch>,
         )>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
-        let max_attempts = self.layers.len() + 1;
-        let mut attempt = 0usize;
-        let mut last_miss_sig: Option<(usize, Vec<u32>)> = None;
+        let max_attempts = gpu_native_attempt_bound(self.layers.len())?;
+        let mut attempts = 0usize;
+        let mut recovery: Option<GpuNativeRecoveryCursor> = None;
         let mut is_warm = true;
 
         loop {
-            if attempt >= max_attempts {
+            if attempts >= max_attempts {
                 self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
                 return Err(GpuNativeTokenLoopError::AttemptBoundExceeded {
-                    attempts: attempt,
+                    attempts,
                     max_attempts,
                 });
             }
 
-            let replay = attempt > 0;
+            let segment = match recovery.as_ref() {
+                Some(cursor) => cursor.plan(self.layers.len())?,
+                None => GpuNativeExecutionSegment::fresh(self.layers.len())?,
+            };
             let sink = diagnostic_sink.map(|(layout, buf)| GpuNativeDiagnosticSink {
                 layout,
                 staging_buffer: buf,
@@ -1851,110 +2170,177 @@ impl GpuNativeTokenLoop {
                     stage_scratch,
                 }
             });
-            let output = self.execute_token_attempt_unified(
-                request,
-                token_id,
-                position,
-                sample,
-                replay,
-                sink.as_ref(),
-                router_rank_sink.as_ref(),
-                semantic_sink.as_ref(),
-            )?;
-            let report = output.boundary_report;
+            let output = if matches!(segment.attempt_start, GpuNativeAttemptStart::Fresh) {
+                self.execute_token_attempt_unified(
+                    request,
+                    token_id,
+                    position,
+                    sample,
+                    false,
+                    sink.as_ref(),
+                    router_rank_sink.as_ref(),
+                    semantic_sink.as_ref(),
+                )?
+            } else {
+                self.execute_token_segment_unified(
+                    request,
+                    token_id,
+                    position,
+                    sample,
+                    false,
+                    &segment,
+                    sink.as_ref(),
+                    router_rank_sink.as_ref(),
+                    semantic_sink.as_ref(),
+                )?
+            };
+            attempts += 1;
+            let report = &output.boundary_report;
 
-            if let Some(fail_layer) = report.first_failure_layer() {
+            if let Some(fail_layer) =
+                report.first_failure_layer_in(segment.attempted_layers.clone())?
+            {
                 let layer_status = report.layer_statuses[fail_layer];
-                if (layer_status & GPU_NATIVE_STATUS_FATAL_MASK) != 0 {
-                    self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
-                    return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
-                        layer_index: Some(fail_layer),
-                        status_bits: layer_status,
-                    });
-                }
-                if (layer_status & GPU_NATIVE_STATUS_RETRYABLE_MASK)
-                    == GPU_NATIVE_STATUS_RETRYABLE_MASK
-                {
-                    is_warm = false;
-                    self.counters
-                        .residency_miss_attempts
-                        .fetch_add(1, Ordering::Relaxed);
-                    let local_ids = &report.selected_ids[fail_layer];
-
-                    for &id in local_ids {
-                        if id as usize >= self.model_geometry.num_experts {
-                            return Err(GpuNativeTokenLoopError::InvalidSelectedExpertId {
-                                layer_index: fail_layer,
-                                expert_id: id,
-                            });
-                        }
-                    }
-                    let mut seen = HashSet::with_capacity(local_ids.len());
-                    for &id in local_ids {
-                        if !seen.insert(id) {
-                            return Err(GpuNativeTokenLoopError::DuplicateSelectedExpertId {
-                                layer_index: fail_layer,
-                                expert_id: id,
-                            });
-                        }
-                    }
-                    if local_ids.len() != self.model_geometry.top_k {
-                        return Err(GpuNativeTokenLoopError::InvalidTopKCount {
-                            expected: self.model_geometry.top_k,
-                            actual: local_ids.len(),
+                match classify_gpu_native_status(layer_status, Some(fail_layer)) {
+                    Ok(GpuNativeStatusDisposition::RetryableResidencyMiss) => {}
+                    Ok(GpuNativeStatusDisposition::Clean) => {
+                        self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                            detail: format!(
+                                "failure layer {fail_layer} classified as clean status"
+                            ),
                         });
                     }
-
-                    if let Some((prev_layer, ref prev_ids)) = last_miss_sig {
-                        if prev_layer == fail_layer && prev_ids == local_ids {
-                            self.counters
-                                .no_progress_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                            return Err(GpuNativeTokenLoopError::NoProgress {
-                                layer_index: fail_layer,
-                                selected_ids: local_ids.clone(),
-                            });
-                        }
+                    Err(error) => {
+                        self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
+                        return Err(error);
                     }
-
-                    let global_ids: Vec<u32> = local_ids
-                        .iter()
-                        .map(|&loc| {
-                            fail_layer as u32 * self.model_geometry.num_experts as u32 + loc
-                        })
-                        .collect();
-
-                    engine
-                        .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
-                        .await
-                        .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
-
-                    self.counters
-                        .residency_services
-                        .fetch_add(1, Ordering::Relaxed);
-                    last_miss_sig = Some((fail_layer, local_ids.clone()));
-                    attempt += 1;
-                    continue;
                 }
 
-                return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
-                    layer_index: Some(fail_layer),
-                    status_bits: layer_status,
-                });
+                is_warm = false;
+                self.counters
+                    .residency_miss_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                self.recovery_counters
+                    .invalid_tail_layers_encoded
+                    .fetch_add(
+                        segment
+                            .attempted_layers
+                            .end
+                            .saturating_sub(fail_layer.saturating_add(1))
+                            as u64,
+                        Ordering::Relaxed,
+                    );
+                let local_ids = &report.selected_ids[fail_layer];
+                if local_ids.len() != self.model_geometry.top_k {
+                    return Err(GpuNativeTokenLoopError::InvalidTopKCount {
+                        expected: self.model_geometry.top_k,
+                        actual: local_ids.len(),
+                    });
+                }
+                for &id in local_ids {
+                    if id as usize >= self.model_geometry.num_experts {
+                        return Err(GpuNativeTokenLoopError::InvalidSelectedExpertId {
+                            layer_index: fail_layer,
+                            expert_id: id,
+                        });
+                    }
+                }
+                let mut seen = HashSet::with_capacity(local_ids.len());
+                for &id in local_ids {
+                    if !seen.insert(id) {
+                        return Err(GpuNativeTokenLoopError::DuplicateSelectedExpertId {
+                            layer_index: fail_layer,
+                            expert_id: id,
+                        });
+                    }
+                }
+
+                let miss = GpuNativeMissSignature {
+                    layer_index: fail_layer,
+                    selected_ids: local_ids.clone(),
+                };
+                if recovery
+                    .as_ref()
+                    .and_then(|cursor| cursor.last_miss.as_ref())
+                    == Some(&miss)
+                {
+                    self.counters
+                        .no_progress_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(GpuNativeTokenLoopError::NoProgress {
+                        layer_index: fail_layer,
+                        selected_ids: local_ids.clone(),
+                    });
+                }
+
+                let layer_base = fail_layer
+                    .checked_mul(self.model_geometry.num_experts)
+                    .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: "global expert layer offset overflow".into(),
+                    })?;
+                let global_ids = local_ids
+                    .iter()
+                    .map(|&local_id| {
+                        layer_base
+                            .checked_add(local_id as usize)
+                            .and_then(|global_id| u32::try_from(global_id).ok())
+                            .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+                                detail: "global selected expert id overflow".into(),
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let residency_started = Instant::now();
+                engine
+                    .ensure_gpu_native_demand_residency(fail_layer, &global_ids)
+                    .await
+                    .map_err(GpuNativeTokenLoopError::ResidencyServiceFailed)?;
+                self.recovery_counters
+                    .residency_service_us
+                    .fetch_add(saturating_micros(residency_started), Ordering::Relaxed);
+                self.counters
+                    .residency_services
+                    .fetch_add(1, Ordering::Relaxed);
+
+                match recovery.as_mut() {
+                    Some(cursor) => cursor.record_serviced_miss(&segment, miss)?,
+                    None => {
+                        recovery = Some(GpuNativeRecoveryCursor::after_serviced_miss(
+                            self.layers.len(),
+                            miss,
+                        )?);
+                    }
+                }
+                continue;
             }
 
-            if (report.final_status & GPU_NATIVE_STATUS_FATAL_MASK) != 0 {
-                self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
-                return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
-                    layer_index: None,
-                    status_bits: report.final_status,
-                });
+            if let Some(cursor) = recovery.as_mut() {
+                let completed = cursor.record_clean_segment(&segment, self.layers.len())?;
+                if completed != segment.completes_token {
+                    return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: "recovery completion disagrees with encoded segment".into(),
+                    });
+                }
             }
-            if report.final_status != 0 {
-                return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
-                    layer_index: None,
-                    status_bits: report.final_status,
-                });
+
+            if !segment.completes_token {
+                continue;
+            }
+
+            match classify_gpu_native_status(report.final_status, None) {
+                Ok(GpuNativeStatusDisposition::Clean) => {}
+                Ok(GpuNativeStatusDisposition::RetryableResidencyMiss) => {
+                    self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+                        layer_index: None,
+                        status_bits: report.final_status,
+                    });
+                }
+                Err(error) => {
+                    self.counters.fatal_failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
             }
 
             request.committed_position += 1;
@@ -1975,7 +2361,7 @@ impl GpuNativeTokenLoop {
                 } else {
                     None
                 },
-                attempts: attempt + 1,
+                attempts,
                 diagnostic_trace: output.diagnostic_trace,
                 router_rank_trace: output.router_rank_trace,
                 semantic_trace: output.semantic_trace,
@@ -2033,6 +2419,143 @@ impl GpuNativeTokenLoop {
             })
     }
 
+    /// Encode the routed expert stage for one layer from the exact current
+    /// hidden/residual/router state. This is shared by ordinary layers and
+    /// checkpoint-restored recovery.
+    fn encode_expert_layer_unified(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        request: &GpuNativeRequestState,
+        layer_idx: usize,
+        diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
+        semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
+    ) -> Result<(), GpuNativeTokenLoopError> {
+        let layer_plan = self.layers.get(layer_idx).ok_or_else(|| {
+            GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!("missing GPU-native layer plan {layer_idx}"),
+            }
+        })?;
+        let arena = self.residency_manager.arena(layer_idx).ok_or_else(|| {
+            GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!("missing expert arena for layer {layer_idx}"),
+            }
+        })?;
+        if let Some(sink) = semantic_sink {
+            if let Some(layout) = sink.q4_expert_stage_layout_for_layer(layer_idx) {
+                let stage_scratch = sink.stage_scratch.ok_or_else(|| {
+                    GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: "Q4 expert stage sink is missing diagnostic scratch".into(),
+                    }
+                })?;
+                self.executor.encode_q4_expert_stage_diagnostic(
+                    encoder,
+                    &layer_plan.router_plan,
+                    &request.router_scratch,
+                    arena,
+                    &request.token_state,
+                    &request.expert_scratch,
+                    stage_scratch,
+                )?;
+                encoder.copy_buffer_to_buffer(
+                    stage_scratch.buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.stages_offset,
+                    layout.stages_bytes,
+                );
+            }
+        }
+        self.executor.encode_q4_expert_arena_combine(
+            encoder,
+            &layer_plan.router_plan,
+            &request.router_scratch,
+            arena,
+            &request.token_state,
+            &request.expert_scratch,
+        )?;
+
+        if let Some(sink) = semantic_sink {
+            if let Some(layout) = sink.target_layout_for_layer(layer_idx) {
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.route_outputs_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.route_outputs_offset,
+                    layout.route_outputs_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.combined_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.routed_moe_output_offset,
+                    layout.routed_moe_output_bytes,
+                );
+            }
+            if let Some(layout) = sink.corpus_layout() {
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.route_outputs_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.route_outputs_offset(layer_idx),
+                    layout.route_outputs_layer_bytes,
+                );
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.combined_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.routed_moe_output_offset(layer_idx),
+                    layout.routed_moe_output_layer_bytes,
+                );
+            }
+            if let Some(layout) = sink.q4_expert_stage_layout_for_layer(layer_idx) {
+                encoder.copy_buffer_to_buffer(
+                    request.expert_scratch.route_outputs_buffer(),
+                    0,
+                    sink.staging_buffer,
+                    layout.production_down_offset,
+                    layout.production_down_bytes,
+                );
+            }
+        }
+
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                request.token_state.hidden_buffer(),
+                0,
+                sink.staging_buffer,
+                sink.layout.layer_post_moe_offset(layer_idx),
+                (self.model_geometry.d_model * 4) as u64,
+            );
+            encoder.copy_buffer_to_buffer(
+                request.token_state.status_buffer(),
+                0,
+                sink.staging_buffer,
+                sink.layout.layer_status_offset(layer_idx),
+                4,
+            );
+        }
+
+        let status_offset = (layer_idx * 4) as u64;
+        encoder.copy_buffer_to_buffer(
+            request.token_state.status_buffer(),
+            0,
+            &request.staging_buffer,
+            status_offset,
+            4,
+        );
+        let ids_offset = (self.layers.len() * 4
+            + layer_idx * self.model_geometry.top_k * std::mem::size_of::<u32>())
+            as u64;
+        encoder.copy_buffer_to_buffer(
+            request.router_scratch.selected_ids_buffer(),
+            0,
+            &request.staging_buffer,
+            ids_offset,
+            (self.model_geometry.top_k * std::mem::size_of::<u32>()) as u64,
+        );
+        Ok(())
+    }
+
     /// Single authoritative internal forward attempt encoder and executor.
     fn execute_token_attempt_unified(
         &self,
@@ -2041,6 +2564,34 @@ impl GpuNativeTokenLoop {
         position: usize,
         sample: bool,
         replay: bool,
+        diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
+        router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
+        semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
+    ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
+        let segment = GpuNativeExecutionSegment::fresh(self.layers.len())?;
+        self.execute_token_segment_unified(
+            request,
+            token_id,
+            position,
+            sample,
+            replay,
+            &segment,
+            diagnostic_sink,
+            router_rank_sink,
+            semantic_sink,
+        )
+    }
+
+    /// Shared monolithic/recovery segment encoder and boundary executor.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_token_segment_unified(
+        &self,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        full_token_replay: bool,
+        segment: &GpuNativeExecutionSegment,
         diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
         router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
         semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
@@ -2059,9 +2610,17 @@ impl GpuNativeTokenLoop {
         }
 
         self.counters.token_attempts.fetch_add(1, Ordering::Relaxed);
-        if replay {
+        if full_token_replay {
+            if segment.attempt_start != GpuNativeAttemptStart::Fresh {
+                return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                    detail: "full-token replay requires a fresh segment".into(),
+                });
+            }
             self.counters
                 .replay_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            self.recovery_counters
+                .full_token_replay_attempts
                 .fetch_add(1, Ordering::Relaxed);
         }
 
@@ -2080,33 +2639,73 @@ impl GpuNativeTokenLoop {
                 }),
             });
 
-        if replay {
-            self.executor
-                .encode_clear_retryable_status(&mut encoder, &request.token_state)?;
-        }
-
-        self.executor.encode_embedding_lookup(
-            &mut encoder,
-            &self.embedding_handle,
-            token_id,
-            &request.token_state,
-        )?;
-
-        if let Some(sink) = diagnostic_sink {
-            encoder.copy_buffer_to_buffer(
-                request.token_state.hidden_buffer(),
-                0,
-                sink.staging_buffer,
-                sink.layout.embedding_offset as u64,
-                sink.layout.embedding_bytes as u64,
-            );
-        }
-
         let num_layers = self.layers.len();
         let top_k = self.model_geometry.top_k;
         let rms_eps = self.model_geometry.rms_eps;
+        if segment.attempted_layers.start >= segment.attempted_layers.end
+            || segment.attempted_layers.end > num_layers
+            || segment.ordinary_layers.start > segment.ordinary_layers.end
+            || segment.ordinary_layers.end > num_layers
+        {
+            return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                detail: format!("invalid GPU-native execution segment: {segment:?}"),
+            });
+        }
 
-        for (layer_idx, layer_plan) in self.layers.iter().enumerate() {
+        match segment.attempt_start {
+            GpuNativeAttemptStart::Fresh => {
+                if full_token_replay {
+                    self.executor
+                        .encode_clear_retryable_status(&mut encoder, &request.token_state)?;
+                }
+                self.executor.encode_embedding_lookup(
+                    &mut encoder,
+                    &self.embedding_handle,
+                    token_id,
+                    &request.token_state,
+                )?;
+                if let Some(sink) = diagnostic_sink {
+                    encoder.copy_buffer_to_buffer(
+                        request.token_state.hidden_buffer(),
+                        0,
+                        sink.staging_buffer,
+                        sink.layout.embedding_offset as u64,
+                        sink.layout.embedding_bytes as u64,
+                    );
+                }
+            }
+            GpuNativeAttemptStart::ResumeExpert { layer_index } => {
+                self.executor
+                    .encode_clear_retryable_status(&mut encoder, &request.token_state)?;
+                self.executor.encode_restore_pre_expert_checkpoint(
+                    &mut encoder,
+                    &request.pre_expert_checkpoints,
+                    layer_index,
+                    &request.token_state,
+                    &request.router_scratch,
+                )?;
+                self.recovery_counters
+                    .checkpoint_restores
+                    .fetch_add(1, Ordering::Relaxed);
+                self.encode_expert_layer_unified(
+                    &mut encoder,
+                    request,
+                    layer_index,
+                    diagnostic_sink,
+                    semantic_sink,
+                )?;
+            }
+            GpuNativeAttemptStart::Continue { layer_index } => {
+                if segment.ordinary_layers.start != layer_index {
+                    return Err(GpuNativeTokenLoopError::InvalidBoundaryReport {
+                        detail: format!("continuation does not start at layer {layer_index}"),
+                    });
+                }
+            }
+        }
+
+        for layer_idx in segment.ordinary_layers.clone() {
+            let layer_plan = &self.layers[layer_idx];
             // 1. Attention Pre-Norm
             self.executor.encode_rms_norm_state_in_place(
                 &mut encoder,
@@ -2310,129 +2909,27 @@ impl GpuNativeTokenLoop {
                 }
             }
 
-            // 6. Expert Combine
-            let arena = self.residency_manager.arena(layer_idx).ok_or_else(|| {
-                GpuNativeTokenLoopError::InvalidBoundaryReport {
-                    detail: format!("missing expert arena for layer {layer_idx}"),
-                }
-            })?;
-            if let Some(sink) = semantic_sink {
-                if let Some(layout) = sink.q4_expert_stage_layout_for_layer(layer_idx) {
-                    let stage_scratch = sink.stage_scratch.ok_or_else(|| {
-                        GpuNativeTokenLoopError::InvalidBoundaryReport {
-                            detail: "Q4 expert stage sink is missing diagnostic scratch".into(),
-                        }
-                    })?;
-                    self.executor.encode_q4_expert_stage_diagnostic(
-                        &mut encoder,
-                        &layer_plan.router_plan,
-                        &request.router_scratch,
-                        arena,
-                        &request.token_state,
-                        &request.expert_scratch,
-                        stage_scratch,
-                    )?;
-                    encoder.copy_buffer_to_buffer(
-                        stage_scratch.buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.stages_offset,
-                        layout.stages_bytes,
-                    );
-                }
-            }
-            self.executor.encode_q4_expert_arena_combine(
+            self.executor.encode_capture_pre_expert_checkpoint(
                 &mut encoder,
-                &layer_plan.router_plan,
-                &request.router_scratch,
-                arena,
+                &request.pre_expert_checkpoints,
+                layer_idx,
                 &request.token_state,
-                &request.expert_scratch,
+                &request.router_scratch,
             )?;
+            self.recovery_counters
+                .checkpoint_captures
+                .fetch_add(1, Ordering::Relaxed);
 
-            if let Some(sink) = semantic_sink {
-                if let Some(layout) = sink.target_layout_for_layer(layer_idx) {
-                    encoder.copy_buffer_to_buffer(
-                        request.expert_scratch.route_outputs_buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.route_outputs_offset,
-                        layout.route_outputs_bytes,
-                    );
-                    encoder.copy_buffer_to_buffer(
-                        request.expert_scratch.combined_buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.routed_moe_output_offset,
-                        layout.routed_moe_output_bytes,
-                    );
-                }
-                if let Some(layout) = sink.corpus_layout() {
-                    encoder.copy_buffer_to_buffer(
-                        request.expert_scratch.route_outputs_buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.route_outputs_offset(layer_idx),
-                        layout.route_outputs_layer_bytes,
-                    );
-                    encoder.copy_buffer_to_buffer(
-                        request.expert_scratch.combined_buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.routed_moe_output_offset(layer_idx),
-                        layout.routed_moe_output_layer_bytes,
-                    );
-                }
-                if let Some(layout) = sink.q4_expert_stage_layout_for_layer(layer_idx) {
-                    encoder.copy_buffer_to_buffer(
-                        request.expert_scratch.route_outputs_buffer(),
-                        0,
-                        sink.staging_buffer,
-                        layout.production_down_offset,
-                        layout.production_down_bytes,
-                    );
-                }
-            }
-
-            if let Some(sink) = diagnostic_sink {
-                encoder.copy_buffer_to_buffer(
-                    request.token_state.hidden_buffer(),
-                    0,
-                    sink.staging_buffer,
-                    sink.layout.layer_post_moe_offset(layer_idx),
-                    (self.model_geometry.d_model * 4) as u64,
-                );
-                encoder.copy_buffer_to_buffer(
-                    request.token_state.status_buffer(),
-                    0,
-                    sink.staging_buffer,
-                    sink.layout.layer_status_offset(layer_idx),
-                    4,
-                );
-            }
-
-            // Copy layer status to staging
-            let status_offset = (layer_idx * 4) as u64;
-            encoder.copy_buffer_to_buffer(
-                request.token_state.status_buffer(),
-                0,
-                &request.staging_buffer,
-                status_offset,
-                4,
-            );
-
-            // Copy selected ids to staging before scratch reuse
-            let ids_offset = (num_layers * 4 + layer_idx * top_k * 4) as u64;
-            encoder.copy_buffer_to_buffer(
-                request.router_scratch.selected_ids_buffer(),
-                0,
-                &request.staging_buffer,
-                ids_offset,
-                (top_k * 4) as u64,
-            );
+            self.encode_expert_layer_unified(
+                &mut encoder,
+                request,
+                layer_idx,
+                diagnostic_sink,
+                semantic_sink,
+            )?;
         }
 
-        if sample {
+        if segment.completes_token && sample {
             // Final RMSNorm
             self.executor.encode_rms_norm_hidden_in_place(
                 &mut encoder,
@@ -2512,7 +3009,7 @@ impl GpuNativeTokenLoop {
                 token_offset,
                 4,
             );
-        } else {
+        } else if segment.completes_token {
             // Ingest-only: copy final status to production staging
             let final_status_offset = (num_layers * 4 + num_layers * top_k * 4) as u64;
             encoder.copy_buffer_to_buffer(
@@ -2533,6 +3030,32 @@ impl GpuNativeTokenLoop {
             }
         }
 
+        let resume_layers = usize::from(matches!(
+            segment.attempt_start,
+            GpuNativeAttemptStart::ResumeExpert { .. }
+        ));
+        self.recovery_counters.layers_encoded.fetch_add(
+            (segment.ordinary_layers.len() + resume_layers) as u64,
+            Ordering::Relaxed,
+        );
+        if !matches!(segment.attempt_start, GpuNativeAttemptStart::Fresh) {
+            self.recovery_counters
+                .recovery_segments
+                .fetch_add(1, Ordering::Relaxed);
+            self.recovery_counters
+                .attention_layers_reexecuted
+                .fetch_add(segment.ordinary_layers.len() as u64, Ordering::Relaxed);
+            self.recovery_counters.expert_layers_reexecuted.fetch_add(
+                (segment.ordinary_layers.len() + resume_layers) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        if resume_layers == 1 {
+            self.recovery_counters
+                .resume_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         // ONE submission
         gpu.queue.submit(Some(encoder.finish()));
         self.counters
@@ -2543,6 +3066,7 @@ impl GpuNativeTokenLoop {
         let slice = request
             .staging_buffer
             .slice(..self.report_layout.total_bytes);
+        let boundary_wait_started = Instant::now();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -2562,6 +3086,9 @@ impl GpuNativeTokenLoop {
         self.counters
             .boundary_readbacks
             .fetch_add(1, Ordering::Relaxed);
+        self.recovery_counters
+            .boundary_wait_us
+            .fetch_add(saturating_micros(boundary_wait_started), Ordering::Relaxed);
 
         let diagnostic_trace = if let Some(sink) = diagnostic_sink {
             let diag_slice = sink.staging_buffer.slice(..sink.layout.total_bytes);
@@ -3030,6 +3557,240 @@ pub(crate) mod tests {
         assert_eq!(report.first_failure_layer(), Some(2));
     }
 
+    fn recovery_miss(layer_index: usize) -> GpuNativeMissSignature {
+        GpuNativeMissSignature {
+            layer_index,
+            selected_ids: vec![7, 2, 5, 1],
+        }
+    }
+
+    #[test]
+    fn zero_miss_warm_plan_is_one_monolithic_boundary() {
+        let segment = GpuNativeExecutionSegment::fresh(48).unwrap();
+        assert_eq!(segment.attempt_start, GpuNativeAttemptStart::Fresh);
+        assert_eq!(segment.ordinary_layers, 0..48);
+        assert_eq!(segment.attempted_layers, 0..48);
+        assert!(segment.completes_token);
+        assert_eq!(gpu_native_attempt_bound(48).unwrap(), 98);
+    }
+
+    #[test]
+    fn recovery_resumes_layer_zero_middle_and_last_without_prior_layers() {
+        for layer_index in [0, 24, 47] {
+            let cursor =
+                GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(layer_index))
+                    .unwrap();
+            let segment = cursor.plan(48).unwrap();
+            assert_eq!(
+                segment.attempt_start,
+                GpuNativeAttemptStart::ResumeExpert { layer_index }
+            );
+            assert_eq!(segment.attempted_layers.start, layer_index);
+            assert_eq!(segment.ordinary_layers.start, layer_index + 1);
+            assert_eq!(segment.ordinary_layers.end, (layer_index + 2).min(48));
+            assert_eq!(segment.completes_token, layer_index == 47);
+            assert!(segment.ordinary_layers.start > layer_index);
+        }
+    }
+
+    #[test]
+    fn recovery_window_doubles_one_two_four_eight_and_caps() {
+        let mut cursor =
+            GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(10)).unwrap();
+        let expected = [
+            (1, 11..12),
+            (2, 12..14),
+            (4, 14..18),
+            (8, 18..26),
+            (8, 26..34),
+        ];
+        for (window, ordinary_layers) in expected {
+            assert_eq!(cursor.window_layers, window);
+            let segment = cursor.plan(48).unwrap();
+            assert_eq!(segment.ordinary_layers, ordinary_layers);
+            assert!(!cursor.record_clean_segment(&segment, 48).unwrap());
+        }
+        assert_eq!(cursor.window_layers, 8);
+        assert_eq!(cursor.clean_segments, 5);
+    }
+
+    #[test]
+    fn new_miss_resets_window_and_strictly_increasing_misses_resume() {
+        let mut cursor =
+            GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(0)).unwrap();
+        let first = cursor.plan(48).unwrap();
+        cursor
+            .record_serviced_miss(&first, recovery_miss(1))
+            .unwrap();
+        assert_eq!(cursor.window_layers, 1);
+        assert_eq!(cursor.pending_resume_layer, Some(1));
+        let second = cursor.plan(48).unwrap();
+        assert_eq!(second.attempted_layers, 1..3);
+        cursor
+            .record_serviced_miss(&second, recovery_miss(2))
+            .unwrap();
+        assert_eq!(cursor.window_layers, 1);
+        assert_eq!(cursor.residency_services, 3);
+
+        let third = cursor.plan(48).unwrap();
+        assert!(cursor.record_clean_segment(&third, 48).is_ok());
+        let fourth = cursor.plan(48).unwrap();
+        assert_eq!(cursor.window_layers, 2);
+        cursor
+            .record_serviced_miss(&fourth, recovery_miss(fourth.ordinary_layers.start))
+            .unwrap();
+        assert_eq!(cursor.window_layers, 1);
+    }
+
+    #[test]
+    fn repeated_same_ordered_miss_is_no_progress() {
+        let mut cursor =
+            GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(10)).unwrap();
+        let segment = cursor.plan(48).unwrap();
+        assert_eq!(
+            cursor.record_serviced_miss(&segment, recovery_miss(10)),
+            Err(GpuNativeTokenLoopError::NoProgress {
+                layer_index: 10,
+                selected_ids: vec![7, 2, 5, 1],
+            })
+        );
+        let reordered = GpuNativeMissSignature {
+            layer_index: 10,
+            selected_ids: vec![2, 7, 5, 1],
+        };
+        assert!(cursor.record_serviced_miss(&segment, reordered).is_ok());
+    }
+
+    #[test]
+    fn recovery_cursor_fails_closed_without_forward_progress() {
+        let mut cursor =
+            GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(10)).unwrap();
+        cursor.window_layers = 0;
+        assert!(matches!(
+            cursor.plan(48),
+            Err(GpuNativeTokenLoopError::InvalidBoundaryReport { .. })
+        ));
+
+        let mut last = GpuNativeRecoveryCursor::after_serviced_miss(48, recovery_miss(47)).unwrap();
+        let final_segment = last.plan(48).unwrap();
+        assert!(last.record_clean_segment(&final_segment, 48).unwrap());
+        assert!(matches!(
+            last.plan(48),
+            Err(GpuNativeTokenLoopError::InvalidBoundaryReport { .. })
+        ));
+
+        assert!(matches!(
+            gpu_native_attempt_bound(usize::MAX),
+            Err(GpuNativeTokenLoopError::InvalidBoundaryReport { .. })
+        ));
+    }
+
+    #[test]
+    fn attempted_range_ignores_stale_statuses_outside_segment() {
+        let report = GpuNativeBoundaryReport {
+            layer_statuses: vec![GPU_NATIVE_STATUS_RETRYABLE_MASK, 0, 0, 1 << 31],
+            selected_ids: vec![vec![0, 1]; 4],
+            final_status: GPU_NATIVE_STATUS_RETRYABLE_MASK,
+            sampled_token: 9,
+        };
+        assert_eq!(report.first_failure_layer(), Some(0));
+        assert_eq!(report.first_failure_layer_in(1..3).unwrap(), None);
+        assert_eq!(report.first_failure_layer_in(2..4).unwrap(), Some(3));
+        assert!(report.first_failure_layer_in(4..4).is_err());
+    }
+
+    #[test]
+    fn recovery_kv_rows_equal_warm_reference_and_commit_once() {
+        const NUM_LAYERS: usize = 8;
+        const POSITION: u64 = 7;
+        let warm = (0..NUM_LAYERS)
+            .map(|layer| POSITION * 100 + layer as u64)
+            .collect::<Vec<_>>();
+        let invalid = u64::MAX;
+        let first_miss = 2usize;
+
+        // The monolithic miss attempt has authoritative KV through the failed
+        // layer; later invalid tail rows will be overwritten at the same
+        // absolute position by recovery.
+        let mut recovered = warm.clone();
+        recovered[first_miss + 1..].fill(invalid);
+        let prior_rows = recovered[..=first_miss].to_vec();
+        let mut committed_position = POSITION as usize;
+        let mut cursor =
+            GpuNativeRecoveryCursor::after_serviced_miss(NUM_LAYERS, recovery_miss(first_miss))
+                .unwrap();
+        let mut injected_second_miss = false;
+
+        loop {
+            let segment = cursor.plan(NUM_LAYERS).unwrap();
+            for layer in segment.ordinary_layers.clone() {
+                recovered[layer] = warm[layer];
+            }
+            if !injected_second_miss && segment.ordinary_layers.contains(&4) {
+                let second_miss = 4;
+                for value in &mut recovered[second_miss + 1..segment.ordinary_layers.end] {
+                    *value = invalid;
+                }
+                cursor
+                    .record_serviced_miss(&segment, recovery_miss(second_miss))
+                    .unwrap();
+                injected_second_miss = true;
+                assert_eq!(committed_position, POSITION as usize);
+                continue;
+            }
+            if cursor.record_clean_segment(&segment, NUM_LAYERS).unwrap() {
+                committed_position += 1;
+                break;
+            }
+            assert_eq!(committed_position, POSITION as usize);
+        }
+
+        assert_eq!(&recovered[..=first_miss], prior_rows.as_slice());
+        assert_eq!(recovered, warm);
+        assert_eq!(committed_position, POSITION as usize + 1);
+    }
+
+    #[test]
+    fn recovery_route_assembly_overwrites_only_attempted_layers() {
+        let warm_routes = vec![vec![3, 1], vec![2, 0], vec![1, 3], vec![0, 2]];
+        let mut assembled = warm_routes.clone();
+        assembled[2] = vec![99, 99];
+        assembled[3] = vec![88, 88];
+        let attempted = 1..3;
+        for layer in attempted.clone() {
+            assembled[layer] = warm_routes[layer].clone();
+        }
+        assert_eq!(assembled[0], warm_routes[0]);
+        assert_eq!(assembled[1], warm_routes[1]);
+        assert_eq!(assembled[2], warm_routes[2]);
+        assert_ne!(assembled[3], warm_routes[3]);
+        assembled[3] = warm_routes[3].clone();
+        assert_eq!(assembled, warm_routes);
+    }
+
+    #[test]
+    fn recovery_counter_snapshot_keeps_full_replay_zero() {
+        let counters = GpuNativeRecoveryCounters::default();
+        counters.resume_attempts.fetch_add(2, Ordering::Relaxed);
+        counters.recovery_segments.fetch_add(2, Ordering::Relaxed);
+        counters.checkpoint_captures.fetch_add(3, Ordering::Relaxed);
+        counters.checkpoint_restores.fetch_add(2, Ordering::Relaxed);
+        counters.layers_encoded.fetch_add(4, Ordering::Relaxed);
+        counters
+            .attention_layers_reexecuted
+            .fetch_add(1, Ordering::Relaxed);
+        counters
+            .expert_layers_reexecuted
+            .fetch_add(3, Ordering::Relaxed);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.resume_attempts, 2);
+        assert_eq!(snapshot.recovery_segments, 2);
+        assert_eq!(snapshot.checkpoint_restores, 2);
+        assert_eq!(snapshot.full_token_replay_attempts, 0);
+        assert_eq!(snapshot.attention_layers_reexecuted, 1);
+        assert_eq!(snapshot.expert_layers_reexecuted, 3);
+    }
+
     #[test]
     fn greedy_argmax_reference_semantics() {
         let reference_argmax = |logits: &[f32]| -> Result<u32, &'static str> {
@@ -3083,6 +3844,36 @@ pub(crate) mod tests {
             ),
             GPU_NATIVE_STATUS_FATAL_MASK
         );
+
+        let unknown = 1u32 << 31;
+        assert_eq!(
+            crate::backend::gpu_native::status_after_retryable_clear(
+                GPU_NATIVE_STATUS_FATAL_MASK | GPU_NATIVE_STATUS_RETRYABLE_MASK | unknown
+            ),
+            GPU_NATIVE_STATUS_FATAL_MASK | unknown
+        );
+        assert!(matches!(
+            classify_gpu_native_status(
+                GPU_NATIVE_STATUS_FATAL_MASK | GPU_NATIVE_STATUS_RETRYABLE_MASK,
+                Some(4)
+            ),
+            Err(GpuNativeTokenLoopError::FatalNumericalFailure {
+                layer_index: Some(4),
+                ..
+            })
+        ));
+        assert!(matches!(
+            classify_gpu_native_status(unknown, Some(5)),
+            Err(GpuNativeTokenLoopError::UnknownStatusBits {
+                layer_index: Some(5),
+                unknown_bits,
+                ..
+            }) if unknown_bits == unknown
+        ));
+        assert_eq!(
+            classify_gpu_native_status(GPU_NATIVE_STATUS_RETRYABLE_MASK, Some(6)),
+            Ok(GpuNativeStatusDisposition::RetryableResidencyMiss)
+        );
     }
 
     #[test]
@@ -3127,11 +3918,12 @@ pub(crate) mod tests {
         assert!(status.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!status.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
-        // 4. Router selected-ids result:
-        // STORAGE | COPY_SRC, strictly no MAP_READ, no MAP_WRITE
+        // 4. Router selected ids/weights are checkpoint-restorable:
+        // STORAGE | COPY_SRC | COPY_DST, strictly no MAP_READ, no MAP_WRITE
         let router_result = GpuNativeRouterScratchLayout::result_usage();
         assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
         assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_DST));
         assert!(
             !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
         );
@@ -3717,9 +4509,14 @@ pub(crate) mod tests {
         assert_eq!(snap1.tokens_completed, 1);
         assert_eq!(snap1.token_attempts, 3);
         assert_eq!(snap1.residency_miss_attempts, 2);
-        assert_eq!(snap1.replay_attempts, 2);
+        assert_eq!(snap1.replay_attempts, 0);
         assert_eq!(snap1.residency_services, 2);
         assert_eq!(snap1.fatal_failures, 0);
+        let recovery1 = harness.token_loop.recovery_snapshot();
+        assert_eq!(recovery1.resume_attempts, 2);
+        assert_eq!(recovery1.recovery_segments, 2);
+        assert_eq!(recovery1.checkpoint_restores, 2);
+        assert_eq!(recovery1.full_token_replay_attempts, 0);
 
         let _second_token = pollster::block_on(harness.token_loop.step_token(
             &harness.engine,
@@ -3741,6 +4538,8 @@ pub(crate) mod tests {
         assert_eq!(snap2.boundary_readbacks, 4);
         assert_eq!(snap2.residency_services, 2);
         assert_eq!(snap2.fatal_failures, 0);
+        let recovery2 = harness.token_loop.recovery_snapshot();
+        assert_eq!(recovery2.full_token_replay_attempts, 0);
 
         assert_eq!(
             harness.engine.report().bytes_read,
