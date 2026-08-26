@@ -20,10 +20,14 @@ use crate::qualification::{
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v2";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-real-benchmark.v4";
 pub(crate) const MODE: &str = "gpu-native-real-benchmark";
-pub(crate) const OPTIMIZATION: &str = "gpu-native-resumable-recovery-pr1";
-pub(crate) const BASELINE_COMMIT: &str = "db0664159fe4a57e5b630984b9229e233fa21487";
+pub(crate) const OPTIMIZATION: &str = "gpu-native-physical-source-of-truth-pr1bb";
+pub(crate) const IMMEDIATE_COMPARISON_COMMIT: &str = "a39c58062ce167773248d3fa5618ac5fd55e54ba";
+pub(crate) const PR1B_A_EXPERIMENT_COMMIT: &str = "9b1a1da029151dacbb1ad49a562d4eb60e80e260";
+pub(crate) const PR1B_A_EXPERIMENT_REPORT_SHA256: &str =
+    "ac98c83c52df95967a315452517fb2556e82771aa49c5a5b1ab239fa1b3ec4e4";
+pub(crate) const ORIGINAL_BASELINE_COMMIT: &str = "db0664159fe4a57e5b630984b9229e233fa21487";
 
 const EXPECTED_NUM_LAYERS: usize = 48;
 const EXPECTED_NUM_EXPERTS: usize = 128;
@@ -86,7 +90,7 @@ pub(crate) struct ProductionSemantics {
 }
 
 impl ProductionSemantics {
-    pub(crate) const fn resumable_recovery_pr1() -> Self {
+    pub(crate) const fn physical_source_of_truth_pr1bb() -> Self {
         Self {
             production_inference_math_changed: false,
             production_q4_changed: false,
@@ -94,7 +98,7 @@ impl ProductionSemantics {
             production_attention_changed: false,
             production_rmsnorm_changed: false,
             production_lm_head_changed: false,
-            production_residency_policy_changed: false,
+            production_residency_policy_changed: true,
             production_replay_policy_changed: true,
             production_prefetch_policy_changed: false,
             diagnostic_trace_enabled: false,
@@ -720,6 +724,9 @@ impl EngineStorageSnapshot {
 pub(crate) struct GpuNativeResidencyDelta {
     pub(crate) vram_hits: u64,
     pub(crate) vram_misses: u64,
+    pub(crate) physical_current_hits: u64,
+    pub(crate) physical_source_acquisitions: u64,
+    pub(crate) logical_admissions_for_physical_misses: u64,
     pub(crate) ram_to_vram_installs: u64,
     pub(crate) physical_evictions: u64,
     pub(crate) physical_reinstalls: u64,
@@ -738,6 +745,24 @@ fn gpu_native_residency_delta(
     Ok(GpuNativeResidencyDelta {
         vram_hits: checked_delta!(after, before, vram_hits, "gpu-native-residency"),
         vram_misses: checked_delta!(after, before, vram_misses, "gpu-native-residency"),
+        physical_current_hits: checked_delta!(
+            after,
+            before,
+            physical_current_hits,
+            "gpu-native-residency"
+        ),
+        physical_source_acquisitions: checked_delta!(
+            after,
+            before,
+            physical_source_acquisitions,
+            "gpu-native-residency"
+        ),
+        logical_admissions_for_physical_misses: checked_delta!(
+            after,
+            before,
+            logical_admissions_for_physical_misses,
+            "gpu-native-residency"
+        ),
         ram_to_vram_installs: checked_delta!(
             after,
             before,
@@ -1120,7 +1145,10 @@ pub(crate) struct BenchmarkReport {
     pub(crate) schema: &'static str,
     pub(crate) mode: &'static str,
     pub(crate) optimization: &'static str,
-    pub(crate) baseline_commit: &'static str,
+    pub(crate) immediate_comparison_commit: &'static str,
+    pub(crate) pr1b_a_experiment_commit: &'static str,
+    pub(crate) pr1b_a_experiment_report_sha256: &'static str,
+    pub(crate) original_baseline_commit: &'static str,
     pub(crate) benchmark_complete: bool,
     pub(crate) failure: Option<BenchmarkFailure>,
     pub(crate) qualification_pass: bool,
@@ -1158,7 +1186,10 @@ impl BenchmarkReport {
             schema: SCHEMA,
             mode: MODE,
             optimization: OPTIMIZATION,
-            baseline_commit: BASELINE_COMMIT,
+            immediate_comparison_commit: IMMEDIATE_COMPARISON_COMMIT,
+            pr1b_a_experiment_commit: PR1B_A_EXPERIMENT_COMMIT,
+            pr1b_a_experiment_report_sha256: PR1B_A_EXPERIMENT_REPORT_SHA256,
+            original_baseline_commit: ORIGINAL_BASELINE_COMMIT,
             benchmark_complete: false,
             failure: None,
             qualification_pass: false,
@@ -1178,7 +1209,7 @@ impl BenchmarkReport {
             aggregate: None,
             runtime_contract: None,
             production_configuration,
-            production_semantics: ProductionSemantics::resumable_recovery_pr1(),
+            production_semantics: ProductionSemantics::physical_source_of_truth_pr1bb(),
         }
     }
 
@@ -2440,6 +2471,39 @@ mod tests {
     }
 
     #[test]
+    fn physical_source_of_truth_counters_are_reported_without_speculation() {
+        let before = GpuNativeTieredResidencySnapshot {
+            vram_hits: 10,
+            vram_misses: 4,
+            physical_current_hits: 10,
+            physical_source_acquisitions: 4,
+            logical_admissions_for_physical_misses: 3,
+            ram_to_vram_installs: 4,
+            ..GpuNativeTieredResidencySnapshot::default()
+        };
+        let after = GpuNativeTieredResidencySnapshot {
+            vram_hits: 17,
+            vram_misses: 6,
+            physical_current_hits: 17,
+            physical_source_acquisitions: 6,
+            logical_admissions_for_physical_misses: 5,
+            ram_to_vram_installs: 6,
+            ..before.clone()
+        };
+        let delta = gpu_native_residency_delta(&before, &after).unwrap();
+        assert_eq!(delta.vram_hits, 7);
+        assert_eq!(delta.vram_misses, 2);
+        assert_eq!(delta.physical_current_hits, 7);
+        assert_eq!(delta.physical_source_acquisitions, 2);
+        assert_eq!(delta.logical_admissions_for_physical_misses, 2);
+        assert_eq!(delta.ram_to_vram_installs, 2);
+        assert_eq!(delta.speculative_requests, 0);
+        assert_eq!(delta.speculative_vram_hits, 0);
+        assert_eq!(delta.speculative_ram_to_vram_installs, 0);
+        assert_eq!(delta.speculative_dropped_capacity_or_pressure, 0);
+    }
+
+    #[test]
     fn cache_reset_semantics_define_runtime_construction_count() {
         assert_eq!(
             expected_runtime_constructions(crate::BenchRealCacheReset::Keep, 3, 4),
@@ -2795,7 +2859,7 @@ mod tests {
         assert!(!report.production_semantics.production_rmsnorm_changed);
         assert!(!report.production_semantics.production_lm_head_changed);
         assert!(
-            !report
+            report
                 .production_semantics
                 .production_residency_policy_changed
         );
@@ -2810,7 +2874,20 @@ mod tests {
         assert_eq!(json["correctness_qualification_pending"], true);
         assert_eq!(json["schema"], SCHEMA);
         assert_eq!(json["optimization"], OPTIMIZATION);
-        assert_eq!(json["baseline_commit"], BASELINE_COMMIT);
+        assert_eq!(
+            json["immediate_comparison_commit"],
+            IMMEDIATE_COMPARISON_COMMIT
+        );
+        assert_eq!(json["pr1b_a_experiment_commit"], PR1B_A_EXPERIMENT_COMMIT);
+        assert_eq!(
+            json["pr1b_a_experiment_report_sha256"],
+            PR1B_A_EXPERIMENT_REPORT_SHA256
+        );
+        assert_eq!(json["original_baseline_commit"], ORIGINAL_BASELINE_COMMIT);
+        assert_eq!(
+            json["production_semantics"]["production_residency_policy_changed"],
+            true
+        );
         assert_eq!(
             json["production_semantics"]["production_replay_policy_changed"],
             true
