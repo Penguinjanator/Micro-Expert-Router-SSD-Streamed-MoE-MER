@@ -2985,6 +2985,35 @@ impl<B> GpuNativeQ4ExpertArena<B> {
             .count()
     }
 
+    /// Check that one manager-held residency still names the exact live arena
+    /// owner. This is deliberately independent of host logical-admission LRU
+    /// state: the arena's context, layer, logical id, install generation,
+    /// physical location, and slot epoch are the physical identity contract.
+    pub(crate) fn contains_exact_residency(
+        &self,
+        context_id: u64,
+        residency: GpuNativeQ4ExpertResidency,
+    ) -> bool {
+        if self.context_id != context_id || residency.key.layer_index != self.layer_index {
+            return false;
+        }
+        let logical_id = residency.key.expert_id as usize;
+        let state = self.state.lock();
+        let Some(flat_slot) = state.logical_slots.get(logical_id).copied().flatten() else {
+            return false;
+        };
+        state.latest_generations.get(logical_id).copied().flatten()
+            == Some(residency.key.logical_generation)
+            && state.slots.get(flat_slot).is_some_and(|slot| {
+                slot.location == residency.location
+                    && slot.last_epoch == residency.slot_epoch
+                    && matches!(
+                        slot.owner,
+                        GpuNativeQ4ExpertSlotOwner::Resident(current) if current == residency
+                    )
+            })
+    }
+
     pub(crate) const fn vram_plan(&self) -> GpuNativeQ4ExpertVramPlan {
         self.plan
     }
@@ -6220,6 +6249,10 @@ impl GpuNativeExecutorContext {
             greedy_argmax_pipeline,
             counters: GpuNativeExecutionCounters::default(),
         })
+    }
+
+    pub(crate) const fn context_id(&self) -> u64 {
+        self.context_id
     }
 
     pub(crate) fn create_token_state(
@@ -10154,6 +10187,29 @@ pub(crate) mod tests {
             7 * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64
         );
         assert_eq!(mapping.borrow()[0].1, residency_a.mapping_entry().unwrap());
+        assert!(arena.contains_exact_residency(7, residency_a));
+        assert!(!arena.contains_exact_residency(8, residency_a));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                key: GpuNativeQ4ExpertKey::new(2, 7, 10),
+                ..residency_a
+            }
+        ));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                key: GpuNativeQ4ExpertKey::new(3, 8, 10),
+                ..residency_a
+            }
+        ));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                slot_epoch: residency_a.slot_epoch() + 1,
+                ..residency_a
+            }
+        ));
         assert!(matches!(
             arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap(),
             GpuNativeQ4ExpertAcquire::Hit(hit) if hit == residency_a
@@ -10186,6 +10242,7 @@ pub(crate) mod tests {
                 GpuNativeQ4ExpertMappingEntry::UNMAPPED,
             )]
         );
+        assert!(!arena.contains_exact_residency(7, residency_a));
 
         let reinstall =
             expect_expert_install(arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap());
@@ -10194,7 +10251,65 @@ pub(crate) mod tests {
             .install_with_writes(&payload, |_, _, _| {}, |_, _| {})
             .unwrap();
         assert_eq!(reinstalled.key().logical_generation(), 10);
+        assert_ne!(reinstalled.slot_epoch(), residency_a.slot_epoch());
+        assert!(arena.contains_exact_residency(7, reinstalled));
+        assert!(!arena.contains_exact_residency(7, residency_a));
         assert_eq!(arena.residency_snapshot().expert_slot_reuses, 1);
+    }
+
+    #[test]
+    fn gpu_native_residency_physical_arena_survives_logical_admission_eviction() {
+        use crate::expert_cache::{GpuExpertCache, GpuResident};
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let cache = GpuExpertCache::new(payload.len(), 0.0, 0);
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(7, payload.clone())))
+            .unwrap();
+        let admission = cache.current_admission(7).unwrap();
+        let key = GpuNativeQ4ExpertKey::new(3, 7, admission.generation());
+        let physical_writes = RefCell::new(Vec::new());
+        let permit = expect_expert_install(arena.acquire_with_unpublish(key, |_, _| {}).unwrap());
+        let residency = permit
+            .install_with_writes(
+                &payload,
+                |bank, offset, bytes| {
+                    physical_writes
+                        .borrow_mut()
+                        .push((bank, offset, bytes.to_vec()));
+                },
+                |_, _| {},
+            )
+            .unwrap();
+        let before = arena.residency_snapshot();
+        assert!(arena.contains_exact_residency(7, residency));
+
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![9; payload.len()])))
+            .unwrap();
+        assert!(!cache.contains_generation(7, admission.generation()));
+        drop(admission);
+
+        let hit = match arena.acquire_with_unpublish(key, |_, _| {}).unwrap() {
+            GpuNativeQ4ExpertAcquire::Hit(hit) => hit,
+            _ => panic!("logical eviction must not invalidate exact physical residency"),
+        };
+        assert_eq!(hit, residency);
+        assert_eq!(hit.key(), key);
+        assert_eq!(hit.location(), residency.location());
+        assert_eq!(hit.slot_epoch(), residency.slot_epoch());
+        assert!(arena.contains_exact_residency(7, hit));
+        assert_eq!(arena.residency_snapshot(), before);
+
+        let physical = physical_writes.borrow();
+        assert_eq!(physical.len(), 1);
+        let payload_start = arena.geometry().payload_offset_bytes();
+        assert_eq!(
+            &physical[0].2[payload_start..payload_start + payload.len()],
+            payload.as_slice()
+        );
     }
 
     #[test]
@@ -14789,9 +14904,42 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let payload = q4_uniform_expert(geometry, 0.001 * id as f32, 0.002, 0.001);
             let _ = make_source(id, &payload);
         }
+        assert!(!gpu_cache.contains_generation(2, stale_admission_a.generation()));
+        let before_physical_only_hit = manager.snapshot();
+        assert!(manager.has_current_for_demand(2).unwrap());
+        let physical_only_hit = manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[GpuNativeDemandExpert::current(2)],
+            )
+            .unwrap()[0];
+        assert_eq!(physical_only_hit, new_residencies[0]);
+        let after_physical_only_hit = manager.snapshot();
+        assert_eq!(
+            after_physical_only_hit.physical_current_hits,
+            before_physical_only_hit.physical_current_hits + 1
+        );
+        assert_eq!(
+            after_physical_only_hit.ram_to_vram_installs,
+            before_physical_only_hit.ram_to_vram_installs
+        );
+        assert_eq!(
+            after_physical_only_hit.physical_source_acquisitions,
+            before_physical_only_hit.physical_source_acquisitions
+        );
+        assert_eq!(
+            after_physical_only_hit.logical_admissions_for_physical_misses,
+            before_physical_only_hit.logical_admissions_for_physical_misses
+        );
+        assert_eq!(
+            after_physical_only_hit.layers,
+            before_physical_only_hit.layers
+        );
+
         let (newer_resident_a, newer_admission_a) = make_source(2, &payload_a);
         assert!(newer_admission_a.generation() > stale_admission_a.generation());
-        let newest = manager
+        let physical_after_newer_logical_admission = manager
             .ensure_demand_set(
                 GpuNativeResidencyPriority::Demand,
                 0,
@@ -14802,6 +14950,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 )],
             )
             .unwrap()[0];
+        assert_eq!(physical_after_newer_logical_admission, new_residencies[0]);
         let before_stale = manager.snapshot();
         assert!(matches!(
             manager.ensure_demand_set(
@@ -14830,7 +14979,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     &[GpuNativeDemandExpert::current(2)],
                 )
                 .unwrap()[0],
-            newest
+            new_residencies[0]
         );
     }
 

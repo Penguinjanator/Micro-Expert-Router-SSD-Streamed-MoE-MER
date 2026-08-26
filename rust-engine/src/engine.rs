@@ -454,6 +454,20 @@ const fn gpu_native_physical_demand_recovery_allowed(completed_attempts: usize) 
     completed_attempts < GPU_NATIVE_PHYSICAL_DEMAND_RECOVERY_LIMIT
 }
 
+fn gpu_native_physical_missing_ids(global_ids: &[u32], physical_current: &[bool]) -> Vec<u32> {
+    assert_eq!(
+        global_ids.len(),
+        physical_current.len(),
+        "physical probe results must cover the complete selected set"
+    );
+    global_ids
+        .iter()
+        .copied()
+        .zip(physical_current.iter().copied())
+        .filter_map(|(global_id, current)| (!current).then_some(global_id))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GpuNativeResidencyInstallError {
     LegacyPhysicalExpertPlaneActive,
@@ -4057,7 +4071,7 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
-    ) -> Result<Vec<GpuAdmission>, GpuNativeDemandResidencyError> {
+    ) -> Result<(Vec<GpuAdmission>, usize), GpuNativeDemandResidencyError> {
         let gpu = self.execution_context().gpu_expert_cache();
         let mut payloads = HashMap::with_capacity(global_ids.len());
         for attempt in 1..=GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS {
@@ -4072,7 +4086,7 @@ impl Engine {
                             prom.set_vram_used_bytes(gpu.used_bytes());
                         }
                     }
-                    return Ok(admissions);
+                    return Ok((admissions, newly_admitted));
                 }
                 GpuDemandSetAdmission::PayloadRequired(missing)
                     if attempt == GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS =>
@@ -4102,12 +4116,12 @@ impl Engine {
         unreachable!("logical demand-set loop has a fixed positive attempt count")
     }
 
-    /// GPU-native foreground demand service. Healthy physical hits never
-    /// touch RAM or storage. A complete selected set is protected in the
-    /// logical LRU before any async source acquisition; missing sources use
-    /// the exact existing RAM -> `fetch_with_retry` hierarchy and are admitted
-    /// atomically before physical resolution. Demand never consults the
-    /// speculative governor or semaphore.
+    /// GPU-native foreground demand service. Exact physical hits are
+    /// authoritative and never touch the logical cache, RAM, or storage.
+    /// Only physical misses use the existing RAM -> `fetch_with_retry`
+    /// hierarchy, protect/admit their complete missing subset atomically, and
+    /// authorize a physical install. Demand never consults the speculative
+    /// governor or semaphore.
     pub(crate) async fn ensure_gpu_native_demand_residency(
         self: &Arc<Self>,
         layer_index: usize,
@@ -4143,50 +4157,67 @@ impl Engine {
             }
         }
 
-        let gpu = self.execution_context().gpu_expert_cache().clone();
-        let _logical_protection = gpu.protect_demand_set(global_ids)?;
-
-        // Lock order is deliberately non-nested: protection registration
-        // released the logical-cache mutex before these physical layer probes,
-        // and the guard retains metadata only. No cache/layer mutex is held
-        // across the RAM/NVMe awaits below. Physical resolution may take its
-        // layer lock and then validate logical generations without inversion.
-        let mut initially_current = Vec::with_capacity(global_ids.len());
         let mut residents = HashMap::with_capacity(global_ids.len());
-        for &global_id in global_ids {
-            let current = manager.has_current_for_demand(global_id)?;
-            initially_current.push(current);
-            if !current {
-                self.gpu_native_demand_source(global_id, &mut residents)
-                    .await?;
-            }
-        }
-
-        let mut admissions = self
-            .ensure_gpu_native_logical_demand_set(global_ids, &mut residents)
-            .await?;
-        let mut demands = global_ids
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, global_id)| {
-                if initially_current[index] {
-                    GpuNativeDemandExpert::current(global_id)
-                } else {
-                    GpuNativeDemandExpert::install(
-                        global_id,
-                        residents
-                            .get(&global_id)
-                            .expect("physical miss acquired an authoritative source")
-                            .clone(),
-                        admissions[index].clone(),
-                    )
-                }
-            })
-            .collect::<Vec<_>>();
-
         let mut recovery_attempts = 0usize;
         loop {
+            // No logical-cache lock is held while probing the physical layer.
+            // A probe result may race with a later physical eviction; the
+            // fixed one-retry recovery below re-probes the complete set.
+            let mut physical_current = Vec::with_capacity(global_ids.len());
+            for &global_id in global_ids {
+                let current = manager.has_current_for_demand(global_id)?;
+                physical_current.push(current);
+            }
+            let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+
+            // Physical hits never reach this logical/source block. Protection
+            // is metadata-only and releases the logical mutex before every
+            // RAM/NVMe await, so there is no logical -> physical nesting.
+            let mut admissions_by_id = HashMap::with_capacity(physical_missing.len());
+            let _logical_protection = if physical_missing.is_empty() {
+                None
+            } else {
+                let gpu = self.execution_context().gpu_expert_cache().clone();
+                let protection = gpu.protect_demand_set(&physical_missing)?;
+                for &global_id in &physical_missing {
+                    if !residents.contains_key(&global_id) {
+                        manager.record_physical_source_acquisition();
+                        self.gpu_native_demand_source(global_id, &mut residents)
+                            .await?;
+                    }
+                }
+                let (admissions, newly_admitted) = self
+                    .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
+                    .await?;
+                manager.record_logical_admissions_for_physical_misses(newly_admitted);
+                admissions_by_id
+                    .extend(physical_missing.iter().copied().zip(admissions.into_iter()));
+                Some(protection)
+            };
+
+            let demands = global_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, global_id)| {
+                    if physical_current[index] {
+                        GpuNativeDemandExpert::current(global_id)
+                    } else {
+                        GpuNativeDemandExpert::install(
+                            global_id,
+                            residents
+                                .get(&global_id)
+                                .expect("physical miss acquired an authoritative source")
+                                .clone(),
+                            admissions_by_id
+                                .get(&global_id)
+                                .expect("physical miss established a logical admission")
+                                .clone(),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+
             match manager.ensure_demand_set(
                 GpuNativeResidencyPriority::Demand,
                 layer_index,
@@ -4197,34 +4228,9 @@ impl Engine {
                     if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
                 {
                     recovery_attempts += 1;
-
                     // A Current record changed before the physical transaction.
-                    // Reacquire sources for the whole selected set so the one
-                    // bounded retry cannot fail merely because a later Current
-                    // member also changed. Install demands still resolve VRAM
-                    // hits without reinstalling them.
-                    for &selected_id in global_ids {
-                        self.gpu_native_demand_source(selected_id, &mut residents)
-                            .await?;
-                    }
-                    admissions = self
-                        .ensure_gpu_native_logical_demand_set(global_ids, &mut residents)
-                        .await?;
-                    demands = global_ids
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .map(|(index, selected_id)| {
-                            GpuNativeDemandExpert::install(
-                                selected_id,
-                                residents
-                                    .get(&selected_id)
-                                    .expect("bounded recovery acquired every selected source")
-                                    .clone(),
-                                admissions[index].clone(),
-                            )
-                        })
-                        .collect();
+                    // The loop re-probes the whole selected set, but only the
+                    // now-missing members may acquire source/admission state.
                 }
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id }) => {
                     return Err(
@@ -6959,6 +6965,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gpu_native_physical_partition_skips_hits_and_preserves_miss_order() {
+        let selected = [7, 3, 11, 5];
+        assert!(gpu_native_physical_missing_ids(&selected, &[true; 4]).is_empty());
+        assert_eq!(
+            gpu_native_physical_missing_ids(&selected, &[true, false, true, false]),
+            vec![3, 5]
+        );
+    }
+
     fn build_engine(
         data_dir: &std::path::Path,
         num_experts: u32,
@@ -7016,6 +7032,36 @@ mod tests {
                 hidden_seed: seed,
             },
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_native_demand_source_reuses_ram_without_duplicate_nvme_read() {
+        let dir = TempDir::new("gpu-native-demand-source");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        assert_eq!(engine.report().bytes_read, 0);
+
+        let mut first_request = HashMap::new();
+        let first = engine
+            .gpu_native_demand_source(0, &mut first_request)
+            .await
+            .unwrap();
+        let after_nvme = engine.report().bytes_read;
+        assert_eq!(after_nvme, engine.core.storage.config().expert_size as u64);
+
+        let mut second_request = HashMap::new();
+        let ram_hit = engine
+            .gpu_native_demand_source(0, &mut second_request)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &ram_hit));
+        assert_eq!(engine.report().bytes_read, after_nvme);
+
+        let same_request = engine
+            .gpu_native_demand_source(0, &mut second_request)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&ram_hit, &same_request));
+        assert_eq!(engine.report().bytes_read, after_nvme);
     }
 
     #[test]

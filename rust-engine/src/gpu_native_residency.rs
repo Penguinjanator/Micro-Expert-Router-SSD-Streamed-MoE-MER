@@ -83,6 +83,9 @@ pub(crate) enum GpuNativeTieredResidencyError {
         global_id: u32,
         generation: u64,
     },
+    PhysicalIdentityCorrupt {
+        global_id: u32,
+    },
     ResidencyPriorityMismatch,
     Backend(GpuNativeBootstrapError),
 }
@@ -108,6 +111,7 @@ impl fmt::Display for GpuNativeTieredResidencyError {
             Self::NoPhysicalSlot { layer_index } => write!(f, "layer {layer_index} has no free physical expert slot"),
             Self::NoEvictablePhysicalSlot { layer_index } => write!(f, "layer {layer_index} has no physical victim outside the protected demand set"),
             Self::StalePhysicalRequester { global_id, generation } => write!(f, "stale physical requester for global expert {global_id} generation {generation}"),
+            Self::PhysicalIdentityCorrupt { global_id } => write!(f, "GPU-native physical metadata disagrees with the authoritative arena for global expert {global_id}"),
             Self::ResidencyPriorityMismatch => f.write_str("residency request used the wrong demand/speculative priority"),
             Self::Backend(error) => write!(f, "GPU-native residency backend error: {error}"),
         }
@@ -409,6 +413,28 @@ impl Default for LayerResidencyState {
     }
 }
 
+fn touch_physical_record<T: Copy>(residents: &mut LruCache<u32, T>, global_id: u32) -> Option<T> {
+    residents.get(&global_id).copied()
+}
+
+fn validate_physical_install_source(
+    gpu_cache: &GpuExpertCache,
+    global_id: u32,
+    resident: &Arc<ExpertResident>,
+    admission: &GpuAdmission,
+) -> Result<(), GpuNativeTieredResidencyError> {
+    if resident.id != global_id || admission.resident().id != global_id {
+        return Err(GpuNativeTieredResidencyError::DemandSourceIdentityMismatch { global_id });
+    }
+    if !gpu_cache.contains_generation(global_id, admission.generation()) {
+        return Err(GpuNativeTieredResidencyError::LogicalAdmissionStale {
+            global_id,
+            generation: admission.generation(),
+        });
+    }
+    Ok(())
+}
+
 struct LayerResidency {
     arena: Arc<GpuNativeQ4ExpertArena>,
     state: Mutex<LayerResidencyState>,
@@ -418,6 +444,9 @@ struct LayerResidency {
 struct TieredResidencyCounters {
     vram_hits: AtomicU64,
     vram_misses: AtomicU64,
+    physical_current_hits: AtomicU64,
+    physical_source_acquisitions: AtomicU64,
+    logical_admissions_for_physical_misses: AtomicU64,
     ram_to_vram_installs: AtomicU64,
     physical_evictions: AtomicU64,
     physical_reinstalls: AtomicU64,
@@ -446,6 +475,9 @@ pub(crate) struct GpuNativeTieredResidencySnapshot {
     pub(crate) free_physical_slots: usize,
     pub(crate) vram_hits: u64,
     pub(crate) vram_misses: u64,
+    pub(crate) physical_current_hits: u64,
+    pub(crate) physical_source_acquisitions: u64,
+    pub(crate) logical_admissions_for_physical_misses: u64,
     pub(crate) ram_to_vram_installs: u64,
     pub(crate) physical_evictions: u64,
     pub(crate) physical_reinstalls: u64,
@@ -526,8 +558,10 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
-    /// Read-only tier selection probe for the engine's async demand path.
-    /// A stale logical identity is retired before returning `false`.
+    /// Read-only physical tier-selection probe for the engine's async demand
+    /// path. Host logical-admission LRU state is intentionally not consulted:
+    /// an exact, internally current arena residency owns immutable executable
+    /// bytes for the lifetime of this manager.
     pub(crate) fn has_current_for_demand(
         &self,
         global_id: u32,
@@ -538,6 +572,18 @@ impl GpuNativeTieredResidencyManager {
         Ok(self
             .current_record_locked(global_id, layer, &mut state, false)?
             .is_some())
+    }
+
+    pub(crate) fn record_physical_source_acquisition(&self) {
+        self.counters
+            .physical_source_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_logical_admissions_for_physical_misses(&self, count: usize) {
+        self.counters
+            .logical_admissions_for_physical_misses
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     /// VRAM-first speculative probe. It never waits behind a demand mutation;
@@ -629,6 +675,9 @@ impl GpuNativeTieredResidencyManager {
             let global_id = demand.global_id();
             if let Some(record) = self.current_record_locked(global_id, layer, &mut state, true)? {
                 self.counters.vram_hits.fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .physical_current_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 resolved[index] = Some(record.residency);
             } else {
                 self.counters.vram_misses.fetch_add(1, Ordering::Relaxed);
@@ -752,6 +801,15 @@ impl GpuNativeTieredResidencyManager {
             free_physical_slots: layers.iter().map(|layer| layer.free_slots).sum(),
             vram_hits: self.counters.vram_hits.load(Ordering::Relaxed),
             vram_misses: self.counters.vram_misses.load(Ordering::Relaxed),
+            physical_current_hits: self.counters.physical_current_hits.load(Ordering::Relaxed),
+            physical_source_acquisitions: self
+                .counters
+                .physical_source_acquisitions
+                .load(Ordering::Relaxed),
+            logical_admissions_for_physical_misses: self
+                .counters
+                .logical_admissions_for_physical_misses
+                .load(Ordering::Relaxed),
             ram_to_vram_installs: self.counters.ram_to_vram_installs.load(Ordering::Relaxed),
             physical_evictions: self.counters.physical_evictions.load(Ordering::Relaxed),
             physical_reinstalls: self.counters.physical_reinstalls.load(Ordering::Relaxed),
@@ -780,22 +838,21 @@ impl GpuNativeTieredResidencyManager {
         resident: &Arc<ExpertResident>,
         admission: &GpuAdmission,
     ) -> Result<(), GpuNativeTieredResidencyError> {
-        if resident.id != global_id || admission.resident().id != global_id {
-            return Err(GpuNativeTieredResidencyError::DemandSourceIdentityMismatch { global_id });
-        }
-        if !self
-            .gpu_cache
-            .contains_generation(global_id, admission.generation())
-        {
+        let result = validate_physical_install_source(
+            self.gpu_cache.as_ref(),
+            global_id,
+            resident,
+            admission,
+        );
+        if matches!(
+            result,
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale { .. })
+        ) {
             self.counters
                 .stale_generation_rejections
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(GpuNativeTieredResidencyError::LogicalAdmissionStale {
-                global_id,
-                generation: admission.generation(),
-            });
         }
-        Ok(())
+        result
     }
 
     fn current_record_locked(
@@ -808,21 +865,19 @@ impl GpuNativeTieredResidencyManager {
         let Some(record) = state.residents.peek(&global_id).copied() else {
             return Ok(None);
         };
-        if !self
-            .gpu_cache
-            .contains_generation(global_id, record.key.logical_generation())
+        let identity = self.identity(global_id)?;
+        if record.key.layer_index() != identity.layer_index
+            || record.key.expert_id() != identity.local_expert_id
+            || record.residency.key() != record.key
+            || layer.arena.layer_index() != identity.layer_index
+            || !layer
+                .arena
+                .contains_exact_residency(self.executor.context_id(), record.residency)
         {
-            self.retire_metadata_record_locked(global_id, layer, state, false)?;
-            self.counters
-                .stale_generation_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+            return Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt { global_id });
         }
         if touch {
-            let record = state
-                .residents
-                .get(&global_id)
-                .copied()
+            let record = touch_physical_record(&mut state.residents, global_id)
                 .expect("peeked current physical record remains under layer lock");
             Ok(Some(record))
         } else {
@@ -967,6 +1022,7 @@ fn oldest_unprotected<T>(cache: &LruCache<u32, T>, protected: &HashSet<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_pool::BufferPool;
     use crate::expert_cache::GpuResident;
 
     fn geometry() -> GpuNativeQ4ExpertGeometry {
@@ -1041,6 +1097,38 @@ mod tests {
         assert_eq!(newer_key.logical_generation(), newer.generation());
         assert!(!cache.contains_generation(7, first_key.logical_generation()));
         assert!(cache.contains_generation(7, newer_key.logical_generation()));
+    }
+
+    #[test]
+    fn physical_install_source_requires_current_matching_logical_admission() {
+        let cache = GpuExpertCache::new(8, 0.0, 0);
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(7, vec![1; 8])))
+            .unwrap();
+        let admission = cache.current_admission(7).unwrap();
+        let pool = BufferPool::new(2, 8, 4);
+        let resident = Arc::new(ExpertResident::new(7, pool.try_acquire().unwrap()));
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Ok(())
+        );
+
+        let wrong_resident = Arc::new(ExpertResident::new(8, pool.try_acquire().unwrap()));
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &wrong_resident, &admission),
+            Err(GpuNativeTieredResidencyError::DemandSourceIdentityMismatch { global_id: 7 })
+        );
+
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![2; 8])))
+            .unwrap();
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale {
+                global_id: 7,
+                generation: admission.generation(),
+            })
+        );
     }
 
     #[test]
@@ -1187,5 +1275,18 @@ mod tests {
             other_layer.iter().map(|(&id, _)| id).collect::<Vec<_>>(),
             other_before
         );
+    }
+
+    #[test]
+    fn normal_physical_demand_hit_promotes_lru_recency() {
+        let mut residents = LruCache::unbounded();
+        residents.put(7, 70);
+        residents.put(8, 80);
+        assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(7));
+
+        assert_eq!(touch_physical_record(&mut residents, 7), Some(70));
+        assert_eq!(oldest_unprotected(&residents, &HashSet::new()), Some(8));
+        assert_eq!(residents.peek(&7), Some(&70));
+        assert_eq!(residents.peek(&8), Some(&80));
     }
 }
