@@ -17,7 +17,8 @@ use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{
-    ExpertResident, GpuExpertCache, GpuHotPromotionOutcome, GpuResident,
+    ExpertResident, GpuAdmission, GpuDemandAdmissionError, GpuDemandSetAdmission, GpuExpertCache,
+    GpuHotPromotionOutcome, GpuResident,
 };
 use crate::gating::Router;
 use crate::gpu_native_residency::{
@@ -44,9 +45,10 @@ use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -380,6 +382,15 @@ pub(crate) enum GpuNativeDemandResidencyError {
     ManagerNotInstalled,
     ExpertRead(ExpertReadError),
     LogicalAdmission(crate::backend::GpuExpertDispatchError),
+    LogicalDemandSet(GpuDemandAdmissionError),
+    LogicalDemandSetRecoveryExhausted {
+        global_ids: Vec<u32>,
+        attempts: usize,
+    },
+    PhysicalDemandRecoveryExhausted {
+        global_id: u32,
+        recovery_attempts: usize,
+    },
     Tiered(GpuNativeTieredResidencyError),
 }
 
@@ -393,6 +404,23 @@ impl std::fmt::Display for GpuNativeDemandResidencyError {
             Self::LogicalAdmission(error) => {
                 write!(f, "tiered residency logical admission failed: {error}")
             }
+            Self::LogicalDemandSet(error) => {
+                write!(f, "tiered residency logical demand-set admission failed: {error}")
+            }
+            Self::LogicalDemandSetRecoveryExhausted {
+                global_ids,
+                attempts,
+            } => write!(
+                f,
+                "tiered residency logical demand-set source resolution remained incomplete for experts {global_ids:?} after {attempts} bounded attempts"
+            ),
+            Self::PhysicalDemandRecoveryExhausted {
+                global_id,
+                recovery_attempts,
+            } => write!(
+                f,
+                "tiered residency physical demand-set recovery remained stale/missing for expert {global_id} after {recovery_attempts} bounded recovery attempt(s)"
+            ),
             Self::Tiered(error) => error.fmt(f),
         }
     }
@@ -410,6 +438,34 @@ impl From<GpuNativeTieredResidencyError> for GpuNativeDemandResidencyError {
     fn from(value: GpuNativeTieredResidencyError) -> Self {
         Self::Tiered(value)
     }
+}
+
+impl From<GpuDemandAdmissionError> for GpuNativeDemandResidencyError {
+    fn from(value: GpuDemandAdmissionError) -> Self {
+        Self::LogicalDemandSet(value)
+    }
+}
+
+const GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS: usize = 2;
+const GPU_NATIVE_PHYSICAL_DEMAND_RECOVERY_LIMIT: usize = 1;
+
+#[inline]
+const fn gpu_native_physical_demand_recovery_allowed(completed_attempts: usize) -> bool {
+    completed_attempts < GPU_NATIVE_PHYSICAL_DEMAND_RECOVERY_LIMIT
+}
+
+fn gpu_native_physical_missing_ids(global_ids: &[u32], physical_current: &[bool]) -> Vec<u32> {
+    assert_eq!(
+        global_ids.len(),
+        physical_current.len(),
+        "physical probe results must cover the complete selected set"
+    );
+    global_ids
+        .iter()
+        .copied()
+        .zip(physical_current.iter().copied())
+        .filter_map(|(global_id, current)| (!current).then_some(global_id))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1585,6 +1641,144 @@ impl EngineMetrics {
     }
 }
 
+/// Explicit lifecycle for asynchronous work owned by an [`Engine`].
+///
+/// Background promotion and speculative-prefetch tasks used to be detached
+/// `tokio::spawn` calls. Several of those futures own an `Arc<Engine>`, so
+/// dropping the caller's last runtime handle was not sufficient to retire the
+/// engine or any resource family reachable through it. This controller stops
+/// new admissions, cooperatively cancels every registered future, and retains
+/// abort handles only as a bounded fallback for work that does not yield
+/// promptly. It never owns a task future or an `Arc<Engine>` itself.
+struct EngineBackgroundTasks {
+    shutdown_requested: AtomicBool,
+    active: AtomicUsize,
+    state: parking_lot::Mutex<EngineBackgroundTaskState>,
+    shutdown_notify: Notify,
+    idle_notify: Notify,
+}
+
+#[derive(Default)]
+struct EngineBackgroundTaskState {
+    abort_handles: Vec<tokio::task::AbortHandle>,
+}
+
+struct EngineBackgroundTaskGuard {
+    owner: Arc<EngineBackgroundTasks>,
+}
+
+impl Drop for EngineBackgroundTaskGuard {
+    fn drop(&mut self) {
+        if self.owner.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.owner.idle_notify.notify_waiters();
+        }
+    }
+}
+
+impl EngineBackgroundTasks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shutdown_requested: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            state: parking_lot::Mutex::new(EngineBackgroundTaskState::default()),
+            shutdown_notify: Notify::new(),
+            idle_notify: Notify::new(),
+        })
+    }
+
+    #[inline]
+    fn accepts_work(&self) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    /// Register and detach one runtime-owned background future.
+    ///
+    /// The state lock makes the admission check and handle registration atomic
+    /// with respect to `shutdown`: once shutdown flips the flag while holding
+    /// the same lock, no later task can escape registration.
+    fn spawn<F>(self: &Arc<Self>, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock();
+        if !self.accepts_work() {
+            return false;
+        }
+        state.abort_handles.retain(|handle| !handle.is_finished());
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let owner = self.clone();
+        let cancellation = self.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = EngineBackgroundTaskGuard { owner };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                _ = future => {}
+            }
+        });
+        state.abort_handles.push(handle.abort_handle());
+        true
+    }
+
+    async fn cancelled(&self) {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.shutdown_notify.notified();
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    async fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.idle_notify.notified();
+                if self.active.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        const COOPERATIVE_GRACE: Duration = Duration::from_secs(1);
+        const ABORT_GRACE: Duration = Duration::from_secs(4);
+
+        let abort_handles = {
+            let mut state = self.state.lock();
+            self.shutdown_requested.store(true, Ordering::Release);
+            state.abort_handles.retain(|handle| !handle.is_finished());
+            state.abort_handles.clone()
+        };
+        self.shutdown_notify.notify_waiters();
+
+        if self.wait_for_idle(COOPERATIVE_GRACE).await {
+            self.state.lock().abort_handles.clear();
+            return Ok(());
+        }
+
+        // Speculation and logical-GPU promotion are best-effort background
+        // work. Aborting their futures is resource-safe: buffer, semaphore,
+        // singleflight, and promotion claims all have drop/error cleanup.
+        for handle in abort_handles {
+            handle.abort();
+        }
+        if self.wait_for_idle(ABORT_GRACE).await {
+            self.state.lock().abort_handles.clear();
+            Ok(())
+        } else {
+            Err(format!(
+                "engine background tasks remained active after controlled shutdown: active={}",
+                self.active.load(Ordering::Acquire)
+            ))
+        }
+    }
+}
+
 /// Top-level façade: composes [`EngineCore`] (MoE/IO), [`EngineSpeculation`]
 /// (aliasing, locality, neural speculator) and [`EngineMetrics`]
 /// (histograms, counters, Prometheus / trace sinks).
@@ -1596,6 +1790,7 @@ pub struct Engine {
     pub(crate) core: EngineCore,
     pub(crate) speculation: EngineSpeculation,
     pub(crate) metrics: EngineMetrics,
+    background_tasks: Arc<EngineBackgroundTasks>,
     diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool,
     diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
@@ -1953,6 +2148,7 @@ impl Engine {
             ),
             speculation: EngineSpeculation::new(speculator_topk_default),
             metrics: EngineMetrics::new(),
+            background_tasks: EngineBackgroundTasks::new(),
             diagnostic_cpu_q4_boundary_emulation: std::sync::atomic::AtomicBool::new(false),
             diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
@@ -2199,7 +2395,9 @@ impl Engine {
         let resident = self
             .fetch_with_retry(global_expert_id)
             .await
-            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
+            .map_err(|error| {
+                format!("failed to fetch global expert {global_expert_id}: {error}")
+            })?;
         if resident.data().len() != checkpoint_payload_bytes {
             return Err(format!(
                 "global expert {global_expert_id} checkpoint payload has {} bytes, expected exactly {checkpoint_payload_bytes} ({expected_payload} canonical Q4_0 bytes plus alignment padding)",
@@ -2273,6 +2471,247 @@ impl Engine {
             payload_sha256,
             checkpoint_payload_sha256,
             dispatches,
+        })
+    }
+
+    /// Diagnostic-only replay of one frozen exact-f32 GPU expert input through
+    /// the old boundary-emulated CPU reference, the ordinary production CPU
+    /// Q4 reference, and the existing current-GPU arithmetic emulator. The
+    /// canonical payload hash is checked before any arithmetic is performed.
+    pub(crate) async fn audit_q4_0_f32_reference_boundary(
+        self: &Arc<Self>,
+        global_expert_id: u32,
+        exact_gpu_f32_input: &[f32],
+        expected_canonical_payload_sha256: &str,
+    ) -> Result<crate::gpu_native_f32_reference_boundary_audit::Q4F32ReferenceReplayBundle, String>
+    {
+        use sha2::{Digest, Sha256};
+
+        if self.core.options.dtype != WeightDtype::Q4_0
+            || self.execution_context().plan().routed_experts()
+                != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "f32 reference-boundary audit requires a strict CPU Q4_0 routed-expert plan"
+                    .to_string(),
+            );
+        }
+        if exact_gpu_f32_input.len() != self.core.shape.d_model
+            || exact_gpu_f32_input.iter().any(|value| !value.is_finite())
+            || expected_canonical_payload_sha256.len() != 64
+            || !expected_canonical_payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "f32 reference-boundary audit received malformed input or payload identity"
+                    .to_string(),
+            );
+        }
+        self.core
+            .storage
+            .validate_expert_file_layout(std::iter::once(global_expert_id))
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} does not have the exact configured checkpoint file size: {error}"
+                )
+            })?;
+        let expected_payload = crate::inference::expert_weight_bytes_for(
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            WeightDtype::Q4_0,
+        );
+        let checkpoint_payload_bytes = crate::q4_parity::aligned_checkpoint_payload_bytes(
+            expected_payload,
+            self.core.storage.config().block_align,
+        )?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| format!("failed to fetch global expert {global_expert_id}: {error}"))?;
+        if resident.data().len() != checkpoint_payload_bytes {
+            return Err(format!(
+                "global expert {global_expert_id} checkpoint payload has {} bytes, expected {checkpoint_payload_bytes}",
+                resident.data().len()
+            ));
+        }
+        let (payload, padding) = resident.data().split_at(expected_payload);
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(format!(
+                "global expert {global_expert_id} has non-zero checkpoint alignment padding"
+            ));
+        }
+        let canonical_payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        if !canonical_payload_sha256.eq_ignore_ascii_case(expected_canonical_payload_sha256) {
+            return Err(format!(
+                "global expert {global_expert_id} canonical Q4 payload SHA differs: observed {canonical_payload_sha256} expected {expected_canonical_payload_sha256}"
+            ));
+        }
+        crate::gpu_native_f32_reference_boundary_audit::audit_q4_reference_paths(
+            payload,
+            exact_gpu_f32_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            canonical_payload_sha256,
+        )
+    }
+
+    /// Diagnostic-only internal-stage attribution for one exact Q4_0 expert.
+    /// It fetches the canonical production payload, observes the unchanged
+    /// Candle reference sequence, and constructs host-only mixed replays. No
+    /// result from this method is admitted back into production execution.
+    pub(crate) async fn diagnose_q4_0_expert_stages(
+        self: &Arc<Self>,
+        global_expert_id: u32,
+        gpu_effective_input: &[f32],
+        actual_gpu_gate: &[f32],
+        actual_gpu_up: &[f32],
+        actual_gpu_gated: &[f32],
+    ) -> Result<crate::inference::Q4ExpertStageDiagnosticBundle, String> {
+        use sha2::{Digest, Sha256};
+
+        if self.core.options.dtype != WeightDtype::Q4_0
+            || self.execution_context().plan().routed_experts()
+                != crate::backend::ExecutionPlane::Cpu
+            || self.core.options.policy != crate::inference::RealInferencePolicy::STRICT
+        {
+            return Err(
+                "Q4 stage attribution requires a strict CPU Q4_0 routed-expert plan".to_string(),
+            );
+        }
+        if gpu_effective_input.len() != self.core.shape.d_model
+            || actual_gpu_gate.len() != self.core.shape.d_ff
+            || actual_gpu_up.len() != self.core.shape.d_ff
+            || actual_gpu_gated.len() != self.core.shape.d_ff
+            || gpu_effective_input
+                .iter()
+                .chain(actual_gpu_gate)
+                .chain(actual_gpu_up)
+                .chain(actual_gpu_gated)
+                .any(|value| !value.is_finite())
+        {
+            return Err("Q4 stage attribution received nonfinite or malformed vectors".to_string());
+        }
+
+        self.core
+            .storage
+            .validate_expert_file_layout(std::iter::once(global_expert_id))
+            .map_err(|error| {
+                format!(
+                    "global expert {global_expert_id} does not have the exact configured checkpoint file size: {error}"
+                )
+            })?;
+        let expected_payload = crate::inference::expert_weight_bytes_for(
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            WeightDtype::Q4_0,
+        );
+        let block_align = self.core.storage.config().block_align;
+        let checkpoint_payload_bytes =
+            crate::q4_parity::aligned_checkpoint_payload_bytes(expected_payload, block_align)?;
+        let resident = self
+            .fetch_with_retry(global_expert_id)
+            .await
+            .map_err(|error| {
+                format!("failed to fetch global expert {global_expert_id}: {error}")
+            })?;
+        if resident.data().len() != checkpoint_payload_bytes {
+            return Err(format!(
+                "global expert {global_expert_id} checkpoint payload has {} bytes, expected {checkpoint_payload_bytes}",
+                resident.data().len()
+            ));
+        }
+        let (payload, padding) = resident.data().split_at(expected_payload);
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(format!(
+                "global expert {global_expert_id} has non-zero checkpoint alignment padding"
+            ));
+        }
+        let weights = crate::inference::OwnedExpertWeights::from_bytes_q4_0_with_tolerance(
+            payload,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            0,
+        )
+        .map_err(|error| format!("CPU Q4 stage weights failed: {error}"))?;
+        let cpu_boundary_input =
+            crate::numerical_diagnostics::round_trip_f16_values(gpu_effective_input)
+                .map_err(|error| format!("CPU input boundary emulation failed: {error}"))?;
+        let cpu_production = weights
+            .diagnostic_forward_stage_trace(&cpu_boundary_input)
+            .map_err(|error| format!("CPU production stage trace failed: {error}"))?;
+        let ordinary_cpu = crate::inference::q4_0_cpu_reference_forward(
+            payload,
+            &cpu_boundary_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+        )
+        .map_err(|error| format!("ordinary CPU production expert failed: {error}"))?;
+        if ordinary_cpu
+            .iter()
+            .map(|value| value.to_bits())
+            .ne(cpu_production.down.iter().map(|value| value.to_bits()))
+        {
+            return Err(
+                "CPU diagnostic stage final output differs from ordinary production output"
+                    .to_string(),
+            );
+        }
+        let cpu_effective_output =
+            crate::numerical_diagnostics::round_trip_f16_values(&cpu_production.down)
+                .map_err(|error| format!("CPU output boundary emulation failed: {error}"))?;
+        let current_gpu_emulation = crate::inference::diagnostic_q4_0_expert_arithmetic(
+            payload,
+            gpu_effective_input,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("current-GPU arithmetic emulation failed: {error}"))?;
+        let rejected_logical_dequant_emulation =
+            crate::inference::diagnostic_q4_0_expert_arithmetic(
+                payload,
+                gpu_effective_input,
+                self.core.shape.d_model,
+                self.core.shape.d_ff,
+                crate::inference::DiagnosticQ4DotArithmetic::RejectedLogicalDequant,
+            )
+            .map_err(|error| format!("rejected logical-dequant emulation failed: {error}"))?;
+        let gpu_gate_up_through_cpu_swiglu_down = weights
+            .diagnostic_replay_gate_up(actual_gpu_gate, actual_gpu_up)
+            .map_err(|error| format!("GPU gate/up CPU replay failed: {error}"))?;
+        let gpu_gated_through_cpu_down = weights
+            .diagnostic_replay_down(actual_gpu_gated)
+            .map_err(|error| format!("GPU gated CPU-down replay failed: {error}"))?;
+        let cpu_gated_through_current_gpu_down = crate::inference::diagnostic_q4_0_down_arithmetic(
+            payload,
+            &cpu_production.gated,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("CPU gated current-GPU down replay failed: {error}"))?;
+        let gpu_gated_through_current_gpu_down = crate::inference::diagnostic_q4_0_down_arithmetic(
+            payload,
+            actual_gpu_gated,
+            self.core.shape.d_model,
+            self.core.shape.d_ff,
+            crate::inference::DiagnosticQ4DotArithmetic::CurrentGpu,
+        )
+        .map_err(|error| format!("GPU gated current-GPU down replay failed: {error}"))?;
+
+        Ok(crate::inference::Q4ExpertStageDiagnosticBundle {
+            canonical_payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            cpu_boundary_input,
+            cpu_production,
+            cpu_effective_output,
+            current_gpu_emulation,
+            rejected_logical_dequant_emulation,
+            gpu_gate_up_through_cpu_swiglu_down,
+            gpu_gated_through_cpu_down,
+            cpu_gated_through_current_gpu_down,
+            gpu_gated_through_current_gpu_down,
         })
     }
 
@@ -2639,7 +3078,7 @@ impl Engine {
         if let Some(p) = prom_for_task.as_ref() {
             p.set_vram_capacity_bytes(gpu.capacity_bytes() as u64);
         }
-        tokio::spawn(async move {
+        let spawned = self.background_tasks.spawn(async move {
             while let Some((id, resident)) = rx.recv().await {
                 // Existing LRU admissions graduate atomically without a host
                 // payload copy. Absent ids copy outside the cache mutex and
@@ -2653,8 +3092,20 @@ impl Engine {
                 );
             }
         });
+        debug_assert!(
+            spawned,
+            "a newly built engine must accept GPU promotion work"
+        );
         self.core.gpu_cache = Some(gpu.clone());
         self.core.gpu_promotion_tx = Some(tx);
+    }
+
+    /// Stop admission and deterministically retire every anonymous async task
+    /// owned by this engine. Isolated qualification runtimes call this before
+    /// dropping their strong engine handle; ordinary steady-state serving is
+    /// unchanged until a caller explicitly requests shutdown.
+    pub(crate) async fn shutdown_background_tasks(&self) -> Result<(), String> {
+        self.background_tasks.shutdown().await
     }
 
     /// **Test-only** wiring of the GPU promotion channel without
@@ -3059,14 +3510,16 @@ impl Engine {
                 // the (previously dead) `prefetch_used` counter so the
                 // run summary can report end-to-end prefetch precision.
                 self.credit_prefetch_use(&r, new_hits);
-                if let (Some(gpu), Some(tx)) = (
-                    self.core.gpu_cache.as_ref(),
-                    self.core.gpu_promotion_tx.as_ref(),
-                ) {
-                    if gpu.claim_promotion(id, new_hits)
-                        && tx.send((id, r.clone())).is_err()
-                    {
-                        gpu.cancel_promotion(id);
+                if self.background_tasks.accepts_work() {
+                    if let (Some(gpu), Some(tx)) = (
+                        self.core.gpu_cache.as_ref(),
+                        self.core.gpu_promotion_tx.as_ref(),
+                    ) {
+                        if gpu.claim_promotion(id, new_hits)
+                            && tx.send((id, r.clone())).is_err()
+                        {
+                            gpu.cancel_promotion(id);
+                        }
                     }
                 }
                 residents[i] = Some(r);
@@ -3598,11 +4051,77 @@ impl Engine {
         })
     }
 
-    /// Future GPU-native retry service. Physical hits never touch RAM or
-    /// storage. RAM misses use the exact existing `fetch_with_retry`
-    /// singleflight path, then the existing logical demand-admission policy,
-    /// before Slice 8 receives `ExpertResident::data()` for physical upload.
-    /// Demand never consults the speculative governor or semaphore.
+    async fn gpu_native_demand_source(
+        self: &Arc<Self>,
+        global_id: u32,
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
+        if let Some(resident) = residents.get(&global_id) {
+            return Ok(resident.clone());
+        }
+        let resident = match self.core.cache.get(global_id) {
+            Some(resident) => resident,
+            None => self.fetch_with_retry(global_id).await?,
+        };
+        residents.insert(global_id, resident.clone());
+        Ok(resident)
+    }
+
+    async fn ensure_gpu_native_logical_demand_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(Vec<GpuAdmission>, usize), GpuNativeDemandResidencyError> {
+        let gpu = self.execution_context().gpu_expert_cache();
+        let mut payloads = HashMap::with_capacity(global_ids.len());
+        for attempt in 1..=GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS {
+            match gpu.demand_admit_set(global_ids, &payloads)? {
+                GpuDemandSetAdmission::Ready {
+                    admissions,
+                    newly_admitted,
+                } => {
+                    if newly_admitted > 0 {
+                        if let Some(prom) = self.metrics.prom.as_ref() {
+                            prom.record_promotions(newly_admitted as u64);
+                            prom.set_vram_used_bytes(gpu.used_bytes());
+                        }
+                    }
+                    return Ok((admissions, newly_admitted));
+                }
+                GpuDemandSetAdmission::PayloadRequired(missing)
+                    if attempt == GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS =>
+                {
+                    return Err(
+                        GpuNativeDemandResidencyError::LogicalDemandSetRecoveryExhausted {
+                            global_ids: missing,
+                            attempts: GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS,
+                        },
+                    );
+                }
+                GpuDemandSetAdmission::PayloadRequired(missing) => {
+                    for global_id in missing {
+                        let resident = self.gpu_native_demand_source(global_id, residents).await?;
+                        payloads.insert(
+                            global_id,
+                            Arc::new(GpuResident::new_with_dtype(
+                                global_id,
+                                resident.data().to_vec(),
+                                self.core.options.dtype,
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        unreachable!("logical demand-set loop has a fixed positive attempt count")
+    }
+
+    /// GPU-native foreground demand service. Exact physical hits are
+    /// authoritative and never touch the logical cache, RAM, or storage.
+    /// Only physical misses use the existing RAM -> `fetch_with_retry`
+    /// hierarchy, protect/admit their complete missing subset atomically, and
+    /// authorize a physical install. Demand never consults the speculative
+    /// governor or semaphore.
     pub(crate) async fn ensure_gpu_native_demand_residency(
         self: &Arc<Self>,
         layer_index: usize,
@@ -3638,35 +4157,92 @@ impl Engine {
             }
         }
 
-        let mut demands = Vec::with_capacity(global_ids.len());
-        for &global_id in global_ids {
-            if manager.has_current_for_demand(global_id)? {
-                demands.push(GpuNativeDemandExpert::current(global_id));
-                continue;
+        let mut residents = HashMap::with_capacity(global_ids.len());
+        let mut recovery_attempts = 0usize;
+        loop {
+            // No logical-cache lock is held while probing the physical layer.
+            // A probe result may race with a later physical eviction; the
+            // fixed one-retry recovery below re-probes the complete set.
+            let mut physical_current = Vec::with_capacity(global_ids.len());
+            for &global_id in global_ids {
+                let current = manager.has_current_for_demand(global_id)?;
+                physical_current.push(current);
             }
-            let resident = match self.core.cache.get(global_id) {
-                Some(resident) => resident,
-                None => self.fetch_with_retry(global_id).await?,
+            let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+
+            // Physical hits never reach this logical/source block. Protection
+            // is metadata-only and releases the logical mutex before every
+            // RAM/NVMe await, so there is no logical -> physical nesting.
+            let mut admissions_by_id = HashMap::with_capacity(physical_missing.len());
+            let _logical_protection = if physical_missing.is_empty() {
+                None
+            } else {
+                let gpu = self.execution_context().gpu_expert_cache().clone();
+                let protection = gpu.protect_demand_set(&physical_missing)?;
+                for &global_id in &physical_missing {
+                    if !residents.contains_key(&global_id) {
+                        manager.record_physical_source_acquisition();
+                        self.gpu_native_demand_source(global_id, &mut residents)
+                            .await?;
+                    }
+                }
+                let (admissions, newly_admitted) = self
+                    .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
+                    .await?;
+                manager.record_logical_admissions_for_physical_misses(newly_admitted);
+                admissions_by_id
+                    .extend(physical_missing.iter().copied().zip(admissions.into_iter()));
+                Some(protection)
             };
-            self.demand_admit_resident_to_gpu(layer_index as u32, resident.as_ref())
-                .map_err(GpuNativeDemandResidencyError::LogicalAdmission)?;
-            let admission = self
-                .core
-                .execution_context
-                .gpu_expert_cache()
-                .current_admission(global_id)
-                .ok_or_else(|| {
-                    GpuNativeDemandResidencyError::Tiered(
-                        GpuNativeTieredResidencyError::DemandSourceMissing { global_id },
-                    )
-                })?;
-            demands.push(GpuNativeDemandExpert::install(
-                global_id, resident, admission,
-            ));
+
+            let demands = global_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, global_id)| {
+                    if physical_current[index] {
+                        GpuNativeDemandExpert::current(global_id)
+                    } else {
+                        GpuNativeDemandExpert::install(
+                            global_id,
+                            residents
+                                .get(&global_id)
+                                .expect("physical miss acquired an authoritative source")
+                                .clone(),
+                            admissions_by_id
+                                .get(&global_id)
+                                .expect("physical miss established a logical admission")
+                                .clone(),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            match manager.ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                layer_index,
+                &demands,
+            ) {
+                Ok(residencies) => return Ok(residencies),
+                Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
+                    if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
+                {
+                    recovery_attempts += 1;
+                    // A Current record changed before the physical transaction.
+                    // The loop re-probes the whole selected set, but only the
+                    // now-missing members may acquire source/admission state.
+                }
+                Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id }) => {
+                    return Err(
+                        GpuNativeDemandResidencyError::PhysicalDemandRecoveryExhausted {
+                            global_id,
+                            recovery_attempts,
+                        },
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        manager
-            .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands)
-            .map_err(Into::into)
     }
 
     /// One single fetch attempt. Acquires a buffer (yielding briefly
@@ -3759,6 +4335,9 @@ impl Engine {
         resident: Arc<ExpertResident>,
         p: f64,
     ) {
+        if !self.background_tasks.accepts_work() {
+            return;
+        }
         let id = resident.id;
         // This is the prediction's one and only governor decision. A PCIe
         // write does not call `record_completed`; that denominator remains
@@ -3781,7 +4360,7 @@ impl Engine {
             }
         };
         let me = self.clone();
-        tokio::spawn(async move {
+        self.background_tasks.spawn(async move {
             let _permit = permit;
             let Some(admission) = me.ensure_speculative_gpu_admission(&resident) else {
                 return;
@@ -3808,6 +4387,9 @@ impl Engine {
     }
 
     fn spawn_prefetch(self: &Arc<Self>, id: u32, p: f64) {
+        if !self.background_tasks.accepts_work() {
+            return;
+        }
         if let Some(manager) = self.core.gpu_native_residency.as_ref().cloned() {
             match manager.probe_speculative(
                 id,
@@ -3885,7 +4467,7 @@ impl Engine {
             }
         };
         let me = self.clone();
-        tokio::spawn(async move {
+        self.background_tasks.spawn(async move {
             // Permit released on task completion (drop). Holding it
             // across the I/O is what enforces the bound.
             let _permit = permit;
@@ -5351,18 +5933,20 @@ impl Engine {
                 // first hit on a shadow-backed resident is a prefetch
                 // that paid off. No-op when the governor is disabled.
                 self.credit_prefetch_use(&r, new_hits);
-                if let (Some(gpu), Some(tx)) = (
-                    self.core.gpu_cache.as_ref(),
-                    self.core.gpu_promotion_tx.as_ref(),
-                ) {
-                    // One outstanding claim prevents queue flooding while
-                    // allowing a new request after logical eviction, even
-                    // though the RAM resident's hit count no longer has a
-                    // fresh threshold-crossing edge.
-                    if gpu.claim_promotion(id, new_hits)
-                        && tx.send((id, r.clone())).is_err()
-                    {
-                        gpu.cancel_promotion(id);
+                if self.background_tasks.accepts_work() {
+                    if let (Some(gpu), Some(tx)) = (
+                        self.core.gpu_cache.as_ref(),
+                        self.core.gpu_promotion_tx.as_ref(),
+                    ) {
+                        // One outstanding claim prevents queue flooding while
+                        // allowing a new request after logical eviction, even
+                        // though the RAM resident's hit count no longer has a
+                        // fresh threshold-crossing edge.
+                        if gpu.claim_promotion(id, new_hits)
+                            && tx.send((id, r.clone())).is_err()
+                        {
+                            gpu.cancel_promotion(id);
+                        }
                     }
                 }
                 residents[i] = Some(r);
@@ -6363,6 +6947,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_native_current_to_missing_recovery_is_bounded_fail_closed() {
+        assert!(gpu_native_physical_demand_recovery_allowed(0));
+        assert!(!gpu_native_physical_demand_recovery_allowed(1));
+        assert!(!gpu_native_physical_demand_recovery_allowed(usize::MAX));
+        assert_eq!(GPU_NATIVE_PHYSICAL_DEMAND_RECOVERY_LIMIT, 1);
+        assert_eq!(GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS, 2);
+
+        let error = GpuNativeDemandResidencyError::PhysicalDemandRecoveryExhausted {
+            global_id: 6065,
+            recovery_attempts: GPU_NATIVE_PHYSICAL_DEMAND_RECOVERY_LIMIT,
+        };
+        assert_eq!(
+            error.to_string(),
+            "tiered residency physical demand-set recovery remained stale/missing for expert 6065 after 1 bounded recovery attempt(s)"
+        );
+    }
+
+    #[test]
+    fn gpu_native_physical_partition_skips_hits_and_preserves_miss_order() {
+        let selected = [7, 3, 11, 5];
+        assert!(gpu_native_physical_missing_ids(&selected, &[true; 4]).is_empty());
+        assert_eq!(
+            gpu_native_physical_missing_ids(&selected, &[true, false, true, false]),
+            vec![3, 5]
+        );
+    }
+
     fn build_engine(
         data_dir: &std::path::Path,
         num_experts: u32,
@@ -6420,6 +7032,36 @@ mod tests {
                 hidden_seed: seed,
             },
         ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_native_demand_source_reuses_ram_without_duplicate_nvme_read() {
+        let dir = TempDir::new("gpu-native-demand-source");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 1, 1, 17);
+        assert_eq!(engine.report().bytes_read, 0);
+
+        let mut first_request = HashMap::new();
+        let first = engine
+            .gpu_native_demand_source(0, &mut first_request)
+            .await
+            .unwrap();
+        let after_nvme = engine.report().bytes_read;
+        assert_eq!(after_nvme, engine.core.storage.config().expert_size as u64);
+
+        let mut second_request = HashMap::new();
+        let ram_hit = engine
+            .gpu_native_demand_source(0, &mut second_request)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &ram_hit));
+        assert_eq!(engine.report().bytes_read, after_nvme);
+
+        let same_request = engine
+            .gpu_native_demand_source(0, &mut second_request)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&ram_hit, &same_request));
+        assert_eq!(engine.report().bytes_read, after_nvme);
     }
 
     #[test]
@@ -8200,6 +8842,72 @@ mod tests {
         );
         // Sanity: the report surface mirrors the counter.
         assert_eq!(engine.report().prefetch_dropped_concurrency, dropped);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_shutdown_cancels_in_flight_engine_owned_background_work() {
+        let dir = TempDir::new("controlled-background-shutdown");
+        let engine = build_engine(&dir.path, 4, 16, 32, 2, 1, 1, 0x5A17);
+        let weak_engine = Arc::downgrade(&engine);
+
+        // Test seam with the exact ownership shape of spawn_prefetch: the
+        // detached future owns Arc<Engine> and otherwise cannot finish. The
+        // old untracked spawn design would keep the full engine graph alive.
+        let task_engine = engine.clone();
+        assert!(engine.background_tasks.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(task_engine);
+        }));
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 1);
+        assert!(weak_engine.strong_count() >= 2);
+
+        engine.shutdown_background_tasks().await.unwrap();
+        assert!(!engine.background_tasks.accepts_work());
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 0);
+
+        // Shutdown is an admission boundary: neither direct tracker users nor
+        // the real speculative-prefetch producer may create later work.
+        assert!(!engine.background_tasks.spawn(std::future::pending::<()>()));
+        engine.spawn_prefetch(0, 0.5);
+        assert_eq!(engine.background_tasks.active.load(Ordering::Acquire), 0);
+
+        drop(engine);
+        assert!(weak_engine.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_shutdown_prevents_cross_engine_cache_and_counter_contamination() {
+        let first_dir = TempDir::new("isolated-runtime-a");
+        let first = build_engine(&first_dir.path, 4, 16, 32, 2, 1, 1, 0xA11CE);
+        first.warm_with(&[0]).await.unwrap();
+        let _ = first.generate(0).await.unwrap();
+        assert!(first.core.cache.len() > 0);
+        assert!(first.report().tokens_processed > 0);
+
+        // Include work in flight so this is not merely a clean empty-engine
+        // drop. It retains the same Arc<Engine> graph as speculation.
+        let task_engine = first.clone();
+        assert!(first.background_tasks.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(task_engine);
+        }));
+        first.shutdown_background_tasks().await.unwrap();
+        drop(first);
+
+        let second_dir = TempDir::new("isolated-runtime-b");
+        let second = build_engine(&second_dir.path, 4, 16, 32, 2, 1, 1, 0xB0B);
+        let report = second.report();
+        assert_eq!(second.core.cache.len(), 0);
+        assert_eq!(report.tokens_processed, 0);
+        assert_eq!(report.hits, 0);
+        assert_eq!(report.misses, 0);
+        assert_eq!(report.bytes_read, 0);
+        assert_eq!(
+            second.routed_expert_execution_snapshot(),
+            RoutedExpertExecutionSnapshot::default()
+        );
+        assert!(second.gpu_expert_io_snapshot().is_none());
+        second.shutdown_background_tasks().await.unwrap();
     }
 
     /// Regression test for the post-`predict_min_prob` panic:

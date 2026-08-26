@@ -1446,6 +1446,32 @@ pub fn forward_candle_tensors(
     d_model: usize,
     x: &[f32],
 ) -> Result<HiddenState, ExpertWeightsError> {
+    forward_candle_tensors_with_observer(gate_t, up_t, down_t, d_model, x, |_, _, _, _| Ok(()))
+        .map(|(output, ())| output)
+}
+
+/// Diagnostic-only copies of the four internal tensors produced by the
+/// ordinary Candle expert sequence. This type never participates in serving
+/// or qualification decisions.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Q4ExpertStageTrace {
+    pub gate: Vec<f32>,
+    pub up: Vec<f32>,
+    pub gated: Vec<f32>,
+    pub down: Vec<f32>,
+}
+
+fn forward_candle_tensors_with_observer<T, Observe>(
+    gate_t: &Tensor,
+    up_t: &Tensor,
+    down_t: &Tensor,
+    d_model: usize,
+    x: &[f32],
+    observe: Observe,
+) -> Result<(HiddenState, T), ExpertWeightsError>
+where
+    Observe: FnOnce(&Tensor, &Tensor, &Tensor, &Tensor) -> Result<T, ExpertWeightsError>,
+{
     let device = Device::Cpu;
     let map_err = |e: candle_core::Error| ExpertWeightsError::Candle(e.to_string());
 
@@ -1453,12 +1479,12 @@ pub fn forward_candle_tensors(
     // line up: gate[d_ff, d_model] · x[d_model, 1] -> [d_ff, 1].
     let x_t = Tensor::from_slice(x, (d_model, 1), &device).map_err(map_err)?;
 
-    let g = gate_t.matmul(&x_t).map_err(map_err)?;
+    let raw_gate = gate_t.matmul(&x_t).map_err(map_err)?;
     let u = up_t.matmul(&x_t).map_err(map_err)?;
 
     // SwiGLU: silu(clamp(g)) ⊙ u. The clamp is the GPT-OSS `swiglu_limit`
     // (no-op for every other architecture; see `clamp_swiglu_gate`).
-    let g = clamp_swiglu_gate(g).map_err(map_err)?;
+    let g = clamp_swiglu_gate(raw_gate.clone()).map_err(map_err)?;
     let gated = candle_core::Tensor::silu(&g)
         .map_err(map_err)?
         .mul(&u)
@@ -1466,10 +1492,304 @@ pub fn forward_candle_tensors(
 
     // Down projection: down[d_model, d_ff] · gated[d_ff, 1] -> [d_model, 1].
     let y = down_t.matmul(&gated).map_err(map_err)?;
+    let observed = observe(&raw_gate, &u, &gated, &y)?;
 
     // Squeeze the trailing dim and convert back to Vec<f32>.
     let y = y.squeeze(1).map_err(map_err)?;
-    y.to_vec1::<f32>().map_err(map_err)
+    Ok((y.to_vec1::<f32>().map_err(map_err)?, observed))
+}
+
+impl OwnedExpertWeights {
+    /// Observe the existing production Candle stages without changing their
+    /// arithmetic or substituting a scalar matrix multiply.
+    pub(crate) fn diagnostic_forward_stage_trace(
+        &self,
+        x: &[f32],
+    ) -> Result<Q4ExpertStageTrace, ExpertWeightsError> {
+        let device = Device::Cpu;
+        let map_err = |error: candle_core::Error| ExpertWeightsError::Candle(error.to_string());
+        let gate_t =
+            Tensor::from_slice(&self.gate, (self.d_ff, self.d_model), &device).map_err(map_err)?;
+        let up_t =
+            Tensor::from_slice(&self.up, (self.d_ff, self.d_model), &device).map_err(map_err)?;
+        let down_t =
+            Tensor::from_slice(&self.down, (self.d_model, self.d_ff), &device).map_err(map_err)?;
+        let (output, (gate, up, gated, observed_down)) = forward_candle_tensors_with_observer(
+            &gate_t,
+            &up_t,
+            &down_t,
+            self.d_model,
+            x,
+            |gate, up, gated, down| {
+                let to_vec = |tensor: &Tensor, squeeze_dim: usize| {
+                    tensor
+                        .squeeze(squeeze_dim)
+                        .and_then(|tensor| tensor.to_vec1::<f32>())
+                        .map_err(map_err)
+                };
+                Ok((
+                    to_vec(gate, 1)?,
+                    to_vec(up, 1)?,
+                    to_vec(gated, 1)?,
+                    to_vec(down, 1)?,
+                ))
+            },
+        )?;
+        if output
+            .iter()
+            .map(|value| value.to_bits())
+            .ne(observed_down.iter().map(|value| value.to_bits()))
+        {
+            return Err(ExpertWeightsError::Candle(
+                "diagnostic observer changed the final Candle expert vector".to_string(),
+            ));
+        }
+        Ok(Q4ExpertStageTrace {
+            gate,
+            up,
+            gated,
+            down: output,
+        })
+    }
+
+    /// Replay supplied gate/up vectors through the same production Candle
+    /// clamp, SiLU, elementwise multiply, and down projection.
+    pub(crate) fn diagnostic_replay_gate_up(
+        &self,
+        gate: &[f32],
+        up: &[f32],
+    ) -> Result<Q4ExpertStageTrace, ExpertWeightsError> {
+        if gate.len() != self.d_ff || up.len() != self.d_ff {
+            return Err(ExpertWeightsError::InvalidLayout(
+                "diagnostic gate/up replay geometry differs from d_ff".to_string(),
+            ));
+        }
+        let device = Device::Cpu;
+        let map_err = |error: candle_core::Error| ExpertWeightsError::Candle(error.to_string());
+        let gate_t = Tensor::from_slice(gate, (self.d_ff, 1), &device).map_err(map_err)?;
+        let up_t = Tensor::from_slice(up, (self.d_ff, 1), &device).map_err(map_err)?;
+        let down_t =
+            Tensor::from_slice(&self.down, (self.d_model, self.d_ff), &device).map_err(map_err)?;
+        let clamped = clamp_swiglu_gate(gate_t).map_err(map_err)?;
+        let gated = Tensor::silu(&clamped)
+            .map_err(map_err)?
+            .mul(&up_t)
+            .map_err(map_err)?;
+        let down = down_t.matmul(&gated).map_err(map_err)?;
+        let gated = gated
+            .squeeze(1)
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(map_err)?;
+        let down = down
+            .squeeze(1)
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(map_err)?;
+        Ok(Q4ExpertStageTrace {
+            gate: gate.to_vec(),
+            up: up.to_vec(),
+            gated,
+            down,
+        })
+    }
+
+    /// Replay a supplied activation through the same production Candle down
+    /// projection used by the ordinary expert forward path.
+    pub(crate) fn diagnostic_replay_down(
+        &self,
+        gated: &[f32],
+    ) -> Result<Vec<f32>, ExpertWeightsError> {
+        if gated.len() != self.d_ff {
+            return Err(ExpertWeightsError::InvalidLayout(
+                "diagnostic gated replay geometry differs from d_ff".to_string(),
+            ));
+        }
+        let device = Device::Cpu;
+        let map_err = |error: candle_core::Error| ExpertWeightsError::Candle(error.to_string());
+        let down_t =
+            Tensor::from_slice(&self.down, (self.d_model, self.d_ff), &device).map_err(map_err)?;
+        let gated_t = Tensor::from_slice(gated, (self.d_ff, 1), &device).map_err(map_err)?;
+        down_t
+            .matmul(&gated_t)
+            .and_then(|tensor| tensor.squeeze(1))
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(map_err)
+    }
+}
+
+/// CPU descriptions of GPU Q4 arithmetic used only by stage-attribution
+/// diagnostics. `RejectedLogicalDequant` records the failed hypothesis and is
+/// explicitly not an intended production contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiagnosticQ4DotArithmetic {
+    CurrentGpu,
+    RejectedLogicalDequant,
+}
+
+impl DiagnosticQ4DotArithmetic {
+    pub(crate) const fn status(self) -> &'static str {
+        match self {
+            Self::CurrentGpu => "descriptive-current-production-gpu-q4-arithmetic",
+            Self::RejectedLogicalDequant => {
+                "rejected-software-hypothesis-diagnostic-only-not-production"
+            }
+        }
+    }
+}
+
+fn diagnostic_q4_signed_value(block: &[u8], logical_index: usize) -> f32 {
+    let packed = block[2 + (logical_index & 15)];
+    let nibble = if logical_index < 16 {
+        packed & 0x0f
+    } else {
+        packed >> 4
+    };
+    (i32::from(nibble) - 8) as f32
+}
+
+fn diagnostic_q4_dot(blocks: &[u8], input: &[f32], arithmetic: DiagnosticQ4DotArithmetic) -> f32 {
+    debug_assert_eq!(blocks.len() % Q4_0_BLOCK_BYTES, 0);
+    debug_assert_eq!(
+        input.len(),
+        blocks.len() / Q4_0_BLOCK_BYTES * Q4_0_BLOCK_ELEMS
+    );
+    let mut sum = 0.0f32;
+    for (block_index, block) in blocks.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        let input_base = block_index * Q4_0_BLOCK_ELEMS;
+        match arithmetic {
+            DiagnosticQ4DotArithmetic::CurrentGpu => {
+                let mut partial = 0.0f32;
+                for nibble in 0..16 {
+                    partial = partial
+                        + diagnostic_q4_signed_value(block, nibble) * input[input_base + nibble];
+                    partial = partial
+                        + diagnostic_q4_signed_value(block, nibble + 16)
+                            * input[input_base + nibble + 16];
+                }
+                sum = sum + scale * partial;
+            }
+            DiagnosticQ4DotArithmetic::RejectedLogicalDequant => {
+                for logical_index in 0..Q4_0_BLOCK_ELEMS {
+                    let dequantized_weight =
+                        scale * diagnostic_q4_signed_value(block, logical_index);
+                    sum = sum + dequantized_weight * input[input_base + logical_index];
+                }
+            }
+        }
+    }
+    sum
+}
+
+fn diagnostic_q4_projection(
+    payload: &[u8],
+    first_block: usize,
+    rows: usize,
+    columns: usize,
+    input: &[f32],
+    arithmetic: DiagnosticQ4DotArithmetic,
+) -> Vec<f32> {
+    debug_assert_eq!(input.len(), columns);
+    let blocks_per_row = columns / Q4_0_BLOCK_ELEMS;
+    (0..rows)
+        .map(|row| {
+            let first = first_block + row * blocks_per_row;
+            let byte_start = first * Q4_0_BLOCK_BYTES;
+            let byte_end = byte_start + blocks_per_row * Q4_0_BLOCK_BYTES;
+            diagnostic_q4_dot(&payload[byte_start..byte_end], input, arithmetic)
+        })
+        .collect()
+}
+
+pub(crate) fn diagnostic_q4_0_expert_arithmetic(
+    payload: &[u8],
+    input: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    arithmetic: DiagnosticQ4DotArithmetic,
+) -> Result<Q4ExpertStageTrace, ExpertWeightsError> {
+    let expected = expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q4_0);
+    if payload.len() != expected
+        || input.len() != d_model
+        || !d_model.is_multiple_of(Q4_0_BLOCK_ELEMS)
+        || !d_ff.is_multiple_of(Q4_0_BLOCK_ELEMS)
+    {
+        return Err(ExpertWeightsError::InvalidLayout(
+            "diagnostic Q4 arithmetic received invalid payload or geometry".to_string(),
+        ));
+    }
+    let blocks_per_projection = d_model * d_ff / Q4_0_BLOCK_ELEMS;
+    let gate = diagnostic_q4_projection(payload, 0, d_ff, d_model, input, arithmetic);
+    let up = diagnostic_q4_projection(
+        payload,
+        blocks_per_projection,
+        d_ff,
+        d_model,
+        input,
+        arithmetic,
+    );
+    let gated = gate
+        .iter()
+        .copied()
+        .zip(up.iter().copied())
+        .map(|(gate, up)| {
+            let gate = swiglu_limit()
+                .map(|limit| gate.clamp(-limit, limit))
+                .unwrap_or(gate);
+            (gate / (1.0 + (-gate).exp())) * up
+        })
+        .collect::<Vec<_>>();
+    let down = diagnostic_q4_projection(
+        payload,
+        blocks_per_projection * 2,
+        d_model,
+        d_ff,
+        &gated,
+        arithmetic,
+    );
+    Ok(Q4ExpertStageTrace {
+        gate,
+        up,
+        gated,
+        down,
+    })
+}
+
+pub(crate) fn diagnostic_q4_0_down_arithmetic(
+    payload: &[u8],
+    gated: &[f32],
+    d_model: usize,
+    d_ff: usize,
+    arithmetic: DiagnosticQ4DotArithmetic,
+) -> Result<Vec<f32>, ExpertWeightsError> {
+    let expected = expert_weight_bytes_for(d_model, d_ff, WeightDtype::Q4_0);
+    if payload.len() != expected || gated.len() != d_ff {
+        return Err(ExpertWeightsError::InvalidLayout(
+            "diagnostic Q4 down replay received invalid payload or activation geometry".to_string(),
+        ));
+    }
+    let blocks_per_projection = d_model * d_ff / Q4_0_BLOCK_ELEMS;
+    Ok(diagnostic_q4_projection(
+        payload,
+        blocks_per_projection * 2,
+        d_model,
+        d_ff,
+        gated,
+        arithmetic,
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Q4ExpertStageDiagnosticBundle {
+    pub canonical_payload_sha256: String,
+    pub cpu_boundary_input: Vec<f32>,
+    pub cpu_production: Q4ExpertStageTrace,
+    pub cpu_effective_output: Vec<f32>,
+    pub current_gpu_emulation: Q4ExpertStageTrace,
+    pub rejected_logical_dequant_emulation: Q4ExpertStageTrace,
+    pub gpu_gate_up_through_cpu_swiglu_down: Q4ExpertStageTrace,
+    pub gpu_gated_through_cpu_down: Vec<f32>,
+    pub cpu_gated_through_current_gpu_down: Vec<f32>,
+    pub gpu_gated_through_current_gpu_down: Vec<f32>,
 }
 
 /// Fused gate / up SwiGLU projection: `gated[i] = silu(gate[i,:]·x) * (up[i,:]·x)`.
@@ -6591,6 +6911,75 @@ mod tests {
                 "QMatMul Q4_0 path diverged at {i}: baseline={a} qmm={b} (tol={tol})"
             );
         }
+    }
+
+    #[test]
+    fn q4_stage_observer_matches_ordinary_production_candle_output_and_geometry() {
+        let d_model = Q4_0_BLOCK_ELEMS;
+        let d_ff = 2 * Q4_0_BLOCK_ELEMS;
+        let bytes = synth_q4_0_blob(d_model, d_ff);
+        let input: Vec<f32> = (0..d_model)
+            .map(|index| (index as f32 - 15.0) / 19.0)
+            .collect();
+        let weights =
+            OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff).expect("Q4 weights");
+        let trace = weights
+            .diagnostic_forward_stage_trace(&input)
+            .expect("diagnostic Candle stages");
+        let ordinary = q4_0_cpu_reference_forward(&bytes, &input, d_model, d_ff)
+            .expect("ordinary production Candle expert");
+        assert_eq!(trace.gate.len(), d_ff);
+        assert_eq!(trace.up.len(), d_ff);
+        assert_eq!(trace.gated.len(), d_ff);
+        assert_eq!(trace.down.len(), d_model);
+        assert_eq!(
+            trace
+                .down
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            ordinary
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn diagnostic_q4_low_high_nibble_mapping_matches_ggml_layout() {
+        let mut block = [0u8; Q4_0_BLOCK_BYTES];
+        block[..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        for nibble in 0..16 {
+            block[2 + nibble] = nibble as u8 | ((15 - nibble as u8) << 4);
+        }
+        for logical in 0..16 {
+            assert_eq!(
+                diagnostic_q4_signed_value(&block, logical),
+                logical as f32 - 8.0
+            );
+            assert_eq!(
+                diagnostic_q4_signed_value(&block, logical + 16),
+                (15 - logical) as f32 - 8.0
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_mixed_gate_up_replay_preserves_supplied_stage_vectors() {
+        let d_model = Q4_0_BLOCK_ELEMS;
+        let d_ff = Q4_0_BLOCK_ELEMS;
+        let bytes = synth_q4_0_blob(d_model, d_ff);
+        let weights =
+            OwnedExpertWeights::from_bytes_q4_0(&bytes, d_model, d_ff).expect("Q4 weights");
+        let gate: Vec<f32> = (0..d_ff).map(|index| index as f32 / 31.0).collect();
+        let up: Vec<f32> = (0..d_ff).map(|index| 1.0 - index as f32 / 63.0).collect();
+        let replay = weights
+            .diagnostic_replay_gate_up(&gate, &up)
+            .expect("mixed replay");
+        assert_eq!(replay.gate, gate);
+        assert_eq!(replay.up, up);
+        assert_eq!(replay.gated.len(), d_ff);
+        assert_eq!(replay.down.len(), d_model);
     }
 
     #[test]

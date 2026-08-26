@@ -49,6 +49,8 @@ const GPU_NATIVE_KV_APPEND_SHADER: &str = include_str!("wgpu_shaders/gpu_native_
 const GPU_NATIVE_ATTENTION_SHADER: &str = include_str!("wgpu_shaders/gpu_native_attention.wgsl");
 const GPU_NATIVE_ROUTER_SHADER: &str = include_str!("wgpu_shaders/gpu_native_router.wgsl");
 const GPU_NATIVE_Q4_EXPERT_SHADER: &str = include_str!("wgpu_shaders/gpu_native_q4_expert.wgsl");
+const GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER: &str =
+    include_str!("wgpu_shaders/gpu_native_q4_expert_stage_diagnostic.wgsl");
 const GPU_NATIVE_EXPERT_CONTROL_SHADER: &str =
     include_str!("wgpu_shaders/gpu_native_expert_control.wgsl");
 const GPU_NATIVE_STATUS_CONTROL_SHADER: &str =
@@ -84,6 +86,29 @@ pub(crate) enum GpuNativeBootstrapError {
     InvalidDModel,
     StateSizeOverflow {
         d_model: usize,
+    },
+    InvalidPreExpertCheckpointGeometry {
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    },
+    PreExpertCheckpointSizeOverflow {
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    },
+    PreExpertCheckpointLayerOutOfRange {
+        layer_index: usize,
+        num_layers: usize,
+    },
+    ForeignPreExpertCheckpoints,
+    PreExpertCheckpointGeometryMismatch {
+        expected_num_layers: usize,
+        expected_d_model: usize,
+        expected_top_k: usize,
+        actual_num_layers: usize,
+        actual_d_model: usize,
+        actual_top_k: usize,
     },
     InvalidDenseWeightKey,
     InvalidDenseWeightShape {
@@ -351,6 +376,10 @@ pub(crate) enum GpuNativeBootstrapError {
         expected: GpuNativeQ4ExpertGeometry,
         actual: GpuNativeQ4ExpertGeometry,
     },
+    ExpertStageScratchElements {
+        expected: usize,
+        actual: usize,
+    },
     InvalidAttentionHeadCount {
         tensor: GpuNativeAttentionTensor,
         heads: usize,
@@ -487,6 +516,44 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::StateSizeOverflow { d_model } => write!(
                 f,
                 "GPU-native token-state size overflows for d_model={d_model}"
+            ),
+            Self::InvalidPreExpertCheckpointGeometry {
+                num_layers,
+                d_model,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint geometry must have non-zero layers/d_model and top_k in 1..={MAX_GPU_NATIVE_ROUTER_TOP_K}, got layers={num_layers} d_model={d_model} top_k={top_k}"
+            ),
+            Self::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint layout overflows for layers={num_layers} d_model={d_model} top_k={top_k}"
+            ),
+            Self::PreExpertCheckpointLayerOutOfRange {
+                layer_index,
+                num_layers,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint layer {layer_index} is outside 0..{num_layers}"
+            ),
+            Self::ForeignPreExpertCheckpoints => write!(
+                f,
+                "GPU-native pre-expert checkpoints belong to a different executor context"
+            ),
+            Self::PreExpertCheckpointGeometryMismatch {
+                expected_num_layers,
+                expected_d_model,
+                expected_top_k,
+                actual_num_layers,
+                actual_d_model,
+                actual_top_k,
+            } => write!(
+                f,
+                "GPU-native pre-expert checkpoint geometry layers={actual_num_layers} d_model={actual_d_model} top_k={actual_top_k} does not match expected layers={expected_num_layers} d_model={expected_d_model} top_k={expected_top_k}"
             ),
             Self::InvalidDenseWeightKey => {
                 write!(f, "GPU-native dense weight key must be non-empty")
@@ -865,6 +932,10 @@ impl fmt::Display for GpuNativeBootstrapError {
             Self::ExpertScratchGeometry { expected, actual } => write!(
                 f,
                 "GPU-native expert scratch geometry {actual:?} does not match {expected:?}"
+            ),
+            Self::ExpertStageScratchElements { expected, actual } => write!(
+                f,
+                "GPU-native expert stage scratch has {actual} elements, expected {expected}"
             ),
             Self::InvalidAttentionHeadCount { tensor, heads } => write!(
                 f,
@@ -1645,6 +1716,18 @@ impl GpuNativeQ4ExpertGeometry {
 
     pub(crate) const fn top_k(self) -> usize {
         self.top_k
+    }
+
+    pub(crate) fn diagnostic_stage_elements(self) -> usize {
+        self.top_k
+            .checked_mul(self.d_ff)
+            .and_then(|elements| elements.checked_mul(3))
+            .and_then(|elements| {
+                self.top_k
+                    .checked_mul(self.d_model)
+                    .and_then(|down| elements.checked_add(down))
+            })
+            .expect("validated expert geometry must fit diagnostic stage elements")
     }
 
     pub(crate) const fn blocks_per_projection(self) -> usize {
@@ -2902,6 +2985,35 @@ impl<B> GpuNativeQ4ExpertArena<B> {
             .count()
     }
 
+    /// Check that one manager-held residency still names the exact live arena
+    /// owner. This is deliberately independent of host logical-admission LRU
+    /// state: the arena's context, layer, logical id, install generation,
+    /// physical location, and slot epoch are the physical identity contract.
+    pub(crate) fn contains_exact_residency(
+        &self,
+        context_id: u64,
+        residency: GpuNativeQ4ExpertResidency,
+    ) -> bool {
+        if self.context_id != context_id || residency.key.layer_index != self.layer_index {
+            return false;
+        }
+        let logical_id = residency.key.expert_id as usize;
+        let state = self.state.lock();
+        let Some(flat_slot) = state.logical_slots.get(logical_id).copied().flatten() else {
+            return false;
+        };
+        state.latest_generations.get(logical_id).copied().flatten()
+            == Some(residency.key.logical_generation)
+            && state.slots.get(flat_slot).is_some_and(|slot| {
+                slot.location == residency.location
+                    && slot.last_epoch == residency.slot_epoch
+                    && matches!(
+                        slot.owner,
+                        GpuNativeQ4ExpertSlotOwner::Resident(current) if current == residency
+                    )
+            })
+    }
+
     pub(crate) const fn vram_plan(&self) -> GpuNativeQ4ExpertVramPlan {
         self.plan
     }
@@ -3539,6 +3651,228 @@ pub(crate) struct GpuNativeTokenStateLayout {
     total_buffer_bytes: u64,
 }
 
+/// Exact byte ranges for one layer's request-local pre-expert checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativePreExpertCheckpointRegions {
+    pub(crate) hidden_offset: u64,
+    pub(crate) residual_offset: u64,
+    pub(crate) selected_ids_offset: u64,
+    pub(crate) selected_weights_offset: u64,
+}
+
+/// Checked packed layout for all pre-expert checkpoints owned by one request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuNativePreExpertCheckpointLayout {
+    num_layers: usize,
+    d_model: usize,
+    top_k: usize,
+    hidden_bytes: u64,
+    residual_bytes: u64,
+    selected_ids_bytes: u64,
+    selected_weights_bytes: u64,
+    layer_bytes: u64,
+    total_bytes: u64,
+}
+
+impl GpuNativePreExpertCheckpointLayout {
+    pub(crate) fn try_new(
+        num_layers: usize,
+        d_model: usize,
+        top_k: usize,
+    ) -> Result<Self, GpuNativeBootstrapError> {
+        if num_layers == 0 || d_model == 0 || top_k == 0 || top_k > MAX_GPU_NATIVE_ROUTER_TOP_K {
+            return Err(
+                GpuNativeBootstrapError::InvalidPreExpertCheckpointGeometry {
+                    num_layers,
+                    d_model,
+                    top_k,
+                },
+            );
+        }
+
+        let checked_bytes = |elements: usize| {
+            elements
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                    num_layers,
+                    d_model,
+                    top_k,
+                })
+        };
+        let hidden_bytes = checked_bytes(d_model)?;
+        let residual_bytes = checked_bytes(d_model)?;
+        let selected_ids_bytes = checked_bytes(top_k)?;
+        let selected_weights_bytes = checked_bytes(top_k)?;
+        let layer_bytes = hidden_bytes
+            .checked_add(residual_bytes)
+            .and_then(|bytes| bytes.checked_add(selected_ids_bytes))
+            .and_then(|bytes| bytes.checked_add(selected_weights_bytes))
+            .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            })?;
+        let total_bytes = u64::try_from(num_layers)
+            .ok()
+            .and_then(|layers| layer_bytes.checked_mul(layers))
+            .ok_or(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+                num_layers,
+                d_model,
+                top_k,
+            })?;
+
+        let layout = Self {
+            num_layers,
+            d_model,
+            top_k,
+            hidden_bytes,
+            residual_bytes,
+            selected_ids_bytes,
+            selected_weights_bytes,
+            layer_bytes,
+            total_bytes,
+        };
+        debug_assert_eq!(layout.total_bytes % wgpu::COPY_BUFFER_ALIGNMENT, 0);
+        Ok(layout)
+    }
+
+    pub(crate) const fn num_layers(self) -> usize {
+        self.num_layers
+    }
+
+    pub(crate) const fn d_model(self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) const fn top_k(self) -> usize {
+        self.top_k
+    }
+
+    pub(crate) const fn hidden_bytes(self) -> u64 {
+        self.hidden_bytes
+    }
+
+    pub(crate) const fn residual_bytes(self) -> u64 {
+        self.residual_bytes
+    }
+
+    pub(crate) const fn selected_ids_bytes(self) -> u64 {
+        self.selected_ids_bytes
+    }
+
+    pub(crate) const fn selected_weights_bytes(self) -> u64 {
+        self.selected_weights_bytes
+    }
+
+    pub(crate) const fn layer_bytes(self) -> u64 {
+        self.layer_bytes
+    }
+
+    pub(crate) const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    pub(crate) fn usage() -> wgpu::BufferUsages {
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+    }
+
+    pub(crate) fn regions(
+        self,
+        layer_index: usize,
+    ) -> Result<GpuNativePreExpertCheckpointRegions, GpuNativeBootstrapError> {
+        if layer_index >= self.num_layers {
+            return Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index,
+                    num_layers: self.num_layers,
+                },
+            );
+        }
+        let overflow = || GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow {
+            num_layers: self.num_layers,
+            d_model: self.d_model,
+            top_k: self.top_k,
+        };
+        let base = self
+            .layer_bytes
+            .checked_mul(layer_index as u64)
+            .ok_or_else(overflow)?;
+        let residual_offset = base.checked_add(self.hidden_bytes).ok_or_else(overflow)?;
+        let selected_ids_offset = residual_offset
+            .checked_add(self.residual_bytes)
+            .ok_or_else(overflow)?;
+        let selected_weights_offset = selected_ids_offset
+            .checked_add(self.selected_ids_bytes)
+            .ok_or_else(overflow)?;
+        let end = selected_weights_offset
+            .checked_add(self.selected_weights_bytes)
+            .ok_or_else(overflow)?;
+        if end > self.total_bytes
+            || [
+                base,
+                residual_offset,
+                selected_ids_offset,
+                selected_weights_offset,
+                end,
+            ]
+            .into_iter()
+            .any(|offset| offset % wgpu::COPY_BUFFER_ALIGNMENT != 0)
+        {
+            return Err(overflow());
+        }
+        Ok(GpuNativePreExpertCheckpointRegions {
+            hidden_offset: base,
+            residual_offset,
+            selected_ids_offset,
+            selected_weights_offset,
+        })
+    }
+
+    fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
+        super::validate_startup_buffer(
+            "gpu_native_pre_expert_checkpoints",
+            self.total_bytes,
+            Self::usage(),
+            limits,
+        )?;
+        Ok(())
+    }
+}
+
+/// Opaque request-local, GPU-resident storage for exact pre-expert state.
+pub(crate) struct GpuNativePreExpertCheckpoints<B = wgpu::Buffer> {
+    context_id: u64,
+    layout: GpuNativePreExpertCheckpointLayout,
+    buffer: B,
+}
+
+impl<B> GpuNativePreExpertCheckpoints<B> {
+    fn from_buffer(context_id: u64, layout: GpuNativePreExpertCheckpointLayout, buffer: B) -> Self {
+        Self {
+            context_id,
+            layout,
+            buffer,
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> GpuNativePreExpertCheckpointLayout {
+        self.layout
+    }
+
+    pub(crate) fn buffer(&self) -> &B {
+        &self.buffer
+    }
+}
+
+impl<B> fmt::Debug for GpuNativePreExpertCheckpoints<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpuNativePreExpertCheckpoints")
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
 impl GpuNativeTokenStateLayout {
     pub(crate) fn try_new(d_model: usize) -> Result<Self, GpuNativeBootstrapError> {
         if d_model == 0 {
@@ -3579,7 +3913,7 @@ impl GpuNativeTokenStateLayout {
     }
 
     pub(crate) fn tensor_usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
     }
 
     pub(crate) fn status_usage() -> wgpu::BufferUsages {
@@ -3640,7 +3974,7 @@ impl GpuNativeScratchLayout {
     }
 
     pub(crate) fn usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC
     }
 
     pub(crate) fn boundary_result_usage() -> wgpu::BufferUsages {
@@ -3761,8 +4095,12 @@ impl GpuNativeRouterScratchLayout {
         wgpu::BufferUsages::STORAGE
     }
 
+    pub(crate) fn diagnostic_logits_usage() -> wgpu::BufferUsages {
+        Self::logits_usage() | wgpu::BufferUsages::COPY_SRC
+    }
+
     pub(crate) fn result_usage() -> wgpu::BufferUsages {
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
     }
 
     fn validate_for_limits(self, limits: &wgpu::Limits) -> Result<(), GpuNativeBootstrapError> {
@@ -3843,6 +4181,14 @@ impl<B> GpuNativeRouterScratch<B> {
 
     pub(crate) fn selected_ids_buffer(&self) -> &B {
         &self.selected_ids
+    }
+
+    pub(crate) fn selected_weights_buffer(&self) -> &B {
+        &self.selected_weights
+    }
+
+    pub(crate) fn logits_buffer(&self) -> &B {
+        &self.logits
     }
 }
 
@@ -4001,6 +4347,14 @@ impl<B> GpuNativeQ4ExpertScratch<B> {
     pub(crate) const fn layout(&self) -> GpuNativeQ4ExpertScratchLayout {
         self.layout
     }
+
+    pub(crate) fn route_outputs_buffer(&self) -> &B {
+        &self.route_outputs.buffer
+    }
+
+    pub(crate) fn combined_buffer(&self) -> &B {
+        &self.combined.buffer
+    }
 }
 
 impl<B> fmt::Debug for GpuNativeQ4ExpertScratch<B> {
@@ -4015,6 +4369,11 @@ impl<B> fmt::Debug for GpuNativeQ4ExpertScratch<B> {
 /// Request-scoped, non-mappable F32 attention intermediates with geometry
 /// attached, preventing projection, context, and output buffers from being
 /// interchanged at the composed API.
+pub struct Layer0AttentionGpuDiagnosticSink<'a> {
+    pub layout: &'a crate::gpu_native_layer0_diagnostics::Layer0AttentionDiagnosticTraceLayout,
+    pub staging_buffer: &'a wgpu::Buffer,
+}
+
 pub(crate) struct GpuNativeAttentionScratch<B = wgpu::Buffer> {
     context_id: u64,
     geometry: GpuNativeAttentionGeometry,
@@ -4161,6 +4520,14 @@ impl<B> GpuNativeTokenState<B> {
     pub(crate) fn status_buffer(&self) -> &B {
         &self.status
     }
+
+    pub(crate) fn hidden_buffer(&self) -> &B {
+        &self.hidden
+    }
+
+    pub(crate) fn residual_buffer(&self) -> &B {
+        &self.residual
+    }
 }
 
 impl<B> fmt::Debug for GpuNativeTokenState<B> {
@@ -4225,6 +4592,43 @@ fn validate_router_scratch<B>(
         });
     }
     Ok(())
+}
+
+fn validate_pre_expert_checkpoint_resources<B, C>(
+    context_id: u64,
+    checkpoints: &GpuNativePreExpertCheckpoints<C>,
+    state: &GpuNativeTokenState<B>,
+    router_scratch: &GpuNativeRouterScratch<B>,
+    layer_index: usize,
+) -> Result<GpuNativePreExpertCheckpointRegions, GpuNativeBootstrapError> {
+    if checkpoints.context_id != context_id {
+        return Err(GpuNativeBootstrapError::ForeignPreExpertCheckpoints);
+    }
+    validate_token_state_owner(context_id, state.context_id)?;
+    validate_router_scratch(context_id, router_scratch.layout.geometry, router_scratch)?;
+    let expected = checkpoints.layout;
+    let actual_d_model = state.layout.d_model;
+    let router_geometry = router_scratch.layout.geometry;
+    if actual_d_model != expected.d_model
+        || router_geometry.d_model != expected.d_model
+        || router_geometry.top_k != expected.top_k
+        || state.layout.vector_bytes != expected.hidden_bytes
+        || state.layout.vector_bytes != expected.residual_bytes
+        || router_scratch.layout.selected_ids_bytes != expected.selected_ids_bytes
+        || router_scratch.layout.selected_weights_bytes != expected.selected_weights_bytes
+    {
+        return Err(
+            GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch {
+                expected_num_layers: expected.num_layers,
+                expected_d_model: expected.d_model,
+                expected_top_k: expected.top_k,
+                actual_num_layers: expected.num_layers,
+                actual_d_model,
+                actual_top_k: router_geometry.top_k,
+            },
+        );
+    }
+    expected.regions(layer_index)
 }
 
 fn validate_router_plan_with_registry<B>(
@@ -5489,6 +5893,8 @@ struct GpuNativeQ4ExpertPipelines {
     route_resolve: wgpu::ComputePipeline,
     gate_up: wgpu::ComputePipeline,
     down: wgpu::ComputePipeline,
+    diagnostic_stage_gate_up: wgpu::ComputePipeline,
+    diagnostic_stage_down: wgpu::ComputePipeline,
     validate: wgpu::ComputePipeline,
     combine: wgpu::ComputePipeline,
     contain: wgpu::ComputePipeline,
@@ -5704,6 +6110,10 @@ impl GpuNativeQ4ExpertPipelines {
             label: Some("gpu_native_q4_expert_shader"),
             source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_Q4_EXPERT_SHADER.into()),
         });
+        let diagnostic_stage_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gpu_native_q4_expert_stage_diagnostic_shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER.into()),
+        });
         let control_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpu_native_expert_control_shader"),
             source: wgpu::ShaderSource::Wgsl(GPU_NATIVE_EXPERT_CONTROL_SHADER.into()),
@@ -5739,6 +6149,18 @@ impl GpuNativeQ4ExpertPipelines {
                 &expert_pipeline_layout,
                 &expert_module,
                 "q4_expert_down_main",
+            ),
+            diagnostic_stage_gate_up: pipeline(
+                "gpu_native_q4_expert_stage_diagnostic_gate_up_pipeline",
+                &expert_pipeline_layout,
+                &diagnostic_stage_module,
+                "q4_expert_stage_gate_up_main",
+            ),
+            diagnostic_stage_down: pipeline(
+                "gpu_native_q4_expert_stage_diagnostic_down_pipeline",
+                &expert_pipeline_layout,
+                &diagnostic_stage_module,
+                "q4_expert_stage_down_main",
             ),
             validate: pipeline(
                 "gpu_native_expert_validate_pipeline",
@@ -5829,6 +6251,10 @@ impl GpuNativeExecutorContext {
         })
     }
 
+    pub(crate) const fn context_id(&self) -> u64 {
+        self.context_id
+    }
+
     pub(crate) fn create_token_state(
         &self,
     ) -> Result<GpuNativeTokenState, GpuNativeBootstrapError> {
@@ -5872,6 +6298,138 @@ impl GpuNativeExecutorContext {
             residual,
             status,
         ))
+    }
+
+    /// Allocate one request's exact, GPU-only pre-expert checkpoints.
+    pub(crate) fn create_pre_expert_checkpoints(
+        &self,
+        layout: GpuNativePreExpertCheckpointLayout,
+    ) -> Result<GpuNativePreExpertCheckpoints, GpuNativeBootstrapError> {
+        if layout.d_model != self.layout.d_model {
+            return Err(
+                GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch {
+                    expected_num_layers: layout.num_layers,
+                    expected_d_model: self.layout.d_model,
+                    expected_top_k: layout.top_k,
+                    actual_num_layers: layout.num_layers,
+                    actual_d_model: layout.d_model,
+                    actual_top_k: layout.top_k,
+                },
+            );
+        }
+        let gpu = self.authoritative_gpu()?;
+        layout.validate_for_limits(&gpu.device.limits())?;
+        let buffer = create_startup_buffer(
+            &gpu.device,
+            "gpu_native_pre_expert_checkpoints",
+            layout.total_bytes,
+            GpuNativePreExpertCheckpointLayout::usage(),
+        )?;
+        Ok(GpuNativePreExpertCheckpoints::from_buffer(
+            self.context_id,
+            layout,
+            buffer,
+        ))
+    }
+
+    /// Capture exact post-router, pre-expert state for one layer.
+    pub(crate) fn encode_capture_pre_expert_checkpoint(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        checkpoints: &GpuNativePreExpertCheckpoints,
+        layer_index: usize,
+        state: &GpuNativeTokenState,
+        router_scratch: &GpuNativeRouterScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.authoritative_gpu()?;
+        let regions = validate_pre_expert_checkpoint_resources(
+            self.context_id,
+            checkpoints,
+            state,
+            router_scratch,
+            layer_index,
+        )?;
+        let layout = checkpoints.layout;
+
+        encoder.copy_buffer_to_buffer(
+            &state.hidden,
+            0,
+            &checkpoints.buffer,
+            regions.hidden_offset,
+            layout.hidden_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &state.residual,
+            0,
+            &checkpoints.buffer,
+            regions.residual_offset,
+            layout.residual_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &router_scratch.selected_ids,
+            0,
+            &checkpoints.buffer,
+            regions.selected_ids_offset,
+            layout.selected_ids_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &router_scratch.selected_weights,
+            0,
+            &checkpoints.buffer,
+            regions.selected_weights_offset,
+            layout.selected_weights_bytes,
+        );
+        Ok(())
+    }
+
+    /// Restore one layer's exact post-router, pre-expert state.
+    pub(crate) fn encode_restore_pre_expert_checkpoint(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        checkpoints: &GpuNativePreExpertCheckpoints,
+        layer_index: usize,
+        state: &GpuNativeTokenState,
+        router_scratch: &GpuNativeRouterScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.authoritative_gpu()?;
+        let regions = validate_pre_expert_checkpoint_resources(
+            self.context_id,
+            checkpoints,
+            state,
+            router_scratch,
+            layer_index,
+        )?;
+        let layout = checkpoints.layout;
+
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.hidden_offset,
+            &state.hidden,
+            0,
+            layout.hidden_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.residual_offset,
+            &state.residual,
+            0,
+            layout.residual_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.selected_ids_offset,
+            &router_scratch.selected_ids,
+            0,
+            layout.selected_ids_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &checkpoints.buffer,
+            regions.selected_weights_offset,
+            &router_scratch.selected_weights,
+            0,
+            layout.selected_weights_bytes,
+        );
+        Ok(())
     }
 
     /// Record the future replay boundary into the caller-owned encoder.
@@ -6163,6 +6721,23 @@ impl GpuNativeExecutorContext {
         &self,
         geometry: GpuNativeRouterGeometry,
     ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_inner(geometry, false)
+    }
+
+    /// Router scratch whose exact GEMV logits may be copied by an explicitly
+    /// active diagnostic. Ordinary request allocation uses `create_router_scratch`.
+    pub(crate) fn create_router_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
+        self.create_router_scratch_inner(geometry, true)
+    }
+
+    fn create_router_scratch_inner(
+        &self,
+        geometry: GpuNativeRouterGeometry,
+        diagnostic_logits_copy: bool,
+    ) -> Result<GpuNativeRouterScratch, GpuNativeBootstrapError> {
         if geometry.d_model != self.layout.d_model {
             return Err(GpuNativeBootstrapError::RouterDModelMismatch {
                 expected: self.layout.d_model,
@@ -6174,11 +6749,22 @@ impl GpuNativeExecutorContext {
         layout.validate_for_limits(&gpu.device.limits())?;
         validate_router_dispatch(&gpu.device.limits())?;
         let scratch_id = next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "router scratch");
+        let logits_usage = if diagnostic_logits_copy {
+            GpuNativeRouterScratchLayout::diagnostic_logits_usage()
+        } else {
+            GpuNativeRouterScratchLayout::logits_usage()
+        };
+        super::validate_startup_buffer(
+            "gpu_native_router_logits",
+            layout.logits_bytes,
+            logits_usage,
+            &gpu.device.limits(),
+        )?;
         let logits = create_startup_buffer(
             &gpu.device,
             &format!("gpu_native_router_scratch_{scratch_id}_logits"),
             layout.logits_bytes,
-            GpuNativeRouterScratchLayout::logits_usage(),
+            logits_usage,
         )?;
         let selected_ids = create_startup_buffer(
             &gpu.device,
@@ -6357,6 +6943,62 @@ impl GpuNativeExecutorContext {
         &self,
         geometry: GpuNativeQ4ExpertGeometry,
     ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
+        self.create_q4_expert_scratch_inner(geometry, false)
+    }
+
+    /// Allocate request-local expert scratch whose completed route outputs and
+    /// combined vector are copyable only for the explicit semantic diagnostic.
+    /// Normal production requests continue to use storage-only expert tensors.
+    pub(crate) fn create_q4_expert_semantic_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+    ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
+        self.create_q4_expert_scratch_inner(geometry, true)
+    }
+
+    /// Allocate one diagnostic-only storage vector containing raw gate, raw
+    /// up, post-SwiGLU activation, and down outputs for every selected route.
+    pub(crate) fn create_q4_expert_stage_diagnostic_scratch(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+    ) -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+        if geometry.d_model != self.layout.d_model {
+            return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
+                expected: self.layout.d_model,
+                actual: geometry.d_model,
+            });
+        }
+        let gpu = self.authoritative_gpu()?;
+        let layout = GpuNativeScratchLayout::try_new(geometry.diagnostic_stage_elements())?;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+        super::validate_startup_buffer(
+            "gpu_native_q4_expert_stage_diagnostic_scratch",
+            layout.bytes,
+            usage,
+            &gpu.device.limits(),
+        )?;
+        let scratch_id = next_nonzero_id(
+            &NEXT_GPU_NATIVE_SCRATCH_ID,
+            "Q4 expert stage diagnostic scratch",
+        );
+        Ok(GpuNativeScratch::from_buffer(
+            self.context_id,
+            scratch_id,
+            layout,
+            create_startup_buffer(
+                &gpu.device,
+                &format!("gpu_native_q4_expert_stage_diagnostic_{scratch_id}"),
+                layout.bytes,
+                usage,
+            )?,
+        ))
+    }
+
+    fn create_q4_expert_scratch_inner(
+        &self,
+        geometry: GpuNativeQ4ExpertGeometry,
+        semantic_diagnostic: bool,
+    ) -> Result<GpuNativeQ4ExpertScratch, GpuNativeBootstrapError> {
         if geometry.d_model != self.layout.d_model {
             return Err(GpuNativeBootstrapError::ExpertDModelMismatch {
                 expected: self.layout.d_model,
@@ -6375,31 +7017,36 @@ impl GpuNativeExecutorContext {
             GpuNativeQ4ExpertScratchLayout::resolved_usage(),
         )?;
         let create_tensor = |label: &str,
-                             tensor_layout: GpuNativeScratchLayout|
+                             tensor_layout: GpuNativeScratchLayout,
+                             copy_src: bool|
          -> Result<GpuNativeScratch, GpuNativeBootstrapError> {
+            let usage = GpuNativeQ4ExpertScratchLayout::tensor_usage()
+                | if copy_src {
+                    wgpu::BufferUsages::COPY_SRC
+                } else {
+                    wgpu::BufferUsages::empty()
+                };
             Ok(GpuNativeScratch::from_buffer(
                 self.context_id,
                 next_nonzero_id(&NEXT_GPU_NATIVE_SCRATCH_ID, "expert tensor scratch"),
                 tensor_layout,
-                create_startup_buffer(
-                    &gpu.device,
-                    label,
-                    tensor_layout.bytes,
-                    GpuNativeQ4ExpertScratchLayout::tensor_usage(),
-                )?,
+                create_startup_buffer(&gpu.device, label, tensor_layout.bytes, usage)?,
             ))
         };
         let activation = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_activation"),
             layout.activation,
+            false,
         )?;
         let route_outputs = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_route_outputs"),
             layout.route_outputs,
+            semantic_diagnostic,
         )?;
         let combined = create_tensor(
             &format!("gpu_native_expert_scratch_{scratch_id}_combined"),
             layout.combined,
+            semantic_diagnostic,
         )?;
         Ok(GpuNativeQ4ExpertScratch::from_buffers(
             self.context_id,
@@ -6733,6 +7380,160 @@ impl GpuNativeExecutorContext {
         pass.dispatch_workgroups(1, 1, 1);
         drop(pass);
         self.counters.record_router_dispatch();
+        Ok(())
+    }
+
+    /// Diagnostic-only observation of raw Q4 expert stages. The method uses
+    /// the same arena, actual selected routes, push constants, byte layout,
+    /// workgroup geometry, Q4 accumulation contract, and SwiGLU expression as
+    /// production, but writes only to caller-owned diagnostic scratch.
+    pub(crate) fn encode_q4_expert_stage_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        router_plan: &GpuNativeRouterPlan,
+        router_scratch: &GpuNativeRouterScratch,
+        arena: &GpuNativeQ4ExpertArena,
+        state: &GpuNativeTokenState,
+        expert_scratch: &GpuNativeQ4ExpertScratch,
+        stage_scratch: &GpuNativeScratch,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let gpu = self.authoritative_gpu()?;
+        let limits = gpu.device.limits();
+        validate_token_state_owner(self.context_id, state.context_id)?;
+        let _gate = validate_router_plan_with_registry(
+            self.context_id,
+            self.layout.d_model,
+            &self.dense_weights.lock(),
+            router_plan,
+        )?;
+        validate_router_scratch(self.context_id, router_plan.geometry, router_scratch)?;
+        validate_q4_expert_arena(self.context_id, arena, &limits)?;
+        validate_q4_expert_scratch(self.context_id, arena.geometry, expert_scratch, &limits)?;
+        validate_scratch_owner(self.context_id, stage_scratch.context_id)?;
+        validate_router_expert_geometry(router_plan, arena)?;
+        if stage_scratch.layout.elements() != arena.geometry.diagnostic_stage_elements() {
+            return Err(GpuNativeBootstrapError::ExpertStageScratchElements {
+                expected: arena.geometry.diagnostic_stage_elements(),
+                actual: stage_scratch.layout.elements(),
+            });
+        }
+        validate_q4_expert_pipeline_limits(&limits)?;
+        let route_workgroups = self.checked_workgroups(arena.geometry.top_k, &limits)?;
+        let gate_up_workgroups = self.checked_workgroups(arena.geometry.d_ff, &limits)?;
+        let down_workgroups = self.checked_workgroups(arena.geometry.d_model, &limits)?;
+        let bank_slots =
+            arena.plan.layout.banks.map(|bank| {
+                u32::try_from(bank.slot_capacity).expect("validated bank slot capacity")
+            });
+        let resolve_pc = GpuNativeExpertResolvePushConstants {
+            num_experts: arena.geometry.num_experts as u32,
+            top_k: arena.geometry.top_k as u32,
+            active_banks: arena.plan.layout.active_banks as u32,
+            _reserved: 0,
+            bank_slots,
+        };
+        let route_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_q4_stage_route_resolve_bind_group"),
+            layout: &self.q4_expert_pipelines.route_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: router_scratch.selected_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: arena.mapping.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu_native_q4_stage_route_resolve_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.q4_expert_pipelines.route_resolve);
+            pass.set_bind_group(0, &route_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&resolve_pc));
+            pass.dispatch_workgroups(route_workgroups, 1, 1);
+        }
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_native_q4_expert_stage_diagnostic_bind_group"),
+            layout: &self.q4_expert_pipelines.expert_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: arena.banks[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: arena.banks[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: arena.banks[2].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: arena.banks[3].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.hidden.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: expert_scratch.resolved_locations.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: stage_scratch.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: state.status.as_entire_binding(),
+                },
+            ],
+        });
+        for route_slot in 0..arena.geometry.top_k {
+            let pc = GpuNativeQ4ExpertPushConstants {
+                d_model: arena.geometry.d_model as u32,
+                d_ff: arena.geometry.d_ff as u32,
+                blocks_per_projection: arena.geometry.blocks_per_projection as u32,
+                slot_stride_bytes: arena.geometry.slot_stride_bytes as u32,
+                route_slot: route_slot as u32,
+                top_k: arena.geometry.top_k as u32,
+                swiglu_limit: crate::inference::swiglu_limit().unwrap_or(f32::INFINITY),
+                _reserved: 0,
+            };
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_stage_diagnostic_gate_up_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.diagnostic_stage_gate_up);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(gate_up_workgroups, 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpu_native_q4_expert_stage_diagnostic_down_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.q4_expert_pipelines.diagnostic_stage_down);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.set_push_constants(0, bytemuck::bytes_of(&pc));
+                pass.dispatch_workgroups(down_workgroups, 1, 1);
+            }
+        }
         Ok(())
     }
 
@@ -7486,6 +8287,42 @@ impl GpuNativeExecutorContext {
         kv: &GpuNativeKvState,
         position: usize,
     ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_prepare_impl(encoder, plan, state, scratch, kv, position, None)
+    }
+
+    /// Diagnostic variant of [`Self::encode_attention_prepare`] that captures intermediate
+    /// Q/K/V activations before and after norm and RoPE into `diagnostic_sink`.
+    pub(crate) fn encode_attention_prepare_layer0_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: &Layer0AttentionGpuDiagnosticSink<'_>,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_prepare_impl(
+            encoder,
+            plan,
+            state,
+            scratch,
+            kv,
+            position,
+            Some(diagnostic_sink),
+        )
+    }
+
+    fn encode_attention_prepare_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: Option<&Layer0AttentionGpuDiagnosticSink<'_>>,
+    ) -> Result<(), GpuNativeBootstrapError> {
         let gpu = self.authoritative_gpu()?;
         self.validate_attention_plan(plan)?;
         validate_token_state_owner(self.context_id, state.context_id)?;
@@ -7506,8 +8343,35 @@ impl GpuNativeExecutorContext {
         self.validate_attention_dispatch_limits(plan, &gpu.device.limits())?;
 
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.q_projection, state, &scratch.q)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_raw_offset as u64,
+                sink.layout.q_raw_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.k_projection, state, &scratch.k)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_raw_offset as u64,
+                sink.layout.k_raw_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_hidden_to_scratch(encoder, &plan.v_projection, state, &scratch.v)?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.v.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.v_raw_offset as u64,
+                sink.layout.v_raw_bytes as u64,
+            );
+        }
         if let Some(norm) = &plan.q_norm {
             self.encode_rms_norm_scratch_in_place(
                 encoder,
@@ -7517,6 +8381,15 @@ impl GpuNativeExecutorContext {
                 plan.geometry.num_heads,
                 plan.geometry.head_dim,
             )?;
+        }
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_after_norm_offset as u64,
+                sink.layout.q_after_norm_bytes as u64,
+            );
         }
         if let Some(norm) = &plan.k_norm {
             self.encode_rms_norm_scratch_in_place(
@@ -7528,6 +8401,15 @@ impl GpuNativeExecutorContext {
                 plan.geometry.head_dim,
             )?;
         }
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_after_norm_offset as u64,
+                sink.layout.k_after_norm_bytes as u64,
+            );
+        }
         self.encode_rope_scratch_in_place(
             encoder,
             &plan.rope,
@@ -7537,6 +8419,15 @@ impl GpuNativeExecutorContext {
             plan.geometry.head_dim,
             position,
         )?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.q.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.q_after_rope_offset as u64,
+                sink.layout.q_after_rope_bytes as u64,
+            );
+        }
         self.encode_rope_scratch_in_place(
             encoder,
             &plan.rope,
@@ -7546,6 +8437,15 @@ impl GpuNativeExecutorContext {
             plan.geometry.head_dim,
             position,
         )?;
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.k.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.k_after_rope_offset as u64,
+                sink.layout.k_after_rope_bytes as u64,
+            );
+        }
         self.encode_kv_append(
             encoder,
             &scratch.k,
@@ -7627,6 +8527,42 @@ impl GpuNativeExecutorContext {
         kv: &GpuNativeKvState,
         position: usize,
     ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_complete_impl(encoder, plan, state, scratch, kv, position, None)
+    }
+
+    /// Diagnostic variant of [`Self::encode_attention_complete`] that captures intermediate
+    /// causal attention context and O-projection activations into `diagnostic_sink`.
+    pub(crate) fn encode_attention_complete_layer0_diagnostic(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: &Layer0AttentionGpuDiagnosticSink<'_>,
+    ) -> Result<(), GpuNativeBootstrapError> {
+        self.encode_attention_complete_impl(
+            encoder,
+            plan,
+            state,
+            scratch,
+            kv,
+            position,
+            Some(diagnostic_sink),
+        )
+    }
+
+    fn encode_attention_complete_impl(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &GpuNativeAttentionPlan,
+        state: &GpuNativeTokenState,
+        scratch: &GpuNativeAttentionScratch,
+        kv: &GpuNativeKvState,
+        position: usize,
+        diagnostic_sink: Option<&Layer0AttentionGpuDiagnosticSink<'_>>,
+    ) -> Result<(), GpuNativeBootstrapError> {
         let gpu = self.authoritative_gpu()?;
         self.validate_attention_plan(plan)?;
         validate_token_state_owner(self.context_id, state.context_id)?;
@@ -7681,6 +8617,15 @@ impl GpuNativeExecutorContext {
             self.checked_workgroups(state.layout.d_model, &gpu.device.limits())?;
 
         self.encode_causal_attention_pass(gpu, encoder, plan, state, scratch, kv, seq_len);
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.context.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.attention_context_offset as u64,
+                sink.layout.attention_context_bytes as u64,
+            );
+        }
         self.encode_dense_gemv_resolved(
             gpu,
             encoder,
@@ -7689,6 +8634,15 @@ impl GpuNativeExecutorContext {
             &scratch.projected.buffer,
             &o_workgroups,
         );
+        if let Some(sink) = diagnostic_sink {
+            encoder.copy_buffer_to_buffer(
+                &scratch.projected.buffer,
+                0,
+                sink.staging_buffer,
+                sink.layout.o_projection_offset as u64,
+                sink.layout.o_projection_bytes as u64,
+            );
+        }
         self.encode_residual_add_pass(gpu, encoder, state, &scratch.projected, residual_workgroups);
         self.counters.record_attention_complete_dispatch();
         Ok(())
@@ -9233,6 +10187,29 @@ pub(crate) mod tests {
             7 * GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64
         );
         assert_eq!(mapping.borrow()[0].1, residency_a.mapping_entry().unwrap());
+        assert!(arena.contains_exact_residency(7, residency_a));
+        assert!(!arena.contains_exact_residency(8, residency_a));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                key: GpuNativeQ4ExpertKey::new(2, 7, 10),
+                ..residency_a
+            }
+        ));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                key: GpuNativeQ4ExpertKey::new(3, 8, 10),
+                ..residency_a
+            }
+        ));
+        assert!(!arena.contains_exact_residency(
+            7,
+            GpuNativeQ4ExpertResidency {
+                slot_epoch: residency_a.slot_epoch() + 1,
+                ..residency_a
+            }
+        ));
         assert!(matches!(
             arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap(),
             GpuNativeQ4ExpertAcquire::Hit(hit) if hit == residency_a
@@ -9265,6 +10242,7 @@ pub(crate) mod tests {
                 GpuNativeQ4ExpertMappingEntry::UNMAPPED,
             )]
         );
+        assert!(!arena.contains_exact_residency(7, residency_a));
 
         let reinstall =
             expect_expert_install(arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap());
@@ -9273,7 +10251,65 @@ pub(crate) mod tests {
             .install_with_writes(&payload, |_, _, _| {}, |_, _| {})
             .unwrap();
         assert_eq!(reinstalled.key().logical_generation(), 10);
+        assert_ne!(reinstalled.slot_epoch(), residency_a.slot_epoch());
+        assert!(arena.contains_exact_residency(7, reinstalled));
+        assert!(!arena.contains_exact_residency(7, residency_a));
         assert_eq!(arena.residency_snapshot().expert_slot_reuses, 1);
+    }
+
+    #[test]
+    fn gpu_native_residency_physical_arena_survives_logical_admission_eviction() {
+        use crate::expert_cache::{GpuExpertCache, GpuResident};
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let cache = GpuExpertCache::new(payload.len(), 0.0, 0);
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(7, payload.clone())))
+            .unwrap();
+        let admission = cache.current_admission(7).unwrap();
+        let key = GpuNativeQ4ExpertKey::new(3, 7, admission.generation());
+        let physical_writes = RefCell::new(Vec::new());
+        let permit = expect_expert_install(arena.acquire_with_unpublish(key, |_, _| {}).unwrap());
+        let residency = permit
+            .install_with_writes(
+                &payload,
+                |bank, offset, bytes| {
+                    physical_writes
+                        .borrow_mut()
+                        .push((bank, offset, bytes.to_vec()));
+                },
+                |_, _| {},
+            )
+            .unwrap();
+        let before = arena.residency_snapshot();
+        assert!(arena.contains_exact_residency(7, residency));
+
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![9; payload.len()])))
+            .unwrap();
+        assert!(!cache.contains_generation(7, admission.generation()));
+        drop(admission);
+
+        let hit = match arena.acquire_with_unpublish(key, |_, _| {}).unwrap() {
+            GpuNativeQ4ExpertAcquire::Hit(hit) => hit,
+            _ => panic!("logical eviction must not invalidate exact physical residency"),
+        };
+        assert_eq!(hit, residency);
+        assert_eq!(hit.key(), key);
+        assert_eq!(hit.location(), residency.location());
+        assert_eq!(hit.slot_epoch(), residency.slot_epoch());
+        assert!(arena.contains_exact_residency(7, hit));
+        assert_eq!(arena.residency_snapshot(), before);
+
+        let physical = physical_writes.borrow();
+        assert_eq!(physical.len(), 1);
+        let payload_start = arena.geometry().payload_offset_bytes();
+        assert_eq!(
+            &physical[0].2[payload_start..payload_start + payload.len()],
+            payload.as_slice()
+        );
     }
 
     #[test]
@@ -9731,9 +10767,15 @@ pub(crate) mod tests {
         assert_eq!(layout.total_bytes(), 576);
         assert!(!GpuNativeRouterScratchLayout::logits_usage()
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
+        assert!(
+            !GpuNativeRouterScratchLayout::logits_usage().contains(wgpu::BufferUsages::COPY_SRC)
+        );
+        assert!(GpuNativeRouterScratchLayout::diagnostic_logits_usage()
+            .contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!GpuNativeRouterScratchLayout::result_usage()
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
         assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(GpuNativeRouterScratchLayout::result_usage().contains(wgpu::BufferUsages::COPY_DST));
 
         let scratch = GpuNativeRouterScratch::from_buffers(7, 1, layout, (), (), ());
         assert_eq!(validate_router_scratch(7, geometry, &scratch), Ok(()));
@@ -9774,6 +10816,176 @@ pub(crate) mod tests {
             validate_router_scratch(7, geometry, &wrong_weights),
             Err(GpuNativeBootstrapError::RouterSelectedWeightsLength { .. })
         ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_layout_is_exact_checked_and_aligned() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(48, 2048, 8).unwrap();
+        assert_eq!(layout.num_layers(), 48);
+        assert_eq!(layout.d_model(), 2048);
+        assert_eq!(layout.top_k(), 8);
+        assert_eq!(layout.hidden_bytes(), 8192);
+        assert_eq!(layout.residual_bytes(), 8192);
+        assert_eq!(layout.selected_ids_bytes(), 32);
+        assert_eq!(layout.selected_weights_bytes(), 32);
+        assert_eq!(layout.layer_bytes(), 16_448);
+        assert_eq!(layout.total_bytes(), 789_504);
+
+        for layer_index in 0..layout.num_layers() {
+            let regions = layout.regions(layer_index).unwrap();
+            let offsets = [
+                regions.hidden_offset,
+                regions.residual_offset,
+                regions.selected_ids_offset,
+                regions.selected_weights_offset,
+            ];
+            assert!(offsets
+                .iter()
+                .all(|offset| offset % wgpu::COPY_BUFFER_ALIGNMENT == 0));
+            assert_eq!(regions.hidden_offset, layer_index as u64 * 16_448);
+            assert_eq!(regions.residual_offset, regions.hidden_offset + 8192);
+            assert_eq!(regions.selected_ids_offset, regions.residual_offset + 8192);
+            assert_eq!(
+                regions.selected_weights_offset,
+                regions.selected_ids_offset + 32
+            );
+            assert!(regions.selected_weights_offset + 32 <= layout.total_bytes());
+        }
+        assert_eq!(
+            layout.regions(48),
+            Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index: 48,
+                    num_layers: 48,
+                }
+            )
+        );
+
+        let usage = GpuNativePreExpertCheckpointLayout::usage();
+        assert_eq!(
+            usage,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+        );
+        assert!(!usage.intersects(
+            wgpu::BufferUsages::MAP_READ
+                | wgpu::BufferUsages::MAP_WRITE
+                | wgpu::BufferUsages::STORAGE
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_layout_rejects_invalid_or_overflowing_geometry() {
+        for (num_layers, d_model, top_k) in [(0, 2048, 8), (48, 0, 8), (48, 2048, 0), (48, 2048, 9)]
+        {
+            assert_eq!(
+                GpuNativePreExpertCheckpointLayout::try_new(num_layers, d_model, top_k),
+                Err(
+                    GpuNativeBootstrapError::InvalidPreExpertCheckpointGeometry {
+                        num_layers,
+                        d_model,
+                        top_k,
+                    }
+                )
+            );
+        }
+        assert!(matches!(
+            GpuNativePreExpertCheckpointLayout::try_new(usize::MAX, usize::MAX, 8),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointSizeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_ownership_and_geometry_fail_closed() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(2, 16, 4).unwrap();
+        let checkpoints = GpuNativePreExpertCheckpoints::from_buffer(7, layout, ());
+        let state_layout = GpuNativeTokenStateLayout::try_new(16).unwrap();
+        let state = GpuNativeTokenState::from_buffers(7, 1, state_layout, (), (), ());
+        let router_geometry = GpuNativeRouterGeometry::try_new(16, 8, 4).unwrap();
+        let router_layout = GpuNativeRouterScratchLayout::try_new(router_geometry).unwrap();
+        let router = GpuNativeRouterScratch::from_buffers(7, 1, router_layout, (), (), ());
+
+        assert!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &router, 1).is_ok()
+        );
+        assert_eq!(
+            validate_pre_expert_checkpoint_resources(8, &checkpoints, &state, &router, 0),
+            Err(GpuNativeBootstrapError::ForeignPreExpertCheckpoints)
+        );
+        assert_eq!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &router, 2),
+            Err(
+                GpuNativeBootstrapError::PreExpertCheckpointLayerOutOfRange {
+                    layer_index: 2,
+                    num_layers: 2,
+                }
+            )
+        );
+
+        let wrong_state_layout = GpuNativeTokenStateLayout::try_new(8).unwrap();
+        let wrong_state = GpuNativeTokenState::from_buffers(7, 2, wrong_state_layout, (), (), ());
+        assert!(matches!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &wrong_state, &router, 0),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch { .. })
+        ));
+
+        let wrong_router_geometry = GpuNativeRouterGeometry::try_new(16, 8, 2).unwrap();
+        let wrong_router_layout =
+            GpuNativeRouterScratchLayout::try_new(wrong_router_geometry).unwrap();
+        let wrong_router =
+            GpuNativeRouterScratch::from_buffers(7, 2, wrong_router_layout, (), (), ());
+        assert!(matches!(
+            validate_pre_expert_checkpoint_resources(7, &checkpoints, &state, &wrong_router, 0),
+            Err(GpuNativeBootstrapError::PreExpertCheckpointGeometryMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_expert_checkpoint_roundtrip_preserves_exact_ordered_state_bytes() {
+        let layout = GpuNativePreExpertCheckpointLayout::try_new(3, 4, 3).unwrap();
+        let regions = layout.regions(1).unwrap();
+        let hidden = [1.0f32, -0.0, f32::from_bits(1), f32::INFINITY];
+        let residual = [-3.5f32, 7.25, f32::MIN_POSITIVE, f32::NEG_INFINITY];
+        let selected_ids = [7u32, 2, 5];
+        let selected_weights = [0.625f32, 0.25, 0.125];
+        let mut checkpoint = vec![0u8; layout.total_bytes() as usize];
+
+        let mut capture = |offset: u64, bytes: &[u8]| {
+            let start = offset as usize;
+            checkpoint[start..start + bytes.len()].copy_from_slice(bytes);
+        };
+        capture(regions.hidden_offset, bytemuck::cast_slice(&hidden));
+        capture(regions.residual_offset, bytemuck::cast_slice(&residual));
+        capture(
+            regions.selected_ids_offset,
+            bytemuck::cast_slice(&selected_ids),
+        );
+        capture(
+            regions.selected_weights_offset,
+            bytemuck::cast_slice(&selected_weights),
+        );
+
+        let restore = |offset: u64, bytes: u64| {
+            checkpoint[offset as usize..(offset + bytes) as usize].to_vec()
+        };
+        assert_eq!(
+            restore(regions.hidden_offset, layout.hidden_bytes()),
+            bytemuck::cast_slice::<f32, u8>(&hidden)
+        );
+        assert_eq!(
+            restore(regions.residual_offset, layout.residual_bytes()),
+            bytemuck::cast_slice::<f32, u8>(&residual)
+        );
+        assert_eq!(
+            restore(regions.selected_ids_offset, layout.selected_ids_bytes()),
+            bytemuck::cast_slice::<u32, u8>(&selected_ids)
+        );
+        assert_eq!(
+            restore(
+                regions.selected_weights_offset,
+                layout.selected_weights_bytes()
+            ),
+            bytemuck::cast_slice::<f32, u8>(&selected_weights)
+        );
     }
 
     #[test]
@@ -11023,6 +12235,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn q4_expert_stage_shader_is_pinned_to_production_arithmetic() {
+        fn wgsl_function(source: &str, name: &str) -> String {
+            let marker = format!("fn {name}(");
+            let start = source.find(&marker).expect("WGSL function start");
+            let brace = source[start..]
+                .find('{')
+                .map(|offset| start + offset)
+                .expect("WGSL function brace");
+            let mut depth = 0usize;
+            let end = source[brace..]
+                .char_indices()
+                .find_map(|(offset, value)| {
+                    if value == '{' {
+                        depth += 1;
+                    } else if value == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(brace + offset + 1);
+                        }
+                    }
+                    None
+                })
+                .expect("WGSL function end");
+            source[start..end].to_string()
+        }
+
+        let production = wgsl_function(GPU_NATIVE_Q4_EXPERT_SHADER, "q4_dot");
+        let diagnostic_input =
+            wgsl_function(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER, "q4_dot_input")
+                .replace("q4_dot_input", "q4_dot");
+        let diagnostic_gated =
+            wgsl_function(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER, "q4_dot_gated")
+                .replace("q4_dot_gated", "q4_dot")
+                .replace("STAGES", "INPUT");
+        assert_eq!(diagnostic_input, production);
+        assert_eq!(diagnostic_gated, production);
+        let production_activation =
+            "let activation = (clamped_gate / (1.0 + exp(-clamped_gate))) * up;";
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains(production_activation));
+        assert!(GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER.contains(production_activation));
+
+        use sha2::Digest as _;
+        assert_eq!(
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(GPU_NATIVE_Q4_EXPERT_SHADER.as_bytes())
+            ),
+            "54bae352aad7f25920212f596c00b8e3bac2c0a14281b9664d219d1eea212306"
+        );
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("fn q4_expert_gate_up_main"));
+        assert!(GPU_NATIVE_Q4_EXPERT_SHADER.contains("fn q4_expert_down_main"));
+    }
+
+    #[test]
     fn retryable_status_clear_preserves_fatal_and_unknown_bits() {
         assert_eq!(
             status_after_retryable_clear(GPU_NATIVE_STATUS_RETRYABLE_MASK),
@@ -11071,6 +12337,10 @@ pub(crate) mod tests {
             (
                 GPU_NATIVE_Q4_EXPERT_SHADER,
                 &["q4_expert_gate_up_main", "q4_expert_down_main"][..],
+            ),
+            (
+                GPU_NATIVE_Q4_EXPERT_STAGE_DIAGNOSTIC_SHADER,
+                &["q4_expert_stage_gate_up_main", "q4_expert_stage_down_main"][..],
             ),
             (
                 GPU_NATIVE_EXPERT_CONTROL_SHADER,
@@ -13634,9 +14904,42 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let payload = q4_uniform_expert(geometry, 0.001 * id as f32, 0.002, 0.001);
             let _ = make_source(id, &payload);
         }
+        assert!(!gpu_cache.contains_generation(2, stale_admission_a.generation()));
+        let before_physical_only_hit = manager.snapshot();
+        assert!(manager.has_current_for_demand(2).unwrap());
+        let physical_only_hit = manager
+            .ensure_demand_set(
+                GpuNativeResidencyPriority::Demand,
+                0,
+                &[GpuNativeDemandExpert::current(2)],
+            )
+            .unwrap()[0];
+        assert_eq!(physical_only_hit, new_residencies[0]);
+        let after_physical_only_hit = manager.snapshot();
+        assert_eq!(
+            after_physical_only_hit.physical_current_hits,
+            before_physical_only_hit.physical_current_hits + 1
+        );
+        assert_eq!(
+            after_physical_only_hit.ram_to_vram_installs,
+            before_physical_only_hit.ram_to_vram_installs
+        );
+        assert_eq!(
+            after_physical_only_hit.physical_source_acquisitions,
+            before_physical_only_hit.physical_source_acquisitions
+        );
+        assert_eq!(
+            after_physical_only_hit.logical_admissions_for_physical_misses,
+            before_physical_only_hit.logical_admissions_for_physical_misses
+        );
+        assert_eq!(
+            after_physical_only_hit.layers,
+            before_physical_only_hit.layers
+        );
+
         let (newer_resident_a, newer_admission_a) = make_source(2, &payload_a);
         assert!(newer_admission_a.generation() > stale_admission_a.generation());
-        let newest = manager
+        let physical_after_newer_logical_admission = manager
             .ensure_demand_set(
                 GpuNativeResidencyPriority::Demand,
                 0,
@@ -13647,6 +14950,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 )],
             )
             .unwrap()[0];
+        assert_eq!(physical_after_newer_logical_admission, new_residencies[0]);
         let before_stale = manager.snapshot();
         assert!(matches!(
             manager.ensure_demand_set(
@@ -13675,7 +14979,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     &[GpuNativeDemandExpert::current(2)],
                 )
                 .unwrap()[0],
-            newest
+            new_residencies[0]
         );
     }
 
@@ -14129,7 +15433,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let tensor = GpuNativeTokenStateLayout::tensor_usage();
         assert!(tensor.contains(wgpu::BufferUsages::STORAGE));
         assert!(tensor.contains(wgpu::BufferUsages::COPY_DST));
-        assert!(!tensor.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(tensor.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!tensor.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
         let status = GpuNativeTokenStateLayout::status_usage();
@@ -14141,7 +15445,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let generic_scratch = GpuNativeScratchLayout::usage();
         assert!(generic_scratch.contains(wgpu::BufferUsages::STORAGE));
         assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_DST));
-        assert!(!generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(generic_scratch.contains(wgpu::BufferUsages::COPY_SRC));
         assert!(!generic_scratch
             .intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE));
 
@@ -14155,6 +15459,7 @@ fn compare_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let router_result = GpuNativeRouterScratchLayout::result_usage();
         assert!(router_result.contains(wgpu::BufferUsages::STORAGE));
         assert!(router_result.contains(wgpu::BufferUsages::COPY_SRC));
+        assert!(router_result.contains(wgpu::BufferUsages::COPY_DST));
         assert!(
             !router_result.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
         );

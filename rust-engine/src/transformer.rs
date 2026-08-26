@@ -997,6 +997,19 @@ impl MultiHeadSelfAttention {
         v: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
+        self.project_kv_into_impl(x, pos, k, v, timings, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_kv_into_impl(
+        &self,
+        x: &[f32],
+        pos: usize,
+        k: &mut Vec<f32>,
+        v: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        mut diagnostic_sink: Option<&mut Layer0AttentionCpuDiagnosticSink>,
+    ) {
         k.resize(self.kv_dim(), 0.0);
         v.resize(self.v_proj_dim(), 0.0);
         crate::stage_timing::time_optional(timings, crate::stage_timing::K_PROJECTION, || {
@@ -1015,15 +1028,25 @@ impl MultiHeadSelfAttention {
                 *vi += bi;
             }
         }
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.k_raw = Some(k.clone());
+            sink.v_raw = Some(v.clone());
+        }
         crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
             self.apply_k_norm(k.as_mut_slice())
         });
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.k_after_norm = Some(k.clone());
+        }
         crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
             for h in 0..self.num_kv_heads {
                 let s = h * self.head_dim;
                 self.apply_rope_to(&mut k[s..s + self.rope_dim], pos);
             }
         });
+        if let Some(sink) = diagnostic_sink {
+            sink.k_after_rope = Some(k.clone());
+        }
     }
 
     /// Forward one token at absolute position `pos`. Updates `kv` with
@@ -1436,8 +1459,10 @@ impl MultiHeadSelfAttention {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
-        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, false)
-            .expect("legacy attention path is infallible (uniform softmax fallback)");
+        self.forward_into_impl(
+            x, pos, layer_idx, kv, backend, scratch, out, timings, false, None,
+        )
+        .expect("legacy attention path is infallible (uniform softmax fallback)");
     }
 
     /// Strict variant of [`Self::forward_into_with_timing`] (A3
@@ -1456,7 +1481,9 @@ impl MultiHeadSelfAttention {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Result<(), AttentionNumericalError> {
-        self.forward_into_impl(x, pos, layer_idx, kv, backend, scratch, out, timings, true)
+        self.forward_into_impl(
+            x, pos, layer_idx, kv, backend, scratch, out, timings, true, None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1471,6 +1498,7 @@ impl MultiHeadSelfAttention {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
         strict: bool,
+        mut diagnostic_sink: Option<&mut Layer0AttentionCpuDiagnosticSink>,
     ) -> Result<(), AttentionNumericalError> {
         // The scratch path is the CPU-production path. Keep GPU behaviour
         // byte-for-byte by delegating to the existing allocating path when a
@@ -1500,22 +1528,32 @@ impl MultiHeadSelfAttention {
                 *qi += bi;
             }
         }
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.q_raw = Some(scratch.q.clone());
+        }
         crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
             self.apply_q_norm(&mut scratch.q)
         });
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.q_after_norm = Some(scratch.q.clone());
+        }
         crate::stage_timing::time_optional(timings, crate::stage_timing::ROPE, || {
             for h in 0..self.num_heads {
                 let s = h * self.head_dim;
                 self.apply_rope_to(&mut scratch.q[s..s + self.rope_dim], pos);
             }
         });
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.q_after_rope = Some(scratch.q.clone());
+        }
 
-        self.project_kv_into_with_timing(
+        self.project_kv_into_impl(
             x,
             pos,
             &mut scratch.k,
             &mut scratch.v,
             timings,
+            diagnostic_sink.as_deref_mut(),
         );
         debug_assert_eq!(pos, kv.seq_len);
         kv.append(&scratch.k, &scratch.v);
@@ -1535,12 +1573,18 @@ impl MultiHeadSelfAttention {
             },
         )?;
         self.apply_value_scale(&mut scratch.attn_out);
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.attention_context = Some(scratch.attn_out.clone());
+        }
 
         out.resize(self.d_model, 0.0);
         crate::stage_timing::time_optional(timings, crate::stage_timing::O_PROJECTION, || {
             self.wo.matvec_into(&scratch.attn_out, out);
             self.apply_o_bias(out);
         });
+        if let Some(sink) = diagnostic_sink {
+            sink.o_projection = Some(out.clone());
+        }
         Ok(())
     }
 
@@ -1604,8 +1648,7 @@ impl MultiHeadSelfAttention {
             for (idx, score) in scores.iter().enumerate() {
                 let t = t_start + idx;
                 let v_t = kv.value(t);
-                let v_h =
-                    &v_t[kv_head * self.v_head_dim..(kv_head + 1) * self.v_head_dim];
+                let v_h = &v_t[kv_head * self.v_head_dim..(kv_head + 1) * self.v_head_dim];
                 for j in 0..self.v_head_dim {
                     out_h[j] += score * v_h[j];
                 }
@@ -2284,6 +2327,22 @@ pub struct TransformerLayer {
     pub dense_ffn: Option<SharedExpert>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Layer0AttentionCpuDiagnosticSink {
+    pub embedding: Option<Vec<f32>>,
+    pub attention_pre_norm: Option<Vec<f32>>,
+    pub q_raw: Option<Vec<f32>>,
+    pub k_raw: Option<Vec<f32>>,
+    pub v_raw: Option<Vec<f32>>,
+    pub q_after_norm: Option<Vec<f32>>,
+    pub k_after_norm: Option<Vec<f32>>,
+    pub q_after_rope: Option<Vec<f32>>,
+    pub k_after_rope: Option<Vec<f32>>,
+    pub attention_context: Option<Vec<f32>>,
+    pub o_projection: Option<Vec<f32>>,
+    pub post_attention_residual: Option<Vec<f32>>,
+}
+
 #[derive(Debug, Default)]
 pub struct TransformerLayerScratch {
     pub(crate) attn_normed: Vec<f32>,
@@ -2353,7 +2412,7 @@ impl TransformerLayer {
         timings: Option<&crate::stage_timing::StageTimings>,
     ) {
         self.attn_block_into_impl(
-            hidden, pos, layer_idx, kv, backend, scratch, out, timings, false,
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, false, None,
         )
         .expect("legacy attention path is infallible (uniform softmax fallback)");
     }
@@ -2375,7 +2434,36 @@ impl TransformerLayer {
         timings: Option<&crate::stage_timing::StageTimings>,
     ) -> Result<(), AttentionNumericalError> {
         self.attn_block_into_impl(
-            hidden, pos, layer_idx, kv, backend, scratch, out, timings, true,
+            hidden, pos, layer_idx, kv, backend, scratch, out, timings, true, None,
+        )
+    }
+
+    /// Diagnostic variant of [`Self::try_attn_block_into_with_timing`] that records
+    /// intermediate layer-0 attention activations into `diagnostic_sink`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attn_block_into_layer0_diagnostic(
+        &self,
+        hidden: &[f32],
+        pos: usize,
+        layer_idx: usize,
+        kv: &mut KvCache,
+        backend: &crate::backend::BackendBox,
+        scratch: &mut TransformerLayerScratch,
+        out: &mut Vec<f32>,
+        timings: Option<&crate::stage_timing::StageTimings>,
+        diagnostic_sink: &mut Layer0AttentionCpuDiagnosticSink,
+    ) -> Result<(), AttentionNumericalError> {
+        self.attn_block_into_impl(
+            hidden,
+            pos,
+            layer_idx,
+            kv,
+            backend,
+            scratch,
+            out,
+            timings,
+            true,
+            Some(diagnostic_sink),
         )
     }
 
@@ -2391,10 +2479,14 @@ impl TransformerLayer {
         out: &mut Vec<f32>,
         timings: Option<&crate::stage_timing::StageTimings>,
         strict: bool,
+        mut diagnostic_sink: Option<&mut Layer0AttentionCpuDiagnosticSink>,
     ) -> Result<(), AttentionNumericalError> {
         crate::stage_timing::time_optional(timings, crate::stage_timing::RMS_NORM, || {
             self.rms_attn.forward_into(hidden, &mut scratch.attn_normed)
         });
+        if let Some(sink) = diagnostic_sink.as_deref_mut() {
+            sink.attention_pre_norm = Some(scratch.attn_normed.clone());
+        }
         let normed = &scratch.attn_normed;
         match self.mla.as_ref() {
             // DeepSeek-V3 multi-head latent attention runs on CPU against
@@ -2415,6 +2507,9 @@ impl TransformerLayer {
                     },
                 )?;
                 add_residual_into(hidden, &attn_out, out);
+                if let Some(sink) = diagnostic_sink {
+                    sink.post_attention_residual = Some(out.clone());
+                }
             }
             None => {
                 self.attn.forward_into_impl(
@@ -2427,10 +2522,14 @@ impl TransformerLayer {
                     out,
                     timings,
                     strict,
+                    diagnostic_sink.as_deref_mut(),
                 )?;
                 debug_assert_eq!(hidden.len(), out.len());
                 for (oi, hi) in out.iter_mut().zip(hidden.iter()) {
                     *oi += hi;
+                }
+                if let Some(sink) = diagnostic_sink {
+                    sink.post_attention_residual = Some(out.clone());
                 }
             }
         }
@@ -4072,7 +4171,10 @@ mod tests {
         boundary_ns.sort_unstable();
         let p50 = boundary_ns[boundary_ns.len() / 2];
         let p99 = boundary_ns[boundary_ns.len() * 99 / 100];
-        println!("kv block-boundary append+evict: p50={p50}ns p99={p99}ns (n={})", boundary_ns.len());
+        println!(
+            "kv block-boundary append+evict: p50={p50}ns p99={p99}ns (n={})",
+            boundary_ns.len()
+        );
     }
 
     #[test]
@@ -4207,6 +4309,95 @@ mod tests {
                     "block {i} element {j} not zeroised: {v}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn layer0_attention_cpu_diagnostic_sink_preserves_production_output() {
+        let d_model = 16;
+        let layer = make_layer(d_model, 4, 2);
+        let backend = cpu_backend();
+
+        let mut kv_prod = KvCache::new(layer.attn.kv_dim());
+        let mut kv_diag = KvCache::new(layer.attn.kv_dim());
+
+        let mut scratch_prod = TransformerLayerScratch::new();
+        let mut scratch_diag = TransformerLayerScratch::new();
+
+        let x0: Vec<f32> = (0..d_model).map(|i| 0.1 * i as f32 - 0.5).collect();
+        let x1: Vec<f32> = (0..d_model).map(|i| 0.05 * i as f32 + 0.2).collect();
+
+        for (pos, x) in [x0, x1].iter().enumerate() {
+            let mut out_prod = Vec::with_capacity(d_model);
+            let mut out_diag = Vec::with_capacity(d_model);
+            let mut sink = Layer0AttentionCpuDiagnosticSink::default();
+
+            layer
+                .try_attn_block_into_with_timing(
+                    x,
+                    pos,
+                    0,
+                    &mut kv_prod,
+                    &backend,
+                    &mut scratch_prod,
+                    &mut out_prod,
+                    None,
+                )
+                .unwrap();
+
+            layer
+                .try_attn_block_into_layer0_diagnostic(
+                    x,
+                    pos,
+                    0,
+                    &mut kv_diag,
+                    &backend,
+                    &mut scratch_diag,
+                    &mut out_diag,
+                    None,
+                    &mut sink,
+                )
+                .unwrap();
+
+            // 1. Output must be identical bit-for-bit
+            assert_eq!(out_prod, out_diag);
+            assert_eq!(out_diag, sink.post_attention_residual.clone().unwrap());
+
+            // 2. All sink fields must be populated with correct lengths
+            assert_eq!(sink.attention_pre_norm.as_ref().unwrap().len(), d_model);
+            assert_eq!(sink.q_raw.as_ref().unwrap().len(), layer.attn.q_dim());
+            assert_eq!(sink.k_raw.as_ref().unwrap().len(), layer.attn.kv_dim());
+            assert_eq!(sink.v_raw.as_ref().unwrap().len(), layer.attn.v_proj_dim());
+            assert_eq!(
+                sink.q_after_norm.as_ref().unwrap().len(),
+                layer.attn.q_dim()
+            );
+            assert_eq!(
+                sink.k_after_norm.as_ref().unwrap().len(),
+                layer.attn.kv_dim()
+            );
+            assert_eq!(
+                sink.q_after_rope.as_ref().unwrap().len(),
+                layer.attn.q_dim()
+            );
+            assert_eq!(
+                sink.k_after_rope.as_ref().unwrap().len(),
+                layer.attn.kv_dim()
+            );
+            assert_eq!(
+                sink.attention_context.as_ref().unwrap().len(),
+                layer.attn.attn_out_dim()
+            );
+            assert_eq!(sink.o_projection.as_ref().unwrap().len(), d_model);
+            assert_eq!(
+                sink.post_attention_residual.as_ref().unwrap().len(),
+                d_model
+            );
+
+            // 3. KV sequence length and contents must match
+            assert_eq!(kv_prod.seq_len, kv_diag.seq_len);
+            assert_eq!(kv_prod.key(pos), kv_diag.key(pos));
+            assert_eq!(kv_prod.value(pos), kv_diag.value(pos));
         }
     }
 }

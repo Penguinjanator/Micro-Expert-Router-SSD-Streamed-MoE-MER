@@ -2788,6 +2788,184 @@ impl RealModel {
         ))
     }
 
+    /// Diagnostic variant of token forward pass that captures intermediate activation traces at each layer boundary.
+    pub async fn forward_token_diagnostic_trace(
+        &self,
+        engine: &Arc<Engine>,
+        token_id: u32,
+        pos: usize,
+        kv: &mut [KvCache],
+        timings: Option<&crate::stage_timing::StageTimings>,
+    ) -> Result<crate::gpu_native_diagnostics::ModelDiagnosticTrace, RealInferenceError> {
+        assert_eq!(
+            kv.len(),
+            self.config.num_layers,
+            "kv cache slice must have one entry per layer"
+        );
+        let mut x =
+            crate::stage_timing::time_optional(timings, crate::stage_timing::EMBEDDING, || {
+                self.try_embed(token_id)
+            })?;
+        let embedding_trace = x.clone();
+
+        let backend = engine.execution_context().attention_backend();
+        let mut layer_scratch = crate::transformer::TransformerLayerScratch::new();
+        let mut next_x = Vec::with_capacity(self.config.d_model);
+        let strict_numerics = !engine.allow_nonfinite_attention_fallback();
+        let allow_degraded = engine.allow_degraded_experts();
+
+        let mut layer_post_attn = Vec::with_capacity(self.layers.len());
+        let mut layer_router_input = Vec::with_capacity(self.layers.len());
+        let mut layer_selected_ids = Vec::with_capacity(self.layers.len());
+        let mut layer_selected_weights = Vec::with_capacity(self.layers.len());
+        let mut layer_routed_moe_output = Vec::with_capacity(self.layers.len());
+        let mut layer_post_moe = Vec::with_capacity(self.layers.len());
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Attention sub-block.
+            if strict_numerics {
+                layer
+                    .try_attn_block_into_with_timing(
+                        &x,
+                        pos,
+                        layer_idx,
+                        &mut kv[layer_idx],
+                        &**backend,
+                        &mut layer_scratch,
+                        &mut next_x,
+                        timings,
+                    )
+                    .map_err(|e| RealInferenceError::NonFiniteAttention {
+                        layer: layer_idx,
+                        head: e.head,
+                        pos: e.pos,
+                        architecture: self.config.architecture,
+                        kind: e.kind,
+                    })?;
+            } else {
+                layer.attn_block_into_with_timing(
+                    &x,
+                    pos,
+                    layer_idx,
+                    &mut kv[layer_idx],
+                    &**backend,
+                    &mut layer_scratch,
+                    &mut next_x,
+                    timings,
+                );
+            }
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
+            if let crate::architecture::AttentionMode::SlidingWindow { window } =
+                layer.attn.attention_mode()
+            {
+                kv[layer_idx].evict_before(pos.saturating_sub(window));
+            }
+            layer_post_attn.push(x.clone());
+            // MoE sub-block: route, await SSD-streamed expert FFNs, combine.
+            let routing = layer.moe_pre_into_with_timing(&x, &mut layer_scratch, timings);
+            layer_scratch.global_expert_ids.clear();
+            layer_scratch
+                .global_expert_ids
+                .extend(
+                    routing
+                        .experts
+                        .iter()
+                        .map(|&local| self.global_expert_id(layer_idx, local)),
+                );
+            let normed = &layer_scratch.moe_normed;
+            layer_router_input.push(normed.clone());
+            layer_selected_ids.push(routing.experts.clone());
+            layer_selected_weights.push(routing.weights.clone());
+
+            let token_idx =
+                (pos as u64).wrapping_mul(self.config.num_layers as u64) + layer_idx as u64;
+            engine
+                .moe_step_weighted_into_with_timing(
+                    token_idx,
+                    layer_idx as u32,
+                    normed,
+                    &layer_scratch.global_expert_ids,
+                    &routing.weights,
+                    &mut layer_scratch.moe_accum,
+                    timings,
+                )
+                .await?;
+            layer_routed_moe_output.push(layer_scratch.moe_accum.clone());
+            layer.moe_accumulated_into_with_timing(
+                &x,
+                &layer_scratch.moe_accum,
+                &mut next_x,
+                timings,
+            );
+            std::mem::swap(&mut x, &mut next_x);
+            next_x.clear();
+            layer_scratch.routing.recycle_decision(routing);
+
+            match layer.shared_expert_forward_with_timing(normed, timings) {
+                Ok(Some(shared)) => {
+                    crate::transformer::add_residual_into(&x, &shared, &mut next_x);
+                    std::mem::swap(&mut x, &mut next_x);
+                    next_x.clear();
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    if !allow_degraded {
+                        return Err(RealInferenceError::ResidentFfn {
+                            layer: layer_idx,
+                            role: ResidentFfnRole::Shared,
+                            source,
+                        });
+                    }
+                    engine.record_degraded_expert_substitution();
+                    tracing::warn!(
+                        layer = layer_idx,
+                        error = %source,
+                        "DEGRADED MODE: shared expert failed; dropping its \
+                         contribution (allow_degraded_experts = true, output is \
+                         non-authoritative)"
+                    );
+                }
+            }
+            layer_post_moe.push(x.clone());
+        }
+
+        let final_norm = crate::stage_timing::time_optional(
+            timings,
+            crate::stage_timing::FINAL_RMS_NORM,
+            || self.final_rms.forward(&x),
+        );
+        let logits = self.lm_head.diagnostic_greedy_logits(&final_norm);
+        let sampled_token =
+            self.sample_hidden(&final_norm, &crate::sampling::SamplingParams::greedy(), pos);
+
+        Ok(crate::gpu_native_diagnostics::ModelDiagnosticTrace {
+            embedding: embedding_trace,
+            layer_post_attn,
+            layer_router_input,
+            layer_selected_ids,
+            layer_selected_weights,
+            layer_routed_moe_output,
+            layer_post_moe,
+            final_norm,
+            logits,
+            sampled_token,
+        })
+    }
+
+    /// Diagnostic-only replay of the production final RMSNorm on a
+    /// caller-supplied hidden vector. Ordinary inference does not call this
+    /// observation seam.
+    pub(crate) fn diagnostic_final_rms_norm(&self, hidden: &[f32]) -> Vec<f32> {
+        self.final_rms.forward(hidden)
+    }
+
+    /// Diagnostic-only full-logit view using the same per-row dot contract as
+    /// the production greedy argmax path.
+    pub(crate) fn diagnostic_greedy_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        self.lm_head.diagnostic_greedy_logits(hidden)
+    }
+
     /// Sample a next-token id from an already-computed final hidden state.
     ///
     /// Sampling is delegated to [`crate::sampling::sample`], so

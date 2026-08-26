@@ -648,7 +648,26 @@ impl GpuLookup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuDemandAdmissionError {
     EmptyPayload,
-    PayloadExceedsLruCapacity { bytes: usize, capacity: usize },
+    PayloadExceedsLruCapacity {
+        bytes: usize,
+        capacity: usize,
+    },
+    DuplicateDemandExpert {
+        expert_id: u32,
+    },
+    DemandSourceIdentityMismatch {
+        selected_id: u32,
+        source_id: u32,
+    },
+    DemandSetExceedsLruCapacity {
+        required_bytes: usize,
+        capacity: usize,
+    },
+    ProtectedDemandCapacity {
+        required_bytes: usize,
+        protected_bytes: usize,
+        capacity: usize,
+    },
     GenerationExhausted,
 }
 
@@ -656,6 +675,19 @@ pub enum GpuDemandAdmissionError {
 pub enum GpuDemandAdmissionPreflight {
     AlreadyAdmitted,
     NeedsPayload,
+}
+
+/// Atomic result of resolving one complete foreground selected-expert set.
+pub enum GpuDemandSetAdmission {
+    /// Every selected id has a current logical admission. Existing identities
+    /// are retained and `newly_admitted` counts only genuinely new identities.
+    Ready {
+        admissions: Vec<GpuAdmission>,
+        newly_admitted: usize,
+    },
+    /// The cache needs owned payloads for these currently absent selected ids.
+    /// No logical state was changed.
+    PayloadRequired(Vec<u32>),
 }
 
 /// Precise result of one threshold-driven logical GPU promotion attempt.
@@ -702,6 +734,31 @@ impl std::fmt::Display for GpuDemandAdmissionError {
             Self::PayloadExceedsLruCapacity { bytes, capacity } => write!(
                 f,
                 "expert payload {bytes} bytes exceeds logical GPU demand LRU capacity {capacity} bytes"
+            ),
+            Self::DuplicateDemandExpert { expert_id } => {
+                write!(f, "logical GPU demand set repeats expert {expert_id}")
+            }
+            Self::DemandSourceIdentityMismatch {
+                selected_id,
+                source_id,
+            } => write!(
+                f,
+                "logical GPU demand source expert {source_id} does not match selected expert {selected_id}"
+            ),
+            Self::DemandSetExceedsLruCapacity {
+                required_bytes,
+                capacity,
+            } => write!(
+                f,
+                "selected logical GPU demand set requires {required_bytes} LRU bytes but capacity is {capacity} bytes"
+            ),
+            Self::ProtectedDemandCapacity {
+                required_bytes,
+                protected_bytes,
+                capacity,
+            } => write!(
+                f,
+                "logical GPU demand requires {required_bytes} bytes but {protected_bytes} bytes are protected within {capacity}-byte LRU capacity"
             ),
             Self::GenerationExhausted => {
                 f.write_str("logical GPU admission generation space exhausted")
@@ -757,6 +814,36 @@ pub struct GpuExpertCache {
     misses: AtomicU64,
 }
 
+/// RAII protection for one complete foreground selected-expert set.
+///
+/// The guard records ids in cache metadata but never retains the cache mutex,
+/// so it is safe to hold across async RAM/NVMe acquisition. Every logical LRU
+/// eviction path consults this registry. Dropping the guard releases only this
+/// transaction's references, allowing overlapping demand sets to share ids.
+pub struct GpuDemandSetProtection {
+    cache: Arc<GpuExpertCache>,
+    expert_ids: Vec<u32>,
+}
+
+impl Drop for GpuDemandSetProtection {
+    fn drop(&mut self) {
+        let mut g = self.cache.inner.lock();
+        for expert_id in &self.expert_ids {
+            let remove = {
+                let count = g
+                    .demand_protections
+                    .get_mut(expert_id)
+                    .expect("foreground demand protection must remain registered");
+                *count -= 1;
+                *count == 0
+            };
+            if remove {
+                g.demand_protections.remove(expert_id);
+            }
+        }
+    }
+}
+
 struct GpuExpertCacheInner {
     /// **Anchor Core** — permanently pinned high-frequency experts.
     anchor: HashMap<u32, GpuAdmission>,
@@ -776,6 +863,10 @@ struct GpuExpertCacheInner {
     /// a fresh hit-count edge. Consuming this marker prevents a failed or
     /// oversized promotion from retrying on every later RAM hit.
     promotion_rearm: HashSet<u32>,
+    /// Reference-counted selected ids protected by in-flight foreground
+    /// demand-set transactions. This is metadata only; no lock is retained
+    /// while a transaction performs async source acquisition.
+    demand_protections: HashMap<u32, usize>,
 }
 
 impl GpuExpertCacheInner {
@@ -784,6 +875,41 @@ impl GpuExpertCacheInner {
         self.next_generation = generation.checked_add(1)?;
         Some(generation)
     }
+}
+
+fn logical_lru_is_protected(
+    inner: &GpuExpertCacheInner,
+    expert_id: u32,
+    additionally_protected: &HashSet<u32>,
+) -> bool {
+    additionally_protected.contains(&expert_id)
+        || inner
+            .demand_protections
+            .get(&expert_id)
+            .is_some_and(|count| *count > 0)
+}
+
+fn oldest_unprotected_logical_lru(
+    inner: &GpuExpertCacheInner,
+    additionally_protected: &HashSet<u32>,
+) -> Option<u32> {
+    inner.lru.iter().rev().find_map(|(&expert_id, _)| {
+        (!logical_lru_is_protected(inner, expert_id, additionally_protected)).then_some(expert_id)
+    })
+}
+
+fn unprotected_logical_lru_bytes(
+    inner: &GpuExpertCacheInner,
+    additionally_protected: &HashSet<u32>,
+) -> usize {
+    inner
+        .lru
+        .iter()
+        .filter_map(|(&expert_id, admission)| {
+            (!logical_lru_is_protected(inner, expert_id, additionally_protected))
+                .then_some(admission.byte_len())
+        })
+        .sum()
 }
 
 impl GpuExpertCache {
@@ -813,6 +939,7 @@ impl GpuExpertCache {
                 next_generation: 1,
                 promotion_pending: HashSet::new(),
                 promotion_rearm: HashSet::new(),
+                demand_protections: HashMap::new(),
             }),
             anchor_capacity_bytes,
             lru_capacity_bytes,
@@ -1001,6 +1128,16 @@ impl GpuExpertCache {
             g.promotion_rearm.remove(&id);
             return GpuHotPromotionOutcome::NoCapacity;
         }
+        if !use_anchor {
+            let additionally_protected = HashSet::new();
+            let required_bytes = g.lru_used_bytes.saturating_add(bytes);
+            let bytes_to_evict = required_bytes.saturating_sub(self.lru_capacity_bytes);
+            if bytes_to_evict > unprotected_logical_lru_bytes(&g, &additionally_protected) {
+                g.promotion_pending.remove(&id);
+                g.promotion_rearm.remove(&id);
+                return GpuHotPromotionOutcome::NoCapacity;
+            }
+        }
         let Some(generation) = g.allocate_generation() else {
             g.promotion_pending.remove(&id);
             g.promotion_rearm.remove(&id);
@@ -1018,15 +1155,18 @@ impl GpuExpertCache {
                 .expect("logical GPU anchor byte overflow after capacity check");
             GpuHotPromotionOutcome::InstalledAnchor
         } else {
+            let additionally_protected = HashSet::new();
             while g
                 .lru_used_bytes
                 .checked_add(bytes)
                 .is_none_or(|used| used > self.lru_capacity_bytes)
             {
-                let (evicted_id, victim) = g
+                let evicted_id = oldest_unprotected_logical_lru(&g, &additionally_protected)
+                    .expect("hot capacity preflight proved an unprotected logical victim");
+                let victim = g
                     .lru
-                    .pop_lru()
-                    .expect("hot payload fits an empty LRU by prior capacity check");
+                    .pop(&evicted_id)
+                    .expect("selected hot logical victim remained under cache lock");
                 g.lru_used_bytes = g
                     .lru_used_bytes
                     .checked_sub(victim.byte_len())
@@ -1142,6 +1282,14 @@ impl GpuExpertCache {
         if !use_anchor && bytes > self.lru_capacity_bytes {
             return false;
         }
+        if !use_anchor {
+            let additionally_protected = HashSet::new();
+            let required_bytes = g.lru_used_bytes.saturating_add(bytes);
+            let bytes_to_evict = required_bytes.saturating_sub(self.lru_capacity_bytes);
+            if bytes_to_evict > unprotected_logical_lru_bytes(&g, &additionally_protected) {
+                return false;
+            }
+        }
         let Some(generation) = g.allocate_generation() else {
             return false;
         };
@@ -1159,18 +1307,20 @@ impl GpuExpertCache {
         }
         // Evict LRU entries until there is room. `LruCache::pop_lru`
         // returns the least-recently-used (k, v).
+        let additionally_protected = HashSet::new();
         while g
             .lru_used_bytes
             .checked_add(bytes)
             .is_none_or(|used| used > self.lru_capacity_bytes)
         {
-            match g.lru.pop_lru() {
-                Some((evicted_id, victim)) => {
-                    g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
-                    g.promotion_rearm.insert(evicted_id);
-                }
-                None => break,
-            }
+            let evicted_id = oldest_unprotected_logical_lru(&g, &additionally_protected)
+                .expect("promotion capacity preflight proved an unprotected logical victim");
+            let victim = g
+                .lru
+                .pop(&evicted_id)
+                .expect("selected promotion victim remained under cache lock");
+            g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
+            g.promotion_rearm.insert(evicted_id);
         }
         let already = g.lru.put(admission.resident.id, admission);
         if let Some(prev) = already {
@@ -1245,6 +1395,213 @@ impl GpuExpertCache {
         true
     }
 
+    /// Protect one complete foreground selected-expert set from logical LRU
+    /// eviction until the returned guard is dropped. Registration is atomic,
+    /// but the guard holds no mutex and may cross async RAM/NVMe awaits.
+    pub fn protect_demand_set(
+        self: &Arc<Self>,
+        expert_ids: &[u32],
+    ) -> Result<GpuDemandSetProtection, GpuDemandAdmissionError> {
+        let mut seen = HashSet::with_capacity(expert_ids.len());
+        for &expert_id in expert_ids {
+            if !seen.insert(expert_id) {
+                return Err(GpuDemandAdmissionError::DuplicateDemandExpert { expert_id });
+            }
+        }
+
+        let mut g = self.inner.lock();
+        for &expert_id in expert_ids {
+            let count = g.demand_protections.entry(expert_id).or_insert(0);
+            *count = count
+                .checked_add(1)
+                .expect("foreground demand protection reference count overflowed");
+        }
+        drop(g);
+        Ok(GpuDemandSetProtection {
+            cache: self.clone(),
+            expert_ids: expert_ids.to_vec(),
+        })
+    }
+
+    /// Resolve a complete foreground selected-expert set as one logical
+    /// transaction. Existing admissions retain their exact generation and
+    /// payload. Missing admissions are installed together after evicting only
+    /// non-selected, non-protected LRU entries. Every validation and capacity
+    /// check completes before the first eviction, so failures are atomic.
+    ///
+    /// Callers first pass no `sources`. `PayloadRequired` identifies exactly
+    /// which multi-megabyte payload copies are needed outside the cache mutex;
+    /// a second call supplies only those copies and revalidates atomically.
+    pub fn demand_admit_set(
+        &self,
+        expert_ids: &[u32],
+        sources: &HashMap<u32, Arc<GpuResident>>,
+    ) -> Result<GpuDemandSetAdmission, GpuDemandAdmissionError> {
+        let mut selected = HashSet::with_capacity(expert_ids.len());
+        for &expert_id in expert_ids {
+            if !selected.insert(expert_id) {
+                return Err(GpuDemandAdmissionError::DuplicateDemandExpert { expert_id });
+            }
+        }
+
+        let mut g = self.inner.lock();
+        let mut payload_required = Vec::new();
+        let mut new_ids = Vec::new();
+        let mut selected_lru_bytes = 0usize;
+        let mut new_bytes = 0usize;
+
+        for &expert_id in expert_ids {
+            if g.anchor.contains_key(&expert_id) {
+                continue;
+            }
+            if let Some(admission) = g.lru.peek(&expert_id) {
+                selected_lru_bytes = selected_lru_bytes.checked_add(admission.byte_len()).ok_or(
+                    GpuDemandAdmissionError::DemandSetExceedsLruCapacity {
+                        required_bytes: usize::MAX,
+                        capacity: self.lru_capacity_bytes,
+                    },
+                )?;
+                continue;
+            }
+
+            let Some(source) = sources.get(&expert_id) else {
+                payload_required.push(expert_id);
+                continue;
+            };
+            if source.id != expert_id {
+                return Err(GpuDemandAdmissionError::DemandSourceIdentityMismatch {
+                    selected_id: expert_id,
+                    source_id: source.id,
+                });
+            }
+            let bytes = source.byte_len();
+            if bytes == 0 {
+                return Err(GpuDemandAdmissionError::EmptyPayload);
+            }
+            if bytes > self.lru_capacity_bytes {
+                return Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                    bytes,
+                    capacity: self.lru_capacity_bytes,
+                });
+            }
+            selected_lru_bytes = selected_lru_bytes.checked_add(bytes).ok_or(
+                GpuDemandAdmissionError::DemandSetExceedsLruCapacity {
+                    required_bytes: usize::MAX,
+                    capacity: self.lru_capacity_bytes,
+                },
+            )?;
+            new_bytes = new_bytes.checked_add(bytes).ok_or(
+                GpuDemandAdmissionError::DemandSetExceedsLruCapacity {
+                    required_bytes: usize::MAX,
+                    capacity: self.lru_capacity_bytes,
+                },
+            )?;
+            new_ids.push(expert_id);
+        }
+
+        if !payload_required.is_empty() {
+            return Ok(GpuDemandSetAdmission::PayloadRequired(payload_required));
+        }
+        if selected_lru_bytes > self.lru_capacity_bytes {
+            return Err(GpuDemandAdmissionError::DemandSetExceedsLruCapacity {
+                required_bytes: selected_lru_bytes,
+                capacity: self.lru_capacity_bytes,
+            });
+        }
+
+        let required_bytes = g.lru_used_bytes.checked_add(new_bytes).ok_or(
+            GpuDemandAdmissionError::ProtectedDemandCapacity {
+                required_bytes: usize::MAX,
+                protected_bytes: g.lru_used_bytes,
+                capacity: self.lru_capacity_bytes,
+            },
+        )?;
+        let bytes_to_evict = required_bytes.saturating_sub(self.lru_capacity_bytes);
+        let evictable_bytes = unprotected_logical_lru_bytes(&g, &selected);
+        if bytes_to_evict > evictable_bytes {
+            return Err(GpuDemandAdmissionError::ProtectedDemandCapacity {
+                required_bytes,
+                protected_bytes: g.lru_used_bytes.saturating_sub(evictable_bytes),
+                capacity: self.lru_capacity_bytes,
+            });
+        }
+
+        let generation_count = u64::try_from(new_ids.len())
+            .map_err(|_| GpuDemandAdmissionError::GenerationExhausted)?;
+        let next_generation = g
+            .next_generation
+            .checked_add(generation_count)
+            .ok_or(GpuDemandAdmissionError::GenerationExhausted)?;
+
+        while g
+            .lru_used_bytes
+            .checked_add(new_bytes)
+            .is_none_or(|used| used > self.lru_capacity_bytes)
+        {
+            let victim_id = oldest_unprotected_logical_lru(&g, &selected)
+                .expect("set capacity preflight proved an unprotected logical victim");
+            let victim = g
+                .lru
+                .pop(&victim_id)
+                .expect("selected logical victim remained under cache lock");
+            g.lru_used_bytes = g
+                .lru_used_bytes
+                .checked_sub(victim.byte_len())
+                .expect("logical GPU LRU byte underflow during demand-set admission");
+            g.promotion_rearm.insert(victim_id);
+        }
+
+        let first_generation = g.next_generation;
+        g.next_generation = next_generation;
+        for (offset, expert_id) in new_ids.iter().copied().enumerate() {
+            let source = sources
+                .get(&expert_id)
+                .expect("demand-set source validated before mutation")
+                .clone();
+            let generation = first_generation
+                .checked_add(offset as u64)
+                .expect("generation range preflight covered every new admission");
+            let bytes = source.byte_len();
+            g.promotion_pending.remove(&expert_id);
+            g.promotion_rearm.remove(&expert_id);
+            let previous = g.lru.put(
+                expert_id,
+                GpuAdmission {
+                    resident: source,
+                    generation,
+                },
+            );
+            debug_assert!(previous.is_none(), "demand set rechecked under one lock");
+            g.lru_used_bytes = g
+                .lru_used_bytes
+                .checked_add(bytes)
+                .expect("logical GPU demand-set LRU byte overflow after capacity check");
+        }
+
+        let admissions = expert_ids
+            .iter()
+            .map(|expert_id| {
+                g.anchor
+                    .get(expert_id)
+                    .or_else(|| g.lru.peek(expert_id))
+                    .cloned()
+                    .expect("every selected expert is admitted by the atomic transaction")
+            })
+            .collect();
+        let newly_admitted = new_ids.len();
+        drop(g);
+
+        if newly_admitted > 0 {
+            self.promotions
+                .fetch_add(newly_admitted as u64, Ordering::Relaxed);
+            self.refresh_used_bytes();
+        }
+        Ok(GpuDemandSetAdmission::Ready {
+            admissions,
+            newly_admitted,
+        })
+    }
+
     /// Check whether a selected foreground expert needs an owned host payload
     /// before attempting logical LRU admission. This probe never changes
     /// routing telemetry, LRU recency, generations, or byte accounting.
@@ -1297,6 +1654,22 @@ impl GpuExpertCache {
                 capacity: self.lru_capacity_bytes,
             });
         }
+        let additionally_protected = HashSet::new();
+        let required_bytes = g.lru_used_bytes.checked_add(bytes).ok_or(
+            GpuDemandAdmissionError::ProtectedDemandCapacity {
+                required_bytes: usize::MAX,
+                protected_bytes: g.lru_used_bytes,
+                capacity: self.lru_capacity_bytes,
+            },
+        )?;
+        let evictable_bytes = unprotected_logical_lru_bytes(&g, &additionally_protected);
+        if required_bytes.saturating_sub(self.lru_capacity_bytes) > evictable_bytes {
+            return Err(GpuDemandAdmissionError::ProtectedDemandCapacity {
+                required_bytes,
+                protected_bytes: g.lru_used_bytes.saturating_sub(evictable_bytes),
+                capacity: self.lru_capacity_bytes,
+            });
+        }
         // Allocate identity before eviction so generation exhaustion cannot
         // disturb any existing admission or byte accounting.
         let generation = g
@@ -1308,10 +1681,12 @@ impl GpuExpertCache {
             .checked_add(bytes)
             .is_none_or(|used| used > self.lru_capacity_bytes)
         {
-            let (evicted_id, victim) = g
+            let evicted_id = oldest_unprotected_logical_lru(&g, &additionally_protected)
+                .expect("demand capacity preflight proved an unprotected logical victim");
+            let victim = g
                 .lru
-                .pop_lru()
-                .expect("demand payload fits an empty LRU by prior capacity check");
+                .pop(&evicted_id)
+                .expect("selected demand victim remained under cache lock");
             g.lru_used_bytes = g.lru_used_bytes.saturating_sub(victim.byte_len());
             g.promotion_rearm.insert(evicted_id);
         }
@@ -1643,6 +2018,203 @@ mod tests {
 
     fn gpu_res(id: u32, bytes: usize) -> Arc<GpuResident> {
         Arc::new(GpuResident::new(id, vec![0u8; bytes]))
+    }
+
+    fn ready_demand_set(outcome: GpuDemandSetAdmission) -> (Vec<GpuAdmission>, usize) {
+        match outcome {
+            GpuDemandSetAdmission::Ready {
+                admissions,
+                newly_admitted,
+            } => (admissions, newly_admitted),
+            GpuDemandSetAdmission::PayloadRequired(missing) => {
+                panic!("unexpected missing demand payloads: {missing:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn all_current_demand_set_is_hit_only_and_preserves_identity() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 8)), Ok(true));
+        let generations = [
+            cache.current_generation(1).unwrap(),
+            cache.current_generation(2).unwrap(),
+        ];
+        let promotions = cache.promotions();
+        let used = cache.used_bytes();
+        let _protection = cache.protect_demand_set(&[1, 2]).unwrap();
+
+        let (admissions, newly_admitted) =
+            ready_demand_set(cache.demand_admit_set(&[1, 2], &HashMap::new()).unwrap());
+
+        assert_eq!(newly_admitted, 0);
+        assert_eq!(admissions[0].generation(), generations[0]);
+        assert_eq!(admissions[1].generation(), generations[1]);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.used_bytes(), used);
+    }
+
+    #[test]
+    fn all_missing_demand_set_is_admitted_atomically() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
+        let _protection = cache.protect_demand_set(&[1, 2]).unwrap();
+        assert!(matches!(
+            cache.demand_admit_set(&[1, 2], &HashMap::new()).unwrap(),
+            GpuDemandSetAdmission::PayloadRequired(ids) if ids == vec![1, 2]
+        ));
+        let sources = HashMap::from([(1, gpu_res(1, 8)), (2, gpu_res(2, 8))]);
+
+        let (admissions, newly_admitted) =
+            ready_demand_set(cache.demand_admit_set(&[1, 2], &sources).unwrap());
+
+        assert_eq!(newly_admitted, 2);
+        assert_eq!(admissions.len(), 2);
+        assert!(cache.contains_generation(1, admissions[0].generation()));
+        assert!(cache.contains_generation(2, admissions[1].generation()));
+        assert_eq!(cache.used_bytes(), 16);
+    }
+
+    #[test]
+    fn mixed_demand_set_evicts_non_selected_lru_not_current_member() {
+        let cache = Arc::new(GpuExpertCache::new(24, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(90, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(91, 8)), Ok(true));
+        let generation = cache.current_generation(1).unwrap();
+        let _protection = cache.protect_demand_set(&[1, 2]).unwrap();
+        let sources = HashMap::from([(2, gpu_res(2, 8))]);
+
+        let (admissions, newly_admitted) =
+            ready_demand_set(cache.demand_admit_set(&[1, 2], &sources).unwrap());
+
+        assert_eq!(newly_admitted, 1);
+        assert_eq!(admissions[0].generation(), generation);
+        assert!(cache.contains_generation(1, generation));
+        assert!(cache.contains(2));
+        assert!(
+            !cache.contains(90),
+            "oldest non-selected entry must be evicted"
+        );
+        assert!(cache.contains(91));
+    }
+
+    #[test]
+    fn insufficient_selected_set_capacity_fails_atomically() {
+        let cache = Arc::new(GpuExpertCache::new(12, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(90, 4)), Ok(true));
+        let generation = cache.current_generation(90).unwrap();
+        let used = cache.used_bytes();
+        let promotions = cache.promotions();
+        let next_generation = cache.inner.lock().next_generation;
+        let _protection = cache.protect_demand_set(&[1, 2]).unwrap();
+        let sources = HashMap::from([(1, gpu_res(1, 8)), (2, gpu_res(2, 8))]);
+
+        assert!(matches!(
+            cache.demand_admit_set(&[1, 2], &sources),
+            Err(GpuDemandAdmissionError::DemandSetExceedsLruCapacity {
+                required_bytes: 16,
+                capacity: 12,
+            })
+        ));
+        assert!(cache.contains_generation(90, generation));
+        assert!(!cache.contains(1));
+        assert!(!cache.contains(2));
+        assert_eq!(cache.used_bytes(), used);
+        assert_eq!(cache.promotions(), promotions);
+        assert_eq!(cache.inner.lock().next_generation, next_generation);
+    }
+
+    #[test]
+    fn foreground_protection_blocks_individual_self_eviction() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(90, 8)), Ok(true));
+        let generation = cache.current_generation(1).unwrap();
+        let protection = cache.protect_demand_set(&[1, 2]).unwrap();
+
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 8)), Ok(true));
+        assert!(cache.contains_generation(1, generation));
+        assert!(cache.contains(2));
+        assert!(!cache.contains(90));
+
+        drop(protection);
+        assert_eq!(cache.demand_admit_lru(gpu_res(3, 8)), Ok(true));
+        assert!(
+            !cache.contains(1),
+            "released protection restores ordinary LRU eviction"
+        );
+    }
+
+    #[test]
+    fn protected_capacity_conflict_fails_without_oscillation() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 8)), Ok(true));
+        let _other_foreground = cache.protect_demand_set(&[1, 2]).unwrap();
+        let sources = HashMap::from([(3, gpu_res(3, 8))]);
+
+        assert!(matches!(
+            cache.demand_admit_set(&[3], &sources),
+            Err(GpuDemandAdmissionError::ProtectedDemandCapacity {
+                required_bytes: 24,
+                protected_bytes: 16,
+                capacity: 16,
+            })
+        ));
+        assert!(cache.contains(1));
+        assert!(cache.contains(2));
+        assert!(!cache.contains(3));
+    }
+
+    #[test]
+    fn stale_probe_generation_is_rejected_and_recovery_allocates_fresh_identity() {
+        let cache = Arc::new(GpuExpertCache::new(8, 0.0, 0));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        let stale_generation = cache.current_generation(1).unwrap();
+        assert_eq!(cache.demand_admit_lru(gpu_res(90, 8)), Ok(true));
+        assert!(!cache.contains_generation(1, stale_generation));
+        let _protection = cache.protect_demand_set(&[1]).unwrap();
+        let sources = HashMap::from([(1, gpu_res(1, 8))]);
+
+        let (admissions, newly_admitted) =
+            ready_demand_set(cache.demand_admit_set(&[1], &sources).unwrap());
+
+        assert_eq!(newly_admitted, 1);
+        assert!(admissions[0].generation() > stale_generation);
+        assert!(!cache.contains_generation(1, stale_generation));
+        assert!(cache.contains_generation(1, admissions[0].generation()));
+    }
+
+    #[test]
+    fn speculative_hot_promotion_cannot_evict_foreground_set() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 3));
+        assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
+        assert_eq!(cache.demand_admit_lru(gpu_res(2, 8)), Ok(true));
+        let generations = [
+            cache.current_generation(1).unwrap(),
+            cache.current_generation(2).unwrap(),
+        ];
+        assert!(cache.claim_promotion(3, 3));
+        let _protection = cache.protect_demand_set(&[1, 2]).unwrap();
+
+        assert_eq!(
+            cache.promote_hot_sync(gpu_res(3, 8)),
+            GpuHotPromotionOutcome::NoCapacity
+        );
+        assert!(cache.contains_generation(1, generations[0]));
+        assert!(cache.contains_generation(2, generations[1]));
+        assert!(!cache.contains(3));
+    }
+
+    #[test]
+    fn duplicate_demand_protection_is_fail_closed() {
+        let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
+        assert!(matches!(
+            cache.protect_demand_set(&[1, 1]),
+            Err(GpuDemandAdmissionError::DuplicateDemandExpert { expert_id: 1 })
+        ));
+        assert!(cache.inner.lock().demand_protections.is_empty());
     }
 
     #[test]
