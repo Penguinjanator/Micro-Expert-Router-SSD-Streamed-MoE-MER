@@ -37,13 +37,14 @@ use crate::inference::{
 };
 use crate::io_provider::NvmeStorage;
 use crate::metrics::Metrics;
-use crate::multi_layer_cache::MultiLayerExpertCache;
+use crate::multi_layer_cache::{MultiLayerCacheReservation, MultiLayerExpertCache};
 use crate::router::{
     DecayWorkerHandle, LayeredExpertAffinity, LocalityMonitor, NeuralSpeculator, PredictiveLoader,
 };
 use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -380,6 +381,22 @@ impl std::error::Error for ExpertReadError {}
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum GpuNativeDemandResidencyError {
     ManagerNotInstalled,
+    QualificationIsolationViolation,
+    QualificationCompletedReadSetMismatch {
+        requested_global_ids: Vec<u32>,
+        completed_global_ids: Vec<u32>,
+    },
+    ProductionBatchCommitViolation {
+        global_id: u32,
+    },
+    ProductionBatchPoolUnavailableAfterReservation {
+        requested: usize,
+        acquired: usize,
+    },
+    ProductionBatchReadFailedAfterReservation {
+        global_ids: Vec<u32>,
+        source: String,
+    },
     ExpertRead(ExpertReadError),
     LogicalAdmission(crate::backend::GpuExpertDispatchError),
     LogicalDemandSet(GpuDemandAdmissionError),
@@ -400,6 +417,31 @@ impl std::fmt::Display for GpuNativeDemandResidencyError {
             Self::ManagerNotInstalled => {
                 f.write_str("GPU-native tiered residency manager is not installed")
             }
+            Self::QualificationIsolationViolation => f.write_str(
+                "qualification-only exact-demand source observed overlapping foreground demand sets",
+            ),
+            Self::QualificationCompletedReadSetMismatch {
+                requested_global_ids,
+                completed_global_ids,
+            } => write!(
+                f,
+                "qualification-only exact-demand completed-read set {completed_global_ids:?} did not match requested set {requested_global_ids:?}"
+            ),
+            Self::ProductionBatchCommitViolation { global_id } => write!(
+                f,
+                "production exact-demand reserved cache commit invariant failed for expert {global_id}"
+            ),
+            Self::ProductionBatchPoolUnavailableAfterReservation {
+                requested,
+                acquired,
+            } => write!(
+                f,
+                "production exact-demand batch acquired only {acquired} of {requested} primary buffers after committing its cache victim schedule; sequential fallback is unsafe"
+            ),
+            Self::ProductionBatchReadFailedAfterReservation { global_ids, source } => write!(
+                f,
+                "production exact-demand batch read for experts {global_ids:?} failed after committing its cache victim schedule; sequential fallback is unsafe: {source}"
+            ),
             Self::ExpertRead(error) => write!(f, "tiered residency fetch failed: {error}"),
             Self::LogicalAdmission(error) => {
                 write!(f, "tiered residency logical admission failed: {error}")
@@ -443,6 +485,519 @@ impl From<GpuNativeTieredResidencyError> for GpuNativeDemandResidencyError {
 impl From<GpuDemandAdmissionError> for GpuNativeDemandResidencyError {
     fn from(value: GpuDemandAdmissionError) -> Self {
         Self::LogicalDemandSet(value)
+    }
+}
+
+/// Explicit arm of the PR2-A exact-demand source qualification. This is not
+/// part of [`EngineOptions`] or TOML configuration: only the dedicated
+/// qualifier may install it on a fresh isolated runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuNativeDemandSourceQualificationArm {
+    Control,
+    Treatment,
+}
+
+/// Cumulative production-path evidence. These atomics are always present and
+/// add no per-token logging; the dedicated v2 qualifier resets them between
+/// warmup and measured arms and records exact snapshots.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ProductionDemandSourceSnapshot {
+    pub(crate) ordinary_production_path_exercised: bool,
+    pub(crate) production_source_sets: u64,
+    pub(crate) production_batch_eligible_sets: u64,
+    pub(crate) production_batch_attempts: u64,
+    pub(crate) production_batch_successes: u64,
+    pub(crate) production_batch_experts: u64,
+    pub(crate) production_sequential_fallback_mixed_ram: u64,
+    pub(crate) production_sequential_fallback_single_item: u64,
+    pub(crate) production_sequential_fallback_singleflight_contention: u64,
+    pub(crate) production_sequential_fallback_reservation: u64,
+    pub(crate) production_sequential_fallback_pool: u64,
+    pub(crate) production_sequential_fallback_batch_read_error: u64,
+    pub(crate) production_batch_width_min: u64,
+    pub(crate) production_batch_width_max: u64,
+    pub(crate) production_batch_width_mean: f64,
+    pub(crate) production_singleflight_ids_claimed: u64,
+    pub(crate) production_singleflight_claim_rollbacks: u64,
+    pub(crate) production_singleflight_followers_observed: u64,
+    pub(crate) production_cache_slots_reserved: u64,
+    pub(crate) production_cache_reservations_consumed: u64,
+    pub(crate) production_cache_reservations_released: u64,
+    pub(crate) production_cache_reservation_leaks: u64,
+    pub(crate) production_batch_commit_violations: u64,
+    pub(crate) stale_singleflight_entries: u64,
+}
+
+#[derive(Default)]
+struct ProductionDemandSourceTelemetry {
+    source_sets: AtomicU64,
+    batch_eligible_sets: AtomicU64,
+    batch_attempts: AtomicU64,
+    batch_successes: AtomicU64,
+    batch_experts: AtomicU64,
+    fallback_mixed_ram: AtomicU64,
+    fallback_single_item: AtomicU64,
+    fallback_singleflight_contention: AtomicU64,
+    fallback_reservation: AtomicU64,
+    batch_width_min: AtomicU64,
+    batch_width_max: AtomicU64,
+    batch_width_sum: AtomicU64,
+    singleflight_ids_claimed: AtomicU64,
+    singleflight_claim_rollbacks: AtomicU64,
+    singleflight_followers_observed: AtomicU64,
+    cache_slots_reserved: AtomicU64,
+    cache_reservations_consumed: AtomicU64,
+    cache_reservations_released: AtomicU64,
+    batch_commit_violations: AtomicU64,
+}
+
+impl ProductionDemandSourceTelemetry {
+    fn reset(&self) {
+        self.source_sets.store(0, Ordering::Relaxed);
+        self.batch_eligible_sets.store(0, Ordering::Relaxed);
+        self.batch_attempts.store(0, Ordering::Relaxed);
+        self.batch_successes.store(0, Ordering::Relaxed);
+        self.batch_experts.store(0, Ordering::Relaxed);
+        self.fallback_mixed_ram.store(0, Ordering::Relaxed);
+        self.fallback_single_item.store(0, Ordering::Relaxed);
+        self.fallback_singleflight_contention
+            .store(0, Ordering::Relaxed);
+        self.fallback_reservation.store(0, Ordering::Relaxed);
+        self.batch_width_min.store(u64::MAX, Ordering::Relaxed);
+        self.batch_width_max.store(0, Ordering::Relaxed);
+        self.batch_width_sum.store(0, Ordering::Relaxed);
+        self.singleflight_ids_claimed.store(0, Ordering::Relaxed);
+        self.singleflight_claim_rollbacks
+            .store(0, Ordering::Relaxed);
+        self.singleflight_followers_observed
+            .store(0, Ordering::Relaxed);
+        self.cache_slots_reserved.store(0, Ordering::Relaxed);
+        self.cache_reservations_consumed.store(0, Ordering::Relaxed);
+        self.cache_reservations_released.store(0, Ordering::Relaxed);
+        self.batch_commit_violations.store(0, Ordering::Relaxed);
+    }
+
+    fn record_success(&self, width: usize) {
+        let width = width as u64;
+        self.batch_successes.fetch_add(1, Ordering::Relaxed);
+        self.batch_experts.fetch_add(width, Ordering::Relaxed);
+        self.batch_width_min.fetch_min(width, Ordering::Relaxed);
+        self.batch_width_max.fetch_max(width, Ordering::Relaxed);
+        self.batch_width_sum.fetch_add(width, Ordering::Relaxed);
+    }
+
+    fn snapshot(
+        &self,
+        cache_reservation_leaks: usize,
+        stale_singleflight_entries: usize,
+    ) -> ProductionDemandSourceSnapshot {
+        let successes = self.batch_successes.load(Ordering::Relaxed);
+        let width_min = self.batch_width_min.load(Ordering::Relaxed);
+        ProductionDemandSourceSnapshot {
+            ordinary_production_path_exercised: self.source_sets.load(Ordering::Relaxed) > 0,
+            production_source_sets: self.source_sets.load(Ordering::Relaxed),
+            production_batch_eligible_sets: self.batch_eligible_sets.load(Ordering::Relaxed),
+            production_batch_attempts: self.batch_attempts.load(Ordering::Relaxed),
+            production_batch_successes: successes,
+            production_batch_experts: self.batch_experts.load(Ordering::Relaxed),
+            production_sequential_fallback_mixed_ram: self
+                .fallback_mixed_ram
+                .load(Ordering::Relaxed),
+            production_sequential_fallback_single_item: self
+                .fallback_single_item
+                .load(Ordering::Relaxed),
+            production_sequential_fallback_singleflight_contention: self
+                .fallback_singleflight_contention
+                .load(Ordering::Relaxed),
+            production_sequential_fallback_reservation: self
+                .fallback_reservation
+                .load(Ordering::Relaxed),
+            // Retained in schema v2, but fail-closed post-reservation failures
+            // never take a sequential fallback.
+            production_sequential_fallback_pool: 0,
+            production_sequential_fallback_batch_read_error: 0,
+            production_batch_width_min: if successes == 0 || width_min == u64::MAX {
+                0
+            } else {
+                width_min
+            },
+            production_batch_width_max: self.batch_width_max.load(Ordering::Relaxed),
+            production_batch_width_mean: if successes == 0 {
+                0.0
+            } else {
+                self.batch_width_sum.load(Ordering::Relaxed) as f64 / successes as f64
+            },
+            production_singleflight_ids_claimed: self
+                .singleflight_ids_claimed
+                .load(Ordering::Relaxed),
+            production_singleflight_claim_rollbacks: self
+                .singleflight_claim_rollbacks
+                .load(Ordering::Relaxed),
+            production_singleflight_followers_observed: self
+                .singleflight_followers_observed
+                .load(Ordering::Relaxed),
+            production_cache_slots_reserved: self.cache_slots_reserved.load(Ordering::Relaxed),
+            production_cache_reservations_consumed: self
+                .cache_reservations_consumed
+                .load(Ordering::Relaxed),
+            production_cache_reservations_released: self
+                .cache_reservations_released
+                .load(Ordering::Relaxed),
+            production_cache_reservation_leaks: cache_reservation_leaks as u64,
+            production_batch_commit_violations: self
+                .batch_commit_violations
+                .load(Ordering::Relaxed),
+            stale_singleflight_entries: stale_singleflight_entries as u64,
+        }
+    }
+}
+
+/// Low-overhead, qualification-only source and cache evidence. All counters
+/// are cumulative since the most recent explicit qualification reset.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GpuNativeDemandSourceQualificationSnapshot {
+    pub(crate) arm: GpuNativeDemandSourceQualificationArm,
+    pub(crate) qualification_only: bool,
+    pub(crate) production_demand_source_changed: bool,
+    pub(crate) single_request_stream: bool,
+    pub(crate) overlapping_demand_sets: u64,
+    pub(crate) primary_pool_capacity: usize,
+    pub(crate) shadow_pool_capacity: usize,
+    pub(crate) demand_sets: u64,
+    pub(crate) physical_missing_experts: u64,
+    pub(crate) physical_probe_us: u64,
+    pub(crate) source_sets: u64,
+    pub(crate) source_experts: u64,
+    pub(crate) demand_source_requests: u64,
+    pub(crate) source_ram_hits: u64,
+    pub(crate) source_ram_misses: u64,
+    pub(crate) source_nvme_reads: u64,
+    pub(crate) source_nvme_bytes: u64,
+    pub(crate) source_set_width_min: u64,
+    pub(crate) source_set_width_max: u64,
+    pub(crate) source_set_width_mean: f64,
+    pub(crate) source_acquisition_wall_us: u64,
+    pub(crate) sum_individual_source_service_us: Option<u64>,
+    pub(crate) logical_demand_admission_us: u64,
+    pub(crate) physical_demand_install_us: u64,
+    pub(crate) total_residency_service_us: u64,
+    pub(crate) batch_eligible_all_ram_miss_source_sets: u64,
+    pub(crate) sequential_fallback_source_sets_due_ram_residency: u64,
+    pub(crate) batch_eligible_source_experts: u64,
+    pub(crate) sequential_fallback_source_experts: u64,
+    pub(crate) batch_path_exercises: u64,
+    pub(crate) concurrent_source_reads: u64,
+    pub(crate) actual_batch_nvme_width_min: u64,
+    pub(crate) actual_batch_nvme_width_max: u64,
+    pub(crate) actual_batch_nvme_width_mean: f64,
+    pub(crate) mixed_ram_state_batch_attempts: u64,
+    pub(crate) pool_capacity_failures: u64,
+    pub(crate) batch_read_failures: u64,
+    pub(crate) ordered_commit_violations: u64,
+    pub(crate) ram_cache_source_hits: u64,
+    pub(crate) ram_cache_source_misses: u64,
+    pub(crate) ram_cache_inserts: u64,
+    pub(crate) ram_cache_evictions: u64,
+    pub(crate) selected_route_ids_sha256: String,
+    pub(crate) physical_missing_ids_sha256: String,
+    pub(crate) demand_source_request_ids_sha256: String,
+    pub(crate) demand_ram_insert_ids_sha256: String,
+    pub(crate) demand_ram_eviction_ids_sha256: String,
+    pub(crate) deterministic_cache_commit_reconciliation: bool,
+}
+
+#[derive(Clone)]
+struct QualificationOrderedHasher {
+    inner: Sha256,
+}
+
+impl Default for QualificationOrderedHasher {
+    fn default() -> Self {
+        Self {
+            inner: Sha256::new(),
+        }
+    }
+}
+
+impl QualificationOrderedHasher {
+    fn record_set(&mut self, ids: &[u32]) {
+        self.inner.update([0x53]);
+        self.inner.update((ids.len() as u64).to_le_bytes());
+        for &id in ids {
+            self.inner.update(id.to_le_bytes());
+        }
+    }
+
+    fn record_id(&mut self, id: u32) {
+        self.inner.update([0x49]);
+        self.inner.update(id.to_le_bytes());
+    }
+
+    fn hex(&self) -> String {
+        format!("{:x}", self.inner.clone().finalize())
+    }
+}
+
+/// Normalize completed source reads into original request order before any
+/// cache mutation. The completed map is deliberately unordered, so neither
+/// storage-worker completion order nor map iteration order can become LRU
+/// insertion order.
+fn qualification_order_completed_residents(
+    request_order: &[u32],
+    mut completed: HashMap<u32, Arc<ExpertResident>>,
+) -> Result<Vec<(u32, Arc<ExpertResident>)>, GpuNativeDemandResidencyError> {
+    fn completed_set(completed: &HashMap<u32, Arc<ExpertResident>>) -> Vec<u32> {
+        let mut ids = completed.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+    if completed.len() != request_order.len()
+        || request_order.iter().any(|id| !completed.contains_key(id))
+    {
+        return Err(
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            },
+        );
+    }
+    let mut ordered = Vec::with_capacity(request_order.len());
+    for &global_id in request_order {
+        let resident = completed.remove(&global_id).ok_or_else(|| {
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            }
+        })?;
+        ordered.push((global_id, resident));
+    }
+    if !completed.is_empty() {
+        return Err(
+            GpuNativeDemandResidencyError::QualificationCompletedReadSetMismatch {
+                requested_global_ids: request_order.to_vec(),
+                completed_global_ids: completed_set(&completed),
+            },
+        );
+    }
+    Ok(ordered)
+}
+
+struct GpuNativeDemandSourceQualification {
+    arm: GpuNativeDemandSourceQualificationArm,
+    primary_pool_capacity: usize,
+    shadow_pool_capacity: usize,
+    active_demand_set: AtomicBool,
+    overlapping_demand_sets: AtomicU64,
+    demand_sets: AtomicU64,
+    physical_missing_experts: AtomicU64,
+    physical_probe_us: AtomicU64,
+    source_sets: AtomicU64,
+    source_experts: AtomicU64,
+    demand_source_requests: AtomicU64,
+    source_ram_hits: AtomicU64,
+    source_ram_misses: AtomicU64,
+    source_nvme_reads: AtomicU64,
+    source_nvme_bytes: AtomicU64,
+    source_set_width_min: AtomicU64,
+    source_set_width_max: AtomicU64,
+    source_set_width_sum: AtomicU64,
+    source_acquisition_wall_us: AtomicU64,
+    individual_source_service_us: AtomicU64,
+    logical_demand_admission_us: AtomicU64,
+    physical_demand_install_us: AtomicU64,
+    total_residency_service_us: AtomicU64,
+    ram_cache_inserts: AtomicU64,
+    ram_cache_evictions: AtomicU64,
+    selected_route_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    physical_missing_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_source_request_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_ram_insert_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    demand_ram_eviction_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+}
+
+impl GpuNativeDemandSourceQualification {
+    fn new(
+        arm: GpuNativeDemandSourceQualificationArm,
+        primary_pool_capacity: usize,
+        shadow_pool_capacity: usize,
+    ) -> Self {
+        Self {
+            arm,
+            primary_pool_capacity,
+            shadow_pool_capacity,
+            active_demand_set: AtomicBool::new(false),
+            overlapping_demand_sets: AtomicU64::new(0),
+            demand_sets: AtomicU64::new(0),
+            physical_missing_experts: AtomicU64::new(0),
+            physical_probe_us: AtomicU64::new(0),
+            source_sets: AtomicU64::new(0),
+            source_experts: AtomicU64::new(0),
+            demand_source_requests: AtomicU64::new(0),
+            source_ram_hits: AtomicU64::new(0),
+            source_ram_misses: AtomicU64::new(0),
+            source_nvme_reads: AtomicU64::new(0),
+            source_nvme_bytes: AtomicU64::new(0),
+            source_set_width_min: AtomicU64::new(u64::MAX),
+            source_set_width_max: AtomicU64::new(0),
+            source_set_width_sum: AtomicU64::new(0),
+            source_acquisition_wall_us: AtomicU64::new(0),
+            individual_source_service_us: AtomicU64::new(0),
+            logical_demand_admission_us: AtomicU64::new(0),
+            physical_demand_install_us: AtomicU64::new(0),
+            total_residency_service_us: AtomicU64::new(0),
+            ram_cache_inserts: AtomicU64::new(0),
+            ram_cache_evictions: AtomicU64::new(0),
+            selected_route_ids: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
+            physical_missing_ids: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
+            demand_source_request_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+            demand_ram_insert_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+            demand_ram_eviction_ids: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+        }
+    }
+
+    fn snapshot(&self) -> GpuNativeDemandSourceQualificationSnapshot {
+        let source_sets = self.source_sets.load(Ordering::Relaxed);
+        let width_min = self.source_set_width_min.load(Ordering::Relaxed);
+        GpuNativeDemandSourceQualificationSnapshot {
+            arm: self.arm,
+            qualification_only: false,
+            production_demand_source_changed: true,
+            single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
+            overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
+            primary_pool_capacity: self.primary_pool_capacity,
+            shadow_pool_capacity: self.shadow_pool_capacity,
+            demand_sets: self.demand_sets.load(Ordering::Relaxed),
+            physical_missing_experts: self.physical_missing_experts.load(Ordering::Relaxed),
+            physical_probe_us: self.physical_probe_us.load(Ordering::Relaxed),
+            source_sets,
+            source_experts: self.source_experts.load(Ordering::Relaxed),
+            demand_source_requests: self.demand_source_requests.load(Ordering::Relaxed),
+            source_ram_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            source_ram_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            source_nvme_reads: self.source_nvme_reads.load(Ordering::Relaxed),
+            source_nvme_bytes: self.source_nvme_bytes.load(Ordering::Relaxed),
+            source_set_width_min: if source_sets == 0 || width_min == u64::MAX {
+                0
+            } else {
+                width_min
+            },
+            source_set_width_max: self.source_set_width_max.load(Ordering::Relaxed),
+            source_set_width_mean: if source_sets == 0 {
+                0.0
+            } else {
+                self.source_set_width_sum.load(Ordering::Relaxed) as f64 / source_sets as f64
+            },
+            source_acquisition_wall_us: self
+                .source_acquisition_wall_us
+                .load(Ordering::Relaxed),
+            sum_individual_source_service_us: (self.arm
+                == GpuNativeDemandSourceQualificationArm::Control)
+                .then(|| self.individual_source_service_us.load(Ordering::Relaxed)),
+            logical_demand_admission_us: self
+                .logical_demand_admission_us
+                .load(Ordering::Relaxed),
+            physical_demand_install_us: self.physical_demand_install_us.load(Ordering::Relaxed),
+            total_residency_service_us: self.total_residency_service_us.load(Ordering::Relaxed),
+            // Schema-v2 compatibility fields from the retired v1 algorithm.
+            // The production qualifier never populated them.
+            batch_eligible_all_ram_miss_source_sets: 0,
+            sequential_fallback_source_sets_due_ram_residency: 0,
+            batch_eligible_source_experts: 0,
+            sequential_fallback_source_experts: 0,
+            batch_path_exercises: 0,
+            concurrent_source_reads: 0,
+            actual_batch_nvme_width_min: 0,
+            actual_batch_nvme_width_max: 0,
+            actual_batch_nvme_width_mean: 0.0,
+            mixed_ram_state_batch_attempts: 0,
+            pool_capacity_failures: 0,
+            batch_read_failures: 0,
+            ordered_commit_violations: 0,
+            ram_cache_source_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            ram_cache_source_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            ram_cache_inserts: self.ram_cache_inserts.load(Ordering::Relaxed),
+            ram_cache_evictions: self.ram_cache_evictions.load(Ordering::Relaxed),
+            selected_route_ids_sha256: self.selected_route_ids.lock().hex(),
+            physical_missing_ids_sha256: self.physical_missing_ids.lock().hex(),
+            demand_source_request_ids_sha256: self.demand_source_request_ids.lock().hex(),
+            demand_ram_insert_ids_sha256: self.demand_ram_insert_ids.lock().hex(),
+            demand_ram_eviction_ids_sha256: self.demand_ram_eviction_ids.lock().hex(),
+            deterministic_cache_commit_reconciliation: true,
+        }
+    }
+
+    fn record_source_set(&self, ids: &[u32]) {
+        let width = ids.len() as u64;
+        self.source_sets.fetch_add(1, Ordering::Relaxed);
+        self.source_experts.fetch_add(width, Ordering::Relaxed);
+        self.source_set_width_min.fetch_min(width, Ordering::Relaxed);
+        self.source_set_width_max.fetch_max(width, Ordering::Relaxed);
+        self.source_set_width_sum.fetch_add(width, Ordering::Relaxed);
+    }
+
+    fn record_source_request(&self, id: u32) {
+        self.demand_source_requests.fetch_add(1, Ordering::Relaxed);
+        self.demand_source_request_ids.lock().record_id(id);
+    }
+
+    fn record_cache_insert(&self, id: u32) {
+        self.ram_cache_inserts.fetch_add(1, Ordering::Relaxed);
+        self.demand_ram_insert_ids.lock().record_id(id);
+    }
+
+    fn record_cache_eviction(&self, id: u32) {
+        self.ram_cache_evictions.fetch_add(1, Ordering::Relaxed);
+        self.demand_ram_eviction_ids.lock().record_id(id);
+    }
+
+}
+
+fn qualification_elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+struct QualificationDemandServiceGuard {
+    state: Arc<GpuNativeDemandSourceQualification>,
+    started: Instant,
+}
+
+impl QualificationDemandServiceGuard {
+    fn enter(
+        state: Arc<GpuNativeDemandSourceQualification>,
+    ) -> Result<Self, GpuNativeDemandResidencyError> {
+        if state
+            .active_demand_set
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            state
+                .overlapping_demand_sets
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(GpuNativeDemandResidencyError::QualificationIsolationViolation);
+        }
+        state.demand_sets.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            state,
+            started: Instant::now(),
+        })
+    }
+}
+
+impl Drop for QualificationDemandServiceGuard {
+    fn drop(&mut self) {
+        self.state
+            .total_residency_service_us
+            .fetch_add(qualification_elapsed_us(self.started), Ordering::Relaxed);
+        self.state
+            .active_demand_set
+            .store(false, Ordering::Release);
     }
 }
 
@@ -509,6 +1064,24 @@ struct SingleflightLeaderGuard {
     armed: bool,
 }
 
+impl SingleflightLeaderGuard {
+    fn try_claim(map: Arc<DashMap<u32, Arc<Notify>>>, id: u32) -> Result<Self, Arc<Notify>> {
+        match map.entry(id) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => Err(occupied.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let notify = Arc::new(Notify::new());
+                vacant.insert(notify.clone());
+                Ok(Self {
+                    map: map.clone(),
+                    id,
+                    notify,
+                    armed: true,
+                })
+            }
+        }
+    }
+}
+
 impl Drop for SingleflightLeaderGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -516,11 +1089,77 @@ impl Drop for SingleflightLeaderGuard {
         }
         // Remove the entry first so any caller landing *after* the
         // notify_waiters() call below sees a fresh slot to fill.
-        self.map.remove(&self.id);
+        // Remove only our own notification identity. This guards against a
+        // future protocol refactor replacing an entry before an older guard
+        // drops; an old guard must never delete a newer leader's claim.
+        if let dashmap::mapref::entry::Entry::Occupied(occupied) = self.map.entry(self.id) {
+            if Arc::ptr_eq(occupied.get(), &self.notify) {
+                occupied.remove();
+            }
+        }
         // Wake every follower that parked on this id. They will
         // re-check the cache and either return a hit (the common
         // case) or fall through to their own fetch.
         self.notify.notify_waiters();
+    }
+}
+
+/// All-or-nothing leadership over one exact expert-id set. Partially acquired
+/// claims are ordinary [`SingleflightLeaderGuard`]s, so contention,
+/// cancellation, error, and unwind all remove entries and notify followers.
+struct MultiIdSingleflightLeadership {
+    guards: Vec<SingleflightLeaderGuard>,
+    telemetry: Arc<ProductionDemandSourceTelemetry>,
+    successful: bool,
+}
+
+impl MultiIdSingleflightLeadership {
+    fn finish(mut self) {
+        self.successful = true;
+    }
+}
+
+impl Drop for MultiIdSingleflightLeadership {
+    fn drop(&mut self) {
+        if !self.successful {
+            self.telemetry
+                .singleflight_claim_rollbacks
+                .fetch_add(self.guards.len() as u64, Ordering::Relaxed);
+        }
+        // Fields drop after this body; each guard performs the authoritative
+        // map removal followed by follower notification.
+    }
+}
+
+/// Telemetry-aware wrapper around the per-layer cache reservation. The inner
+/// guard owns the actual positions; this wrapper only accounts consumption
+/// and unused release without changing its safety protocol.
+struct ProductionCacheReservation {
+    inner: MultiLayerCacheReservation,
+    telemetry: Arc<ProductionDemandSourceTelemetry>,
+}
+
+impl ProductionCacheReservation {
+    fn commit(&mut self, resident: Arc<ExpertResident>) -> Result<bool, Arc<ExpertResident>> {
+        let cached = self.inner.commit(resident)?;
+        if cached {
+            self.telemetry
+                .cache_reservations_consumed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(cached)
+    }
+}
+
+impl Drop for ProductionCacheReservation {
+    fn drop(&mut self) {
+        let unused = self.inner.remaining();
+        if unused > 0 {
+            self.telemetry
+                .cache_reservations_released
+                .fetch_add(unused as u64, Ordering::Relaxed);
+        }
+        // `inner` drops next and releases the actual positions.
     }
 }
 
@@ -1795,6 +2434,19 @@ pub struct Engine {
     diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
     diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+    gpu_native_demand_source_qualification:
+        parking_lot::RwLock<Option<Arc<GpuNativeDemandSourceQualification>>>,
+    production_demand_source: Arc<ProductionDemandSourceTelemetry>,
+    #[cfg(test)]
+    production_batch_test_hooks: parking_lot::Mutex<ProductionBatchTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ProductionBatchTestHooks {
+    after_claims: Option<Arc<tokio::sync::Barrier>>,
+    after_claim_rollback: Option<Arc<tokio::sync::Barrier>>,
+    after_buffers: Option<Arc<tokio::sync::Barrier>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2135,6 +2787,8 @@ impl Engine {
             );
         }
         let speculator_topk_default = router.top_k();
+        let production_demand_source = Arc::new(ProductionDemandSourceTelemetry::default());
+        production_demand_source.reset();
         Self {
             core: EngineCore::new(
                 cache,
@@ -2153,6 +2807,12 @@ impl Engine {
             diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture: parking_lot::Mutex::new(None),
+            gpu_native_demand_source_qualification: parking_lot::RwLock::new(None),
+            production_demand_source,
+            #[cfg(test)]
+            production_batch_test_hooks: parking_lot::Mutex::new(
+                ProductionBatchTestHooks::default(),
+            ),
         }
     }
 
@@ -2972,6 +3632,93 @@ impl Engine {
             .map(|manager| manager.snapshot())
     }
 
+    /// Install v2 evidence. Control explicitly forces the legacy sequential
+    /// helper; treatment exercises the same ordinary production path used
+    /// when no qualifier is active. The dedicated command calls this only on a
+    /// fresh isolated runtime; normal construction leaves the slot `None`.
+    pub(crate) fn enable_gpu_native_demand_source_production_qualification(
+        &self,
+        arm: GpuNativeDemandSourceQualificationArm,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err(
+                "cannot enable exact-demand source qualification with active singleflight entries or cache reservations"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        if slot.is_some() {
+            return Err("exact-demand source qualification is already enabled".into());
+        }
+        *slot = Some(Arc::new(GpuNativeDemandSourceQualification::new(
+            arm,
+            self.core.pool.capacity(),
+            self.core.pool.shadow_capacity(),
+        )));
+        self.production_demand_source.reset();
+        Ok(())
+    }
+
+    /// Reset qualification-only counters between warmup and measurement.
+    /// Cache, pool, residency, router, and all production state are retained.
+    pub(crate) fn reset_gpu_native_demand_source_qualification(&self) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err(
+                "cannot reset exact-demand source qualification with active singleflight entries or cache reservations"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        let current = slot
+            .as_ref()
+            .ok_or("exact-demand source qualification is not enabled")?;
+        if current.active_demand_set.load(Ordering::Acquire) {
+            return Err("cannot reset exact-demand source qualification during demand service".into());
+        }
+        let arm = current.arm;
+        let primary_pool_capacity = current.primary_pool_capacity;
+        let shadow_pool_capacity = current.shadow_pool_capacity;
+        *slot = Some(Arc::new(GpuNativeDemandSourceQualification::new(
+            arm,
+            primary_pool_capacity,
+            shadow_pool_capacity,
+        )));
+        self.production_demand_source.reset();
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_demand_source_qualification_snapshot(
+        &self,
+    ) -> Option<GpuNativeDemandSourceQualificationSnapshot> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .map(|state| state.snapshot())
+    }
+
+    pub(crate) fn production_demand_source_snapshot(&self) -> ProductionDemandSourceSnapshot {
+        self.production_demand_source
+            .snapshot(self.core.cache.reserved_slots(), self.core.in_flight.len())
+    }
+
+    pub(crate) fn gpu_native_demand_source_qualification_ram_cache_state_sha256(
+        &self,
+    ) -> Option<String> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .map(|_| self.core.cache.qualification_state_sha256())
+    }
+
+    fn gpu_native_demand_source_qualification(
+        &self,
+    ) -> Option<Arc<GpuNativeDemandSourceQualification>> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .cloned()
+    }
+
     /// Record actual GPU-native route selections across layers into the engine's
     /// route observation and prefetch infrastructure without requiring CPU hidden state.
     pub(crate) fn record_gpu_native_actual_routes(
@@ -2980,6 +3727,22 @@ impl Engine {
     ) {
         self.core.governor.refresh();
         let per_layer_opt = self.core.storage.config().num_experts_per_layer;
+
+        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+            let per_layer = per_layer_opt.unwrap_or(0);
+            let mut hasher = qualification.selected_route_ids.lock();
+            for (layer_idx, local_ids) in selected_ids_by_layer.iter().enumerate() {
+                let global_ids = if per_layer > 0 {
+                    local_ids
+                        .iter()
+                        .map(|&local_id| layer_idx as u32 * per_layer + local_id)
+                        .collect::<Vec<_>>()
+                } else {
+                    local_ids.clone()
+                };
+                hasher.record_set(&global_ids);
+            }
+        }
 
         for (layer_idx, local_ids) in selected_ids_by_layer.iter().enumerate() {
             if local_ids.is_empty() {
@@ -3921,34 +4684,20 @@ impl Engine {
             // DashMap's `Entry::Occupied/Vacant` distinction so the
             // leader bit is unambiguous (Arc strong-count is racy
             // under TSO).
-            let (is_leader, notify) = match self.core.in_flight.entry(id) {
-                dashmap::mapref::entry::Entry::Occupied(occ) => (false, occ.get().clone()),
-                dashmap::mapref::entry::Entry::Vacant(vac) => {
-                    let n = Arc::new(Notify::new());
-                    vac.insert(n.clone());
-                    (true, n)
-                }
-            };
-
-            if !is_leader {
-                // Pre-register as a waiter *before* re-checking the
-                // cache and the in_flight map, so we cannot miss the
-                // leader's `notify_waiters()` call if it lands
-                // between our entry lookup and our await. This is
-                // the standard `tokio::sync::Notify` race-free
-                // pattern.
-                let fut = notify.notified();
-                tokio::pin!(fut);
-                fut.as_mut().enable();
-                if let Some(r) = self.core.cache.get(id) {
-                    self.metrics
-                        .counters
-                        .singleflight_followers
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(r);
-                }
-                if self.core.in_flight.contains_key(&id) {
-                    fut.await;
+            let _guard = match SingleflightLeaderGuard::try_claim(
+                self.core.in_flight.clone(),
+                id,
+            ) {
+                Ok(guard) => guard,
+                Err(notify) => {
+                    // Pre-register as a waiter *before* re-checking the
+                    // cache and the in_flight map, so we cannot miss the
+                    // leader's `notify_waiters()` call if it lands
+                    // between our entry lookup and our await. This is
+                    // the standard `tokio::sync::Notify` race-free pattern.
+                    let fut = notify.notified();
+                    tokio::pin!(fut);
+                    fut.as_mut().enable();
                     if let Some(r) = self.core.cache.get(id) {
                         self.metrics
                             .counters
@@ -3956,24 +4705,21 @@ impl Engine {
                             .fetch_add(1, Ordering::Relaxed);
                         return Ok(r);
                     }
-                    // Leader failed. Loop back and contend for the
-                    // singleflight slot again. Exactly one of the
-                    // woken followers will win the next CAS and
-                    // become the new leader; the rest will park on
-                    // its Notify. This prevents the thundering
-                    // herd (F1.4 in the audit).
+                    if self.core.in_flight.contains_key(&id) {
+                        fut.await;
+                        if let Some(r) = self.core.cache.get(id) {
+                            self.metrics
+                                .counters
+                                .singleflight_followers
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Ok(r);
+                        }
+                        // Leader failed. Loop back and contend for the
+                        // singleflight slot again. Exactly one woken follower
+                        // becomes the new leader; the rest park on its Notify.
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            // Leader path: drive the retry loop ourselves. Ensure
-            // the in_flight slot is removed and waiters are notified
-            // on every exit branch.
-            let _guard = SingleflightLeaderGuard {
-                map: self.core.in_flight.clone(),
-                id,
-                notify: notify.clone(),
-                armed: true,
             };
 
             // Re-check the cache now that we hold leadership. The
@@ -4056,15 +4802,347 @@ impl Engine {
         global_id: u32,
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
+        let qualification = self.gpu_native_demand_source_qualification();
+        if let Some(state) = qualification.as_ref() {
+            state.record_source_request(global_id);
+        }
         if let Some(resident) = residents.get(&global_id) {
             return Ok(resident.clone());
         }
         let resident = match self.core.cache.get(global_id) {
-            Some(resident) => resident,
-            None => self.fetch_with_retry(global_id).await?,
+            Some(resident) => {
+                if let Some(state) = qualification.as_ref() {
+                    state.source_ram_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                resident
+            }
+            None => {
+                if let Some(state) = qualification.as_ref() {
+                    state.source_ram_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                self.fetch_with_retry(global_id).await?
+            }
         };
         residents.insert(global_id, resident.clone());
         Ok(resident)
+    }
+
+    async fn gpu_native_source_physical_missing_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        let qualification = self.gpu_native_demand_source_qualification();
+        if let Some(state) = qualification.as_ref() {
+            state.record_source_set(global_ids);
+        }
+        let started = Instant::now();
+        let result = match qualification.as_ref().map(|state| state.arm) {
+            Some(GpuNativeDemandSourceQualificationArm::Control) => {
+                self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                    .await
+            }
+            Some(GpuNativeDemandSourceQualificationArm::Treatment) | None => {
+                self.gpu_native_production_source_physical_missing_set(global_ids, residents)
+                    .await
+            }
+        };
+        if let Some(state) = qualification.as_ref() {
+            state
+                .source_acquisition_wall_us
+                .fetch_add(qualification_elapsed_us(started), Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// The exact ordinary foreground source loop shared by control and the
+    /// treatment's conservative RAM-residency fallback. It owns every real
+    /// recency mutation, hit/miss classification, retry, eviction, insertion,
+    /// and request-order side effect.
+    async fn gpu_native_sequential_source_physical_missing_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        for &global_id in global_ids {
+            if residents.contains_key(&global_id) {
+                continue;
+            }
+            let individual_started = Instant::now();
+            let source_result = self
+                .gpu_native_demand_source(global_id, residents)
+                .await
+                .map(|_| ());
+            if let Some(state) = self.gpu_native_demand_source_qualification() {
+                state.individual_source_service_us.fetch_add(
+                    qualification_elapsed_us(individual_started),
+                    Ordering::Relaxed,
+                );
+            }
+            source_result?;
+        }
+        Ok(())
+    }
+
+    /// Ordinary production source for an exact physical-missing set. Setup or
+    /// contention failures before cache reservation remain opportunistic and
+    /// use the complete legacy sequential helper. Once the atomic victim
+    /// schedule has removed residents, pool/read/commit failures are surfaced
+    /// fail-closed: replaying sequentially could stop on an early expert after
+    /// later experts' victims were already removed, so it would falsely claim
+    /// exact failure-state semantics.
+    async fn gpu_native_production_source_physical_missing_set(
+        self: &Arc<Self>,
+        global_ids: &[u32],
+        residents: &mut HashMap<u32, Arc<ExpertResident>>,
+    ) -> Result<(), GpuNativeDemandResidencyError> {
+        let telemetry = self.production_demand_source.clone();
+        telemetry.source_sets.fetch_add(1, Ordering::Relaxed);
+        let unresolved = global_ids
+            .iter()
+            .copied()
+            .filter(|global_id| !residents.contains_key(global_id))
+            .collect::<Vec<_>>();
+
+        if unresolved.len() <= 1 {
+            telemetry
+                .fallback_single_item
+                .fetch_add(1, Ordering::Relaxed);
+            return self
+                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .await;
+        }
+
+        // Conservative PR2-A eligibility probe: `contains` is explicitly
+        // non-recency-mutating. One hit makes the entire original-order set
+        // sequential; mixed RAM state is never batched.
+        if unresolved
+            .iter()
+            .any(|global_id| self.core.cache.contains(*global_id))
+        {
+            telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
+            return self
+                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .await;
+        }
+        telemetry
+            .batch_eligible_sets
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry.batch_attempts.fetch_add(1, Ordering::Relaxed);
+
+        // Reserve process-wide leadership in original request order using the
+        // exact same map/guard protocol as `fetch_with_retry`.
+        let mut leadership = MultiIdSingleflightLeadership {
+            guards: Vec::with_capacity(unresolved.len()),
+            telemetry: telemetry.clone(),
+            successful: false,
+        };
+        for &global_id in &unresolved {
+            match SingleflightLeaderGuard::try_claim(self.core.in_flight.clone(), global_id) {
+                Ok(guard) => {
+                    telemetry
+                        .singleflight_ids_claimed
+                        .fetch_add(1, Ordering::Relaxed);
+                    leadership.guards.push(guard);
+                }
+                Err(_leader_notify) => {
+                    telemetry
+                        .singleflight_followers_observed
+                        .fetch_add(1, Ordering::Relaxed);
+                    telemetry
+                        .fallback_singleflight_contention
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(leadership);
+                    #[cfg(test)]
+                    {
+                        let barrier = {
+                            self.production_batch_test_hooks
+                                .lock()
+                                .after_claim_rollback
+                                .clone()
+                        };
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                            barrier.wait().await;
+                        }
+                    }
+                    return self
+                        .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .await;
+                }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let barrier = { self.production_batch_test_hooks.lock().after_claims.clone() };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+
+        // A cache insert can win between the eligibility probe and the last
+        // leadership claim. Recheck without recency mutation while all ids are
+        // owned; any newly resident id aborts the complete batch.
+        if unresolved
+            .iter()
+            .any(|global_id| self.core.cache.contains(*global_id))
+        {
+            telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
+            drop(leadership);
+            return self
+                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .await;
+        }
+
+        let reservation_outcome =
+            match self.core.cache.try_reserve_exact_demand(&unresolved) {
+                Ok(reservation) => reservation,
+                Err(_) => {
+                    telemetry
+                        .fallback_reservation
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(leadership);
+                    return self
+                        .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .await;
+                }
+            };
+        let reserved_slots = reservation_outcome.reservation.remaining();
+        telemetry
+            .cache_slots_reserved
+            .fetch_add(reserved_slots as u64, Ordering::Relaxed);
+        let mut cache_reservation = ProductionCacheReservation {
+            inner: reservation_outcome.reservation,
+            telemetry: telemetry.clone(),
+        };
+        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+            for &victim_id in &reservation_outcome.eviction_ids {
+                qualification.record_cache_eviction(victim_id);
+            }
+        }
+        drop(reservation_outcome.victims);
+
+        let mut buffers = Vec::with_capacity(unresolved.len());
+        for _ in 0..unresolved.len() {
+            match self.core.pool.try_acquire() {
+                Some(buffer) => buffers.push(buffer),
+                None => {
+                    let acquired = buffers.len();
+                    drop(buffers);
+                    drop(cache_reservation);
+                    drop(leadership);
+                    return Err(
+                        GpuNativeDemandResidencyError::ProductionBatchPoolUnavailableAfterReservation {
+                            requested: unresolved.len(),
+                            acquired,
+                        },
+                    );
+                }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let barrier = {
+                self.production_batch_test_hooks
+                    .lock()
+                    .after_buffers
+                    .clone()
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+
+        let batch_started = Instant::now();
+        let mut refs = buffers.iter_mut().collect::<Vec<_>>();
+        let _foreground = self.core.governor.foreground_guard();
+        let read_result = self
+            .core
+            .storage
+            .read_experts_batch(&unresolved, &mut refs)
+            .await;
+        drop(_foreground);
+        let batch_wall_us = qualification_elapsed_us(batch_started);
+        let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        let read_bytes = match read_result {
+            Ok(read_bytes) if read_bytes == expected_bytes => read_bytes,
+            result => {
+                let source = match result {
+                    Ok(read_bytes) => {
+                        format!("batch returned {read_bytes} bytes, expected {expected_bytes}")
+                    }
+                    Err(error) => error.to_string(),
+                };
+                drop(buffers);
+                drop(cache_reservation);
+                drop(leadership);
+                return Err(
+                    GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation {
+                        global_ids: unresolved,
+                        source,
+                    },
+                );
+            }
+        };
+
+        if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+            for &global_id in &unresolved {
+                qualification.record_source_request(global_id);
+                qualification
+                    .source_ram_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            qualification
+                .source_nvme_reads
+                .fetch_add(unresolved.len() as u64, Ordering::Relaxed);
+            qualification
+                .source_nvme_bytes
+                .fetch_add(read_bytes as u64, Ordering::Relaxed);
+        }
+        self.metrics
+            .counters
+            .bytes_read
+            .fetch_add(read_bytes as u64, Ordering::Relaxed);
+        let _ = self.metrics.io_hist.lock().record(batch_wall_us.max(1));
+
+        let block_align = self.core.storage.config().block_align;
+        let completed = unresolved
+            .iter()
+            .copied()
+            .zip(buffers)
+            .map(|(global_id, buffer)| {
+                (
+                    global_id,
+                    Arc::new(ExpertResident::new_with_block_align(
+                        global_id,
+                        buffer,
+                        block_align,
+                    )),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let staged = qualification_order_completed_residents(&unresolved, completed)?;
+        for (global_id, resident) in staged {
+            if cache_reservation.commit(resident.clone()).is_err() {
+                telemetry
+                    .batch_commit_violations
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(
+                    GpuNativeDemandResidencyError::ProductionBatchCommitViolation { global_id },
+                );
+            }
+            if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+                qualification.record_cache_insert(global_id);
+            }
+            residents.insert(global_id, resident);
+        }
+        telemetry.record_success(unresolved.len());
+        leadership.finish();
+        Ok(())
     }
 
     async fn ensure_gpu_native_logical_demand_set(
@@ -4136,6 +5214,12 @@ impl Engine {
             .as_ref()
             .cloned()
             .ok_or(GpuNativeDemandResidencyError::ManagerNotInstalled)?;
+        let qualification = self.gpu_native_demand_source_qualification();
+        let _qualification_guard = qualification
+            .as_ref()
+            .cloned()
+            .map(QualificationDemandServiceGuard::enter)
+            .transpose()?;
         let num_layers = manager.plan().num_layers();
         let experts_per_layer = manager.plan().geometry().num_experts() as u32;
         let mut seen = HashSet::with_capacity(global_ids.len());
@@ -4163,12 +5247,27 @@ impl Engine {
             // No logical-cache lock is held while probing the physical layer.
             // A probe result may race with a later physical eviction; the
             // fixed one-retry recovery below re-probes the complete set.
+            let physical_probe_started = Instant::now();
             let mut physical_current = Vec::with_capacity(global_ids.len());
             for &global_id in global_ids {
                 let current = manager.has_current_for_demand(global_id)?;
                 physical_current.push(current);
             }
+            if let Some(state) = qualification.as_ref() {
+                state
+                    .physical_probe_us
+                    .fetch_add(qualification_elapsed_us(physical_probe_started), Ordering::Relaxed);
+            }
             let physical_missing = gpu_native_physical_missing_ids(global_ids, &physical_current);
+            if let Some(state) = qualification.as_ref() {
+                state
+                    .physical_missing_experts
+                    .fetch_add(physical_missing.len() as u64, Ordering::Relaxed);
+                state
+                    .physical_missing_ids
+                    .lock()
+                    .record_set(&physical_missing);
+            }
 
             // Physical hits never reach this logical/source block. Protection
             // is metadata-only and releases the logical mutex before every
@@ -4182,13 +5281,20 @@ impl Engine {
                 for &global_id in &physical_missing {
                     if !residents.contains_key(&global_id) {
                         manager.record_physical_source_acquisition();
-                        self.gpu_native_demand_source(global_id, &mut residents)
-                            .await?;
                     }
                 }
+                self.gpu_native_source_physical_missing_set(&physical_missing, &mut residents)
+                    .await?;
+                let logical_admission_started = Instant::now();
                 let (admissions, newly_admitted) = self
                     .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
                     .await?;
+                if let Some(state) = qualification.as_ref() {
+                    state.logical_demand_admission_us.fetch_add(
+                        qualification_elapsed_us(logical_admission_started),
+                        Ordering::Relaxed,
+                    );
+                }
                 manager.record_logical_admissions_for_physical_misses(newly_admitted);
                 admissions_by_id
                     .extend(physical_missing.iter().copied().zip(admissions.into_iter()));
@@ -4218,11 +5324,19 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
 
-            match manager.ensure_demand_set(
+            let physical_install_started = Instant::now();
+            let physical_install_result = manager.ensure_demand_set(
                 GpuNativeResidencyPriority::Demand,
                 layer_index,
                 &demands,
-            ) {
+            );
+            if let Some(state) = qualification.as_ref() {
+                state.physical_demand_install_us.fetch_add(
+                    qualification_elapsed_us(physical_install_started),
+                    Ordering::Relaxed,
+                );
+            }
+            match physical_install_result {
                 Ok(residencies) => return Ok(residencies),
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
                     if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
@@ -4270,6 +5384,9 @@ impl Engine {
         if self.core.cache.len() >= self.core.cache.capacity() {
             if let Some(evicted) = self.core.cache.evict_lru() {
                 debug!(evicted = evicted.id, "evicted LRU to make room");
+                if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+                    qualification.record_cache_eviction(evicted.id);
+                }
                 drop(evicted);
             }
         }
@@ -4284,6 +5401,14 @@ impl Engine {
             Ok(_) => {
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
+                if let Some(qualification) = self.gpu_native_demand_source_qualification() {
+                    qualification
+                        .source_nvme_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    qualification
+                        .source_nvme_bytes
+                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                }
                 // Track every byte the engine actually pulls off the
                 // SSD — including `fetch_with_retry`'s leader path,
                 // not just the `moe_step` critical path. This is
@@ -4303,8 +5428,23 @@ impl Engine {
                     self.core.storage.config().block_align,
                 ));
                 match self.core.cache.insert(resident.clone()) {
-                    Ok(Some(_evicted)) => debug!(expert = id, "inserted (with eviction)"),
-                    Ok(None) => debug!(expert = id, "inserted"),
+                    Ok(Some(evicted)) => {
+                        if let Some(qualification) =
+                            self.gpu_native_demand_source_qualification()
+                        {
+                            qualification.record_cache_insert(id);
+                            qualification.record_cache_eviction(evicted.id);
+                        }
+                        debug!(expert = id, "inserted (with eviction)")
+                    }
+                    Ok(None) => {
+                        if let Some(qualification) =
+                            self.gpu_native_demand_source_qualification()
+                        {
+                            qualification.record_cache_insert(id);
+                        }
+                        debug!(expert = id, "inserted")
+                    }
                     Err(rejected) => {
                         // Cache is full of pinned entries — surface this
                         // explicitly. The caller still gets a usable
@@ -4488,24 +5628,17 @@ impl Engine {
             // foreground leader, or another prefetch) already owns the
             // in-flight slot, there is nothing useful to do: they are
             // already fetching this id, so drop.
-            let notify = match me.core.in_flight.entry(id) {
-                dashmap::mapref::entry::Entry::Occupied(_) => return,
-                dashmap::mapref::entry::Entry::Vacant(vac) => {
-                    let n = Arc::new(Notify::new());
-                    vac.insert(n.clone());
-                    n
-                }
-            };
             // The guard removes the in-flight slot and notifies every
             // parked follower on *every* exit path below (buffer-starved
             // early return, read error, or success). Followers then
             // re-check the cache: a hit on success, or a re-contention
             // for leadership on failure — never a wedged stale entry.
-            let _guard = SingleflightLeaderGuard {
-                map: me.core.in_flight.clone(),
+            let _guard = match SingleflightLeaderGuard::try_claim(
+                me.core.in_flight.clone(),
                 id,
-                notify,
-                armed: true,
+            ) {
+                Ok(guard) => guard,
+                Err(_) => return,
             };
             // **Double-buffered acquire (Part 2).** Speculation draws
             // from the **shadow** (Buffer B) half of the pool, never the
@@ -7034,6 +8167,59 @@ mod tests {
         ))
     }
 
+    fn build_multi_layer_source_engine(
+        data_dir: &std::path::Path,
+        per_layer_caps: Vec<usize>,
+        experts_per_layer: u32,
+        top_k: usize,
+        seed: u64,
+    ) -> Arc<Engine> {
+        let d_model = 8usize;
+        let d_ff = 8usize;
+        let num_experts = experts_per_layer * per_layer_caps.len() as u32;
+        let weight_bytes = crate::inference::expert_weight_bytes(d_model, d_ff);
+        let block_align = 4096usize;
+        let expert_size = weight_bytes.div_ceil(block_align) * block_align;
+        generate_synthetic_experts(data_dir, num_experts, expert_size, d_model, d_ff)
+            .expect("generate multi-layer synthetic experts");
+        let storage = Arc::new(
+            NvmeStorage::new(StorageConfig {
+                base_path: data_dir.to_path_buf(),
+                expert_size,
+                block_align,
+                use_direct_io: false,
+                num_experts_per_layer: Some(experts_per_layer),
+            })
+            .expect("multi-layer storage init"),
+        );
+        storage
+            .warmup_fds(0..num_experts)
+            .expect("pre-open multi-layer expert fds");
+        let cache = Arc::new(MultiLayerExpertCache::with_capacities(
+            per_layer_caps,
+            experts_per_layer,
+        ));
+        let pool = BufferPool::new(
+            cache.capacity() + top_k.max(1),
+            expert_size,
+            block_align,
+        );
+        let router = Router::Markov(Arc::new(TopKRouter::new(num_experts, top_k, seed)));
+        let predictor = Arc::new(PredictiveLoader::new(num_experts, 0, 0.05, seed));
+        Arc::new(Engine::new(
+            cache,
+            pool,
+            storage,
+            router,
+            predictor,
+            ModelShape {
+                d_model,
+                d_ff,
+                hidden_seed: seed,
+            },
+        ))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gpu_native_demand_source_reuses_ram_without_duplicate_nvme_read() {
         let dir = TempDir::new("gpu-native-demand-source");
@@ -7062,6 +8248,556 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));
         assert_eq!(engine.report().bytes_read, after_nvme);
+    }
+
+    #[test]
+    fn production_commit_order_ignores_later_request_completing_first() {
+        let pool = BufferPool::new(3, 4096, 4096);
+        let request_order = [3, 1, 2];
+        let mut completed = HashMap::new();
+        for &id in request_order.iter().rev() {
+            completed.insert(id, Arc::new(ExpertResident::new(id, pool.try_acquire().unwrap())));
+        }
+
+        let ordered = qualification_order_completed_residents(&request_order, completed).unwrap();
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            request_order
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_multilayer_warmup_shape_reconciles_ordered_hashes_and_full_state() {
+        let control_dir = TempDir::new("production-multilayer-warmup-control");
+        let treatment_dir = TempDir::new("production-multilayer-warmup-treatment");
+        let control =
+            build_multi_layer_source_engine(&control_dir.path, vec![3, 2], 8, 2, 0xA21);
+        let treatment =
+            build_multi_layer_source_engine(&treatment_dir.path, vec![3, 2], 8, 2, 0xA21);
+        control
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Control,
+            )
+            .unwrap();
+        treatment
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Treatment,
+            )
+            .unwrap();
+
+        // Cold start, then alternate layers until both aggregate and
+        // per-layer limits have been crossed repeatedly. Every set is an
+        // exact all-RAM-miss pair and treatment uses ordinary production.
+        let source_sets = [
+            [0, 1],
+            [8, 9],
+            [2, 3],
+            [10, 11],
+            [4, 5],
+            [12, 13],
+            [6, 7],
+            [14, 15],
+        ];
+        for ids in source_sets {
+            run_production_source_set(control.clone(), ids.to_vec())
+                .await
+                .unwrap();
+            run_production_source_set(treatment.clone(), ids.to_vec())
+                .await
+                .unwrap();
+        }
+
+        let control_source = control
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        let treatment_source = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert_eq!(
+            control_source.demand_ram_eviction_ids_sha256,
+            treatment_source.demand_ram_eviction_ids_sha256,
+            "authoritative warmup-shaped ordered eviction stream"
+        );
+        assert_eq!(
+            control_source.demand_ram_insert_ids_sha256,
+            treatment_source.demand_ram_insert_ids_sha256,
+            "authoritative warmup-shaped ordered insertion stream"
+        );
+        assert_eq!(
+            control.core.cache.qualification_state_sha256(),
+            treatment.core.cache.qualification_state_sha256(),
+            "complete layer-indexed MRU-to-LRU cache state"
+        );
+        assert_eq!(control.core.cache.len(), treatment.core.cache.len());
+        for layer in 0..control.core.cache.num_layers() {
+            assert_eq!(
+                control
+                    .core
+                    .cache
+                    .cache_for_layer(layer as u32)
+                    .resident_ids(),
+                treatment
+                    .core
+                    .cache
+                    .cache_for_layer(layer as u32)
+                    .resident_ids()
+            );
+        }
+        assert!(control_source.ram_cache_evictions > 0);
+        assert_eq!(
+            control_source.ram_cache_evictions,
+            treatment_source.ram_cache_evictions
+        );
+        let production = treatment.production_demand_source_snapshot();
+        assert_eq!(production.production_batch_successes, source_sets.len() as u64);
+        assert_eq!(production.production_cache_reservation_leaks, 0);
+        assert_eq!(production.production_batch_commit_violations, 0);
+        assert_eq!(production.stale_singleflight_entries, 0);
+    }
+
+    async fn wait_for_production_snapshot<F>(engine: &Arc<Engine>, condition: F)
+    where
+        F: Fn(&ProductionDemandSourceSnapshot) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = engine.production_demand_source_snapshot();
+                if condition(&snapshot) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production telemetry condition timed out");
+    }
+
+    async fn run_production_source_set(
+        engine: Arc<Engine>,
+        ids: Vec<u32>,
+    ) -> Result<HashMap<u32, Arc<ExpertResident>>, GpuNativeDemandResidencyError> {
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&ids, &mut residents)
+            .await?;
+        Ok(residents)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_same_all_miss_set_singleflights_one_batch_per_unique_expert() {
+        let dir = TempDir::new("production-same-set");
+        let engine = build_engine(&dir.path, 8, 8, 8, 6, 3, 0, 17);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        engine.production_batch_test_hooks.lock().after_claims = Some(barrier.clone());
+
+        let first = tokio::spawn(run_production_source_set(engine.clone(), vec![0, 1, 2]));
+        barrier.wait().await;
+        let second = tokio::spawn(run_production_source_set(engine.clone(), vec![0, 1, 2]));
+        wait_for_production_snapshot(&engine, |snapshot| {
+            snapshot.production_sequential_fallback_singleflight_contention == 1
+        })
+        .await;
+        barrier.wait().await;
+
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        engine.production_batch_test_hooks.lock().after_claims = None;
+        for id in [0, 1, 2] {
+            assert!(Arc::ptr_eq(&first[&id], &second[&id]));
+        }
+        assert_eq!(
+            engine.report().bytes_read,
+            3 * engine.core.storage.config().expert_size as u64
+        );
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_batch_successes, 1);
+        assert_eq!(snapshot.production_batch_experts, 3);
+        assert!(snapshot.production_singleflight_followers_observed > 0);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_partial_overlap_never_reads_shared_ids_twice() {
+        let dir = TempDir::new("production-overlap");
+        let engine = build_engine(&dir.path, 8, 8, 8, 8, 4, 0, 18);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        engine.production_batch_test_hooks.lock().after_claims = Some(barrier.clone());
+
+        let first = tokio::spawn(run_production_source_set(engine.clone(), vec![1, 2, 3, 4]));
+        barrier.wait().await;
+        let second = tokio::spawn(run_production_source_set(engine.clone(), vec![3, 4, 5, 6]));
+        wait_for_production_snapshot(&engine, |snapshot| {
+            snapshot.production_sequential_fallback_singleflight_contention == 1
+        })
+        .await;
+        barrier.wait().await;
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        engine.production_batch_test_hooks.lock().after_claims = None;
+        assert!(Arc::ptr_eq(&first[&3], &second[&3]));
+        assert!(Arc::ptr_eq(&first[&4], &second[&4]));
+        assert_eq!(
+            engine.report().bytes_read,
+            6 * engine.core.storage.config().expert_size as u64
+        );
+        assert_eq!(
+            engine
+                .production_demand_source_snapshot()
+                .stale_singleflight_entries,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_disjoint_same_layer_reservations_never_steal_or_evict_pins() {
+        let dir = TempDir::new("production-disjoint-reservations");
+        let engine = build_engine(&dir.path, 10, 8, 8, 6, 2, 0, 19);
+        let mut priming = HashMap::new();
+        for id in 0..6 {
+            engine
+                .gpu_native_demand_source(id, &mut priming)
+                .await
+                .unwrap();
+        }
+        drop(priming);
+        engine.core.cache.pin(0);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        engine.production_batch_test_hooks.lock().after_buffers = Some(barrier.clone());
+
+        let first = tokio::spawn(run_production_source_set(engine.clone(), vec![6, 7]));
+        let second = tokio::spawn(run_production_source_set(engine.clone(), vec![8, 9]));
+        barrier.wait().await;
+        assert_eq!(engine.core.cache.reserved_slots(), 4);
+        assert!(
+            engine.core.cache.len() + engine.core.cache.reserved_slots()
+                <= engine.core.cache.capacity()
+        );
+        assert!(engine.core.cache.contains(0));
+        assert!(engine.core.cache.is_pinned(0));
+        barrier.wait().await;
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        engine.production_batch_test_hooks.lock().after_buffers = None;
+
+        assert_eq!(engine.core.cache.len(), engine.core.cache.capacity());
+        assert!(engine.core.cache.contains(0));
+        assert!(engine.core.cache.is_pinned(0));
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_batch_successes, 2);
+        assert_eq!(snapshot.production_cache_slots_reserved, 4);
+        assert_eq!(snapshot.production_cache_reservations_consumed, 4);
+        assert_eq!(snapshot.production_cache_reservations_released, 0);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.production_batch_commit_violations, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_partial_claim_race_rolls_back_and_falls_back_without_deadlock() {
+        let dir = TempDir::new("production-claim-race");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 20);
+        let occupied_notify = Arc::new(Notify::new());
+        assert!(engine
+            .core
+            .in_flight
+            .insert(2, occupied_notify.clone())
+            .is_none());
+        let rollback_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        engine
+            .production_batch_test_hooks
+            .lock()
+            .after_claim_rollback = Some(rollback_barrier.clone());
+
+        let request = tokio::spawn(run_production_source_set(engine.clone(), vec![1, 2]));
+        rollback_barrier.wait().await;
+        assert!(!engine.core.in_flight.contains_key(&1));
+        assert!(engine.core.in_flight.contains_key(&2));
+        rollback_barrier.wait().await;
+        engine.core.in_flight.remove(&2);
+        occupied_notify.notify_waiters();
+        let residents = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("claim-race fallback deadlocked")
+            .unwrap()
+            .unwrap();
+        engine
+            .production_batch_test_hooks
+            .lock()
+            .after_claim_rollback = None;
+        assert_eq!(residents.len(), 2);
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 1);
+        assert_eq!(
+            snapshot.production_sequential_fallback_singleflight_contention,
+            1
+        );
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_post_claim_cache_insertion_aborts_batch_without_duplicate_read() {
+        let dir = TempDir::new("production-cache-insertion-race");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 21);
+        let mut priming = HashMap::new();
+        let retained = engine
+            .gpu_native_demand_source(0, &mut priming)
+            .await
+            .unwrap();
+        drop(priming);
+        let evicted = engine.core.cache.evict_lru().unwrap();
+        assert!(Arc::ptr_eq(&retained, &evicted));
+        let before = engine.report().bytes_read;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        engine.production_batch_test_hooks.lock().after_claims = Some(barrier.clone());
+
+        let request = tokio::spawn(run_production_source_set(engine.clone(), vec![0, 1]));
+        barrier.wait().await;
+        assert!(engine.core.cache.insert(evicted).is_ok());
+        barrier.wait().await;
+        let residents = request.await.unwrap().unwrap();
+        engine.production_batch_test_hooks.lock().after_claims = None;
+        assert!(Arc::ptr_eq(&retained, &residents[&0]));
+        assert_eq!(
+            engine.report().bytes_read - before,
+            engine.core.storage.config().expert_size as u64
+        );
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_batch_successes, 0);
+        assert_eq!(snapshot.production_sequential_fallback_mixed_ram, 1);
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_batch_device_failure_after_victims_fails_closed_without_late_fallback() {
+        let dir = TempDir::new("production-batch-read-error");
+        let engine = build_engine(&dir.path, 6, 8, 8, 4, 2, 0, 22);
+        let mut priming = HashMap::new();
+        for id in 0..4 {
+            engine
+                .gpu_native_demand_source(id, &mut priming)
+                .await
+                .unwrap();
+        }
+        drop(priming);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path.join("expert_4.bin"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let mut residents = HashMap::new();
+        let error = engine
+            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation { .. }
+        ));
+        assert!(residents.is_empty());
+        assert!(!engine.core.cache.contains(0));
+        assert!(!engine.core.cache.contains(1));
+        assert!(engine.core.cache.contains(2));
+        assert!(engine.core.cache.contains(3));
+        assert!(!engine.core.cache.contains(4));
+        assert!(!engine.core.cache.contains(5));
+        if let Err(error) = engine.fetch_with_retry(5).await {
+            panic!("sequential recovery for healthy expert failed: {error}");
+        }
+        assert!(!engine.core.storage.is_drive_unavailable(5));
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_sequential_fallback_batch_read_error, 0);
+        assert_eq!(snapshot.production_batch_successes, 0);
+        assert_eq!(snapshot.production_cache_reservations_released, 2);
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_pool_failure_after_victims_fails_closed_and_releases_transaction() {
+        let dir = TempDir::new("production-pool-fail-closed");
+        let engine = build_engine(&dir.path, 4, 8, 8, 2, 2, 0, 122);
+        let mut retained = HashMap::new();
+        for id in [0, 1] {
+            engine
+                .gpu_native_demand_source(id, &mut retained)
+                .await
+                .unwrap();
+        }
+
+        // Eviction removes both cache references, but request-local Arcs keep
+        // those victim buffers unavailable. Only the single headroom buffer
+        // can be acquired, forcing the post-reservation fail-closed path.
+        let mut residents = HashMap::new();
+        let error = engine
+            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuNativeDemandResidencyError::ProductionBatchPoolUnavailableAfterReservation {
+                requested: 2,
+                acquired: 1,
+            }
+        ));
+        assert!(residents.is_empty());
+        assert_eq!(engine.core.cache.len(), 0);
+        assert_eq!(engine.core.cache.reserved_slots(), 0);
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_sequential_fallback_pool, 0);
+        assert_eq!(snapshot.production_cache_reservations_released, 2);
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+        drop(retained);
+        assert_eq!(
+            engine.core.pool.primary_available(),
+            engine.core.pool.capacity()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn production_batch_cancellation_releases_claims_reservations_and_buffers() {
+        let dir = TempDir::new("production-batch-cancel");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 23);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        engine.production_batch_test_hooks.lock().after_buffers = Some(barrier.clone());
+        let request = tokio::spawn(run_production_source_set(engine.clone(), vec![0, 1]));
+        barrier.wait().await;
+        assert_eq!(engine.core.cache.reserved_slots(), 2);
+        assert_eq!(engine.core.in_flight.len(), 2);
+        assert_eq!(
+            engine.core.pool.primary_available(),
+            engine.core.pool.capacity() - 2
+        );
+        request.abort();
+        match request.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("cancelled production batch unexpectedly completed"),
+        }
+        engine.production_batch_test_hooks.lock().after_buffers = None;
+
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
+        assert_eq!(snapshot.production_cache_reservations_released, 2);
+        assert_eq!(snapshot.production_singleflight_claim_rollbacks, 2);
+        assert_eq!(
+            engine.core.pool.primary_available(),
+            engine.core.pool.capacity()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_path_batches_without_qualifier_and_v2_control_remains_sequential() {
+        let normal_dir = TempDir::new("production-normal");
+        let control_dir = TempDir::new("production-v2-control");
+        let treatment_dir = TempDir::new("production-v2-treatment");
+        let normal = build_engine(&normal_dir.path, 4, 8, 8, 4, 2, 0, 24);
+        let control = build_engine(&control_dir.path, 4, 8, 8, 4, 2, 0, 24);
+        let treatment = build_engine(&treatment_dir.path, 4, 8, 8, 4, 2, 0, 24);
+        control
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Control,
+            )
+            .unwrap();
+        treatment
+            .enable_gpu_native_demand_source_production_qualification(
+                GpuNativeDemandSourceQualificationArm::Treatment,
+            )
+            .unwrap();
+
+        let normal_residents = run_production_source_set(normal.clone(), vec![2, 0])
+            .await
+            .unwrap();
+        let control_residents = run_production_source_set(control.clone(), vec![2, 0])
+            .await
+            .unwrap();
+        let treatment_residents = run_production_source_set(treatment.clone(), vec![2, 0])
+            .await
+            .unwrap();
+        for id in [2, 0] {
+            assert_eq!(normal_residents[&id].data(), control_residents[&id].data());
+            assert_eq!(
+                normal_residents[&id].data(),
+                treatment_residents[&id].data()
+            );
+        }
+        assert_eq!(
+            normal
+                .production_demand_source_snapshot()
+                .production_batch_successes,
+            1
+        );
+        assert_eq!(
+            control
+                .production_demand_source_snapshot()
+                .production_batch_successes,
+            0
+        );
+        assert_eq!(
+            treatment
+                .production_demand_source_snapshot()
+                .production_batch_successes,
+            1
+        );
+        let source = treatment
+            .gpu_native_demand_source_qualification_snapshot()
+            .unwrap();
+        assert!(!source.qualification_only);
+        assert!(source.production_demand_source_changed);
+        assert!(
+            treatment
+                .production_demand_source_snapshot()
+                .ordinary_production_path_exercised
+        );
+        assert_eq!(
+            normal.core.cache.resident_ids(),
+            treatment.core.cache.resident_ids()
+        );
+        assert_eq!(normal.report().prefetch_completed, 0);
+        assert_eq!(treatment.report().prefetch_completed, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_all_hit_mixed_one_miss_and_cost_aware_sets_stay_sequential() {
+        let dir = TempDir::new("production-sequential-fallbacks");
+        let engine = build_engine(&dir.path, 6, 8, 8, 6, 2, 0, 25);
+        let mut priming = HashMap::new();
+        for id in [0, 1] {
+            engine
+                .gpu_native_demand_source(id, &mut priming)
+                .await
+                .unwrap();
+        }
+        drop(priming);
+        let before = engine.report().bytes_read;
+        run_production_source_set(engine.clone(), vec![0, 1])
+            .await
+            .unwrap();
+        run_production_source_set(engine.clone(), vec![1, 2])
+            .await
+            .unwrap();
+        run_production_source_set(engine.clone(), vec![3])
+            .await
+            .unwrap();
+        engine.core.cache.set_cost_aware(true);
+        run_production_source_set(engine.clone(), vec![4, 5])
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.report().bytes_read - before,
+            4 * engine.core.storage.config().expert_size as u64
+        );
+        let snapshot = engine.production_demand_source_snapshot();
+        assert_eq!(snapshot.production_batch_successes, 0);
+        assert_eq!(snapshot.production_sequential_fallback_mixed_ram, 2);
+        assert_eq!(snapshot.production_sequential_fallback_single_item, 1);
+        assert_eq!(snapshot.production_sequential_fallback_reservation, 1);
+        assert_eq!(snapshot.production_cache_reservation_leaks, 0);
+        assert_eq!(snapshot.stale_singleflight_entries, 0);
     }
 
     #[test]
