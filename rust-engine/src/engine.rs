@@ -14,6 +14,9 @@
 //! 6. Record per-token latency and emit structured tracing events.
 
 use crate::aligned_buffer::AlignedBuffer;
+use crate::backend::gpu_native::{
+    GpuNativePhysicalInstallEvidence, GpuNativePhysicalInstallStaging, GpuNativeQ4ExpertResidency,
+};
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
 use crate::expert_cache::{
@@ -23,8 +26,8 @@ use crate::expert_cache::{
 use crate::gating::Router;
 use crate::gpu_native_residency::{
     global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
-    GpuNativeResidencyPriority, GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe,
-    GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
+    GpuNativePhysicalInstallObserver, GpuNativeResidencyPriority, GpuNativeSpeculativeInstall,
+    GpuNativeSpeculativeProbe, GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
     GpuNativeTieredResidencySnapshot,
 };
 use crate::inference::{
@@ -498,6 +501,67 @@ pub(crate) enum GpuNativeDemandSourceQualificationArm {
     Treatment,
 }
 
+/// Explicit arm of the PR2-B-A physical-install staging qualification. It is
+/// installed only by the dedicated command and is never an Engine option.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuNativePhysicalInstallStagingQualificationArm {
+    Control,
+    Treatment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuNativeQualificationPurpose {
+    DemandSource(GpuNativeDemandSourceQualificationArm),
+    PhysicalInstallStaging(GpuNativePhysicalInstallStagingQualificationArm),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
+    pub(crate) arm: GpuNativePhysicalInstallStagingQualificationArm,
+    pub(crate) qualification_only: bool,
+    pub(crate) normal_production_default_changed: bool,
+    pub(crate) single_request_stream: bool,
+    pub(crate) overlapping_demand_sets: u64,
+    pub(crate) primary_pool_capacity: usize,
+    pub(crate) shadow_pool_capacity: usize,
+    pub(crate) demand_sets: u64,
+    pub(crate) physical_missing_experts: u64,
+    pub(crate) physical_probe_us: u64,
+    pub(crate) source_sets: u64,
+    pub(crate) source_experts: u64,
+    pub(crate) demand_source_requests: u64,
+    pub(crate) source_ram_hits: u64,
+    pub(crate) source_ram_misses: u64,
+    pub(crate) source_nvme_reads: u64,
+    pub(crate) source_nvme_bytes: u64,
+    pub(crate) source_acquisition_wall_us: u64,
+    pub(crate) logical_demand_admission_us: u64,
+    pub(crate) physical_demand_install_us: u64,
+    pub(crate) total_residency_service_us: u64,
+    pub(crate) ram_cache_inserts: u64,
+    pub(crate) ram_cache_evictions: u64,
+    pub(crate) selected_route_ids_sha256: String,
+    pub(crate) physical_missing_ids_sha256: String,
+    pub(crate) demand_source_request_ids_sha256: String,
+    pub(crate) demand_ram_insert_ids_sha256: String,
+    pub(crate) demand_ram_eviction_ids_sha256: String,
+    pub(crate) physical_victim_ids_sha256: String,
+    pub(crate) physical_residency_identity_sha256: String,
+    pub(crate) physical_install_attempts: u64,
+    pub(crate) physical_install_completions: u64,
+    pub(crate) full_slot_vec_materializations: u64,
+    pub(crate) direct_staging_writes: u64,
+    pub(crate) direct_staging_failures: u64,
+    pub(crate) physical_slot_bytes_staged: u64,
+    pub(crate) mapping_publications: u64,
+    pub(crate) mapping_unpublications: u64,
+    pub(crate) physical_slot_prepare_us: u64,
+    pub(crate) physical_queue_staging_us: u64,
+    pub(crate) mapping_publication_us: u64,
+    pub(crate) physical_install_total_us: u64,
+}
+
 /// Cumulative production-path evidence. These atomics are always present and
 /// add no per-token logging; the dedicated v2 qualifier resets them between
 /// warmup and measured arms and records exact snapshots.
@@ -734,6 +798,20 @@ impl QualificationOrderedHasher {
         self.inner.update(id.to_le_bytes());
     }
 
+    fn record_residency_identity(
+        &mut self,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
+    ) {
+        self.inner.update([0x52]);
+        self.inner.update(global_id.to_le_bytes());
+        self.inner
+            .update(residency.key().logical_generation().to_le_bytes());
+        self.inner.update(residency.location().bank().to_le_bytes());
+        self.inner.update(residency.location().slot().to_le_bytes());
+        self.inner.update(residency.slot_epoch().to_le_bytes());
+    }
+
     fn hex(&self) -> String {
         format!("{:x}", self.inner.clone().finalize())
     }
@@ -784,7 +862,7 @@ fn qualification_order_completed_residents(
 }
 
 struct GpuNativeDemandSourceQualification {
-    arm: GpuNativeDemandSourceQualificationArm,
+    purpose: GpuNativeQualificationPurpose,
     primary_pool_capacity: usize,
     shadow_pool_capacity: usize,
     active_demand_set: AtomicBool,
@@ -814,6 +892,20 @@ struct GpuNativeDemandSourceQualification {
     demand_source_request_ids: parking_lot::Mutex<QualificationOrderedHasher>,
     demand_ram_insert_ids: parking_lot::Mutex<QualificationOrderedHasher>,
     demand_ram_eviction_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    physical_victim_ids: parking_lot::Mutex<QualificationOrderedHasher>,
+    physical_residency_identities: parking_lot::Mutex<QualificationOrderedHasher>,
+    physical_install_attempts: AtomicU64,
+    physical_install_completions: AtomicU64,
+    full_slot_vec_materializations: AtomicU64,
+    direct_staging_writes: AtomicU64,
+    direct_staging_failures: AtomicU64,
+    physical_slot_bytes_staged: AtomicU64,
+    mapping_publications: AtomicU64,
+    mapping_unpublications: AtomicU64,
+    physical_slot_prepare_us: AtomicU64,
+    physical_queue_staging_us: AtomicU64,
+    mapping_publication_us: AtomicU64,
+    physical_install_total_us: AtomicU64,
 }
 
 impl GpuNativeDemandSourceQualification {
@@ -823,7 +915,7 @@ impl GpuNativeDemandSourceQualification {
         shadow_pool_capacity: usize,
     ) -> Self {
         Self {
-            arm,
+            purpose: GpuNativeQualificationPurpose::DemandSource(arm),
             primary_pool_capacity,
             shadow_pool_capacity,
             active_demand_set: AtomicBool::new(false),
@@ -859,14 +951,47 @@ impl GpuNativeDemandSourceQualification {
             demand_ram_eviction_ids: parking_lot::Mutex::new(
                 QualificationOrderedHasher::default(),
             ),
+            physical_victim_ids: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
+            physical_residency_identities: parking_lot::Mutex::new(
+                QualificationOrderedHasher::default(),
+            ),
+            physical_install_attempts: AtomicU64::new(0),
+            physical_install_completions: AtomicU64::new(0),
+            full_slot_vec_materializations: AtomicU64::new(0),
+            direct_staging_writes: AtomicU64::new(0),
+            direct_staging_failures: AtomicU64::new(0),
+            physical_slot_bytes_staged: AtomicU64::new(0),
+            mapping_publications: AtomicU64::new(0),
+            mapping_unpublications: AtomicU64::new(0),
+            physical_slot_prepare_us: AtomicU64::new(0),
+            physical_queue_staging_us: AtomicU64::new(0),
+            mapping_publication_us: AtomicU64::new(0),
+            physical_install_total_us: AtomicU64::new(0),
         }
     }
 
+    fn new_physical_install_staging(
+        arm: GpuNativePhysicalInstallStagingQualificationArm,
+        primary_pool_capacity: usize,
+        shadow_pool_capacity: usize,
+    ) -> Self {
+        let mut state = Self::new(
+            GpuNativeDemandSourceQualificationArm::Treatment,
+            primary_pool_capacity,
+            shadow_pool_capacity,
+        );
+        state.purpose = GpuNativeQualificationPurpose::PhysicalInstallStaging(arm);
+        state
+    }
+
     fn snapshot(&self) -> GpuNativeDemandSourceQualificationSnapshot {
+        let GpuNativeQualificationPurpose::DemandSource(arm) = self.purpose else {
+            unreachable!("demand-source snapshot requested for physical-install qualifier")
+        };
         let source_sets = self.source_sets.load(Ordering::Relaxed);
         let width_min = self.source_set_width_min.load(Ordering::Relaxed);
         GpuNativeDemandSourceQualificationSnapshot {
-            arm: self.arm,
+            arm,
             qualification_only: false,
             production_demand_source_changed: true,
             single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
@@ -897,7 +1022,7 @@ impl GpuNativeDemandSourceQualification {
             source_acquisition_wall_us: self
                 .source_acquisition_wall_us
                 .load(Ordering::Relaxed),
-            sum_individual_source_service_us: (self.arm
+            sum_individual_source_service_us: (arm
                 == GpuNativeDemandSourceQualificationArm::Control)
                 .then(|| self.individual_source_service_us.load(Ordering::Relaxed)),
             logical_demand_admission_us: self
@@ -957,6 +1082,107 @@ impl GpuNativeDemandSourceQualification {
         self.demand_ram_eviction_ids.lock().record_id(id);
     }
 
+    fn physical_install_staging_snapshot(
+        &self,
+    ) -> GpuNativePhysicalInstallStagingQualificationSnapshot {
+        let GpuNativeQualificationPurpose::PhysicalInstallStaging(arm) = self.purpose else {
+            unreachable!("physical-install snapshot requested for demand-source qualifier")
+        };
+        GpuNativePhysicalInstallStagingQualificationSnapshot {
+            arm,
+            qualification_only: true,
+            normal_production_default_changed: false,
+            single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
+            overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
+            primary_pool_capacity: self.primary_pool_capacity,
+            shadow_pool_capacity: self.shadow_pool_capacity,
+            demand_sets: self.demand_sets.load(Ordering::Relaxed),
+            physical_missing_experts: self.physical_missing_experts.load(Ordering::Relaxed),
+            physical_probe_us: self.physical_probe_us.load(Ordering::Relaxed),
+            source_sets: self.source_sets.load(Ordering::Relaxed),
+            source_experts: self.source_experts.load(Ordering::Relaxed),
+            demand_source_requests: self.demand_source_requests.load(Ordering::Relaxed),
+            source_ram_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            source_ram_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            source_nvme_reads: self.source_nvme_reads.load(Ordering::Relaxed),
+            source_nvme_bytes: self.source_nvme_bytes.load(Ordering::Relaxed),
+            source_acquisition_wall_us: self.source_acquisition_wall_us.load(Ordering::Relaxed),
+            logical_demand_admission_us: self.logical_demand_admission_us.load(Ordering::Relaxed),
+            physical_demand_install_us: self.physical_demand_install_us.load(Ordering::Relaxed),
+            total_residency_service_us: self.total_residency_service_us.load(Ordering::Relaxed),
+            ram_cache_inserts: self.ram_cache_inserts.load(Ordering::Relaxed),
+            ram_cache_evictions: self.ram_cache_evictions.load(Ordering::Relaxed),
+            selected_route_ids_sha256: self.selected_route_ids.lock().hex(),
+            physical_missing_ids_sha256: self.physical_missing_ids.lock().hex(),
+            demand_source_request_ids_sha256: self.demand_source_request_ids.lock().hex(),
+            demand_ram_insert_ids_sha256: self.demand_ram_insert_ids.lock().hex(),
+            demand_ram_eviction_ids_sha256: self.demand_ram_eviction_ids.lock().hex(),
+            physical_victim_ids_sha256: self.physical_victim_ids.lock().hex(),
+            physical_residency_identity_sha256: self.physical_residency_identities.lock().hex(),
+            physical_install_attempts: self.physical_install_attempts.load(Ordering::Relaxed),
+            physical_install_completions: self.physical_install_completions.load(Ordering::Relaxed),
+            full_slot_vec_materializations: self
+                .full_slot_vec_materializations
+                .load(Ordering::Relaxed),
+            direct_staging_writes: self.direct_staging_writes.load(Ordering::Relaxed),
+            direct_staging_failures: self.direct_staging_failures.load(Ordering::Relaxed),
+            physical_slot_bytes_staged: self.physical_slot_bytes_staged.load(Ordering::Relaxed),
+            mapping_publications: self.mapping_publications.load(Ordering::Relaxed),
+            mapping_unpublications: self.mapping_unpublications.load(Ordering::Relaxed),
+            physical_slot_prepare_us: self.physical_slot_prepare_us.load(Ordering::Relaxed),
+            physical_queue_staging_us: self.physical_queue_staging_us.load(Ordering::Relaxed),
+            mapping_publication_us: self.mapping_publication_us.load(Ordering::Relaxed),
+            physical_install_total_us: self.physical_install_total_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
+    fn record_physical_victim(&self, global_id: u32) {
+        self.physical_victim_ids.lock().record_id(global_id);
+        self.mapping_unpublications
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_physical_install_attempt(&self) {
+        self.physical_install_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_direct_staging_failure(&self) {
+        self.direct_staging_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_physical_install_completion(
+        &self,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
+        evidence: GpuNativePhysicalInstallEvidence,
+        physical_install_total_us: u64,
+    ) {
+        self.physical_install_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.full_slot_vec_materializations
+            .fetch_add(evidence.full_slot_vec_materializations, Ordering::Relaxed);
+        self.direct_staging_writes
+            .fetch_add(evidence.direct_staging_writes, Ordering::Relaxed);
+        self.direct_staging_failures
+            .fetch_add(evidence.direct_staging_failures, Ordering::Relaxed);
+        self.physical_slot_bytes_staged
+            .fetch_add(evidence.physical_slot_bytes_staged, Ordering::Relaxed);
+        self.mapping_publications.fetch_add(1, Ordering::Relaxed);
+        self.physical_slot_prepare_us
+            .fetch_add(evidence.physical_slot_prepare_us, Ordering::Relaxed);
+        self.physical_queue_staging_us
+            .fetch_add(evidence.physical_queue_staging_us, Ordering::Relaxed);
+        self.mapping_publication_us
+            .fetch_add(evidence.mapping_publication_us, Ordering::Relaxed);
+        self.physical_install_total_us
+            .fetch_add(physical_install_total_us, Ordering::Relaxed);
+        self.physical_residency_identities
+            .lock()
+            .record_residency_identity(global_id, residency);
+    }
 }
 
 fn qualification_elapsed_us(start: Instant) -> u64 {
@@ -3675,14 +3901,25 @@ impl Engine {
         if current.active_demand_set.load(Ordering::Acquire) {
             return Err("cannot reset exact-demand source qualification during demand service".into());
         }
-        let arm = current.arm;
+        let purpose = current.purpose;
         let primary_pool_capacity = current.primary_pool_capacity;
         let shadow_pool_capacity = current.shadow_pool_capacity;
-        *slot = Some(Arc::new(GpuNativeDemandSourceQualification::new(
-            arm,
-            primary_pool_capacity,
-            shadow_pool_capacity,
-        )));
+        *slot = Some(Arc::new(match purpose {
+            GpuNativeQualificationPurpose::DemandSource(arm) => {
+                GpuNativeDemandSourceQualification::new(
+                    arm,
+                    primary_pool_capacity,
+                    shadow_pool_capacity,
+                )
+            }
+            GpuNativeQualificationPurpose::PhysicalInstallStaging(arm) => {
+                GpuNativeDemandSourceQualification::new_physical_install_staging(
+                    arm,
+                    primary_pool_capacity,
+                    shadow_pool_capacity,
+                )
+            }
+        }));
         self.production_demand_source.reset();
         Ok(())
     }
@@ -3693,7 +3930,56 @@ impl Engine {
         self.gpu_native_demand_source_qualification
             .read()
             .as_ref()
-            .map(|state| state.snapshot())
+            .and_then(|state| {
+                matches!(
+                    state.purpose,
+                    GpuNativeQualificationPurpose::DemandSource(_)
+                )
+                .then(|| state.snapshot())
+            })
+    }
+
+    /// Enable the isolated PR2-B-A seam on a fresh runtime. Both arms retain
+    /// the ordinary production source path; only treatment selects direct
+    /// queue staging for physical slot writes.
+    pub(crate) fn enable_gpu_native_physical_install_staging_qualification(
+        &self,
+        arm: GpuNativePhysicalInstallStagingQualificationArm,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err(
+                "cannot enable physical-install staging qualification with active singleflight entries or cache reservations"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        if slot.is_some() {
+            return Err("a GPU-native residency qualification is already enabled".into());
+        }
+        *slot = Some(Arc::new(
+            GpuNativeDemandSourceQualification::new_physical_install_staging(
+                arm,
+                self.core.pool.capacity(),
+                self.core.pool.shadow_capacity(),
+            ),
+        ));
+        self.production_demand_source.reset();
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_physical_install_staging_qualification_snapshot(
+        &self,
+    ) -> Option<GpuNativePhysicalInstallStagingQualificationSnapshot> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .and_then(|state| {
+                matches!(
+                    state.purpose,
+                    GpuNativeQualificationPurpose::PhysicalInstallStaging(_)
+                )
+                .then(|| state.physical_install_staging_snapshot())
+            })
     }
 
     pub(crate) fn production_demand_source_snapshot(&self) -> ProductionDemandSourceSnapshot {
@@ -4837,12 +5123,18 @@ impl Engine {
             state.record_source_set(global_ids);
         }
         let started = Instant::now();
-        let result = match qualification.as_ref().map(|state| state.arm) {
-            Some(GpuNativeDemandSourceQualificationArm::Control) => {
+        let result = match qualification.as_ref().map(|state| state.purpose) {
+            Some(GpuNativeQualificationPurpose::DemandSource(
+                GpuNativeDemandSourceQualificationArm::Control,
+            )) => {
                 self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
                     .await
             }
-            Some(GpuNativeDemandSourceQualificationArm::Treatment) | None => {
+            Some(GpuNativeQualificationPurpose::DemandSource(
+                GpuNativeDemandSourceQualificationArm::Treatment,
+            ))
+            | Some(GpuNativeQualificationPurpose::PhysicalInstallStaging(_))
+            | None => {
                 self.gpu_native_production_source_physical_missing_set(global_ids, residents)
                     .await
             }
@@ -5325,11 +5617,30 @@ impl Engine {
                 .collect::<Vec<_>>();
 
             let physical_install_started = Instant::now();
-            let physical_install_result = manager.ensure_demand_set(
-                GpuNativeResidencyPriority::Demand,
-                layer_index,
-                &demands,
-            );
+            let physical_install_result = match qualification.as_ref().map(|state| state.purpose) {
+                Some(GpuNativeQualificationPurpose::PhysicalInstallStaging(arm)) => {
+                    let state = qualification
+                        .as_ref()
+                        .expect("physical-install qualification state is present");
+                    let staging = match arm {
+                        GpuNativePhysicalInstallStagingQualificationArm::Control => {
+                            GpuNativePhysicalInstallStaging::FullSlotVec
+                        }
+                        GpuNativePhysicalInstallStagingQualificationArm::Treatment => {
+                            GpuNativePhysicalInstallStaging::DirectQueueStaging
+                        }
+                    };
+                    manager.ensure_demand_set_qualified(
+                        GpuNativeResidencyPriority::Demand,
+                        layer_index,
+                        &demands,
+                        staging,
+                        state.as_ref(),
+                    )
+                }
+                Some(GpuNativeQualificationPurpose::DemandSource(_)) | None => manager
+                    .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands),
+            };
             if let Some(state) = qualification.as_ref() {
                 state.physical_demand_install_us.fetch_add(
                     qualification_elapsed_us(physical_install_started),
