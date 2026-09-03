@@ -2266,6 +2266,16 @@ pub(crate) struct GpuNativePhysicalInstallEvidence {
     pub(crate) mapping_publication_us: u64,
 }
 
+/// Qualification-only half-transaction produced after an exact physical slot
+/// has been filled through `Queue::write_buffer_with`, but before its logical
+/// mapping or host arena residency has been published. The embedded permit
+/// remains active, so dropping an uncommitted value cancels the reservation.
+pub(crate) struct GpuNativeQ4ExpertPreparedInstall<'a, B = wgpu::Buffer> {
+    permit: GpuNativeQ4ExpertInstallPermit<'a, B>,
+    mapping: GpuNativeQ4ExpertMappingEntry,
+    mapping_offset: u64,
+}
+
 /// Compact cumulative telemetry for the ordinary production demand-install
 /// implementation. Setup uploads, the explicit qualifier control, and the
 /// unchanged speculative Vec path do not contribute to these counters.
@@ -3441,13 +3451,81 @@ pub(crate) struct GpuNativeQ4ExpertInstallPermit<'a, B = wgpu::Buffer> {
     active: bool,
 }
 
-impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
+impl<'arena, B> GpuNativeQ4ExpertInstallPermit<'arena, B> {
     pub(crate) const fn key(&self) -> GpuNativeQ4ExpertKey {
         self.key
     }
 
     pub(crate) const fn reserved_residency(&self) -> GpuNativeQ4ExpertResidency {
         self.residency
+    }
+
+    pub(crate) const fn install_ticket(&self) -> u64 {
+        self.install_ticket
+    }
+
+    fn reservation_current(&self, state: &GpuNativeQ4ExpertArenaState) -> bool {
+        let logical_id = self.key.expert_id as usize;
+        state.latest_generations.get(logical_id).copied().flatten()
+            == Some(self.key.logical_generation)
+            && state.logical_slots.get(logical_id).copied().flatten() == Some(self.flat_slot)
+            && matches!(
+                state.slots.get(self.flat_slot).map(|slot| slot.owner),
+                Some(GpuNativeQ4ExpertSlotOwner::Installing {
+                    key,
+                    slot_epoch,
+                    install_ticket,
+                }) if key == self.key
+                    && slot_epoch == self.residency.slot_epoch
+                    && install_ticket == self.install_ticket
+            )
+    }
+
+    /// Qualification-only staging half of an install transaction. Validation
+    /// and an exact reservation check happen before the arena lock is released;
+    /// the potentially multi-megabyte fill then runs without `arena.state`.
+    fn stage_with_checked_physical_writer<PhysicalWrite>(
+        self,
+        payload: &[u8],
+        mut physical_write: PhysicalWrite,
+    ) -> Result<GpuNativeQ4ExpertPreparedInstall<'arena, B>, GpuNativeBootstrapError>
+    where
+        PhysicalWrite:
+            FnMut(u32, u64, CheckedPhysicalQ4ExpertSlot<'_>) -> Result<(), GpuNativeBootstrapError>,
+    {
+        let checked = CheckedPhysicalQ4ExpertSlot::new(
+            self.arena.geometry,
+            self.key.expert_id,
+            self.residency.slot_epoch,
+            payload,
+        )?;
+        let mapping = self.residency.mapping_entry()?;
+        let logical_id = self.key.expert_id as usize;
+        let physical_offset = u64::from(self.residency.location.slot)
+            .checked_mul(self.arena.geometry.slot_stride_bytes as u64)
+            .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
+        let mapping_offset = u64::try_from(logical_id)
+            .ok()
+            .and_then(|id| id.checked_mul(GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64))
+            .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
+
+        {
+            let mut state = self.arena.state.lock();
+            if !self.reservation_current(&state) {
+                state.counters.expert_stale_install_rejections = state
+                    .counters
+                    .expert_stale_install_rejections
+                    .saturating_add(1);
+                return Err(GpuNativeBootstrapError::ExpertInstallReservationLost);
+            }
+        }
+
+        physical_write(self.residency.location.bank, physical_offset, checked)?;
+        Ok(GpuNativeQ4ExpertPreparedInstall {
+            permit: self,
+            mapping,
+            mapping_offset,
+        })
     }
 
     fn install_with_writes<PhysicalWrite, MappingWrite>(
@@ -3535,20 +3613,7 @@ impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
             .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
 
         let mut state = self.arena.state.lock();
-        let reservation_current = state.latest_generations.get(logical_id).copied().flatten()
-            == Some(self.key.logical_generation)
-            && state.logical_slots.get(logical_id).copied().flatten() == Some(self.flat_slot)
-            && matches!(
-                state.slots.get(self.flat_slot).map(|slot| slot.owner),
-                Some(GpuNativeQ4ExpertSlotOwner::Installing {
-                    key,
-                    slot_epoch,
-                    install_ticket,
-                }) if key == self.key
-                    && slot_epoch == self.residency.slot_epoch
-                    && install_ticket == self.install_ticket
-            );
-        if !reservation_current {
+        if !self.reservation_current(&state) {
             state.counters.expert_stale_install_rejections = state
                 .counters
                 .expert_stale_install_rejections
@@ -3569,6 +3634,49 @@ impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
             state.counters.expert_mapping_publications.saturating_add(1);
         self.active = false;
         Ok(self.residency)
+    }
+}
+
+impl<B> GpuNativeQ4ExpertPreparedInstall<'_, B> {
+    pub(crate) const fn key(&self) -> GpuNativeQ4ExpertKey {
+        self.permit.key
+    }
+
+    pub(crate) const fn residency(&self) -> GpuNativeQ4ExpertResidency {
+        self.permit.residency
+    }
+
+    /// Publish and commit one already-staged slot. Rechecking the complete
+    /// reservation identity here prevents staged-but-stale bytes from ever
+    /// becoming executable.
+    fn commit_with_mapping_writer<MappingWrite>(
+        mut self,
+        mut mapping_write: MappingWrite,
+    ) -> Result<GpuNativeQ4ExpertResidency, GpuNativeBootstrapError>
+    where
+        MappingWrite: FnMut(u64, GpuNativeQ4ExpertMappingEntry),
+    {
+        let mut state = self.permit.arena.state.lock();
+        if !self.permit.reservation_current(&state) {
+            state.counters.expert_stale_install_rejections = state
+                .counters
+                .expert_stale_install_rejections
+                .saturating_add(1);
+            return Err(GpuNativeBootstrapError::ExpertInstallReservationLost);
+        }
+
+        mapping_write(self.mapping_offset, self.mapping);
+        state.slots[self.permit.flat_slot].owner =
+            GpuNativeQ4ExpertSlotOwner::Resident(self.permit.residency);
+        state.slots[self.permit.flat_slot].ever_installed = true;
+        state.counters.expert_slot_installs = state.counters.expert_slot_installs.saturating_add(1);
+        if self.permit.reused {
+            state.counters.expert_slot_reuses = state.counters.expert_slot_reuses.saturating_add(1);
+        }
+        state.counters.expert_mapping_publications =
+            state.counters.expert_mapping_publications.saturating_add(1);
+        self.permit.active = false;
+        Ok(self.permit.residency)
     }
 }
 
@@ -7239,6 +7347,99 @@ impl GpuNativeExecutorContext {
                 mapping_publication_us: mapping_us.get(),
             },
         ))
+    }
+
+    /// Qualification-only physical staging phase. This deliberately does not
+    /// update ordinary production-install counters or publish a logical
+    /// mapping. The returned active permit must be committed in request order
+    /// or dropped to cancel its exact reservation.
+    pub(crate) fn stage_q4_expert_residency_qualification<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        let gpu = self.authoritative_gpu()?;
+        if permit.arena.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let arena = permit.arena;
+        let upload_bytes = arena.geometry.slot_stride_bytes as u64;
+        let prepare_us = std::cell::Cell::new(0u64);
+        let queue_staging_us = std::cell::Cell::new(0u64);
+        let validate_started = Instant::now();
+        let result = permit.stage_with_checked_physical_writer(payload, |bank, offset, checked| {
+            prepare_us.set(elapsed_us(validate_started));
+            let size = wgpu::BufferSize::new(upload_bytes)
+                .expect("validated physical expert slot is nonempty");
+            let queue_started = Instant::now();
+            let Some(mut view) =
+                gpu.queue
+                    .write_buffer_with(&arena.banks[bank as usize], offset, size)
+            else {
+                return Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable {
+                    bank,
+                    offset,
+                    bytes: upload_bytes,
+                });
+            };
+            queue_staging_us.set(elapsed_us(queue_started));
+            let fill_started = Instant::now();
+            checked.fill(view.as_mut())?;
+            prepare_us.set(prepare_us.get().saturating_add(elapsed_us(fill_started)));
+            let drop_started = Instant::now();
+            drop(view);
+            queue_staging_us.set(
+                queue_staging_us
+                    .get()
+                    .saturating_add(elapsed_us(drop_started)),
+            );
+            Ok(())
+        });
+        result.map(|prepared| {
+            (
+                prepared,
+                GpuNativePhysicalInstallEvidence {
+                    full_slot_vec_materializations: 0,
+                    direct_staging_writes: 1,
+                    physical_slot_bytes_staged: upload_bytes,
+                    physical_slot_prepare_us: prepare_us.get(),
+                    physical_queue_staging_us: queue_staging_us.get(),
+                    mapping_publication_us: 0,
+                },
+            )
+        })
+    }
+
+    /// Qualification-only ordered publication/arena-commit phase for an
+    /// already-staged direct-write transaction.
+    pub(crate) fn commit_q4_expert_residency_qualification(
+        &self,
+        prepared: GpuNativeQ4ExpertPreparedInstall<'_>,
+        mut evidence: GpuNativePhysicalInstallEvidence,
+    ) -> Result<
+        (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
+        GpuNativeBootstrapError,
+    > {
+        let gpu = self.authoritative_gpu()?;
+        if prepared.permit.arena.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let arena = prepared.permit.arena;
+        let upload_bytes = arena.geometry.slot_stride_bytes as u64;
+        let mapping_started = Instant::now();
+        let residency = prepared.commit_with_mapping_writer(|offset, entry| {
+            gpu.queue
+                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+        })?;
+        evidence.mapping_publication_us = elapsed_us(mapping_started);
+        self.counters.record_expert_residency_upload(upload_bytes);
+        Ok((residency, evidence))
     }
 
     /// Preserve the pre-PR2-B-A.1 full-slot Vec implementation for the
@@ -10959,6 +11160,282 @@ pub(crate) mod tests {
         assert_eq!(reservation_arena.residency_snapshot().installing_slots, 1);
         drop(new_permit);
         assert_eq!(reservation_arena.residency_snapshot().free_slots, 1);
+    }
+
+    #[test]
+    fn native_direct_staging_worker_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+
+        assert_send_sync::<wgpu::Queue>();
+        assert_send_sync::<wgpu::Buffer>();
+        assert_send_sync::<wgpu::QueueWriteBufferView<'static>>();
+        assert_send::<GpuNativeQ4ExpertInstallPermit<'static>>();
+        assert_send::<GpuNativeQ4ExpertPreparedInstall<'static>>();
+    }
+
+    #[test]
+    fn split_physical_install_stages_without_publication_then_commits_once() {
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, -0.02, 0.005);
+        let key = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let permit = expect_expert_install(arena.acquire_with_unpublish(key, |_, _| {}).unwrap());
+        let physical = RefCell::new(Vec::new());
+        let prepared = permit
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0xa5; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)?;
+                *physical.borrow_mut() = destination;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(prepared.key(), key);
+        assert_eq!(arena.residency_snapshot().installing_slots, 1);
+        assert_eq!(arena.residency_snapshot().resident_slots, 0);
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 0);
+        assert_eq!(physical.borrow()[..4], 1u32.to_le_bytes());
+
+        let mappings = RefCell::new(Vec::new());
+        let residency = prepared
+            .commit_with_mapping_writer(|offset, entry| {
+                mappings.borrow_mut().push((offset, entry));
+            })
+            .unwrap();
+        assert_eq!(mappings.borrow().len(), 1);
+        assert_eq!(mappings.borrow()[0].1, residency.mapping_entry().unwrap());
+        assert!(arena.contains_exact_residency(7, residency));
+        let snapshot = arena.residency_snapshot();
+        assert_eq!(snapshot.resident_slots, 1);
+        assert_eq!(snapshot.expert_slot_installs, 1);
+        assert_eq!(snapshot.expert_mapping_publications, 1);
+    }
+
+    #[test]
+    fn reversed_stage_completion_preserves_reservation_and_publication_order() {
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(2);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let key_a = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let key_b = GpuNativeQ4ExpertKey::new(3, 8, 11);
+        let permit_a =
+            expect_expert_install(arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap());
+        let permit_b =
+            expect_expert_install(arena.acquire_with_unpublish(key_b, |_, _| {}).unwrap());
+        let residency_a = permit_a.reserved_residency();
+        let residency_b = permit_b.reserved_residency();
+        assert_eq!(residency_a.location().slot(), 0);
+        assert_eq!(residency_b.location().slot(), 1);
+        assert_eq!(residency_a.slot_epoch(), 1);
+        assert_eq!(residency_b.slot_epoch(), 1);
+        let stride = arena.geometry().slot_stride_bytes() as u64;
+        assert!(
+            u64::from(residency_a.location().slot()) * stride + stride
+                <= u64::from(residency_b.location().slot()) * stride
+        );
+
+        // Finish B's physical work before A's to model reversed workers.
+        let prepared_b = permit_b
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let prepared_a = permit_a
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let publications = RefCell::new(Vec::new());
+        let committed_a = prepared_a
+            .commit_with_mapping_writer(|_, entry| publications.borrow_mut().push(entry))
+            .unwrap();
+        let committed_b = prepared_b
+            .commit_with_mapping_writer(|_, entry| publications.borrow_mut().push(entry))
+            .unwrap();
+        assert_eq!(
+            publications.borrow().as_slice(),
+            &[
+                committed_a.mapping_entry().unwrap(),
+                committed_b.mapping_entry().unwrap(),
+            ]
+        );
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 2);
+    }
+
+    #[test]
+    fn split_install_widths_one_through_eight_match_sequential_slot_identity_and_order() {
+        for width in 1usize..=8 {
+            let control = test_mutable_expert_arena(width);
+            let treatment = test_mutable_expert_arena(width);
+            let payload = q4_uniform_expert(control.geometry(), 0.01, -0.02, 0.005);
+            let keys = (0..width as u32)
+                .map(|expert_id| GpuNativeQ4ExpertKey::new(3, expert_id, 10 + expert_id as u64))
+                .collect::<Vec<_>>();
+
+            let mut control_residencies = Vec::with_capacity(width);
+            for &key in &keys {
+                let permit = expect_expert_install(
+                    control.acquire_with_unpublish(key, |_, _| {}).unwrap(),
+                );
+                control_residencies.push(
+                    permit
+                        .install_with_checked_physical_writer(
+                            &payload,
+                            |_, _, checked| {
+                                let mut destination =
+                                    vec![0xa5; control.geometry().slot_stride_bytes()];
+                                checked.fill(&mut destination)
+                            },
+                            |_, _| {},
+                        )
+                        .unwrap(),
+                );
+            }
+
+            let permits = keys
+                .iter()
+                .map(|&key| {
+                    expect_expert_install(
+                        treatment.acquire_with_unpublish(key, |_, _| {}).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut prepared = permits
+                .into_iter()
+                .rev()
+                .map(|permit| {
+                    permit
+                        .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                            let mut destination =
+                                vec![0xa5; treatment.geometry().slot_stride_bytes()];
+                            checked.fill(&mut destination)
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            prepared.sort_by_key(|install| install.key().expert_id());
+            let treatment_residencies = prepared
+                .into_iter()
+                .map(|install| install.commit_with_mapping_writer(|_, _| {}).unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(treatment_residencies, control_residencies);
+            assert_eq!(treatment.residency_snapshot(), control.residency_snapshot());
+            for (index, residency) in treatment_residencies.iter().enumerate() {
+                assert_eq!(residency.location().slot(), index as u32);
+                assert_eq!(residency.slot_epoch(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn split_install_failed_and_later_prepared_permits_cancel_without_publication() {
+        use std::cell::Cell;
+
+        let arena = test_mutable_expert_arena(3);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, -0.02, 0.005);
+        let permits = (0..3u32)
+            .map(|expert_id| {
+                expect_expert_install(
+                    arena
+                        .acquire_with_unpublish(
+                            GpuNativeQ4ExpertKey::new(3, expert_id, 10),
+                            |_, _| {},
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let physical_attempts = Cell::new(0u64);
+        let mut results = permits
+            .into_iter()
+            .enumerate()
+            .map(|(index, permit)| {
+                permit.stage_with_checked_physical_writer(&payload, |bank, offset, checked| {
+                    physical_attempts.set(physical_attempts.get() + 1);
+                    if index == 1 {
+                        return Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable {
+                            bank,
+                            offset,
+                            bytes: arena.geometry().slot_stride_bytes() as u64,
+                        });
+                    }
+                    let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                    checked.fill(&mut destination)
+                })
+            })
+            .collect::<Vec<_>>();
+        let first = results.remove(0).unwrap();
+        assert!(matches!(
+            results.remove(0),
+            Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable { .. })
+        ));
+        let later = results.remove(0).unwrap();
+
+        first.commit_with_mapping_writer(|_, _| {}).unwrap();
+        drop(later);
+        assert_eq!(physical_attempts.get(), 3);
+        let snapshot = arena.residency_snapshot();
+        assert_eq!(snapshot.resident_slots, 1);
+        assert_eq!(snapshot.free_slots, 2);
+        assert_eq!(snapshot.expert_slot_installs, 1);
+        assert_eq!(snapshot.expert_mapping_publications, 1);
+        assert_eq!(snapshot.expert_install_cancellations, 2);
+    }
+
+    #[test]
+    fn split_install_reservation_loss_before_stage_or_commit_never_publishes() {
+        use std::cell::Cell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let old_key = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let newer_key = GpuNativeQ4ExpertKey::new(3, 7, 11);
+
+        let before_stage =
+            expect_expert_install(arena.acquire_with_unpublish(old_key, |_, _| {}).unwrap());
+        let newer =
+            expect_expert_install(arena.acquire_with_unpublish(newer_key, |_, _| {}).unwrap());
+        let writes = Cell::new(0);
+        assert!(matches!(
+            before_stage.stage_with_checked_physical_writer(&payload, |_, _, _| {
+                writes.set(writes.get() + 1);
+                Ok(())
+            }),
+            Err(GpuNativeBootstrapError::ExpertInstallReservationLost)
+        ));
+        assert_eq!(writes.get(), 0);
+        drop(newer);
+
+        let stage_key = GpuNativeQ4ExpertKey::new(3, 7, 12);
+        let superseding_key = GpuNativeQ4ExpertKey::new(3, 7, 13);
+        let stage_permit =
+            expect_expert_install(arena.acquire_with_unpublish(stage_key, |_, _| {}).unwrap());
+        let prepared = stage_permit
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                writes.set(writes.get() + 1);
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let superseding = expect_expert_install(
+            arena
+                .acquire_with_unpublish(superseding_key, |_, _| {})
+                .unwrap(),
+        );
+        let mappings = Cell::new(0);
+        assert_eq!(
+            prepared.commit_with_mapping_writer(|_, _| mappings.set(mappings.get() + 1)),
+            Err(GpuNativeBootstrapError::ExpertInstallReservationLost)
+        );
+        assert_eq!(mappings.get(), 0);
+        assert_eq!(arena.residency_snapshot().resident_slots, 0);
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 0);
+        drop(superseding);
     }
 
     #[test]

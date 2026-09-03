@@ -511,10 +511,20 @@ pub(crate) enum GpuNativePhysicalInstallStagingQualificationArm {
     Treatment,
 }
 
+/// Explicit PR2-B-B arm. The treatment seam is qualification-only and cannot
+/// be selected through `EngineOptions` or TOML.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GpuNativePhysicalInstallConcurrencyQualificationArm {
+    Control,
+    Treatment,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GpuNativeQualificationPurpose {
     DemandSource(GpuNativeDemandSourceQualificationArm),
     PhysicalInstallStaging(GpuNativePhysicalInstallStagingQualificationArm),
+    PhysicalInstallConcurrency(GpuNativePhysicalInstallConcurrencyQualificationArm),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -564,6 +574,85 @@ pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
     pub(crate) physical_queue_staging_us: u64,
     pub(crate) mapping_publication_us: u64,
     pub(crate) physical_install_total_us: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
+    pub(crate) arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
+    pub(crate) qualification_only: bool,
+    pub(crate) normal_production_default_changed: bool,
+    pub(crate) control_uses_ordinary_sequential_direct_staging: bool,
+    pub(crate) treatment_uses_qualification_only_parallel_direct_staging: bool,
+    pub(crate) single_request_stream: bool,
+    pub(crate) overlapping_demand_sets: u64,
+    pub(crate) primary_pool_capacity: usize,
+    pub(crate) shadow_pool_capacity: usize,
+    pub(crate) demand_sets: u64,
+    pub(crate) physical_missing_experts: u64,
+    pub(crate) physical_probe_us: u64,
+    pub(crate) source_sets: u64,
+    pub(crate) source_experts: u64,
+    pub(crate) demand_source_requests: u64,
+    pub(crate) source_ram_hits: u64,
+    pub(crate) source_ram_misses: u64,
+    pub(crate) source_nvme_reads: u64,
+    pub(crate) source_nvme_bytes: u64,
+    pub(crate) source_acquisition_wall_us: u64,
+    pub(crate) logical_demand_admission_us: u64,
+    pub(crate) physical_demand_install_us: u64,
+    pub(crate) total_residency_service_us: u64,
+    pub(crate) ram_cache_inserts: u64,
+    pub(crate) ram_cache_evictions: u64,
+    pub(crate) selected_route_ids_sha256: String,
+    pub(crate) physical_missing_ids_sha256: String,
+    pub(crate) demand_source_request_ids_sha256: String,
+    pub(crate) demand_ram_insert_ids_sha256: String,
+    pub(crate) demand_ram_eviction_ids_sha256: String,
+    pub(crate) physical_victim_ids_sha256: String,
+    pub(crate) physical_residency_identity_sha256: String,
+    pub(crate) reservation_identity_sha256: String,
+    pub(crate) physical_install_attempts: u64,
+    pub(crate) physical_install_completions: u64,
+    pub(crate) full_slot_vec_materializations: u64,
+    pub(crate) direct_staging_writes: u64,
+    pub(crate) direct_staging_failures: u64,
+    pub(crate) physical_slot_bytes_staged: u64,
+    pub(crate) mapping_publications: u64,
+    pub(crate) mapping_unpublications: u64,
+    pub(crate) physical_slot_prepare_us: u64,
+    pub(crate) physical_queue_staging_us: u64,
+    pub(crate) mapping_publication_us: u64,
+    pub(crate) physical_install_total_us: u64,
+    pub(crate) physical_install_sets: u64,
+    pub(crate) physical_install_experts: u64,
+    pub(crate) install_set_width_min: u64,
+    pub(crate) install_set_width_max: u64,
+    pub(crate) install_set_width_mean: f64,
+    pub(crate) parallel_eligible_sets: u64,
+    pub(crate) parallel_eligible_experts: u64,
+    pub(crate) parallel_staging_sets: u64,
+    pub(crate) parallel_staging_experts: u64,
+    pub(crate) singleton_staging_sets: u64,
+    pub(crate) reservation_attempts: u64,
+    pub(crate) reservation_successes: u64,
+    pub(crate) reservation_failures: u64,
+    pub(crate) physical_stage_attempts: u64,
+    pub(crate) physical_stage_completions: u64,
+    pub(crate) physical_stage_failures: u64,
+    pub(crate) physical_bytes_staged: u64,
+    pub(crate) ordered_commit_attempts: u64,
+    pub(crate) ordered_commit_completions: u64,
+    pub(crate) ordered_commit_failures: u64,
+    pub(crate) ordered_commit_violations: u64,
+    pub(crate) max_in_flight_physical_staging: u64,
+    pub(crate) physical_reservation_us: u64,
+    pub(crate) physical_parallel_stage_wall_us: u64,
+    pub(crate) sum_individual_physical_stage_us: u64,
+    pub(crate) physical_ordered_commit_us: u64,
+    pub(crate) physical_install_transaction_us: u64,
+    pub(crate) unpublished_physical_writes_after_failure: u64,
+    pub(crate) rayon_num_threads: u64,
+    pub(crate) caller_was_already_rayon_worker: bool,
 }
 
 /// Cumulative production-path evidence. These atomics are always present and
@@ -816,6 +905,22 @@ impl QualificationOrderedHasher {
         self.inner.update(residency.slot_epoch().to_le_bytes());
     }
 
+    fn record_reservation_identity(
+        &mut self,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
+        install_ticket: u64,
+    ) {
+        self.inner.update([0x51]);
+        self.inner.update(global_id.to_le_bytes());
+        self.inner
+            .update(residency.key().logical_generation().to_le_bytes());
+        self.inner.update(residency.location().bank().to_le_bytes());
+        self.inner.update(residency.location().slot().to_le_bytes());
+        self.inner.update(residency.slot_epoch().to_le_bytes());
+        self.inner.update(install_ticket.to_le_bytes());
+    }
+
     fn hex(&self) -> String {
         format!("{:x}", self.inner.clone().finalize())
     }
@@ -910,6 +1015,38 @@ struct GpuNativeDemandSourceQualification {
     physical_queue_staging_us: AtomicU64,
     mapping_publication_us: AtomicU64,
     physical_install_total_us: AtomicU64,
+    physical_install_sets: AtomicU64,
+    physical_install_experts: AtomicU64,
+    install_set_width_min: AtomicU64,
+    install_set_width_max: AtomicU64,
+    install_set_width_sum: AtomicU64,
+    parallel_eligible_sets: AtomicU64,
+    parallel_eligible_experts: AtomicU64,
+    parallel_staging_sets: AtomicU64,
+    parallel_staging_experts: AtomicU64,
+    singleton_staging_sets: AtomicU64,
+    reservation_attempts: AtomicU64,
+    reservation_successes: AtomicU64,
+    reservation_failures: AtomicU64,
+    physical_stage_attempts: AtomicU64,
+    physical_stage_completions: AtomicU64,
+    physical_stage_failures: AtomicU64,
+    physical_bytes_staged: AtomicU64,
+    ordered_commit_attempts: AtomicU64,
+    ordered_commit_completions: AtomicU64,
+    ordered_commit_failures: AtomicU64,
+    ordered_commit_violations: AtomicU64,
+    active_physical_staging: AtomicU64,
+    max_in_flight_physical_staging: AtomicU64,
+    physical_reservation_us: AtomicU64,
+    physical_parallel_stage_wall_us: AtomicU64,
+    sum_individual_physical_stage_us: AtomicU64,
+    physical_ordered_commit_us: AtomicU64,
+    physical_install_transaction_us: AtomicU64,
+    unpublished_physical_writes_after_failure: AtomicU64,
+    rayon_num_threads: AtomicU64,
+    caller_was_already_rayon_worker: AtomicBool,
+    reservation_identities: parking_lot::Mutex<QualificationOrderedHasher>,
 }
 
 impl GpuNativeDemandSourceQualification {
@@ -971,6 +1108,38 @@ impl GpuNativeDemandSourceQualification {
             physical_queue_staging_us: AtomicU64::new(0),
             mapping_publication_us: AtomicU64::new(0),
             physical_install_total_us: AtomicU64::new(0),
+            physical_install_sets: AtomicU64::new(0),
+            physical_install_experts: AtomicU64::new(0),
+            install_set_width_min: AtomicU64::new(u64::MAX),
+            install_set_width_max: AtomicU64::new(0),
+            install_set_width_sum: AtomicU64::new(0),
+            parallel_eligible_sets: AtomicU64::new(0),
+            parallel_eligible_experts: AtomicU64::new(0),
+            parallel_staging_sets: AtomicU64::new(0),
+            parallel_staging_experts: AtomicU64::new(0),
+            singleton_staging_sets: AtomicU64::new(0),
+            reservation_attempts: AtomicU64::new(0),
+            reservation_successes: AtomicU64::new(0),
+            reservation_failures: AtomicU64::new(0),
+            physical_stage_attempts: AtomicU64::new(0),
+            physical_stage_completions: AtomicU64::new(0),
+            physical_stage_failures: AtomicU64::new(0),
+            physical_bytes_staged: AtomicU64::new(0),
+            ordered_commit_attempts: AtomicU64::new(0),
+            ordered_commit_completions: AtomicU64::new(0),
+            ordered_commit_failures: AtomicU64::new(0),
+            ordered_commit_violations: AtomicU64::new(0),
+            active_physical_staging: AtomicU64::new(0),
+            max_in_flight_physical_staging: AtomicU64::new(0),
+            physical_reservation_us: AtomicU64::new(0),
+            physical_parallel_stage_wall_us: AtomicU64::new(0),
+            sum_individual_physical_stage_us: AtomicU64::new(0),
+            physical_ordered_commit_us: AtomicU64::new(0),
+            physical_install_transaction_us: AtomicU64::new(0),
+            unpublished_physical_writes_after_failure: AtomicU64::new(0),
+            rayon_num_threads: AtomicU64::new(0),
+            caller_was_already_rayon_worker: AtomicBool::new(false),
+            reservation_identities: parking_lot::Mutex::new(QualificationOrderedHasher::default()),
         }
     }
 
@@ -985,6 +1154,20 @@ impl GpuNativeDemandSourceQualification {
             shadow_pool_capacity,
         );
         state.purpose = GpuNativeQualificationPurpose::PhysicalInstallStaging(arm);
+        state
+    }
+
+    fn new_physical_install_concurrency(
+        arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
+        primary_pool_capacity: usize,
+        shadow_pool_capacity: usize,
+    ) -> Self {
+        let mut state = Self::new(
+            GpuNativeDemandSourceQualificationArm::Treatment,
+            primary_pool_capacity,
+            shadow_pool_capacity,
+        );
+        state.purpose = GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm);
         state
     }
 
@@ -1148,6 +1331,121 @@ impl GpuNativeDemandSourceQualification {
             physical_install_total_us: self.physical_install_total_us.load(Ordering::Relaxed),
         }
     }
+
+    fn physical_install_concurrency_snapshot(
+        &self,
+    ) -> GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
+        let GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm) = self.purpose else {
+            unreachable!("physical-install concurrency snapshot requested for another qualifier")
+        };
+        let sets = self.physical_install_sets.load(Ordering::Relaxed);
+        let width_min = self.install_set_width_min.load(Ordering::Relaxed);
+        GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
+            arm,
+            qualification_only: true,
+            normal_production_default_changed: false,
+            control_uses_ordinary_sequential_direct_staging: matches!(
+                arm,
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Control
+            ),
+            treatment_uses_qualification_only_parallel_direct_staging: matches!(
+                arm,
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            ),
+            single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
+            overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
+            primary_pool_capacity: self.primary_pool_capacity,
+            shadow_pool_capacity: self.shadow_pool_capacity,
+            demand_sets: self.demand_sets.load(Ordering::Relaxed),
+            physical_missing_experts: self.physical_missing_experts.load(Ordering::Relaxed),
+            physical_probe_us: self.physical_probe_us.load(Ordering::Relaxed),
+            source_sets: self.source_sets.load(Ordering::Relaxed),
+            source_experts: self.source_experts.load(Ordering::Relaxed),
+            demand_source_requests: self.demand_source_requests.load(Ordering::Relaxed),
+            source_ram_hits: self.source_ram_hits.load(Ordering::Relaxed),
+            source_ram_misses: self.source_ram_misses.load(Ordering::Relaxed),
+            source_nvme_reads: self.source_nvme_reads.load(Ordering::Relaxed),
+            source_nvme_bytes: self.source_nvme_bytes.load(Ordering::Relaxed),
+            source_acquisition_wall_us: self.source_acquisition_wall_us.load(Ordering::Relaxed),
+            logical_demand_admission_us: self.logical_demand_admission_us.load(Ordering::Relaxed),
+            physical_demand_install_us: self.physical_demand_install_us.load(Ordering::Relaxed),
+            total_residency_service_us: self.total_residency_service_us.load(Ordering::Relaxed),
+            ram_cache_inserts: self.ram_cache_inserts.load(Ordering::Relaxed),
+            ram_cache_evictions: self.ram_cache_evictions.load(Ordering::Relaxed),
+            selected_route_ids_sha256: self.selected_route_ids.lock().hex(),
+            physical_missing_ids_sha256: self.physical_missing_ids.lock().hex(),
+            demand_source_request_ids_sha256: self.demand_source_request_ids.lock().hex(),
+            demand_ram_insert_ids_sha256: self.demand_ram_insert_ids.lock().hex(),
+            demand_ram_eviction_ids_sha256: self.demand_ram_eviction_ids.lock().hex(),
+            physical_victim_ids_sha256: self.physical_victim_ids.lock().hex(),
+            physical_residency_identity_sha256: self.physical_residency_identities.lock().hex(),
+            reservation_identity_sha256: self.reservation_identities.lock().hex(),
+            physical_install_attempts: self.physical_install_attempts.load(Ordering::Relaxed),
+            physical_install_completions: self.physical_install_completions.load(Ordering::Relaxed),
+            full_slot_vec_materializations: self
+                .full_slot_vec_materializations
+                .load(Ordering::Relaxed),
+            direct_staging_writes: self.direct_staging_writes.load(Ordering::Relaxed),
+            direct_staging_failures: self.direct_staging_failures.load(Ordering::Relaxed),
+            physical_slot_bytes_staged: self.physical_slot_bytes_staged.load(Ordering::Relaxed),
+            mapping_publications: self.mapping_publications.load(Ordering::Relaxed),
+            mapping_unpublications: self.mapping_unpublications.load(Ordering::Relaxed),
+            physical_slot_prepare_us: self.physical_slot_prepare_us.load(Ordering::Relaxed),
+            physical_queue_staging_us: self.physical_queue_staging_us.load(Ordering::Relaxed),
+            mapping_publication_us: self.mapping_publication_us.load(Ordering::Relaxed),
+            physical_install_total_us: self.physical_install_total_us.load(Ordering::Relaxed),
+            physical_install_sets: sets,
+            physical_install_experts: self.physical_install_experts.load(Ordering::Relaxed),
+            install_set_width_min: if sets == 0 || width_min == u64::MAX {
+                0
+            } else {
+                width_min
+            },
+            install_set_width_max: self.install_set_width_max.load(Ordering::Relaxed),
+            install_set_width_mean: if sets == 0 {
+                0.0
+            } else {
+                self.install_set_width_sum.load(Ordering::Relaxed) as f64 / sets as f64
+            },
+            parallel_eligible_sets: self.parallel_eligible_sets.load(Ordering::Relaxed),
+            parallel_eligible_experts: self.parallel_eligible_experts.load(Ordering::Relaxed),
+            parallel_staging_sets: self.parallel_staging_sets.load(Ordering::Relaxed),
+            parallel_staging_experts: self.parallel_staging_experts.load(Ordering::Relaxed),
+            singleton_staging_sets: self.singleton_staging_sets.load(Ordering::Relaxed),
+            reservation_attempts: self.reservation_attempts.load(Ordering::Relaxed),
+            reservation_successes: self.reservation_successes.load(Ordering::Relaxed),
+            reservation_failures: self.reservation_failures.load(Ordering::Relaxed),
+            physical_stage_attempts: self.physical_stage_attempts.load(Ordering::Relaxed),
+            physical_stage_completions: self.physical_stage_completions.load(Ordering::Relaxed),
+            physical_stage_failures: self.physical_stage_failures.load(Ordering::Relaxed),
+            physical_bytes_staged: self.physical_bytes_staged.load(Ordering::Relaxed),
+            ordered_commit_attempts: self.ordered_commit_attempts.load(Ordering::Relaxed),
+            ordered_commit_completions: self.ordered_commit_completions.load(Ordering::Relaxed),
+            ordered_commit_failures: self.ordered_commit_failures.load(Ordering::Relaxed),
+            ordered_commit_violations: self.ordered_commit_violations.load(Ordering::Relaxed),
+            max_in_flight_physical_staging: self
+                .max_in_flight_physical_staging
+                .load(Ordering::Relaxed),
+            physical_reservation_us: self.physical_reservation_us.load(Ordering::Relaxed),
+            physical_parallel_stage_wall_us: self
+                .physical_parallel_stage_wall_us
+                .load(Ordering::Relaxed),
+            sum_individual_physical_stage_us: self
+                .sum_individual_physical_stage_us
+                .load(Ordering::Relaxed),
+            physical_ordered_commit_us: self.physical_ordered_commit_us.load(Ordering::Relaxed),
+            physical_install_transaction_us: self
+                .physical_install_transaction_us
+                .load(Ordering::Relaxed),
+            unpublished_physical_writes_after_failure: self
+                .unpublished_physical_writes_after_failure
+                .load(Ordering::Relaxed),
+            rayon_num_threads: self.rayon_num_threads.load(Ordering::Relaxed),
+            caller_was_already_rayon_worker: self
+                .caller_was_already_rayon_worker
+                .load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
@@ -1160,10 +1458,28 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
     fn record_physical_install_attempt(&self) {
         self.physical_install_attempts
             .fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Control
+            )
+        ) {
+            self.physical_stage_attempts.fetch_add(1, Ordering::Relaxed);
+            self.max_in_flight_physical_staging
+                .fetch_max(1, Ordering::Relaxed);
+        }
     }
 
     fn record_direct_staging_failure(&self) {
         self.direct_staging_failures.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Control
+            )
+        ) {
+            self.physical_stage_failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_physical_install_completion(
@@ -1193,6 +1509,239 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         self.physical_residency_identities
             .lock()
             .record_residency_identity(global_id, residency);
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Control
+            )
+        ) {
+            let stage_us = evidence
+                .physical_slot_prepare_us
+                .saturating_add(evidence.physical_queue_staging_us);
+            self.physical_stage_completions
+                .fetch_add(1, Ordering::Relaxed);
+            self.physical_bytes_staged
+                .fetch_add(evidence.physical_slot_bytes_staged, Ordering::Relaxed);
+            self.sum_individual_physical_stage_us
+                .fetch_add(stage_us, Ordering::Relaxed);
+            self.physical_parallel_stage_wall_us
+                .fetch_add(stage_us, Ordering::Relaxed);
+            self.ordered_commit_attempts.fetch_add(1, Ordering::Relaxed);
+            self.ordered_commit_completions
+                .fetch_add(1, Ordering::Relaxed);
+            self.physical_ordered_commit_us
+                .fetch_add(evidence.mapping_publication_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_physical_install_set(
+        &self,
+        width: usize,
+        parallel: bool,
+        caller_in_rayon_worker: bool,
+        rayon_threads: usize,
+    ) {
+        if !matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            return;
+        }
+        let width = width as u64;
+        self.physical_install_sets.fetch_add(1, Ordering::Relaxed);
+        self.physical_install_experts
+            .fetch_add(width, Ordering::Relaxed);
+        self.install_set_width_min
+            .fetch_min(width, Ordering::Relaxed);
+        self.install_set_width_max
+            .fetch_max(width, Ordering::Relaxed);
+        self.install_set_width_sum
+            .fetch_add(width, Ordering::Relaxed);
+        if width >= 2 {
+            self.parallel_eligible_sets.fetch_add(1, Ordering::Relaxed);
+            self.parallel_eligible_experts
+                .fetch_add(width, Ordering::Relaxed);
+        }
+        if parallel {
+            self.parallel_staging_sets.fetch_add(1, Ordering::Relaxed);
+            self.parallel_staging_experts
+                .fetch_add(width, Ordering::Relaxed);
+        } else if width == 1 {
+            self.singleton_staging_sets.fetch_add(1, Ordering::Relaxed);
+        }
+        self.rayon_num_threads
+            .fetch_max(rayon_threads as u64, Ordering::Relaxed);
+        if caller_in_rayon_worker {
+            self.caller_was_already_rayon_worker
+                .store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn record_reservation_attempt(&self) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.reservation_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_reservation_success(
+        &self,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
+        install_ticket: u64,
+    ) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.reservation_successes.fetch_add(1, Ordering::Relaxed);
+            self.reservation_identities
+                .lock()
+                .record_reservation_identity(global_id, residency, install_ticket);
+        }
+    }
+
+    fn record_reservation_failure(&self) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.reservation_failures.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_physical_stage_started(&self) {
+        if !matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            return;
+        }
+        self.physical_stage_attempts.fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .active_physical_staging
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.max_in_flight_physical_staging
+            .fetch_max(active, Ordering::Relaxed);
+    }
+
+    fn record_physical_stage_completed(
+        &self,
+        evidence: GpuNativePhysicalInstallEvidence,
+        individual_stage_us: u64,
+    ) {
+        if !matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            return;
+        }
+        self.physical_stage_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.physical_bytes_staged
+            .fetch_add(evidence.physical_slot_bytes_staged, Ordering::Relaxed);
+        self.sum_individual_physical_stage_us
+            .fetch_add(individual_stage_us, Ordering::Relaxed);
+        self.active_physical_staging.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn record_physical_stage_failed(&self) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            self.physical_stage_failures.fetch_add(1, Ordering::Relaxed);
+            self.active_physical_staging.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn record_parallel_stage_wall(&self, wall_us: u64) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            self.physical_parallel_stage_wall_us
+                .fetch_add(wall_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_ordered_commit_attempt(&self) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            self.ordered_commit_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_ordered_commit_completed(&self, commit_us: u64) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(
+                GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            )
+        ) {
+            self.ordered_commit_completions
+                .fetch_add(1, Ordering::Relaxed);
+            self.physical_ordered_commit_us
+                .fetch_add(commit_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_ordered_commit_failed(&self, violation: bool) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.ordered_commit_failures.fetch_add(1, Ordering::Relaxed);
+            if violation {
+                self.ordered_commit_violations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_physical_reservation_wall(&self, wall_us: u64) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.physical_reservation_us
+                .fetch_add(wall_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_physical_install_transaction_wall(&self, wall_us: u64) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.physical_install_transaction_us
+                .fetch_add(wall_us, Ordering::Relaxed);
+        }
+    }
+
+    fn record_unpublished_physical_writes_after_failure(&self, count: u64) {
+        if matches!(
+            self.purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+        ) {
+            self.unpublished_physical_writes_after_failure
+                .fetch_add(count, Ordering::Relaxed);
+        }
     }
 }
 
@@ -3930,11 +4479,19 @@ impl Engine {
                     shadow_pool_capacity,
                 )
             }
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm) => {
+                GpuNativeDemandSourceQualification::new_physical_install_concurrency(
+                    arm,
+                    primary_pool_capacity,
+                    shadow_pool_capacity,
+                )
+            }
         }));
         self.production_demand_source.reset();
         if matches!(
             purpose,
             GpuNativeQualificationPurpose::PhysicalInstallStaging(_)
+                | GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
         ) {
             if let Some(manager) = self.core.gpu_native_residency.as_ref() {
                 manager.reset_production_physical_install_telemetry();
@@ -4001,6 +4558,49 @@ impl Engine {
                     GpuNativeQualificationPurpose::PhysicalInstallStaging(_)
                 )
                 .then(|| state.physical_install_staging_snapshot())
+            })
+    }
+
+    pub(crate) fn enable_gpu_native_physical_install_concurrency_qualification(
+        &self,
+        arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err(
+                "cannot enable physical-install concurrency qualification with active singleflight entries or cache reservations"
+                    .into(),
+            );
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        if slot.is_some() {
+            return Err("a GPU-native residency qualification is already enabled".into());
+        }
+        *slot = Some(Arc::new(
+            GpuNativeDemandSourceQualification::new_physical_install_concurrency(
+                arm,
+                self.core.pool.capacity(),
+                self.core.pool.shadow_capacity(),
+            ),
+        ));
+        self.production_demand_source.reset();
+        if let Some(manager) = self.core.gpu_native_residency.as_ref() {
+            manager.reset_production_physical_install_telemetry();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_physical_install_concurrency_qualification_snapshot(
+        &self,
+    ) -> Option<GpuNativePhysicalInstallConcurrencyQualificationSnapshot> {
+        self.gpu_native_demand_source_qualification
+            .read()
+            .as_ref()
+            .and_then(|state| {
+                matches!(
+                    state.purpose,
+                    GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                )
+                .then(|| state.physical_install_concurrency_snapshot())
             })
     }
 
@@ -5165,6 +5765,7 @@ impl Engine {
                 GpuNativeDemandSourceQualificationArm::Treatment,
             ))
             | Some(GpuNativeQualificationPurpose::PhysicalInstallStaging(_))
+            | Some(GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_))
             | None => {
                 self.gpu_native_production_source_physical_missing_set(global_ids, residents)
                     .await
@@ -5670,6 +6271,27 @@ impl Engine {
                                 state.as_ref(),
                             )
                         }
+                        }
+                    }
+                Some(GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm)) => {
+                    let state = qualification
+                        .as_ref()
+                        .expect("physical-install concurrency qualification state is present");
+                    match arm {
+                        GpuNativePhysicalInstallConcurrencyQualificationArm::Control => manager
+                            .ensure_demand_set_physical_install_concurrency_control(
+                                GpuNativeResidencyPriority::Demand,
+                                layer_index,
+                                &demands,
+                                state.as_ref(),
+                            ),
+                        GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment => manager
+                            .ensure_demand_set_physical_install_concurrency_treatment(
+                                GpuNativeResidencyPriority::Demand,
+                                layer_index,
+                                &demands,
+                                state.as_ref(),
+                            ),
                     }
                 }
                 Some(GpuNativeQualificationPurpose::DemandSource(_)) | None => manager
