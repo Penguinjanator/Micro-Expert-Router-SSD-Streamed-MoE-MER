@@ -1,7 +1,8 @@
-//! PR2-B-A qualification for direct physical-install queue staging. Both arms
-//! use the ordinary production source, admission, victim, install, and mapping
-//! paths in fresh runtimes; only the full-slot host staging mechanism differs.
+//! PR2-B-A.1 production qualification for direct physical-install queue
+//! staging. Control explicitly forces the legacy Vec writer; treatment uses
+//! the ordinary production demand-install path in a fresh runtime.
 
+use crate::backend::gpu_native::GpuNativeProductionPhysicalInstallSnapshot;
 use crate::backend::{GpuExpertIoSnapshot, GpuExpertMemorySnapshot};
 use crate::engine::{
     GpuNativePhysicalInstallStagingQualificationArm,
@@ -19,8 +20,8 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) const PRODUCTION_SCHEMA: &str = "mer.gpu-native-physical-install-staging.v1";
-pub(crate) const PRODUCTION_MODE: &str = "qualify-gpu-native-physical-install-staging";
+pub(crate) const PRODUCTION_SCHEMA: &str = "mer.gpu-native-physical-install-staging.v2";
+pub(crate) const PRODUCTION_MODE: &str = "qualify-gpu-native-physical-install-staging-production";
 pub(crate) const FROZEN_PROMPT: &str =
     "Write a Rust function that adds two i32 values and returns the result.";
 pub(crate) const FROZEN_OUTPUT_TOKENS: usize = 128;
@@ -85,11 +86,13 @@ pub(crate) struct ArmReport {
     isolated_runtime: bool,
     warmup_results: Vec<WarmupEvidence>,
     warmup_source: Option<GpuNativePhysicalInstallStagingQualificationSnapshot>,
+    warmup_production_physical_install: Option<GpuNativeProductionPhysicalInstallSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warmup_production: Option<ProductionDemandSourceSnapshot>,
     warmup_ram_cache_state_sha256: Option<String>,
     warmup_work: Option<ArmWorkEvidence>,
     source: Option<GpuNativePhysicalInstallStagingQualificationSnapshot>,
+    production_physical_install: Option<GpuNativeProductionPhysicalInstallSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     production: Option<ProductionDemandSourceSnapshot>,
     work: Option<ArmWorkEvidence>,
@@ -217,6 +220,10 @@ pub(crate) struct ProductionMechanismGate {
     staged_bytes_exact: bool,
     mapping_publications_exact: bool,
     treatment_staging_failures_zero: bool,
+    control_production_direct_staging_successes_zero: bool,
+    treatment_production_direct_staging_successes_gt_zero: bool,
+    treatment_direct_allocation_fallbacks_zero: bool,
+    treatment_production_install_failures_zero: bool,
     passed: bool,
 }
 
@@ -264,9 +271,12 @@ pub(crate) struct ProductionPerformanceComparison {
 pub(crate) struct ProductionQualificationReport {
     schema: &'static str,
     mode: &'static str,
-    normal_production_default_changed: bool,
-    control_uses_full_slot_vec: bool,
-    treatment_uses_direct_queue_staging: bool,
+    production_physical_install_changed: bool,
+    control_forces_legacy_full_slot_vec: bool,
+    treatment_uses_ordinary_production_path: bool,
+    normal_production_uses_direct_queue_staging: bool,
+    allocation_only_fallback_implemented: bool,
+    allocation_only_fallback_decision: &'static str,
     both_arms_use_ordinary_production_source: bool,
     pinned_wgpu_api_audit: WgpuApiAudit,
     timing_definitions: TimingDefinitions,
@@ -298,6 +308,7 @@ pub(crate) struct WgpuApiAudit {
     resolved_version: &'static str,
     supported_api: &'static str,
     exact_destination_range: bool,
+    none_distinguishes_allocation_from_validation: bool,
     schedules_at_next_submit: bool,
     adds_queue_submit: bool,
     adds_device_poll: bool,
@@ -745,6 +756,7 @@ async fn run_arm(
     }
 
     let mut warmup_source = None;
+    let mut warmup_production_physical_install = None;
     let mut warmup_production = None;
     let mut warmup_ram_cache_state_sha256 = None;
     let mut warmup_work = None;
@@ -762,6 +774,16 @@ async fn run_arm(
     }
     if execution_failure.is_none() {
         warmup_production = Some(runtime.engine.production_demand_source_snapshot());
+    }
+    if execution_failure.is_none() {
+        warmup_production_physical_install = runtime.engine.production_physical_install_snapshot();
+        if warmup_production_physical_install.is_none() {
+            execution_failure = Some(BenchmarkFailure::new(
+                "postcondition",
+                "missing-warmup-production-physical-install-snapshot",
+                "PR2-B-A.1 production physical-install counters disappeared after warmup",
+            ));
+        }
     }
     if execution_failure.is_none() {
         warmup_ram_cache_state_sha256 = runtime
@@ -835,6 +857,14 @@ async fn run_arm(
     let source = runtime
         .engine
         .gpu_native_physical_install_staging_qualification_snapshot();
+    let production_physical_install = runtime.engine.production_physical_install_snapshot();
+    if execution_failure.is_none() && production_physical_install.is_none() {
+        execution_failure = Some(BenchmarkFailure::new(
+            "postcondition",
+            "missing-production-physical-install-snapshot",
+            "PR2-B-A.1 production physical-install counters disappeared after measurement",
+        ));
+    }
     let production = Some(runtime.engine.production_demand_source_snapshot());
     let work = if execution_failure.is_none() {
         match start.expect("measurement start captured").finish(&runtime) {
@@ -877,10 +907,12 @@ async fn run_arm(
         isolated_runtime: true,
         warmup_results,
         warmup_source,
+        warmup_production_physical_install,
         warmup_production,
         warmup_ram_cache_state_sha256,
         warmup_work,
         source,
+        production_physical_install,
         production,
         work,
         benchmark,
@@ -1287,6 +1319,22 @@ fn production_gates(
         .warmup_source
         .as_ref()
         .expect("complete treatment warmup staging telemetry");
+    let cwpi = control
+        .warmup_production_physical_install
+        .as_ref()
+        .expect("complete control warmup production physical-install telemetry");
+    let twpi = treatment
+        .warmup_production_physical_install
+        .as_ref()
+        .expect("complete treatment warmup production physical-install telemetry");
+    let cpi = control
+        .production_physical_install
+        .as_ref()
+        .expect("complete control production physical-install telemetry");
+    let tpi = treatment
+        .production_physical_install
+        .as_ref()
+        .expect("complete treatment production physical-install telemetry");
     let cp = control
         .production
         .as_ref()
@@ -1315,7 +1363,17 @@ fn production_gates(
                 && treatment.mapping_publications == treatment.physical_install_completions
                 && treatment.direct_staging_failures == 0
         };
-    let warmup_mechanism_reconciled = pair_reconciles(cws, tws);
+    let warmup_mechanism_reconciled = pair_reconciles(cws, tws)
+        && cwpi.physical_install_attempts == 0
+        && cwpi.direct_staging_successes == 0
+        && cwpi.direct_staging_unavailable == 0
+        && cwpi.direct_staging_allocation_fallbacks == 0
+        && cwpi.physical_install_failures == 0
+        && twpi.physical_install_attempts == tws.physical_install_attempts
+        && twpi.direct_staging_successes == tws.physical_install_completions
+        && twpi.direct_staging_unavailable == 0
+        && twpi.direct_staging_allocation_fallbacks == 0
+        && twpi.physical_install_failures == 0;
     let control_vec_materializations_gt_zero = cs.full_slot_vec_materializations > 0;
     let control_direct_staging_writes_zero = cs.direct_staging_writes == 0;
     let treatment_direct_staging_writes_gt_zero = ts.direct_staging_writes > 0;
@@ -1330,6 +1388,17 @@ fn production_gates(
         && cs.mapping_publications == cs.physical_install_completions
         && ts.mapping_publications == ts.physical_install_completions;
     let treatment_staging_failures_zero = ts.direct_staging_failures == 0;
+    let control_production_direct_staging_successes_zero = cpi.physical_install_attempts == 0
+        && cpi.direct_staging_successes == 0
+        && cpi.direct_staging_unavailable == 0
+        && cpi.direct_staging_allocation_fallbacks == 0
+        && cpi.physical_install_failures == 0;
+    let treatment_production_direct_staging_successes_gt_zero = tpi.direct_staging_successes > 0
+        && tpi.physical_install_attempts == ts.physical_install_attempts
+        && tpi.direct_staging_successes == ts.physical_install_completions;
+    let treatment_direct_allocation_fallbacks_zero = tpi.direct_staging_allocation_fallbacks == 0;
+    let treatment_production_install_failures_zero =
+        tpi.direct_staging_unavailable == 0 && tpi.physical_install_failures == 0;
     let passed = warmup_mechanism_reconciled
         && control_vec_materializations_gt_zero
         && control_direct_staging_writes_zero
@@ -1340,6 +1409,10 @@ fn production_gates(
         && staged_bytes_exact
         && mapping_publications_exact
         && treatment_staging_failures_zero
+        && control_production_direct_staging_successes_zero
+        && treatment_production_direct_staging_successes_gt_zero
+        && treatment_direct_allocation_fallbacks_zero
+        && treatment_production_install_failures_zero
         && production_safety_zero(cp)
         && production_safety_zero(tp);
     ProductionGates {
@@ -1356,6 +1429,10 @@ fn production_gates(
             staged_bytes_exact,
             mapping_publications_exact,
             treatment_staging_failures_zero,
+            control_production_direct_staging_successes_zero,
+            treatment_production_direct_staging_successes_gt_zero,
+            treatment_direct_allocation_fallbacks_zero,
+            treatment_production_install_failures_zero,
             passed,
         },
     }
@@ -1480,15 +1557,19 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let mut report = ProductionQualificationReport {
         schema: PRODUCTION_SCHEMA,
         mode: PRODUCTION_MODE,
-        normal_production_default_changed: false,
-        control_uses_full_slot_vec: true,
-        treatment_uses_direct_queue_staging: true,
+        production_physical_install_changed: true,
+        control_forces_legacy_full_slot_vec: true,
+        treatment_uses_ordinary_production_path: true,
+        normal_production_uses_direct_queue_staging: true,
+        allocation_only_fallback_implemented: false,
+        allocation_only_fallback_decision: "not implemented: wgpu 0.20 Queue::write_buffer_with returns None for either destination validation failure or staging-buffer creation failure, so allocation-only fallback cannot be distinguished and proved without a WGPU API change",
         both_arms_use_ordinary_production_source: true,
         pinned_wgpu_api_audit: WgpuApiAudit {
             requested_version: "0.20",
             resolved_version: "0.20.1",
             supported_api: "Queue::write_buffer_with",
             exact_destination_range: true,
+            none_distinguishes_allocation_from_validation: false,
             schedules_at_next_submit: true,
             adds_queue_submit: false,
             adds_device_poll: false,
@@ -1497,10 +1578,10 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             uses_unsafe_internals: false,
         },
         timing_definitions: TimingDefinitions {
-            physical_slot_prepare_us: "validated host byte-layout preparation: control allocates/zeros/fills a full-slot Vec; treatment validates and fills the direct queue view",
-            physical_queue_staging_us: "control Queue::write_buffer call; treatment Queue::write_buffer_with view acquisition plus Drop scheduling, excluding view fill",
+            physical_slot_prepare_us: "qualification-only timing of validated host byte-layout preparation: control allocates/zeros/fills a full-slot Vec; treatment validates and fills the ordinary production direct queue view",
+            physical_queue_staging_us: "qualification-only timing of control Queue::write_buffer or ordinary-production Queue::write_buffer_with view acquisition plus Drop scheduling, excluding view fill",
             mapping_publication_us: "existing logical mapping Queue::write_buffer call after physical staging",
-            physical_install_total_us: "qualified per-install executor transaction from a validated install permit through physical staging, mapping publication, and host arena commit",
+            physical_install_total_us: "qualification-only per-install timer from a validated install permit through physical staging, mapping publication, and host arena commit; ordinary serving does not execute this timer",
             physical_demand_install_us: "existing aggregate Engine wall timer around the complete residency-manager demand-set transaction",
         },
         benchmark_complete: false,
@@ -1596,14 +1677,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frozen_pr2ba_contract_is_literal_and_versioned_separately() {
+    fn frozen_pr2ba1_production_contract_is_literal_and_versioned_separately() {
         assert_eq!(
             PRODUCTION_SCHEMA,
-            "mer.gpu-native-physical-install-staging.v1"
+            "mer.gpu-native-physical-install-staging.v2"
         );
         assert_eq!(
             PRODUCTION_MODE,
-            "qualify-gpu-native-physical-install-staging"
+            "qualify-gpu-native-physical-install-staging-production"
         );
         assert_eq!(
             FROZEN_CONFIG_PATH,

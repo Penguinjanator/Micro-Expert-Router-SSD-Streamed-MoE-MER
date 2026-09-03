@@ -15,7 +15,8 @@
 
 use crate::aligned_buffer::AlignedBuffer;
 use crate::backend::gpu_native::{
-    GpuNativePhysicalInstallEvidence, GpuNativePhysicalInstallStaging, GpuNativeQ4ExpertResidency,
+    GpuNativePhysicalInstallEvidence, GpuNativeProductionPhysicalInstallSnapshot,
+    GpuNativeQ4ExpertResidency,
 };
 use crate::backend::Backend as _;
 use crate::buffer_pool::BufferPool;
@@ -519,8 +520,11 @@ enum GpuNativeQualificationPurpose {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
     pub(crate) arm: GpuNativePhysicalInstallStagingQualificationArm,
-    pub(crate) qualification_only: bool,
-    pub(crate) normal_production_default_changed: bool,
+    pub(crate) qualification_telemetry_only: bool,
+    pub(crate) production_physical_install_changed: bool,
+    pub(crate) control_forces_legacy_full_slot_vec: bool,
+    pub(crate) treatment_uses_ordinary_production_path: bool,
+    pub(crate) normal_production_uses_direct_queue_staging: bool,
     pub(crate) single_request_stream: bool,
     pub(crate) overlapping_demand_sets: u64,
     pub(crate) primary_pool_capacity: usize,
@@ -1090,8 +1094,17 @@ impl GpuNativeDemandSourceQualification {
         };
         GpuNativePhysicalInstallStagingQualificationSnapshot {
             arm,
-            qualification_only: true,
-            normal_production_default_changed: false,
+            qualification_telemetry_only: true,
+            production_physical_install_changed: true,
+            control_forces_legacy_full_slot_vec: matches!(
+                arm,
+                GpuNativePhysicalInstallStagingQualificationArm::Control
+            ),
+            treatment_uses_ordinary_production_path: matches!(
+                arm,
+                GpuNativePhysicalInstallStagingQualificationArm::Treatment
+            ),
+            normal_production_uses_direct_queue_staging: true,
             single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
             overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
             primary_pool_capacity: self.primary_pool_capacity,
@@ -3921,6 +3934,14 @@ impl Engine {
             }
         }));
         self.production_demand_source.reset();
+        if matches!(
+            purpose,
+            GpuNativeQualificationPurpose::PhysicalInstallStaging(_)
+        ) {
+            if let Some(manager) = self.core.gpu_native_residency.as_ref() {
+                manager.reset_production_physical_install_telemetry();
+            }
+        }
         Ok(())
     }
 
@@ -3939,9 +3960,9 @@ impl Engine {
             })
     }
 
-    /// Enable the isolated PR2-B-A seam on a fresh runtime. Both arms retain
-    /// the ordinary production source path; only treatment selects direct
-    /// queue staging for physical slot writes.
+    /// Enable the isolated PR2-B-A.1 production qualifier on a fresh runtime.
+    /// Control explicitly forces the legacy Vec install; treatment observes
+    /// the same ordinary production demand-install path as normal serving.
     pub(crate) fn enable_gpu_native_physical_install_staging_qualification(
         &self,
         arm: GpuNativePhysicalInstallStagingQualificationArm,
@@ -3964,6 +3985,9 @@ impl Engine {
             ),
         ));
         self.production_demand_source.reset();
+        if let Some(manager) = self.core.gpu_native_residency.as_ref() {
+            manager.reset_production_physical_install_telemetry();
+        }
         Ok(())
     }
 
@@ -3985,6 +4009,15 @@ impl Engine {
     pub(crate) fn production_demand_source_snapshot(&self) -> ProductionDemandSourceSnapshot {
         self.production_demand_source
             .snapshot(self.core.cache.reserved_slots(), self.core.in_flight.len())
+    }
+
+    pub(crate) fn production_physical_install_snapshot(
+        &self,
+    ) -> Option<GpuNativeProductionPhysicalInstallSnapshot> {
+        self.core
+            .gpu_native_residency
+            .as_ref()
+            .map(|manager| manager.production_physical_install_snapshot())
     }
 
     pub(crate) fn gpu_native_demand_source_qualification_ram_cache_state_sha256(
@@ -5622,21 +5655,24 @@ impl Engine {
                     let state = qualification
                         .as_ref()
                         .expect("physical-install qualification state is present");
-                    let staging = match arm {
+                    match arm {
                         GpuNativePhysicalInstallStagingQualificationArm::Control => {
-                            GpuNativePhysicalInstallStaging::FullSlotVec
+                            manager.ensure_demand_set_legacy_control(
+                                GpuNativeResidencyPriority::Demand,
+                                layer_index,
+                                &demands,
+                                state.as_ref(),
+                            )
                         }
                         GpuNativePhysicalInstallStagingQualificationArm::Treatment => {
-                            GpuNativePhysicalInstallStaging::DirectQueueStaging
+                            manager.ensure_demand_set_production_observed(
+                                GpuNativeResidencyPriority::Demand,
+                                layer_index,
+                                &demands,
+                                state.as_ref(),
+                            )
                         }
-                    };
-                    manager.ensure_demand_set_qualified(
-                        GpuNativeResidencyPriority::Demand,
-                        layer_index,
-                        &demands,
-                        staging,
-                        state.as_ref(),
-                    )
+                    }
                 }
                 Some(GpuNativeQualificationPurpose::DemandSource(_)) | None => manager
                     .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands),

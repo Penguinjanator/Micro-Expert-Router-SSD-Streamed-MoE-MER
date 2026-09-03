@@ -9,7 +9,7 @@
 
 use crate::backend::gpu_native::{
     GpuNativeBootstrapError, GpuNativeExecutorContext, GpuNativePhysicalInstallEvidence,
-    GpuNativePhysicalInstallStaging, GpuNativeQ4ExpertAcquire, GpuNativeQ4ExpertArena,
+    GpuNativeProductionPhysicalInstallSnapshot, GpuNativeQ4ExpertAcquire, GpuNativeQ4ExpertArena,
     GpuNativeQ4ExpertGeometry, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertResidency,
     GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
 };
@@ -342,9 +342,23 @@ pub(crate) enum GpuNativeResidencyPriority {
     Speculative { score: f64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DemandPhysicalInstallPath {
+    Production,
+    LegacyFullSlotVecControl,
+}
+
+const fn ordinary_demand_install_path() -> DemandPhysicalInstallPath {
+    DemandPhysicalInstallPath::Production
+}
+
+const fn speculative_install_path() -> DemandPhysicalInstallPath {
+    DemandPhysicalInstallPath::LegacyFullSlotVecControl
+}
+
 /// Qualification observer kept outside ordinary serving. It receives only
 /// already-committed physical events in their production order, except that a
-/// direct-staging allocation failure is recorded explicitly before failing.
+/// direct-staging unavailability is recorded explicitly before failing.
 pub(crate) trait GpuNativePhysicalInstallObserver: Send + Sync {
     fn record_physical_victim(&self, global_id: u32);
     fn record_physical_install_attempt(&self);
@@ -553,6 +567,16 @@ impl GpuNativeTieredResidencyManager {
         &self.executor
     }
 
+    pub(crate) fn production_physical_install_snapshot(
+        &self,
+    ) -> GpuNativeProductionPhysicalInstallSnapshot {
+        self.executor.production_physical_install_snapshot()
+    }
+
+    pub(crate) fn reset_production_physical_install_telemetry(&self) {
+        self.executor.reset_production_physical_install_telemetry();
+    }
+
     pub(crate) fn gpu_cache(&self) -> &Arc<GpuExpertCache> {
         &self.gpu_cache
     }
@@ -645,20 +669,41 @@ impl GpuNativeTieredResidencyManager {
             priority,
             layer_index,
             demands,
-            GpuNativePhysicalInstallStaging::FullSlotVec,
+            ordinary_demand_install_path(),
             None,
         )
     }
 
-    pub(crate) fn ensure_demand_set_qualified(
+    pub(crate) fn ensure_demand_set_legacy_control(
         &self,
         priority: GpuNativeResidencyPriority,
         layer_index: usize,
         demands: &[GpuNativeDemandExpert],
-        staging: GpuNativePhysicalInstallStaging,
         observer: &dyn GpuNativePhysicalInstallObserver,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        self.ensure_demand_set_inner(priority, layer_index, demands, staging, Some(observer))
+        self.ensure_demand_set_inner(
+            priority,
+            layer_index,
+            demands,
+            DemandPhysicalInstallPath::LegacyFullSlotVecControl,
+            Some(observer),
+        )
+    }
+
+    pub(crate) fn ensure_demand_set_production_observed(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        self.ensure_demand_set_inner(
+            priority,
+            layer_index,
+            demands,
+            ordinary_demand_install_path(),
+            Some(observer),
+        )
     }
 
     fn ensure_demand_set_inner(
@@ -666,7 +711,7 @@ impl GpuNativeTieredResidencyManager {
         priority: GpuNativeResidencyPriority,
         layer_index: usize,
         demands: &[GpuNativeDemandExpert],
-        staging: GpuNativePhysicalInstallStaging,
+        install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
         if !matches!(priority, GpuNativeResidencyPriority::Demand) {
@@ -757,7 +802,14 @@ impl GpuNativeTieredResidencyManager {
                 unreachable!("miss list contains only install sources")
             };
             let residency = self.install_locked(
-                *global_id, resident, admission, layer, &mut state, false, staging, observer,
+                *global_id,
+                resident,
+                admission,
+                layer,
+                &mut state,
+                false,
+                install_path,
+                observer,
             )?;
             resolved[index] = Some(residency);
         }
@@ -824,7 +876,7 @@ impl GpuNativeTieredResidencyManager {
             layer,
             &mut state,
             true,
-            GpuNativePhysicalInstallStaging::FullSlotVec,
+            speculative_install_path(),
             None,
         ) {
             Ok(residency) => residency,
@@ -980,7 +1032,7 @@ impl GpuNativeTieredResidencyManager {
         layer: &LayerResidency,
         state: &mut MutexGuard<'_, LayerResidencyState>,
         speculative: bool,
-        staging: GpuNativePhysicalInstallStaging,
+        install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
     ) -> Result<GpuNativeQ4ExpertResidency, GpuNativeTieredResidencyError> {
         let identity = self.identity(global_id)?;
@@ -999,11 +1051,18 @@ impl GpuNativeTieredResidencyManager {
                 if let Some(observer) = observer {
                     observer.record_physical_install_attempt();
                     let started = Instant::now();
-                    match self.executor.install_q4_expert_residency_qualified(
-                        permit,
-                        resident.data(),
-                        staging,
-                    ) {
+                    let result = match install_path {
+                        DemandPhysicalInstallPath::Production => self
+                            .executor
+                            .install_q4_expert_residency_production_observed(
+                                permit,
+                                resident.data(),
+                            ),
+                        DemandPhysicalInstallPath::LegacyFullSlotVecControl => self
+                            .executor
+                            .install_q4_expert_residency_legacy_observed(permit, resident.data()),
+                    };
+                    match result {
                         Ok((residency, evidence)) => {
                             observer.record_physical_install_completion(
                                 global_id,
@@ -1024,11 +1083,15 @@ impl GpuNativeTieredResidencyManager {
                         }
                     }
                 } else {
-                    (
-                        self.executor
+                    let residency = match install_path {
+                        DemandPhysicalInstallPath::Production => self
+                            .executor
                             .install_q4_expert_residency(permit, resident.data())?,
-                        true,
-                    )
+                        DemandPhysicalInstallPath::LegacyFullSlotVecControl => self
+                            .executor
+                            .install_q4_expert_residency_legacy(permit, resident.data())?,
+                    };
+                    (residency, true)
                 }
             }
             GpuNativeQ4ExpertAcquire::InstallInProgress => {
@@ -1128,6 +1191,18 @@ mod tests {
             max_compute_invocations_per_workgroup: 64,
             ..wgpu::Limits::default()
         }
+    }
+
+    #[test]
+    fn ordinary_and_v2_treatment_share_production_while_speculation_stays_legacy() {
+        assert_eq!(
+            ordinary_demand_install_path(),
+            DemandPhysicalInstallPath::Production
+        );
+        assert_eq!(
+            speculative_install_path(),
+            DemandPhysicalInstallPath::LegacyFullSlotVecControl
+        );
     }
 
     #[test]

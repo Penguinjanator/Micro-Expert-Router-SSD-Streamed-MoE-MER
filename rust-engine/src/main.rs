@@ -925,17 +925,17 @@ enum Cmd {
         report_out: PathBuf,
     },
 
-    /// Qualification-only PR2-B-A control/treatment comparison of ordinary
-    /// full-slot Vec staging against WGPU direct queue staging.
-    #[command(name = "qualify-gpu-native-physical-install-staging")]
-    QualifyGpuNativePhysicalInstallStaging {
+    /// Production-path PR2-B-A.1 control/treatment qualification. Control
+    /// forces legacy Vec staging; treatment exercises ordinary production.
+    #[command(name = "qualify-gpu-native-physical-install-staging-production")]
+    QualifyGpuNativePhysicalInstallStagingProduction {
         /// Exact frozen PR2 GPU-native TOML config path.
         #[arg(long)]
         config: PathBuf,
         /// Exact authoritative adapter name required for both isolated arms.
         #[arg(long)]
         expected_adapter_name: String,
-        /// Required destination for the typed v1 qualification report.
+        /// Required destination for the typed v2 qualification report.
         #[arg(long)]
         report_out: PathBuf,
     },
@@ -1891,7 +1891,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
-        | Cmd::QualifyGpuNativePhysicalInstallStaging { config, .. }
+        | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2337,7 +2337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::QualifyGpuNativePhysicalInstallStaging {
+        Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
             config,
             expected_adapter_name,
             report_out,
@@ -16316,10 +16316,10 @@ mod tests {
     }
 
     #[test]
-    fn gpu_native_physical_install_staging_cli_parses_qualified_command() {
+    fn gpu_native_physical_install_staging_production_cli_parses_qualified_command() {
         let cli = <Cli as clap::Parser>::try_parse_from([
             "micro-expert-router",
-            "qualify-gpu-native-physical-install-staging",
+            "qualify-gpu-native-physical-install-staging-production",
             "--config",
             "/home/randyap8/slice11-qwen3-coder-gpu-native.toml",
             "--expected-adapter-name",
@@ -16330,7 +16330,7 @@ mod tests {
         .unwrap();
 
         match &cli.cmd {
-            Cmd::QualifyGpuNativePhysicalInstallStaging {
+            Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
                 config,
                 expected_adapter_name,
                 report_out,
