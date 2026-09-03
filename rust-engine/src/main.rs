@@ -145,6 +145,7 @@ pub(crate) mod gpu_native_expert_permutation_semantic_parity;
 pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
+pub(crate) mod gpu_native_physical_install_staging;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
 pub(crate) mod gpu_native_real_benchmark;
@@ -914,6 +915,21 @@ enum Cmd {
     #[command(name = "qualify-gpu-native-demand-source-concurrency-production")]
     QualifyGpuNativeDemandSourceConcurrencyProduction {
         /// Path to the frozen strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Exact authoritative adapter name required for both isolated arms.
+        #[arg(long)]
+        expected_adapter_name: String,
+        /// Required destination for the typed v2 qualification report.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Production-path PR2-B-A.1 control/treatment qualification. Control
+    /// forces legacy Vec staging; treatment exercises ordinary production.
+    #[command(name = "qualify-gpu-native-physical-install-staging-production")]
+    QualifyGpuNativePhysicalInstallStagingProduction {
+        /// Exact frozen PR2 GPU-native TOML config path.
         #[arg(long)]
         config: PathBuf,
         /// Exact authoritative adapter name required for both isolated arms.
@@ -1875,6 +1891,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
+        | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2319,6 +2336,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 ),
             )
+        }
+        Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::run_command(
+                crate::gpu_native_physical_install_staging::CommandArgs {
+                    config,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
         }
         Cmd::QualifyHybridQ4 {
             config,
@@ -16278,6 +16312,43 @@ mod tests {
         assert_eq!(
             super::startup_config_path(&cli.cmd),
             Some(Path::new("config.toml"))
+        );
+    }
+
+    #[test]
+    fn gpu_native_physical_install_staging_production_cli_parses_qualified_command() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-physical-install-staging-production",
+            "--config",
+            "/home/randyap8/slice11-qwen3-coder-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "pr2ba-report.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
+                config,
+                expected_adapter_name,
+                report_out,
+            } => {
+                assert_eq!(
+                    config,
+                    &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
+                );
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(report_out, &PathBuf::from("pr2ba-report.json"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new(
+                "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+            ))
         );
     }
 
