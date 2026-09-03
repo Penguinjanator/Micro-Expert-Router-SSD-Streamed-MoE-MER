@@ -2254,11 +2254,12 @@ pub(crate) struct GpuNativeQ4ExpertResidency {
 
 /// Per-install mechanism and subphase evidence. This is produced only for the
 /// dedicated control/treatment qualifier, keeping timers off the normal path.
+/// Failed installs return before completion evidence exists; the qualification
+/// observer records direct-staging failures on that error path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativePhysicalInstallEvidence {
     pub(crate) full_slot_vec_materializations: u64,
     pub(crate) direct_staging_writes: u64,
-    pub(crate) direct_staging_failures: u64,
     pub(crate) physical_slot_bytes_staged: u64,
     pub(crate) physical_slot_prepare_us: u64,
     pub(crate) physical_queue_staging_us: u64,
@@ -2282,7 +2283,6 @@ struct GpuNativeProductionPhysicalInstallCounters {
     physical_install_attempts: AtomicU64,
     direct_staging_successes: AtomicU64,
     direct_staging_unavailable: AtomicU64,
-    direct_staging_allocation_fallbacks: AtomicU64,
     physical_install_failures: AtomicU64,
 }
 
@@ -2291,8 +2291,6 @@ impl GpuNativeProductionPhysicalInstallCounters {
         self.physical_install_attempts.store(0, Ordering::Relaxed);
         self.direct_staging_successes.store(0, Ordering::Relaxed);
         self.direct_staging_unavailable.store(0, Ordering::Relaxed);
-        self.direct_staging_allocation_fallbacks
-            .store(0, Ordering::Relaxed);
         self.physical_install_failures.store(0, Ordering::Relaxed);
     }
 
@@ -2301,9 +2299,10 @@ impl GpuNativeProductionPhysicalInstallCounters {
             physical_install_attempts: self.physical_install_attempts.load(Ordering::Relaxed),
             direct_staging_successes: self.direct_staging_successes.load(Ordering::Relaxed),
             direct_staging_unavailable: self.direct_staging_unavailable.load(Ordering::Relaxed),
-            direct_staging_allocation_fallbacks: self
-                .direct_staging_allocation_fallbacks
-                .load(Ordering::Relaxed),
+            // Schema-v2 compatibility: production deliberately has no fallback,
+            // so retaining a permanent atomic for this impossible count would
+            // provide no operational signal.
+            direct_staging_allocation_fallbacks: 0,
             physical_install_failures: self.physical_install_failures.load(Ordering::Relaxed),
         }
     }
@@ -2465,7 +2464,7 @@ fn physical_q4_expert_slot(
 }
 
 /// The single checked physical-slot byte-layout contract shared by setup,
-/// ordinary Vec staging, and the qualification-only direct WGPU staging arm.
+/// legacy Vec staging, and ordinary production direct WGPU staging.
 fn fill_physical_q4_expert_slot(
     geometry: GpuNativeQ4ExpertGeometry,
     logical_id: u32,
@@ -7234,7 +7233,6 @@ impl GpuNativeExecutorContext {
             GpuNativePhysicalInstallEvidence {
                 full_slot_vec_materializations: 0,
                 direct_staging_writes: 1,
-                direct_staging_failures: 0,
                 physical_slot_bytes_staged: upload_bytes,
                 physical_slot_prepare_us: prepare_us.get(),
                 physical_queue_staging_us: queue_staging_us.get(),
@@ -7319,7 +7317,6 @@ impl GpuNativeExecutorContext {
             GpuNativePhysicalInstallEvidence {
                 full_slot_vec_materializations: 1,
                 direct_staging_writes: 0,
-                direct_staging_failures: 0,
                 physical_slot_bytes_staged: upload_bytes,
                 physical_slot_prepare_us: prepare_us,
                 physical_queue_staging_us: queue_staging_us.get(),

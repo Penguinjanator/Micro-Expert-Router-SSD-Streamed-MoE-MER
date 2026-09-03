@@ -1179,8 +1179,6 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
             .fetch_add(evidence.full_slot_vec_materializations, Ordering::Relaxed);
         self.direct_staging_writes
             .fetch_add(evidence.direct_staging_writes, Ordering::Relaxed);
-        self.direct_staging_failures
-            .fetch_add(evidence.direct_staging_failures, Ordering::Relaxed);
         self.physical_slot_bytes_staged
             .fetch_add(evidence.physical_slot_bytes_staged, Ordering::Relaxed);
         self.mapping_publications.fetch_add(1, Ordering::Relaxed);
