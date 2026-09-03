@@ -1515,9 +1515,9 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                 GpuNativePhysicalInstallConcurrencyQualificationArm::Control
             )
         ) {
-            let stage_us = evidence
-                .physical_slot_prepare_us
-                .saturating_add(evidence.physical_queue_staging_us);
+            let stage_us = physical_stage_service_us(evidence);
+            let control_commit_us =
+                control_ordered_commit_service_us(physical_install_total_us, evidence);
             self.physical_stage_completions
                 .fetch_add(1, Ordering::Relaxed);
             self.physical_bytes_staged
@@ -1530,7 +1530,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
             self.ordered_commit_completions
                 .fetch_add(1, Ordering::Relaxed);
             self.physical_ordered_commit_us
-                .fetch_add(evidence.mapping_publication_us, Ordering::Relaxed);
+                .fetch_add(control_commit_us, Ordering::Relaxed);
         }
     }
 
@@ -1743,6 +1743,19 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                 .fetch_add(count, Ordering::Relaxed);
         }
     }
+}
+
+fn physical_stage_service_us(evidence: GpuNativePhysicalInstallEvidence) -> u64 {
+    evidence
+        .physical_slot_prepare_us
+        .saturating_add(evidence.physical_queue_staging_us)
+}
+
+fn control_ordered_commit_service_us(
+    physical_install_total_us: u64,
+    evidence: GpuNativePhysicalInstallEvidence,
+) -> u64 {
+    physical_install_total_us.saturating_sub(physical_stage_service_us(evidence))
 }
 
 fn qualification_elapsed_us(start: Instant) -> u64 {
@@ -9045,6 +9058,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn control_ordered_commit_service_excludes_stage_and_is_not_mapping_only() {
+        let evidence = GpuNativePhysicalInstallEvidence {
+            physical_slot_prepare_us: 31,
+            physical_queue_staging_us: 7,
+            mapping_publication_us: 3,
+            ..GpuNativePhysicalInstallEvidence::default()
+        };
+
+        assert_eq!(physical_stage_service_us(evidence), 38);
+        assert_eq!(control_ordered_commit_service_us(55, evidence), 17);
+        assert_ne!(
+            control_ordered_commit_service_us(55, evidence),
+            evidence.mapping_publication_us
+        );
+        assert_eq!(control_ordered_commit_service_us(20, evidence), 0);
     }
 
     #[test]

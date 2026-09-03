@@ -32,6 +32,11 @@ pub(crate) const FROZEN_MEASURED_RUNS: usize = 3;
 pub(crate) const FROZEN_CONFIG_SHA256: &str =
     "33d7cf96328d9c68b0ff45448d91d597d2e3a757cb99e6e61c72998ceabdd056";
 pub(crate) const FROZEN_CONFIG_PATH: &str = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml";
+const CONCURRENCY_PHYSICAL_INSTALL_TOTAL_DEFINITION: &str = "sum of per-expert post-reservation physical staging plus commit service; control uses the existing ordinary direct-install timer and treatment sums each individual staging service with its ordered commit service; reservation time is reported separately";
+const CONCURRENCY_PHYSICAL_ORDERED_COMMIT_DEFINITION: &str = "sum of per-expert post-staging reservation recheck plus logical mapping publication plus arena Resident commit service";
+const CONCURRENCY_PHYSICAL_TRANSACTION_DEFINITION: &str = "complete per-set wall-clock from before sequential reservation through parallel staging and ordered commit; this is the primary mechanism-wall diagnostic";
+const CONCURRENCY_PARALLEL_STAGE_WALL_DEFINITION: &str = "per-set physical staging critical-path wall after reservation and before ordered commit";
+const CONCURRENCY_INDIVIDUAL_STAGE_SUM_DEFINITION: &str = "sum of individual per-expert physical staging service; its ratio to parallel stage wall measures host preparation overlap, not DMA parallelism";
 
 #[derive(Clone, Debug)]
 pub(crate) struct CommandArgs {
@@ -313,6 +318,32 @@ pub(crate) struct TimingDefinitions {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct ConcurrencyTimingDefinitions {
+    #[serde(flatten)]
+    common: TimingDefinitions,
+    physical_parallel_stage_wall_us: &'static str,
+    sum_individual_physical_stage_us: &'static str,
+    physical_ordered_commit_us: &'static str,
+    physical_install_transaction_us: &'static str,
+}
+
+fn concurrency_timing_definitions() -> ConcurrencyTimingDefinitions {
+    ConcurrencyTimingDefinitions {
+        common: TimingDefinitions {
+            physical_slot_prepare_us: "sum of qualification-only per-expert canonical validation plus unchanged whole-slot zero/fill time",
+            physical_queue_staging_us: "sum of qualification-only Queue::write_buffer_with view acquisition plus Drop scheduling time",
+            mapping_publication_us: "ordered logical mapping Queue::write_buffer time after all treatment staging jobs finish",
+            physical_install_total_us: CONCURRENCY_PHYSICAL_INSTALL_TOTAL_DEFINITION,
+            physical_demand_install_us: "existing aggregate Engine wall timer around the complete residency-manager demand-set transaction",
+        },
+        physical_parallel_stage_wall_us: CONCURRENCY_PARALLEL_STAGE_WALL_DEFINITION,
+        sum_individual_physical_stage_us: CONCURRENCY_INDIVIDUAL_STAGE_SUM_DEFINITION,
+        physical_ordered_commit_us: CONCURRENCY_PHYSICAL_ORDERED_COMMIT_DEFINITION,
+        physical_install_transaction_us: CONCURRENCY_PHYSICAL_TRANSACTION_DEFINITION,
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct WgpuApiAudit {
     requested_version: &'static str,
     resolved_version: &'static str,
@@ -448,7 +479,7 @@ struct PhysicalInstallConcurrencyQualificationReport {
     pinned_wgpu_audit: PinnedWgpuConcurrencyAudit,
     rayon_integration: RayonIntegrationAudit,
     qwen_physical_slot_geometry: QwenPhysicalSlotGeometry,
-    timing_definitions: TimingDefinitions,
+    timing_definitions: ConcurrencyTimingDefinitions,
     benchmark_complete: bool,
     qualification_pass: bool,
     performance_result: &'static str,
@@ -2196,13 +2227,7 @@ pub(crate) async fn run_concurrency_command(
             physical_tail_bytes: 0,
             destination_fill_zero_unchanged: true,
         },
-        timing_definitions: TimingDefinitions {
-            physical_slot_prepare_us: "sum of qualification-only per-expert canonical validation plus unchanged whole-slot zero/fill time",
-            physical_queue_staging_us: "sum of qualification-only Queue::write_buffer_with view acquisition plus Drop scheduling time",
-            mapping_publication_us: "ordered logical mapping Queue::write_buffer time after all treatment staging jobs finish",
-            physical_install_total_us: "sum of per-expert reservation-through-ordered-host-commit wall observations",
-            physical_demand_install_us: "existing aggregate Engine wall timer around the complete residency-manager demand-set transaction",
-        },
+        timing_definitions: concurrency_timing_definitions(),
         benchmark_complete: false,
         qualification_pass: false,
         performance_result: "not_measured",
@@ -2389,5 +2414,82 @@ mod tests {
         assert_eq!(logical, 2_654_208);
         assert_eq!(stride, 2_654_212);
         assert_eq!(stride - 4 - logical, 0);
+    }
+
+    #[test]
+    fn pr2bb_timing_definitions_separate_per_expert_service_from_set_wall() {
+        let definitions = concurrency_timing_definitions();
+
+        assert_eq!(
+            definitions.common.physical_install_total_us,
+            CONCURRENCY_PHYSICAL_INSTALL_TOTAL_DEFINITION
+        );
+        assert_eq!(
+            definitions.physical_ordered_commit_us,
+            CONCURRENCY_PHYSICAL_ORDERED_COMMIT_DEFINITION
+        );
+        assert_eq!(
+            definitions.physical_install_transaction_us,
+            CONCURRENCY_PHYSICAL_TRANSACTION_DEFINITION
+        );
+        assert_eq!(
+            definitions.physical_parallel_stage_wall_us,
+            CONCURRENCY_PARALLEL_STAGE_WALL_DEFINITION
+        );
+        assert_eq!(
+            definitions.sum_individual_physical_stage_us,
+            CONCURRENCY_INDIVIDUAL_STAGE_SUM_DEFINITION
+        );
+        assert!(!definitions
+            .common
+            .physical_install_total_us
+            .contains("reservation-through"));
+        assert!(definitions
+            .physical_install_transaction_us
+            .contains("complete per-set wall-clock"));
+        assert!(definitions
+            .sum_individual_physical_stage_us
+            .contains("not DMA parallelism"));
+    }
+
+    #[test]
+    fn pr2bb_timing_metrics_do_not_enter_the_mechanism_gate_schema() {
+        let serialized = serde_json::to_value(ConcurrencyMechanismGate {
+            warmup_mechanism_reconciled: false,
+            control_direct_staging_writes_gt_zero: false,
+            control_full_slot_vec_materializations_zero: false,
+            control_parallel_staging_sets_zero: false,
+            control_max_in_flight_lte_one: false,
+            treatment_direct_staging_writes_gt_zero: false,
+            treatment_full_slot_vec_materializations_zero: false,
+            treatment_parallel_staging_sets_gt_zero: false,
+            treatment_parallel_staging_experts_gt_zero: false,
+            treatment_max_in_flight_gte_two: false,
+            reservation_failures_zero: false,
+            physical_stage_failures_zero: false,
+            ordered_commit_failures_zero: false,
+            ordered_commit_violations_zero: false,
+            unpublished_physical_writes_after_failure_zero: false,
+            attempts_and_completions_reconcile: false,
+            staged_bytes_exact: false,
+            mapping_publications_exact: false,
+            mapping_unpublications_exact: false,
+            victim_sequence_exact: false,
+            reservation_identity_exact: false,
+            ordered_physical_identity_exact: false,
+            passed: false,
+        })
+        .unwrap();
+        let fields = serialized.as_object().unwrap();
+
+        assert_eq!(fields.len(), 23);
+        assert!(fields.contains_key("warmup_mechanism_reconciled"));
+        assert!(fields.contains_key("control_parallel_staging_sets_zero"));
+        assert!(fields.contains_key("treatment_parallel_staging_sets_gt_zero"));
+        assert!(fields.contains_key("attempts_and_completions_reconcile"));
+        assert!(fields.contains_key("reservation_identity_exact"));
+        assert!(fields.contains_key("ordered_physical_identity_exact"));
+        assert!(fields.contains_key("passed"));
+        assert!(fields.keys().all(|field| !field.ends_with("_us")));
     }
 }

@@ -27,6 +27,13 @@ fn qualification_elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+fn post_reservation_physical_install_total_us(
+    individual_stage_us: u64,
+    commit_us: u64,
+) -> u64 {
+    individual_stage_us.saturating_add(commit_us)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GpuNativeTieredResidencyError {
     InvalidModelLayerCount,
@@ -413,7 +420,6 @@ struct ReservedPhysicalInstall<'a> {
     admission: GpuAdmission,
     key: GpuNativeQ4ExpertKey,
     permit: crate::backend::gpu_native::GpuNativeQ4ExpertInstallPermit<'a>,
-    transaction_started: Instant,
 }
 
 struct StagedPhysicalInstall<'a> {
@@ -423,7 +429,7 @@ struct StagedPhysicalInstall<'a> {
     key: GpuNativeQ4ExpertKey,
     prepared: GpuNativeQ4ExpertPreparedInstall<'a>,
     evidence: GpuNativePhysicalInstallEvidence,
-    transaction_started: Instant,
+    individual_stage_us: u64,
 }
 
 /// Rayon indexed collection retains the input order even when workers finish
@@ -1072,7 +1078,6 @@ impl GpuNativeTieredResidencyManager {
                 admission: admission.clone(),
                 key,
                 permit,
-                transaction_started,
             });
         }
         observer.record_physical_reservation_wall(qualification_elapsed_us(reservation_started));
@@ -1085,10 +1090,8 @@ impl GpuNativeTieredResidencyManager {
                 .stage_q4_expert_residency_qualification(reserved.permit, reserved.resident.data())
             {
                 Ok((prepared, evidence)) => {
-                    observer.record_physical_stage_completed(
-                        evidence,
-                        qualification_elapsed_us(stage_started),
-                    );
+                    let individual_stage_us = qualification_elapsed_us(stage_started);
+                    observer.record_physical_stage_completed(evidence, individual_stage_us);
                     Ok(StagedPhysicalInstall {
                         demand_index: reserved.demand_index,
                         global_id: reserved.global_id,
@@ -1096,7 +1099,7 @@ impl GpuNativeTieredResidencyManager {
                         key: reserved.key,
                         prepared,
                         evidence,
-                        transaction_started: reserved.transaction_started,
+                        individual_stage_us,
                     })
                 }
                 Err(error) => {
@@ -1194,12 +1197,16 @@ impl GpuNativeTieredResidencyManager {
                     .physical_reinstalls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            observer.record_ordered_commit_completed(qualification_elapsed_us(commit_started));
+            let commit_us = qualification_elapsed_us(commit_started);
+            observer.record_ordered_commit_completed(commit_us);
             observer.record_physical_install_completion(
                 staged.global_id,
                 residency,
                 evidence,
-                qualification_elapsed_us(staged.transaction_started),
+                post_reservation_physical_install_total_us(
+                    staged.individual_stage_us,
+                    commit_us,
+                ),
             );
             resolved[staged.demand_index] = Some(residency);
         }
@@ -1615,6 +1622,22 @@ mod tests {
         assert_ne!(
             speculative_install_path(),
             DemandPhysicalInstallPath::QualificationParallelDirectStaging
+        );
+    }
+
+    #[test]
+    fn treatment_physical_install_total_is_post_reservation_stage_plus_commit() {
+        let demand_set_transaction_us = 10_000;
+        let individual_stage_us = 37;
+        let commit_us = 11;
+        let per_expert_total =
+            post_reservation_physical_install_total_us(individual_stage_us, commit_us);
+
+        assert_eq!(per_expert_total, 48);
+        assert_ne!(per_expert_total, demand_set_transaction_us);
+        assert_eq!(
+            post_reservation_physical_install_total_us(u64::MAX, 1),
+            u64::MAX
         );
     }
 
