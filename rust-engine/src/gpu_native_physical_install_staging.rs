@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 pub(crate) const PRODUCTION_SCHEMA: &str = "mer.gpu-native-physical-install-staging.v2";
 pub(crate) const PRODUCTION_MODE: &str = "qualify-gpu-native-physical-install-staging-production";
-pub(crate) const CONCURRENCY_SCHEMA: &str = "mer.gpu-native-physical-install-concurrency.v1";
-pub(crate) const CONCURRENCY_MODE: &str = "qualify-gpu-native-physical-install-concurrency";
+pub(crate) const CONCURRENCY_SCHEMA: &str = "mer.gpu-native-physical-install-concurrency-production.v1";
+pub(crate) const CONCURRENCY_MODE: &str = "qualify-gpu-native-physical-install-concurrency-production";
 pub(crate) const FROZEN_PROMPT: &str =
     "Write a Rust function that adds two i32 values and returns the result.";
 pub(crate) const FROZEN_OUTPUT_TOKENS: usize = 128;
@@ -370,6 +370,10 @@ struct ConcurrencyArmReport {
 #[derive(Clone, Debug, Serialize)]
 struct ConcurrencyMechanismGate {
     warmup_mechanism_reconciled: bool,
+    control_production_parallel_staging_sets_zero: bool,
+    treatment_ordinary_production_path_exercised: bool,
+    treatment_production_parallel_staging_sets_gt_zero: bool,
+    treatment_production_counters_reconcile: bool,
     control_direct_staging_writes_gt_zero: bool,
     control_full_slot_vec_materializations_zero: bool,
     control_parallel_staging_sets_zero: bool,
@@ -463,19 +467,23 @@ struct QwenPhysicalSlotGeometry {
 struct PhysicalInstallConcurrencyQualificationReport {
     schema: &'static str,
     mode: &'static str,
-    normal_production_default_changed: bool,
-    control_uses_ordinary_sequential_direct_staging: bool,
-    treatment_uses_qualification_only_parallel_direct_staging: bool,
+    production_physical_install_concurrency_changed: bool,
+    normal_production_uses_concurrent_physical_staging: bool,
+    control_forces_sequential_direct_staging: bool,
+    treatment_uses_ordinary_production_path: bool,
+    speculative_physical_install_changed: bool,
     both_arms_use_ordinary_production_source: bool,
     victim_policy_changed: bool,
     slot_assignment_policy_changed: bool,
     mapping_publication_order_changed: bool,
+    source_acquisition_changed: bool,
     expert_compute_changed: bool,
     adds_queue_submit: bool,
     adds_device_poll: bool,
     adds_map_async: bool,
     adds_readback: bool,
     wgpu_version_changed: bool,
+    rayon_pool_sizing_changed: bool,
     pinned_wgpu_audit: PinnedWgpuConcurrencyAudit,
     rayon_integration: RayonIntegrationAudit,
     qwen_physical_slot_geometry: QwenPhysicalSlotGeometry,
@@ -858,9 +866,9 @@ fn concurrency_common_snapshot(
             }
         },
         qualification_telemetry_only: true,
-        production_physical_install_changed: false,
+        production_physical_install_changed: true,
         control_forces_legacy_full_slot_vec: false,
-        treatment_uses_ordinary_production_path: false,
+        treatment_uses_ordinary_production_path: source.treatment_uses_ordinary_production_path,
         normal_production_uses_direct_queue_staging: true,
         single_request_stream: source.single_request_stream,
         overlapping_demand_sets: source.overlapping_demand_sets,
@@ -1988,6 +1996,39 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     }
 }
 
+fn production_physical_install_counters_reconcile(
+    source: &GpuNativeProductionPhysicalInstallSnapshot,
+) -> bool {
+    source.physical_install_sets > 0
+        && source.physical_install_experts == source.reservation_attempts
+        && source.reservation_attempts == source.reservation_successes
+        && source.reservation_failures == 0
+        && source.physical_install_attempts == source.physical_stage_attempts
+        && source.physical_stage_attempts == source.physical_stage_completions
+        && source.physical_stage_failures == 0
+        && source.physical_stage_completions == source.direct_staging_successes
+        && source.direct_staging_unavailable == 0
+        && source.direct_staging_allocation_fallbacks == 0
+        && source.ordered_commit_attempts == source.ordered_commit_completions
+        && source.ordered_commit_completions == source.physical_stage_completions
+        && source.ordered_commit_failures == 0
+        && source.ordered_commit_violations == 0
+        && source.unpublished_physical_writes_after_failure == 0
+        && source.physical_install_failures == 0
+        && source.parallel_eligible_sets == source.parallel_staging_sets
+        && source.physical_install_experts
+            == source
+                .parallel_staging_experts
+                .saturating_add(source.singleton_staging_sets)
+}
+
+fn production_concurrency_exercised(source: &GpuNativeProductionPhysicalInstallSnapshot) -> bool {
+    production_physical_install_counters_reconcile(source)
+        && source.parallel_staging_sets > 0
+        && source.parallel_staging_experts > 0
+        && source.max_in_flight_physical_staging >= 2
+}
+
 fn concurrency_mechanism_gate(
     control: &ConcurrencyArmReport,
     treatment: &ConcurrencyArmReport,
@@ -2040,11 +2081,46 @@ fn concurrency_mechanism_gate(
         .warmup_mechanism
         .as_ref()
         .expect("complete treatment warmup mechanism");
+    let cwpi = control
+        .common
+        .warmup_production_physical_install
+        .as_ref()
+        .expect("complete control warmup production physical-install telemetry");
+    let twpi = treatment
+        .common
+        .warmup_production_physical_install
+        .as_ref()
+        .expect("complete treatment warmup production physical-install telemetry");
+    let cpi = control
+        .common
+        .production_physical_install
+        .as_ref()
+        .expect("complete control production physical-install telemetry");
+    let tpi = treatment
+        .common
+        .production_physical_install
+        .as_ref()
+        .expect("complete treatment production physical-install telemetry");
     let warmup_mechanism_reconciled = pair_reconciles(cw, tw)
         && cw.parallel_staging_sets == 0
         && cw.max_in_flight_physical_staging <= 1
         && tw.parallel_staging_sets > 0
-        && tw.max_in_flight_physical_staging >= 2;
+        && tw.max_in_flight_physical_staging >= 2
+        && cwpi.physical_install_sets == 0
+        && cwpi.parallel_staging_sets == 0
+        && production_concurrency_exercised(twpi);
+    let control_production_parallel_staging_sets_zero = cpi.physical_install_sets == 0
+        && cpi.parallel_staging_sets == 0
+        && cpi.physical_install_attempts == 0;
+    let treatment_ordinary_production_path_exercised = t.treatment_uses_ordinary_production_path
+        && t.production_physical_install_concurrency_changed
+        && t.normal_production_uses_concurrent_physical_staging
+        && !c.treatment_uses_ordinary_production_path
+        && c.control_forces_sequential_direct_staging
+        && tpi.physical_install_sets > 0;
+    let treatment_production_parallel_staging_sets_gt_zero = production_concurrency_exercised(tpi);
+    let treatment_production_counters_reconcile =
+        production_physical_install_counters_reconcile(tpi);
     let control_direct_staging_writes_gt_zero = c.direct_staging_writes > 0;
     let control_full_slot_vec_materializations_zero = c.full_slot_vec_materializations == 0;
     let control_parallel_staging_sets_zero = c.parallel_staging_sets == 0;
@@ -2074,6 +2150,10 @@ fn concurrency_mechanism_gate(
     let ordered_physical_identity_exact =
         c.physical_residency_identity_sha256 == t.physical_residency_identity_sha256;
     let passed = warmup_mechanism_reconciled
+        && control_production_parallel_staging_sets_zero
+        && treatment_ordinary_production_path_exercised
+        && treatment_production_parallel_staging_sets_gt_zero
+        && treatment_production_counters_reconcile
         && control_direct_staging_writes_gt_zero
         && control_full_slot_vec_materializations_zero
         && control_parallel_staging_sets_zero
@@ -2097,6 +2177,10 @@ fn concurrency_mechanism_gate(
         && ordered_physical_identity_exact;
     ConcurrencyMechanismGate {
         warmup_mechanism_reconciled,
+        control_production_parallel_staging_sets_zero,
+        treatment_ordinary_production_path_exercised,
+        treatment_production_parallel_staging_sets_gt_zero,
+        treatment_production_counters_reconcile,
         control_direct_staging_writes_gt_zero,
         control_full_slot_vec_materializations_zero,
         control_parallel_staging_sets_zero,
@@ -2179,19 +2263,23 @@ pub(crate) async fn run_concurrency_command(
     let mut report = PhysicalInstallConcurrencyQualificationReport {
         schema: CONCURRENCY_SCHEMA,
         mode: CONCURRENCY_MODE,
-        normal_production_default_changed: false,
-        control_uses_ordinary_sequential_direct_staging: true,
-        treatment_uses_qualification_only_parallel_direct_staging: true,
+        production_physical_install_concurrency_changed: true,
+        normal_production_uses_concurrent_physical_staging: true,
+        control_forces_sequential_direct_staging: true,
+        treatment_uses_ordinary_production_path: true,
+        speculative_physical_install_changed: false,
         both_arms_use_ordinary_production_source: true,
         victim_policy_changed: false,
         slot_assignment_policy_changed: false,
         mapping_publication_order_changed: false,
+        source_acquisition_changed: false,
         expert_compute_changed: false,
         adds_queue_submit: false,
         adds_device_poll: false,
         adds_map_async: false,
         adds_readback: false,
         wgpu_version_changed: false,
+        rayon_pool_sizing_changed: false,
         pinned_wgpu_audit: PinnedWgpuConcurrencyAudit {
             requested_version: "0.20",
             resolved_version: "0.20.1",
@@ -2357,7 +2445,7 @@ pub(crate) async fn run_concurrency_command(
     if qualification_pass {
         Ok(())
     } else {
-        Err("PR2-B-B physical-install concurrency qualification gates did not all pass; see emitted report".into())
+        Err("PR2-B-B.1 production physical-install concurrency qualification gates did not all pass; see emitted report".into())
     }
 }
 
@@ -2400,14 +2488,14 @@ mod tests {
     }
 
     #[test]
-    fn pr2bb_contract_is_qualification_only_and_versioned_separately() {
+    fn pr2bb1_production_contract_is_literal_and_versioned_separately() {
         assert_eq!(
             CONCURRENCY_SCHEMA,
-            "mer.gpu-native-physical-install-concurrency.v1"
+            "mer.gpu-native-physical-install-concurrency-production.v1"
         );
         assert_eq!(
             CONCURRENCY_MODE,
-            "qualify-gpu-native-physical-install-concurrency"
+            "qualify-gpu-native-physical-install-concurrency-production"
         );
         let logical = (2048usize * 768 / 32) * 3 * 18;
         let stride = (4 + logical + 3) & !3;
@@ -2456,6 +2544,10 @@ mod tests {
     fn pr2bb_timing_metrics_do_not_enter_the_mechanism_gate_schema() {
         let serialized = serde_json::to_value(ConcurrencyMechanismGate {
             warmup_mechanism_reconciled: false,
+            control_production_parallel_staging_sets_zero: false,
+            treatment_ordinary_production_path_exercised: false,
+            treatment_production_parallel_staging_sets_gt_zero: false,
+            treatment_production_counters_reconcile: false,
             control_direct_staging_writes_gt_zero: false,
             control_full_slot_vec_materializations_zero: false,
             control_parallel_staging_sets_zero: false,
@@ -2482,8 +2574,9 @@ mod tests {
         .unwrap();
         let fields = serialized.as_object().unwrap();
 
-        assert_eq!(fields.len(), 23);
+        assert_eq!(fields.len(), 27);
         assert!(fields.contains_key("warmup_mechanism_reconciled"));
+        assert!(fields.contains_key("treatment_ordinary_production_path_exercised"));
         assert!(fields.contains_key("control_parallel_staging_sets_zero"));
         assert!(fields.contains_key("treatment_parallel_staging_sets_gt_zero"));
         assert!(fields.contains_key("attempts_and_completions_reconcile"));
@@ -2491,5 +2584,47 @@ mod tests {
         assert!(fields.contains_key("ordered_physical_identity_exact"));
         assert!(fields.contains_key("passed"));
         assert!(fields.keys().all(|field| !field.ends_with("_us")));
+    }
+
+    #[test]
+    fn production_qualifier_fails_closed_without_observed_concurrency() {
+        let sequential_only = GpuNativeProductionPhysicalInstallSnapshot {
+            physical_install_sets: 2,
+            physical_install_experts: 2,
+            singleton_staging_sets: 2,
+            reservation_attempts: 2,
+            reservation_successes: 2,
+            physical_install_attempts: 2,
+            physical_stage_attempts: 2,
+            physical_stage_completions: 2,
+            direct_staging_successes: 2,
+            ordered_commit_attempts: 2,
+            ordered_commit_completions: 2,
+            max_in_flight_physical_staging: 1,
+            ..GpuNativeProductionPhysicalInstallSnapshot::default()
+        };
+        assert!(production_physical_install_counters_reconcile(
+            &sequential_only
+        ));
+        assert!(!production_concurrency_exercised(&sequential_only));
+
+        let concurrent = GpuNativeProductionPhysicalInstallSnapshot {
+            physical_install_sets: 1,
+            physical_install_experts: 2,
+            parallel_eligible_sets: 1,
+            parallel_staging_sets: 1,
+            parallel_staging_experts: 2,
+            reservation_attempts: 2,
+            reservation_successes: 2,
+            physical_install_attempts: 2,
+            physical_stage_attempts: 2,
+            physical_stage_completions: 2,
+            direct_staging_successes: 2,
+            ordered_commit_attempts: 2,
+            ordered_commit_completions: 2,
+            max_in_flight_physical_staging: 2,
+            ..GpuNativeProductionPhysicalInstallSnapshot::default()
+        };
+        assert!(production_concurrency_exercised(&concurrent));
     }
 }

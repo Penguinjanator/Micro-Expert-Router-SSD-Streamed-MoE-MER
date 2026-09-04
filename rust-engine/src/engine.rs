@@ -511,8 +511,8 @@ pub(crate) enum GpuNativePhysicalInstallStagingQualificationArm {
     Treatment,
 }
 
-/// Explicit PR2-B-B arm. The treatment seam is qualification-only and cannot
-/// be selected through `EngineOptions` or TOML.
+/// Explicit PR2-B-B.1 production qualification arm. Control alone selects the
+/// pre-B-B sequential seam; treatment observes ordinary production.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GpuNativePhysicalInstallConcurrencyQualificationArm {
@@ -579,10 +579,10 @@ pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
     pub(crate) arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
-    pub(crate) qualification_only: bool,
-    pub(crate) normal_production_default_changed: bool,
-    pub(crate) control_uses_ordinary_sequential_direct_staging: bool,
-    pub(crate) treatment_uses_qualification_only_parallel_direct_staging: bool,
+    pub(crate) production_physical_install_concurrency_changed: bool,
+    pub(crate) normal_production_uses_concurrent_physical_staging: bool,
+    pub(crate) control_forces_sequential_direct_staging: bool,
+    pub(crate) treatment_uses_ordinary_production_path: bool,
     pub(crate) single_request_stream: bool,
     pub(crate) overlapping_demand_sets: u64,
     pub(crate) primary_pool_capacity: usize,
@@ -1342,13 +1342,13 @@ impl GpuNativeDemandSourceQualification {
         let width_min = self.install_set_width_min.load(Ordering::Relaxed);
         GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
             arm,
-            qualification_only: true,
-            normal_production_default_changed: false,
-            control_uses_ordinary_sequential_direct_staging: matches!(
+            production_physical_install_concurrency_changed: true,
+            normal_production_uses_concurrent_physical_staging: true,
+            control_forces_sequential_direct_staging: matches!(
                 arm,
                 GpuNativePhysicalInstallConcurrencyQualificationArm::Control
             ),
-            treatment_uses_qualification_only_parallel_direct_staging: matches!(
+            treatment_uses_ordinary_production_path: matches!(
                 arm,
                 GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
             ),
@@ -6299,7 +6299,7 @@ impl Engine {
                                 state.as_ref(),
                             ),
                         GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment => manager
-                            .ensure_demand_set_physical_install_concurrency_treatment(
+                            .ensure_demand_set_production_observed(
                                 GpuNativeResidencyPriority::Demand,
                                 layer_index,
                                 &demands,
