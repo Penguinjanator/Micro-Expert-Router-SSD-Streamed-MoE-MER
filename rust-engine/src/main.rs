@@ -940,6 +940,17 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// PR2-C qualification only: ordinary production remains serial.
+    #[command(name = "qualify-gpu-native-q4-route-parallel")]
+    QualifyGpuNativeQ4RouteParallel {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// PR2-B-B.1 production-path qualification. Control forces the frozen
     /// sequential direct-staging implementation; treatment exercises ordinary
     /// production concurrent staging and deterministic ordered commit.
@@ -1907,6 +1918,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
+        | Cmd::QualifyGpuNativeQ4RouteParallel { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
@@ -2353,6 +2365,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 ),
             )
+        }
+        Cmd::QualifyGpuNativeQ4RouteParallel {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_physical_install_staging::q4_route_parallel::run_command(
+                crate::gpu_native_physical_install_staging::CommandArgs {
+                    config,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
         }
         Cmd::QualifyGpuNativePhysicalInstallStagingProduction {
             config,

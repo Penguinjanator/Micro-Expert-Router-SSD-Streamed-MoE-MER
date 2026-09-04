@@ -11,6 +11,8 @@
 // GPU-native slices remain intentionally unreachable from production token entrypoints.
 #![allow(dead_code)]
 
+pub(crate) mod q4_route_parallel;
+
 use super::{create_startup_buffer, BackendBox, GpuDeviceIdentity, GpuStartupAllocationError};
 use crate::dense_tensor::{DenseDType, DenseWeight};
 use crate::inference::{Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMS};

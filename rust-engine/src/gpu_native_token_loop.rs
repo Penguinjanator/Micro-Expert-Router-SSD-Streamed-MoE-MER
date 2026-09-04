@@ -3,6 +3,10 @@
 //! Owns the execution of the entire forward transformer pass on GPU:
 //! Embedding lookup -> Layer (Attention RMSNorm -> QKV/RoPE/KV -> Causal Attention/O -> MoE RMSNorm -> Router -> Q4 Expert Combine) -> Final RMSNorm -> LM Head -> GPU Greedy Argmax.
 
+use crate::backend::gpu_native::q4_route_parallel::GpuNativeQ4RouteParallelScratch;
+use crate::gpu_native_physical_install_staging::q4_route_parallel::{
+    Arm as Q4QualificationArm, Observation as Q4QualificationObservation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -978,9 +982,24 @@ pub struct GpuNativeTokenLoop {
     counters: GpuNativeTokenLoopCounters,
     recovery_counters: GpuNativeRecoveryCounters,
     execution_guard: TokioMutex<()>,
+    q4_qualification: std::sync::OnceLock<Arc<Q4QualificationObservation>>,
 }
 
 impl GpuNativeTokenLoop {
+    /// Only the explicit PR2-C qualifier may install this one-shot observer
+    /// before the first request in an isolated runtime.
+    pub(crate) fn enable_q4_route_parallel_qualification(
+        &self,
+        observation: Arc<Q4QualificationObservation>,
+    ) -> Result<(), String> {
+        if self.snapshot().token_attempts != 0 {
+            return Err("PR2-C must be enabled before any request".into());
+        }
+        self.q4_qualification
+            .set(observation)
+            .map_err(|_| "PR2-C already enabled".into())
+    }
+
     /// Validate that `model` conforms strictly to the supported Qwen3Moe GPU-native contract.
     pub fn validate_model_compatibility(
         model: &RealModel,
@@ -1299,6 +1318,7 @@ impl GpuNativeTokenLoop {
             report_layout,
             counters: GpuNativeTokenLoopCounters::default(),
             recovery_counters: GpuNativeRecoveryCounters::default(),
+            q4_qualification: std::sync::OnceLock::new(),
             execution_guard: TokioMutex::new(()),
         }))
     }
@@ -1407,6 +1427,13 @@ impl GpuNativeTokenLoop {
             self.executor.create_q4_expert_scratch(expert_geom)?
         };
 
+        let q4_parallel_scratch = match self.q4_qualification.get().map(|o| o.arm) {
+            Some(Q4QualificationArm::Treatment) => Some(
+                self.executor
+                    .create_q4_route_parallel_qualification_scratch(expert_geom)?,
+            ),
+            _ => None,
+        };
         let logits_scratch = self
             .executor
             .create_scratch(self.model_geometry.vocab_size)?;
@@ -1434,6 +1461,7 @@ impl GpuNativeTokenLoop {
             attn_scratch,
             router_scratch,
             expert_scratch,
+            q4_parallel_scratch,
             logits_scratch,
             sampled_token_buf,
             pre_expert_checkpoints,
@@ -2196,6 +2224,9 @@ impl GpuNativeTokenLoop {
             };
             attempts += 1;
             let report = &output.boundary_report;
+            if let Some(observation) = self.q4_qualification.get() {
+                observation.record_status(&report.layer_statuses, report.final_status);
+            }
 
             if let Some(fail_layer) =
                 report.first_failure_layer_in(segment.attempted_layers.clone())?
@@ -2465,14 +2496,46 @@ impl GpuNativeTokenLoop {
                 );
             }
         }
-        self.executor.encode_q4_expert_arena_combine(
-            encoder,
-            &layer_plan.router_plan,
-            &request.router_scratch,
-            arena,
-            &request.token_state,
-            &request.expert_scratch,
-        )?;
+        if let Some(observation) = self.q4_qualification.get() {
+            let evidence = match observation.arm {
+                Q4QualificationArm::Control => self.executor.encode_q4_expert_serial_qualification(
+                    encoder,
+                    &layer_plan.router_plan,
+                    &request.router_scratch,
+                    arena,
+                    &request.token_state,
+                    &request.expert_scratch,
+                )?,
+                Q4QualificationArm::Treatment => {
+                    let scratch = request.q4_parallel_scratch.as_ref().ok_or_else(|| {
+                        GpuNativeTokenLoopError::InvalidBoundaryReport {
+                            detail: "PR2-C treatment scratch missing; serial fallback prohibited"
+                                .into(),
+                        }
+                    })?;
+                    self.executor
+                        .encode_q4_expert_route_parallel_qualification(
+                            encoder,
+                            &layer_plan.router_plan,
+                            &request.router_scratch,
+                            arena,
+                            &request.token_state,
+                            &request.expert_scratch,
+                            scratch,
+                        )?
+                }
+            };
+            observation.record(evidence);
+        } else {
+            self.executor.encode_q4_expert_arena_combine(
+                encoder,
+                &layer_plan.router_plan,
+                &request.router_scratch,
+                arena,
+                &request.token_state,
+                &request.expert_scratch,
+            )?;
+        }
 
         if let Some(sink) = semantic_sink {
             if let Some(layout) = sink.target_layout_for_layer(layer_idx) {
@@ -3193,6 +3256,7 @@ pub struct GpuNativeRequestState {
     pub attn_scratch: GpuNativeAttentionScratch,
     pub router_scratch: GpuNativeRouterScratch,
     pub expert_scratch: GpuNativeQ4ExpertScratch,
+    q4_parallel_scratch: Option<GpuNativeQ4RouteParallelScratch>,
     pub logits_scratch: GpuNativeScratch,
     pub sampled_token_buf: GpuNativeScratch,
     pub pre_expert_checkpoints: GpuNativePreExpertCheckpoints,

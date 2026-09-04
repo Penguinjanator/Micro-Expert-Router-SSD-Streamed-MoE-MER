@@ -2,6 +2,9 @@
 //! staging. Control explicitly forces the legacy Vec writer; treatment uses
 //! the ordinary production demand-install path in a fresh runtime.
 
+#[path = "gpu_native_q4_route_parallel.rs"]
+pub(crate) mod q4_route_parallel;
+
 use crate::backend::gpu_native::GpuNativeProductionPhysicalInstallSnapshot;
 use crate::backend::{GpuExpertIoSnapshot, GpuExpertMemorySnapshot};
 use crate::engine::{
