@@ -10,8 +10,8 @@
 use crate::backend::gpu_native::{
     GpuNativeBootstrapError, GpuNativeExecutorContext, GpuNativePhysicalInstallEvidence,
     GpuNativeProductionPhysicalInstallSnapshot, GpuNativeQ4ExpertAcquire, GpuNativeQ4ExpertArena,
-    GpuNativeQ4ExpertGeometry, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertResidency,
-    GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
+    GpuNativeQ4ExpertGeometry, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertPreparedInstall,
+    GpuNativeQ4ExpertResidency, GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
 };
 use crate::expert_cache::{ExpertResident, GpuAdmission, GpuExpertCache};
 use lru::LruCache;
@@ -22,6 +22,17 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+fn qualification_elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn post_reservation_physical_install_total_us(
+    individual_stage_us: u64,
+    commit_us: u64,
+) -> u64 {
+    individual_stage_us.saturating_add(commit_us)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GpuNativeTieredResidencyError {
@@ -344,12 +355,17 @@ pub(crate) enum GpuNativeResidencyPriority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DemandPhysicalInstallPath {
-    Production,
+    ProductionConcurrentDirectStaging,
+    SequentialDirectStagingControl,
     LegacyFullSlotVecControl,
 }
 
 const fn ordinary_demand_install_path() -> DemandPhysicalInstallPath {
-    DemandPhysicalInstallPath::Production
+    DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+}
+
+const fn production_concurrency_control_path() -> DemandPhysicalInstallPath {
+    DemandPhysicalInstallPath::SequentialDirectStagingControl
 }
 
 const fn speculative_install_path() -> DemandPhysicalInstallPath {
@@ -370,6 +386,75 @@ pub(crate) trait GpuNativePhysicalInstallObserver: Send + Sync {
         evidence: GpuNativePhysicalInstallEvidence,
         physical_install_total_us: u64,
     );
+    fn record_physical_install_set(
+        &self,
+        width: usize,
+        parallel: bool,
+        caller_in_rayon_worker: bool,
+        rayon_threads: usize,
+    );
+    fn record_reservation_attempt(&self);
+    fn record_reservation_success(
+        &self,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
+        install_ticket: u64,
+    );
+    fn record_reservation_failure(&self);
+    fn record_physical_stage_started(&self);
+    fn record_physical_stage_completed(
+        &self,
+        evidence: GpuNativePhysicalInstallEvidence,
+        individual_stage_us: u64,
+    );
+    fn record_physical_stage_failed(&self);
+    fn record_parallel_stage_wall(&self, wall_us: u64);
+    fn record_ordered_commit_attempt(&self);
+    fn record_ordered_commit_completed(&self, commit_us: u64);
+    fn record_ordered_commit_failed(&self, violation: bool);
+    fn record_physical_reservation_wall(&self, wall_us: u64);
+    fn record_physical_install_transaction_wall(&self, wall_us: u64);
+    fn record_unpublished_physical_writes_after_failure(&self, count: u64);
+}
+
+struct ReservedPhysicalInstall<'a> {
+    demand_index: usize,
+    global_id: u32,
+    resident: Arc<ExpertResident>,
+    admission: GpuAdmission,
+    key: GpuNativeQ4ExpertKey,
+    permit: crate::backend::gpu_native::GpuNativeQ4ExpertInstallPermit<'a>,
+}
+
+struct StagedPhysicalInstall<'a> {
+    demand_index: usize,
+    global_id: u32,
+    admission: GpuAdmission,
+    key: GpuNativeQ4ExpertKey,
+    prepared: GpuNativeQ4ExpertPreparedInstall<'a>,
+    evidence: GpuNativePhysicalInstallEvidence,
+    individual_stage_us: u64,
+}
+
+/// Rayon indexed collection retains the input order even when workers finish
+/// out of order. Keeping this seam small makes that ordering contract directly
+/// testable and ensures the task count is exactly the install-set width.
+fn collect_physical_stage_results_in_request_order<T, R, F>(
+    reserved: Vec<T>,
+    parallel: bool,
+    stage_one: F,
+) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Send + Sync,
+{
+    if parallel {
+        use rayon::prelude::*;
+        reserved.into_par_iter().map(stage_one).collect()
+    } else {
+        reserved.into_iter().map(stage_one).collect()
+    }
 }
 
 #[derive(Clone)]
@@ -665,7 +750,7 @@ impl GpuNativeTieredResidencyManager {
         layer_index: usize,
         demands: &[GpuNativeDemandExpert],
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        self.ensure_demand_set_inner(
+        self.ensure_demand_set_inner::<false>(
             priority,
             layer_index,
             demands,
@@ -681,7 +766,7 @@ impl GpuNativeTieredResidencyManager {
         demands: &[GpuNativeDemandExpert],
         observer: &dyn GpuNativePhysicalInstallObserver,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        self.ensure_demand_set_inner(
+        self.ensure_demand_set_inner::<true>(
             priority,
             layer_index,
             demands,
@@ -697,7 +782,7 @@ impl GpuNativeTieredResidencyManager {
         demands: &[GpuNativeDemandExpert],
         observer: &dyn GpuNativePhysicalInstallObserver,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        self.ensure_demand_set_inner(
+        self.ensure_demand_set_inner::<true>(
             priority,
             layer_index,
             demands,
@@ -706,7 +791,25 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
-    fn ensure_demand_set_inner(
+    /// PR2-B-B.1 control: the exact pre-B-B sequential production direct-
+    /// staging path, observed only by the dedicated production qualifier.
+    pub(crate) fn ensure_demand_set_physical_install_concurrency_control(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        self.ensure_demand_set_inner::<true>(
+            priority,
+            layer_index,
+            demands,
+            production_concurrency_control_path(),
+            Some(observer),
+        )
+    }
+
+    fn ensure_demand_set_inner<const OBSERVE: bool>(
         &self,
         priority: GpuNativeResidencyPriority,
         layer_index: usize,
@@ -792,26 +895,55 @@ impl GpuNativeTieredResidencyManager {
             }
         }
 
-        for index in misses {
-            let GpuNativeDemandExpert::Install {
-                global_id,
-                resident,
-                admission,
-            } = &demands[index]
-            else {
-                unreachable!("miss list contains only install sources")
-            };
-            let residency = self.install_locked(
-                *global_id,
-                resident,
-                admission,
+        if matches!(
+            install_path,
+            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+        ) {
+            self.install_parallel_physical_misses_locked::<OBSERVE>(
+                demands,
+                &misses,
                 layer,
                 &mut state,
-                false,
-                install_path,
+                &mut resolved,
                 observer,
             )?;
-            resolved[index] = Some(residency);
+        } else {
+            let transaction_started = (OBSERVE && !misses.is_empty()).then(Instant::now);
+            if OBSERVE && !misses.is_empty() {
+                if let Some(observer) = observer {
+                    observer.record_physical_install_set(
+                        misses.len(),
+                        false,
+                        crate::parallel::in_rayon_worker(),
+                        rayon::current_num_threads(),
+                    );
+                }
+            }
+            for index in misses {
+                let GpuNativeDemandExpert::Install {
+                    global_id,
+                    resident,
+                    admission,
+                } = &demands[index]
+                else {
+                    unreachable!("miss list contains only install sources")
+                };
+                let residency = self.install_locked::<OBSERVE>(
+                    *global_id,
+                    resident,
+                    admission,
+                    layer,
+                    &mut state,
+                    false,
+                    install_path,
+                    observer,
+                )?;
+                resolved[index] = Some(residency);
+            }
+            if let (Some(observer), Some(started)) = (observer, transaction_started) {
+                observer
+                    .record_physical_install_transaction_wall(qualification_elapsed_us(started));
+            }
         }
         resolved
             .into_iter()
@@ -822,6 +954,382 @@ impl GpuNativeTieredResidencyManager {
                 })
             })
             .collect()
+    }
+
+    fn install_parallel_physical_misses_locked<'a, const OBSERVE: bool>(
+        &self,
+        demands: &[GpuNativeDemandExpert],
+        misses: &[usize],
+        layer: &'a LayerResidency,
+        state: &mut MutexGuard<'_, LayerResidencyState>,
+        resolved: &mut [Option<GpuNativeQ4ExpertResidency>],
+        observer: Option<&dyn GpuNativePhysicalInstallObserver>,
+    ) -> Result<(), GpuNativeTieredResidencyError> {
+        if misses.is_empty() {
+            return Ok(());
+        }
+        let transaction_started = OBSERVE.then(Instant::now);
+        let parallel = misses.len() >= 2;
+        self.executor
+            .record_production_physical_install_set(misses.len());
+        if OBSERVE {
+            observer
+                .expect("observed production install has an observer")
+                .record_physical_install_set(
+                    misses.len(),
+                    parallel,
+                    crate::parallel::in_rayon_worker(),
+                    rayon::current_num_threads(),
+                );
+        }
+
+        let reservation_started = OBSERVE.then(Instant::now);
+        let mut reserved = Vec::with_capacity(misses.len());
+        for &demand_index in misses {
+            let GpuNativeDemandExpert::Install {
+                global_id,
+                resident,
+                admission,
+            } = &demands[demand_index]
+            else {
+                unreachable!("miss list contains only install sources")
+            };
+            let identity = self.identity(*global_id)?;
+            let key = global_to_q4_expert_key(
+                *global_id,
+                admission.generation(),
+                self.plan.num_layers(),
+                self.plan.geometry().num_experts() as u32,
+            )?;
+            self.executor
+                .record_production_physical_reservation_attempt();
+            if OBSERVE {
+                let observer = observer.expect("observed production install has an observer");
+                observer.record_physical_install_attempt();
+                observer.record_reservation_attempt();
+            }
+            let acquired = match self.executor.acquire_q4_expert_residency(&layer.arena, key) {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    self.executor
+                        .record_production_physical_reservation_failure();
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_reservation_failure();
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
+            let permit = match acquired {
+                GpuNativeQ4ExpertAcquire::Install(permit) => permit,
+                GpuNativeQ4ExpertAcquire::Hit(_) => {
+                    self.executor
+                        .record_production_physical_reservation_failure();
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_reservation_failure();
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(GpuNativeTieredResidencyError::PhysicalIdentityCorrupt {
+                        global_id: *global_id,
+                    });
+                }
+                GpuNativeQ4ExpertAcquire::InstallInProgress => {
+                    self.executor
+                        .record_production_physical_reservation_failure();
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_reservation_failure();
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(GpuNativeTieredResidencyError::InstallInProgress {
+                        global_id: *global_id,
+                        generation: admission.generation(),
+                    });
+                }
+                GpuNativeQ4ExpertAcquire::StaleRequester => {
+                    self.executor
+                        .record_production_physical_reservation_failure();
+                    self.counters
+                        .stale_generation_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_reservation_failure();
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(GpuNativeTieredResidencyError::StalePhysicalRequester {
+                        global_id: *global_id,
+                        generation: admission.generation(),
+                    });
+                }
+                GpuNativeQ4ExpertAcquire::NoPhysicalSlot => {
+                    self.executor
+                        .record_production_physical_reservation_failure();
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_reservation_failure();
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(GpuNativeTieredResidencyError::NoPhysicalSlot {
+                        layer_index: identity.layer_index,
+                    });
+                }
+            };
+            self.executor
+                .record_production_physical_reservation_success();
+            if OBSERVE {
+                observer
+                    .expect("observed production install has an observer")
+                    .record_reservation_success(
+                        *global_id,
+                        permit.reserved_residency(),
+                        permit.install_ticket(),
+                    );
+            }
+            reserved.push(ReservedPhysicalInstall {
+                demand_index,
+                global_id: *global_id,
+                resident: resident.clone(),
+                admission: admission.clone(),
+                key,
+                permit,
+            });
+        }
+        if OBSERVE {
+            observer
+                .expect("observed production install has an observer")
+                .record_physical_reservation_wall(qualification_elapsed_us(
+                    reservation_started.expect("observed reservation has a timer"),
+                ));
+        }
+
+        let stage_one = |reserved: ReservedPhysicalInstall<'a>| {
+            if OBSERVE {
+                observer
+                    .expect("observed production install has an observer")
+                    .record_physical_stage_started();
+            }
+            let stage_started = OBSERVE.then(Instant::now);
+            let result = if OBSERVE {
+                self.executor.stage_q4_expert_residency_production_observed(
+                    reserved.permit,
+                    reserved.resident.data(),
+                )
+            } else {
+                self.executor
+                    .stage_q4_expert_residency_production(reserved.permit, reserved.resident.data())
+                    .map(|prepared| (prepared, GpuNativePhysicalInstallEvidence::default()))
+            };
+            match result {
+                Ok((prepared, evidence)) => {
+                    let individual_stage_us = stage_started.map_or(0, qualification_elapsed_us);
+                    if OBSERVE {
+                        observer
+                            .expect("observed production install has an observer")
+                            .record_physical_stage_completed(evidence, individual_stage_us);
+                    }
+                    Ok(StagedPhysicalInstall {
+                        demand_index: reserved.demand_index,
+                        global_id: reserved.global_id,
+                        admission: reserved.admission,
+                        key: reserved.key,
+                        prepared,
+                        evidence,
+                        individual_stage_us,
+                    })
+                }
+                Err(error) => {
+                    if OBSERVE {
+                        observer
+                            .expect("observed production install has an observer")
+                            .record_physical_stage_failed();
+                    }
+                    Err(GpuNativeTieredResidencyError::from(error))
+                }
+            }
+        };
+        let parallel_stage_started = OBSERVE.then(Instant::now);
+        let staged = collect_physical_stage_results_in_request_order(reserved, parallel, stage_one);
+        if OBSERVE {
+            observer
+                .expect("observed production install has an observer")
+                .record_parallel_stage_wall(qualification_elapsed_us(
+                    parallel_stage_started.expect("observed stage has a timer"),
+                ));
+        }
+
+        let first_stage_failure = staged.iter().position(Result::is_err);
+        let mut remaining_successful = staged.iter().filter(|result| result.is_ok()).count() as u64;
+        for (position, staged_result) in staged.into_iter().enumerate() {
+            if first_stage_failure.is_some_and(|failed| position >= failed) {
+                if position == first_stage_failure.expect("failure position is present") {
+                    let error = match staged_result {
+                        Err(error) => error,
+                        Ok(_) => unreachable!("earliest failed stage is an error"),
+                    };
+                    self.executor
+                        .record_production_unpublished_physical_writes_after_failure(
+                            remaining_successful,
+                        );
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer
+                            .record_unpublished_physical_writes_after_failure(remaining_successful);
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(error);
+                }
+                unreachable!("earliest stage failure returns before later entries")
+            }
+            let staged = staged_result.expect("successful prefix precedes first stage failure");
+            if OBSERVE {
+                observer
+                    .expect("observed production install has an observer")
+                    .record_ordered_commit_attempt();
+            }
+            let commit_started = OBSERVE.then(Instant::now);
+            let commit_result = if OBSERVE {
+                self.executor
+                    .commit_q4_expert_residency_production_observed(
+                        staged.prepared,
+                        staged.evidence,
+                    )
+            } else {
+                self.executor
+                    .commit_q4_expert_residency_production(staged.prepared)
+                    .map(|residency| (residency, staged.evidence))
+            };
+            let (residency, evidence) = match commit_result {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.executor
+                        .record_production_unpublished_physical_writes_after_failure(
+                            remaining_successful,
+                        );
+                    if OBSERVE {
+                        let observer =
+                            observer.expect("observed production install has an observer");
+                        observer.record_ordered_commit_failed(matches!(
+                            error,
+                            GpuNativeBootstrapError::ExpertInstallReservationLost
+                        ));
+                        observer
+                            .record_unpublished_physical_writes_after_failure(remaining_successful);
+                        observer.record_physical_install_transaction_wall(
+                            qualification_elapsed_us(
+                                transaction_started.expect("observed transaction has a timer"),
+                            ),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
+            remaining_successful = remaining_successful.saturating_sub(1);
+            if !self
+                .gpu_cache
+                .contains_generation(staged.global_id, staged.admission.generation())
+            {
+                let _ = self
+                    .executor
+                    .retire_q4_expert_residency(&layer.arena, staged.key)?;
+                self.counters
+                    .stale_generation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                self.executor
+                    .record_production_ordered_commit_failure(false);
+                self.executor
+                    .record_production_unpublished_physical_writes_after_failure(
+                        remaining_successful,
+                    );
+                if OBSERVE {
+                    let observer = observer.expect("observed production install has an observer");
+                    observer.record_ordered_commit_failed(false);
+                    observer.record_unpublished_physical_writes_after_failure(remaining_successful);
+                    observer.record_physical_install_transaction_wall(qualification_elapsed_us(
+                        transaction_started.expect("observed transaction has a timer"),
+                    ));
+                }
+                return Err(GpuNativeTieredResidencyError::LogicalAdmissionStale {
+                    global_id: staged.global_id,
+                    generation: staged.admission.generation(),
+                });
+            }
+            let reinstall = state
+                .last_installed_generations
+                .insert(staged.global_id, staged.admission.generation())
+                == Some(staged.admission.generation());
+            state.residents.put(
+                staged.global_id,
+                PhysicalRecord {
+                    key: staged.key,
+                    residency,
+                },
+            );
+            self.counters
+                .ram_to_vram_installs
+                .fetch_add(1, Ordering::Relaxed);
+            if reinstall {
+                self.counters
+                    .physical_reinstalls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if OBSERVE {
+                let commit_us =
+                    qualification_elapsed_us(commit_started.expect("observed commit has a timer"));
+                let observer = observer.expect("observed production install has an observer");
+                observer.record_ordered_commit_completed(commit_us);
+                observer.record_physical_install_completion(
+                    staged.global_id,
+                    residency,
+                    evidence,
+                    post_reservation_physical_install_total_us(
+                        staged.individual_stage_us,
+                        commit_us,
+                    ),
+                );
+            }
+            resolved[staged.demand_index] = Some(residency);
+        }
+        if OBSERVE {
+            observer
+                .expect("observed production install has an observer")
+                .record_physical_install_transaction_wall(qualification_elapsed_us(
+                    transaction_started.expect("observed transaction has a timer"),
+                ));
+        }
+        Ok(())
     }
 
     pub(crate) fn ensure_speculative_resident(
@@ -869,7 +1377,7 @@ impl GpuNativeTieredResidencyManager {
             self.record_speculative_drop();
             return Ok(GpuNativeSpeculativeInstall::DroppedCapacityOrPressure);
         }
-        let residency = match self.install_locked(
+        let residency = match self.install_locked::<false>(
             global_id,
             resident,
             admission,
@@ -1024,7 +1532,7 @@ impl GpuNativeTieredResidencyManager {
         Ok(())
     }
 
-    fn install_locked(
+    fn install_locked<const OBSERVE: bool>(
         &self,
         global_id: u32,
         resident: &Arc<ExpertResident>,
@@ -1042,25 +1550,39 @@ impl GpuNativeTieredResidencyManager {
             self.plan.num_layers(),
             self.plan.geometry().num_experts() as u32,
         )?;
+        let reservation_started = OBSERVE.then(Instant::now);
         let (residency, installed) = match self
             .executor
             .acquire_q4_expert_residency(&layer.arena, key)?
         {
             GpuNativeQ4ExpertAcquire::Hit(hit) => (hit, false),
             GpuNativeQ4ExpertAcquire::Install(permit) => {
-                if let Some(observer) = observer {
+                if OBSERVE {
+                    let observer = observer.expect("observed sequential install has an observer");
                     observer.record_physical_install_attempt();
+                    observer.record_reservation_attempt();
+                    observer.record_reservation_success(
+                        global_id,
+                        permit.reserved_residency(),
+                        permit.install_ticket(),
+                    );
+                    observer.record_physical_reservation_wall(qualification_elapsed_us(
+                        reservation_started.expect("observed reservation has a timer"),
+                    ));
                     let started = Instant::now();
                     let result = match install_path {
-                        DemandPhysicalInstallPath::Production => self
+                        DemandPhysicalInstallPath::SequentialDirectStagingControl => self
                             .executor
-                            .install_q4_expert_residency_production_observed(
+                            .install_q4_expert_residency_sequential_control_observed(
                                 permit,
                                 resident.data(),
                             ),
                         DemandPhysicalInstallPath::LegacyFullSlotVecControl => self
                             .executor
                             .install_q4_expert_residency_legacy_observed(permit, resident.data()),
+                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging => {
+                            unreachable!("ordinary production installs use the split transaction")
+                        }
                     };
                     match result {
                         Ok((residency, evidence)) => {
@@ -1084,12 +1606,15 @@ impl GpuNativeTieredResidencyManager {
                     }
                 } else {
                     let residency = match install_path {
-                        DemandPhysicalInstallPath::Production => self
-                            .executor
-                            .install_q4_expert_residency(permit, resident.data())?,
                         DemandPhysicalInstallPath::LegacyFullSlotVecControl => self
                             .executor
                             .install_q4_expert_residency_legacy(permit, resident.data())?,
+                        DemandPhysicalInstallPath::SequentialDirectStagingControl => {
+                            unreachable!("sequential control is qualifier-only")
+                        }
+                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging => {
+                            unreachable!("ordinary production installs use the split transaction")
+                        }
                     };
                     (residency, true)
                 }
@@ -1194,15 +1719,66 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_and_v2_treatment_share_production_while_speculation_stays_legacy() {
+    fn ordinary_and_qualification_paths_select_production_concurrency_and_legacy_speculation() {
         assert_eq!(
             ordinary_demand_install_path(),
-            DemandPhysicalInstallPath::Production
+            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+        );
+        assert_eq!(
+            production_concurrency_control_path(),
+            DemandPhysicalInstallPath::SequentialDirectStagingControl
         );
         assert_eq!(
             speculative_install_path(),
             DemandPhysicalInstallPath::LegacyFullSlotVecControl
         );
+        assert_ne!(
+            production_concurrency_control_path(),
+            speculative_install_path()
+        );
+    }
+
+    #[test]
+    fn treatment_physical_install_total_is_post_reservation_stage_plus_commit() {
+        let demand_set_transaction_us = 10_000;
+        let individual_stage_us = 37;
+        let commit_us = 11;
+        let per_expert_total =
+            post_reservation_physical_install_total_us(individual_stage_us, commit_us);
+
+        assert_eq!(per_expert_total, 48);
+        assert_ne!(per_expert_total, demand_set_transaction_us);
+        assert_eq!(
+            post_reservation_physical_install_total_us(u64::MAX, 1),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn treatment_widths_one_through_eight_collect_and_touch_lru_in_request_order() {
+        for width in 1usize..=8 {
+            let task_count = AtomicU64::new(0);
+            let request_order = (0..width as u32).collect::<Vec<_>>();
+            let staged = collect_physical_stage_results_in_request_order(
+                request_order.clone(),
+                width >= 2,
+                |global_id| {
+                    task_count.fetch_add(1, Ordering::Relaxed);
+                    global_id
+                },
+            );
+            assert_eq!(task_count.load(Ordering::Relaxed), width as u64);
+            assert_eq!(staged, request_order);
+
+            let mut residents = LruCache::unbounded();
+            for global_id in staged {
+                residents.put(global_id, ());
+            }
+            assert_eq!(
+                residents.iter().map(|(&id, _)| id).collect::<Vec<_>>(),
+                request_order.into_iter().rev().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

@@ -2266,44 +2266,217 @@ pub(crate) struct GpuNativePhysicalInstallEvidence {
     pub(crate) mapping_publication_us: u64,
 }
 
+/// Unpublished half-transaction produced after an exact physical slot has
+/// been filled through `Queue::write_buffer_with`, but before its logical
+/// mapping or host arena residency has been published. The embedded permit
+/// remains active, so dropping an uncommitted value cancels the reservation.
+pub(crate) struct GpuNativeQ4ExpertPreparedInstall<'a, B = wgpu::Buffer> {
+    permit: GpuNativeQ4ExpertInstallPermit<'a, B>,
+    mapping: GpuNativeQ4ExpertMappingEntry,
+    mapping_offset: u64,
+}
+
 /// Compact cumulative telemetry for the ordinary production demand-install
 /// implementation. Setup uploads, the explicit qualifier control, and the
 /// unchanged speculative Vec path do not contribute to these counters.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeProductionPhysicalInstallSnapshot {
+    pub(crate) physical_install_sets: u64,
+    pub(crate) physical_install_experts: u64,
+    pub(crate) parallel_eligible_sets: u64,
+    pub(crate) parallel_staging_sets: u64,
+    pub(crate) parallel_staging_experts: u64,
+    pub(crate) singleton_staging_sets: u64,
+    pub(crate) reservation_attempts: u64,
+    pub(crate) reservation_successes: u64,
+    pub(crate) reservation_failures: u64,
     pub(crate) physical_install_attempts: u64,
+    pub(crate) physical_stage_attempts: u64,
+    pub(crate) physical_stage_completions: u64,
+    pub(crate) physical_stage_failures: u64,
     pub(crate) direct_staging_successes: u64,
     pub(crate) direct_staging_unavailable: u64,
     pub(crate) direct_staging_allocation_fallbacks: u64,
+    pub(crate) ordered_commit_attempts: u64,
+    pub(crate) ordered_commit_completions: u64,
+    pub(crate) ordered_commit_failures: u64,
+    pub(crate) ordered_commit_violations: u64,
+    pub(crate) unpublished_physical_writes_after_failure: u64,
+    pub(crate) max_in_flight_physical_staging: u64,
     pub(crate) physical_install_failures: u64,
 }
 
 #[derive(Debug, Default)]
 struct GpuNativeProductionPhysicalInstallCounters {
+    physical_install_sets: AtomicU64,
+    physical_install_experts: AtomicU64,
+    parallel_eligible_sets: AtomicU64,
+    parallel_staging_sets: AtomicU64,
+    parallel_staging_experts: AtomicU64,
+    singleton_staging_sets: AtomicU64,
+    reservation_attempts: AtomicU64,
+    reservation_successes: AtomicU64,
+    reservation_failures: AtomicU64,
     physical_install_attempts: AtomicU64,
+    physical_stage_attempts: AtomicU64,
+    physical_stage_completions: AtomicU64,
+    physical_stage_failures: AtomicU64,
+    active_physical_staging: AtomicU64,
+    max_in_flight_physical_staging: AtomicU64,
     direct_staging_successes: AtomicU64,
     direct_staging_unavailable: AtomicU64,
+    ordered_commit_attempts: AtomicU64,
+    ordered_commit_completions: AtomicU64,
+    ordered_commit_failures: AtomicU64,
+    ordered_commit_violations: AtomicU64,
+    unpublished_physical_writes_after_failure: AtomicU64,
     physical_install_failures: AtomicU64,
 }
 
 impl GpuNativeProductionPhysicalInstallCounters {
     fn reset(&self) {
+        self.physical_install_sets.store(0, Ordering::Relaxed);
+        self.physical_install_experts.store(0, Ordering::Relaxed);
+        self.parallel_eligible_sets.store(0, Ordering::Relaxed);
+        self.parallel_staging_sets.store(0, Ordering::Relaxed);
+        self.parallel_staging_experts.store(0, Ordering::Relaxed);
+        self.singleton_staging_sets.store(0, Ordering::Relaxed);
+        self.reservation_attempts.store(0, Ordering::Relaxed);
+        self.reservation_successes.store(0, Ordering::Relaxed);
+        self.reservation_failures.store(0, Ordering::Relaxed);
         self.physical_install_attempts.store(0, Ordering::Relaxed);
+        self.physical_stage_attempts.store(0, Ordering::Relaxed);
+        self.physical_stage_completions.store(0, Ordering::Relaxed);
+        self.physical_stage_failures.store(0, Ordering::Relaxed);
+        self.active_physical_staging.store(0, Ordering::Relaxed);
+        self.max_in_flight_physical_staging
+            .store(0, Ordering::Relaxed);
         self.direct_staging_successes.store(0, Ordering::Relaxed);
         self.direct_staging_unavailable.store(0, Ordering::Relaxed);
+        self.ordered_commit_attempts.store(0, Ordering::Relaxed);
+        self.ordered_commit_completions.store(0, Ordering::Relaxed);
+        self.ordered_commit_failures.store(0, Ordering::Relaxed);
+        self.ordered_commit_violations.store(0, Ordering::Relaxed);
+        self.unpublished_physical_writes_after_failure
+            .store(0, Ordering::Relaxed);
         self.physical_install_failures.store(0, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> GpuNativeProductionPhysicalInstallSnapshot {
         GpuNativeProductionPhysicalInstallSnapshot {
+            physical_install_sets: self.physical_install_sets.load(Ordering::Relaxed),
+            physical_install_experts: self.physical_install_experts.load(Ordering::Relaxed),
+            parallel_eligible_sets: self.parallel_eligible_sets.load(Ordering::Relaxed),
+            parallel_staging_sets: self.parallel_staging_sets.load(Ordering::Relaxed),
+            parallel_staging_experts: self.parallel_staging_experts.load(Ordering::Relaxed),
+            singleton_staging_sets: self.singleton_staging_sets.load(Ordering::Relaxed),
+            reservation_attempts: self.reservation_attempts.load(Ordering::Relaxed),
+            reservation_successes: self.reservation_successes.load(Ordering::Relaxed),
+            reservation_failures: self.reservation_failures.load(Ordering::Relaxed),
             physical_install_attempts: self.physical_install_attempts.load(Ordering::Relaxed),
+            physical_stage_attempts: self.physical_stage_attempts.load(Ordering::Relaxed),
+            physical_stage_completions: self.physical_stage_completions.load(Ordering::Relaxed),
+            physical_stage_failures: self.physical_stage_failures.load(Ordering::Relaxed),
             direct_staging_successes: self.direct_staging_successes.load(Ordering::Relaxed),
             direct_staging_unavailable: self.direct_staging_unavailable.load(Ordering::Relaxed),
             // Schema-v2 compatibility: production deliberately has no fallback,
             // so retaining a permanent atomic for this impossible count would
             // provide no operational signal.
             direct_staging_allocation_fallbacks: 0,
+            ordered_commit_attempts: self.ordered_commit_attempts.load(Ordering::Relaxed),
+            ordered_commit_completions: self.ordered_commit_completions.load(Ordering::Relaxed),
+            ordered_commit_failures: self.ordered_commit_failures.load(Ordering::Relaxed),
+            ordered_commit_violations: self.ordered_commit_violations.load(Ordering::Relaxed),
+            unpublished_physical_writes_after_failure: self
+                .unpublished_physical_writes_after_failure
+                .load(Ordering::Relaxed),
+            max_in_flight_physical_staging: self
+                .max_in_flight_physical_staging
+                .load(Ordering::Relaxed),
             physical_install_failures: self.physical_install_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_install_set(&self, width: usize) {
+        let width = width as u64;
+        self.physical_install_sets.fetch_add(1, Ordering::Relaxed);
+        self.physical_install_experts
+            .fetch_add(width, Ordering::Relaxed);
+        if width >= 2 {
+            self.parallel_eligible_sets.fetch_add(1, Ordering::Relaxed);
+            self.parallel_staging_sets.fetch_add(1, Ordering::Relaxed);
+            self.parallel_staging_experts
+                .fetch_add(width, Ordering::Relaxed);
+        } else if width == 1 {
+            self.singleton_staging_sets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_reservation_attempt(&self) {
+        self.reservation_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_reservation_success(&self) {
+        self.reservation_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_reservation_failure(&self) {
+        self.reservation_failures.fetch_add(1, Ordering::Relaxed);
+        self.physical_install_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_unpublished_physical_writes_after_failure(&self, count: u64) {
+        self.unpublished_physical_writes_after_failure
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn begin_stage(&self) -> ProductionPhysicalStageGuard<'_> {
+        self.physical_install_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        self.physical_stage_attempts.fetch_add(1, Ordering::Relaxed);
+        let active = self
+            .active_physical_staging
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        self.max_in_flight_physical_staging
+            .fetch_max(active, Ordering::Relaxed);
+        ProductionPhysicalStageGuard {
+            counters: self,
+            succeeded: false,
+        }
+    }
+}
+
+struct ProductionPhysicalStageGuard<'a> {
+    counters: &'a GpuNativeProductionPhysicalInstallCounters,
+    succeeded: bool,
+}
+
+impl ProductionPhysicalStageGuard<'_> {
+    fn succeed(mut self) {
+        self.counters
+            .physical_stage_completions
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .direct_staging_successes
+            .fetch_add(1, Ordering::Relaxed);
+        self.succeeded = true;
+    }
+}
+
+impl Drop for ProductionPhysicalStageGuard<'_> {
+    fn drop(&mut self) {
+        self.counters
+            .active_physical_staging
+            .fetch_sub(1, Ordering::AcqRel);
+        if !self.succeeded {
+            self.counters
+                .physical_stage_failures
+                .fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .physical_install_failures
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -3441,13 +3614,81 @@ pub(crate) struct GpuNativeQ4ExpertInstallPermit<'a, B = wgpu::Buffer> {
     active: bool,
 }
 
-impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
+impl<'arena, B> GpuNativeQ4ExpertInstallPermit<'arena, B> {
     pub(crate) const fn key(&self) -> GpuNativeQ4ExpertKey {
         self.key
     }
 
     pub(crate) const fn reserved_residency(&self) -> GpuNativeQ4ExpertResidency {
         self.residency
+    }
+
+    pub(crate) const fn install_ticket(&self) -> u64 {
+        self.install_ticket
+    }
+
+    fn reservation_current(&self, state: &GpuNativeQ4ExpertArenaState) -> bool {
+        let logical_id = self.key.expert_id as usize;
+        state.latest_generations.get(logical_id).copied().flatten()
+            == Some(self.key.logical_generation)
+            && state.logical_slots.get(logical_id).copied().flatten() == Some(self.flat_slot)
+            && matches!(
+                state.slots.get(self.flat_slot).map(|slot| slot.owner),
+                Some(GpuNativeQ4ExpertSlotOwner::Installing {
+                    key,
+                    slot_epoch,
+                    install_ticket,
+                }) if key == self.key
+                    && slot_epoch == self.residency.slot_epoch
+                    && install_ticket == self.install_ticket
+            )
+    }
+
+    /// Staging half of an install transaction. Validation
+    /// and an exact reservation check happen before the arena lock is released;
+    /// the potentially multi-megabyte fill then runs without `arena.state`.
+    fn stage_with_checked_physical_writer<PhysicalWrite>(
+        self,
+        payload: &[u8],
+        mut physical_write: PhysicalWrite,
+    ) -> Result<GpuNativeQ4ExpertPreparedInstall<'arena, B>, GpuNativeBootstrapError>
+    where
+        PhysicalWrite:
+            FnMut(u32, u64, CheckedPhysicalQ4ExpertSlot<'_>) -> Result<(), GpuNativeBootstrapError>,
+    {
+        let checked = CheckedPhysicalQ4ExpertSlot::new(
+            self.arena.geometry,
+            self.key.expert_id,
+            self.residency.slot_epoch,
+            payload,
+        )?;
+        let mapping = self.residency.mapping_entry()?;
+        let logical_id = self.key.expert_id as usize;
+        let physical_offset = u64::from(self.residency.location.slot)
+            .checked_mul(self.arena.geometry.slot_stride_bytes as u64)
+            .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
+        let mapping_offset = u64::try_from(logical_id)
+            .ok()
+            .and_then(|id| id.checked_mul(GPU_NATIVE_EXPERT_MAPPING_ENTRY_BYTES as u64))
+            .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
+
+        {
+            let mut state = self.arena.state.lock();
+            if !self.reservation_current(&state) {
+                state.counters.expert_stale_install_rejections = state
+                    .counters
+                    .expert_stale_install_rejections
+                    .saturating_add(1);
+                return Err(GpuNativeBootstrapError::ExpertInstallReservationLost);
+            }
+        }
+
+        physical_write(self.residency.location.bank, physical_offset, checked)?;
+        Ok(GpuNativeQ4ExpertPreparedInstall {
+            permit: self,
+            mapping,
+            mapping_offset,
+        })
     }
 
     fn install_with_writes<PhysicalWrite, MappingWrite>(
@@ -3535,20 +3776,7 @@ impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
             .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
 
         let mut state = self.arena.state.lock();
-        let reservation_current = state.latest_generations.get(logical_id).copied().flatten()
-            == Some(self.key.logical_generation)
-            && state.logical_slots.get(logical_id).copied().flatten() == Some(self.flat_slot)
-            && matches!(
-                state.slots.get(self.flat_slot).map(|slot| slot.owner),
-                Some(GpuNativeQ4ExpertSlotOwner::Installing {
-                    key,
-                    slot_epoch,
-                    install_ticket,
-                }) if key == self.key
-                    && slot_epoch == self.residency.slot_epoch
-                    && install_ticket == self.install_ticket
-            );
-        if !reservation_current {
+        if !self.reservation_current(&state) {
             state.counters.expert_stale_install_rejections = state
                 .counters
                 .expert_stale_install_rejections
@@ -3569,6 +3797,49 @@ impl<B> GpuNativeQ4ExpertInstallPermit<'_, B> {
             state.counters.expert_mapping_publications.saturating_add(1);
         self.active = false;
         Ok(self.residency)
+    }
+}
+
+impl<B> GpuNativeQ4ExpertPreparedInstall<'_, B> {
+    pub(crate) const fn key(&self) -> GpuNativeQ4ExpertKey {
+        self.permit.key
+    }
+
+    pub(crate) const fn residency(&self) -> GpuNativeQ4ExpertResidency {
+        self.permit.residency
+    }
+
+    /// Publish and commit one already-staged slot. Rechecking the complete
+    /// reservation identity here prevents staged-but-stale bytes from ever
+    /// becoming executable.
+    fn commit_with_mapping_writer<MappingWrite>(
+        mut self,
+        mut mapping_write: MappingWrite,
+    ) -> Result<GpuNativeQ4ExpertResidency, GpuNativeBootstrapError>
+    where
+        MappingWrite: FnMut(u64, GpuNativeQ4ExpertMappingEntry),
+    {
+        let mut state = self.permit.arena.state.lock();
+        if !self.permit.reservation_current(&state) {
+            state.counters.expert_stale_install_rejections = state
+                .counters
+                .expert_stale_install_rejections
+                .saturating_add(1);
+            return Err(GpuNativeBootstrapError::ExpertInstallReservationLost);
+        }
+
+        mapping_write(self.mapping_offset, self.mapping);
+        state.slots[self.permit.flat_slot].owner =
+            GpuNativeQ4ExpertSlotOwner::Resident(self.permit.residency);
+        state.slots[self.permit.flat_slot].ever_installed = true;
+        state.counters.expert_slot_installs = state.counters.expert_slot_installs.saturating_add(1);
+        if self.permit.reused {
+            state.counters.expert_slot_reuses = state.counters.expert_slot_reuses.saturating_add(1);
+        }
+        state.counters.expert_mapping_publications =
+            state.counters.expert_mapping_publications.saturating_add(1);
+        self.permit.active = false;
+        Ok(self.permit.residency)
     }
 }
 
@@ -7091,10 +7362,7 @@ impl GpuNativeExecutorContext {
         })
     }
 
-    /// Ordinary production demand install: validate the canonical physical
-    /// slot layout, fill one exact direct queue staging view, publish the
-    /// mapping, then commit the host arena state. No qualification timer or
-    /// report operation is performed on this path.
+    /// Pre-B-B sequential direct-staging primitive retained for focused tests.
     pub(crate) fn install_q4_expert_residency(
         &self,
         permit: GpuNativeQ4ExpertInstallPermit<'_>,
@@ -7102,15 +7370,14 @@ impl GpuNativeExecutorContext {
     ) -> Result<GpuNativeQ4ExpertResidency, GpuNativeBootstrapError> {
         self.install_q4_expert_residency_production_inner::<{
             NORMAL_PRODUCTION_MEASURES_PHYSICAL_INSTALL_SUBPHASES
-        }>(
+        }, true>(
             permit,
             payload,
         )
         .map(|(residency, _)| residency)
     }
 
-    /// The v2 treatment observes the exact ordinary production primitive; its
-    /// timing-enabled monomorphization is confined to the dedicated qualifier.
+    /// Timing-enabled observation of the pre-B-B sequential primitive.
     pub(crate) fn install_q4_expert_residency_production_observed(
         &self,
         permit: GpuNativeQ4ExpertInstallPermit<'_>,
@@ -7119,13 +7386,30 @@ impl GpuNativeExecutorContext {
         (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
         GpuNativeBootstrapError,
     > {
-        self.install_q4_expert_residency_production_inner::<true>(permit, payload)
+        self.install_q4_expert_residency_production_inner::<true, true>(permit, payload)
     }
 
-    /// `MEASURE=false` is the ordinary production monomorphization: its timing
-    /// branches and `Instant` construction are compile-time dead. The v2
-    /// qualifier alone instantiates `MEASURE=true`.
-    fn install_q4_expert_residency_production_inner<const MEASURE: bool>(
+    /// Explicit PR2-B-B.1 control: the pre-B-B sequential direct-staging
+    /// primitive with qualification timing but without ordinary-production
+    /// telemetry. Normal serving never selects this wrapper.
+    pub(crate) fn install_q4_expert_residency_sequential_control_observed(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'_>,
+        payload: &[u8],
+    ) -> Result<
+        (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
+        GpuNativeBootstrapError,
+    > {
+        self.install_q4_expert_residency_production_inner::<true, false>(permit, payload)
+    }
+
+    /// Shared sequential primitive. `MEASURE=false` removes all subphase
+    /// timers; `RECORD_PRODUCTION=false` keeps the explicit B-B.1 control out
+    /// of ordinary-production telemetry.
+    fn install_q4_expert_residency_production_inner<
+        const MEASURE: bool,
+        const RECORD_PRODUCTION: bool,
+    >(
         &self,
         permit: GpuNativeQ4ExpertInstallPermit<'_>,
         payload: &[u8],
@@ -7137,9 +7421,11 @@ impl GpuNativeExecutorContext {
         if permit.arena.context_id != self.context_id {
             return Err(GpuNativeBootstrapError::ForeignExpertArena);
         }
-        self.production_physical_install
-            .physical_install_attempts
-            .fetch_add(1, Ordering::Relaxed);
+        if RECORD_PRODUCTION {
+            self.production_physical_install
+                .physical_install_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let arena = permit.arena;
         let upload_bytes = arena.geometry.slot_stride_bytes as u64;
         let prepare_us = std::cell::Cell::new(0u64);
@@ -7154,9 +7440,11 @@ impl GpuNativeExecutorContext {
         ) {
             Ok(checked) => checked,
             Err(error) => {
-                self.production_physical_install
-                    .physical_install_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                if RECORD_PRODUCTION {
+                    self.production_physical_install
+                        .physical_install_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return Err(error);
             }
         };
@@ -7210,23 +7498,29 @@ impl GpuNativeExecutorContext {
         let residency = match result {
             Ok(residency) => residency,
             Err(error) => {
-                if matches!(
-                    error,
-                    GpuNativeBootstrapError::ExpertDirectStagingUnavailable { .. }
-                ) {
+                if RECORD_PRODUCTION
+                    && matches!(
+                        error,
+                        GpuNativeBootstrapError::ExpertDirectStagingUnavailable { .. }
+                    )
+                {
                     self.production_physical_install
                         .direct_staging_unavailable
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                self.production_physical_install
-                    .physical_install_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                if RECORD_PRODUCTION {
+                    self.production_physical_install
+                        .physical_install_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 return Err(error);
             }
         };
-        self.production_physical_install
-            .direct_staging_successes
-            .fetch_add(1, Ordering::Relaxed);
+        if RECORD_PRODUCTION {
+            self.production_physical_install
+                .direct_staging_successes
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.counters.record_expert_residency_upload(upload_bytes);
         Ok((
             residency,
@@ -7239,6 +7533,220 @@ impl GpuNativeExecutorContext {
                 mapping_publication_us: mapping_us.get(),
             },
         ))
+    }
+
+    pub(crate) fn stage_q4_expert_residency_production<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<GpuNativeQ4ExpertPreparedInstall<'a>, GpuNativeBootstrapError> {
+        self.stage_q4_expert_residency_inner::<false, true>(permit, payload)
+            .map(|(prepared, _)| prepared)
+    }
+
+    pub(crate) fn stage_q4_expert_residency_production_observed<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        self.stage_q4_expert_residency_inner::<true, true>(permit, payload)
+    }
+
+    /// Historical qualification wrapper retained for focused PR2-B-B tests.
+    pub(crate) fn stage_q4_expert_residency_qualification<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        self.stage_q4_expert_residency_inner::<true, false>(permit, payload)
+    }
+
+    /// `MEASURE=false` removes subphase timers from normal serving.
+    fn stage_q4_expert_residency_inner<'a, const MEASURE: bool, const RECORD_PRODUCTION: bool>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        let gpu = self.authoritative_gpu()?;
+        if permit.arena.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let stage_guard = RECORD_PRODUCTION.then(|| self.production_physical_install.begin_stage());
+        let arena = permit.arena;
+        let upload_bytes = arena.geometry.slot_stride_bytes as u64;
+        let prepare_us = std::cell::Cell::new(0u64);
+        let queue_staging_us = std::cell::Cell::new(0u64);
+        let validate_started = MEASURE.then(Instant::now);
+        let result = permit.stage_with_checked_physical_writer(payload, |bank, offset, checked| {
+            if let Some(started) = validate_started {
+                prepare_us.set(elapsed_us(started));
+            }
+            let size = wgpu::BufferSize::new(upload_bytes)
+                .expect("validated physical expert slot is nonempty");
+            let queue_started = MEASURE.then(Instant::now);
+            let Some(mut view) =
+                gpu.queue
+                    .write_buffer_with(&arena.banks[bank as usize], offset, size)
+            else {
+                return Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable {
+                    bank,
+                    offset,
+                    bytes: upload_bytes,
+                });
+            };
+            if let Some(started) = queue_started {
+                queue_staging_us.set(elapsed_us(started));
+            }
+            let fill_started = MEASURE.then(Instant::now);
+            checked.fill(view.as_mut())?;
+            if let Some(started) = fill_started {
+                prepare_us.set(prepare_us.get().saturating_add(elapsed_us(started)));
+            }
+            let drop_started = MEASURE.then(Instant::now);
+            drop(view);
+            if let Some(started) = drop_started {
+                queue_staging_us.set(queue_staging_us.get().saturating_add(elapsed_us(started)));
+            }
+            Ok(())
+        });
+        match result {
+            Ok(prepared) => {
+                if let Some(stage_guard) = stage_guard {
+                    stage_guard.succeed();
+                }
+                Ok((
+                    prepared,
+                    GpuNativePhysicalInstallEvidence {
+                        full_slot_vec_materializations: 0,
+                        direct_staging_writes: 1,
+                        physical_slot_bytes_staged: upload_bytes,
+                        physical_slot_prepare_us: prepare_us.get(),
+                        physical_queue_staging_us: queue_staging_us.get(),
+                        mapping_publication_us: 0,
+                    },
+                ))
+            }
+            Err(error) => {
+                if RECORD_PRODUCTION
+                    && matches!(
+                        error,
+                        GpuNativeBootstrapError::ExpertDirectStagingUnavailable { .. }
+                    )
+                {
+                    self.production_physical_install
+                        .direct_staging_unavailable
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn commit_q4_expert_residency_production(
+        &self,
+        prepared: GpuNativeQ4ExpertPreparedInstall<'_>,
+    ) -> Result<GpuNativeQ4ExpertResidency, GpuNativeBootstrapError> {
+        self.commit_q4_expert_residency_inner::<false, true>(
+            prepared,
+            GpuNativePhysicalInstallEvidence::default(),
+        )
+        .map(|(residency, _)| residency)
+    }
+
+    pub(crate) fn commit_q4_expert_residency_production_observed(
+        &self,
+        prepared: GpuNativeQ4ExpertPreparedInstall<'_>,
+        evidence: GpuNativePhysicalInstallEvidence,
+    ) -> Result<
+        (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
+        GpuNativeBootstrapError,
+    > {
+        self.commit_q4_expert_residency_inner::<true, true>(prepared, evidence)
+    }
+
+    /// Historical no-production-counter wrapper retained for focused tests.
+    pub(crate) fn commit_q4_expert_residency_qualification(
+        &self,
+        prepared: GpuNativeQ4ExpertPreparedInstall<'_>,
+        evidence: GpuNativePhysicalInstallEvidence,
+    ) -> Result<
+        (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
+        GpuNativeBootstrapError,
+    > {
+        self.commit_q4_expert_residency_inner::<true, false>(prepared, evidence)
+    }
+
+    fn commit_q4_expert_residency_inner<const MEASURE: bool, const RECORD_PRODUCTION: bool>(
+        &self,
+        prepared: GpuNativeQ4ExpertPreparedInstall<'_>,
+        mut evidence: GpuNativePhysicalInstallEvidence,
+    ) -> Result<
+        (GpuNativeQ4ExpertResidency, GpuNativePhysicalInstallEvidence),
+        GpuNativeBootstrapError,
+    > {
+        let gpu = self.authoritative_gpu()?;
+        if prepared.permit.arena.context_id != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        if RECORD_PRODUCTION {
+            self.production_physical_install
+                .ordered_commit_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let arena = prepared.permit.arena;
+        let upload_bytes = arena.geometry.slot_stride_bytes as u64;
+        let mapping_started = MEASURE.then(Instant::now);
+        let result = prepared.commit_with_mapping_writer(|offset, entry| {
+            gpu.queue
+                .write_buffer(&arena.mapping, offset, bytemuck::bytes_of(&entry));
+        });
+        let residency = match result {
+            Ok(residency) => residency,
+            Err(error) => {
+                if RECORD_PRODUCTION {
+                    self.production_physical_install
+                        .ordered_commit_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if matches!(error, GpuNativeBootstrapError::ExpertInstallReservationLost) {
+                        self.production_physical_install
+                            .ordered_commit_violations
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.production_physical_install
+                        .physical_install_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(started) = mapping_started {
+            evidence.mapping_publication_us = elapsed_us(started);
+        }
+        if RECORD_PRODUCTION {
+            self.production_physical_install
+                .ordered_commit_completions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.counters.record_expert_residency_upload(upload_bytes);
+        Ok((residency, evidence))
     }
 
     /// Preserve the pre-PR2-B-A.1 full-slot Vec implementation for the
@@ -9167,6 +9675,44 @@ impl GpuNativeExecutorContext {
         self.production_physical_install.snapshot()
     }
 
+    pub(crate) fn record_production_physical_install_set(&self, width: usize) {
+        self.production_physical_install.record_install_set(width);
+    }
+
+    pub(crate) fn record_production_physical_reservation_attempt(&self) {
+        self.production_physical_install
+            .record_reservation_attempt();
+    }
+
+    pub(crate) fn record_production_physical_reservation_success(&self) {
+        self.production_physical_install
+            .record_reservation_success();
+    }
+
+    pub(crate) fn record_production_physical_reservation_failure(&self) {
+        self.production_physical_install
+            .record_reservation_failure();
+    }
+
+    pub(crate) fn record_production_ordered_commit_failure(&self, violation: bool) {
+        self.production_physical_install
+            .ordered_commit_failures
+            .fetch_add(1, Ordering::Relaxed);
+        if violation {
+            self.production_physical_install
+                .ordered_commit_violations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.production_physical_install
+            .physical_install_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_production_unpublished_physical_writes_after_failure(&self, count: u64) {
+        self.production_physical_install
+            .record_unpublished_physical_writes_after_failure(count);
+    }
+
     pub(crate) fn reset_production_physical_install_telemetry(&self) {
         self.production_physical_install.reset();
     }
@@ -10962,6 +11508,282 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_direct_staging_worker_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+
+        assert_send_sync::<wgpu::Queue>();
+        assert_send_sync::<wgpu::Buffer>();
+        assert_send_sync::<wgpu::QueueWriteBufferView<'static>>();
+        assert_send::<GpuNativeQ4ExpertInstallPermit<'static>>();
+        assert_send::<GpuNativeQ4ExpertPreparedInstall<'static>>();
+    }
+
+    #[test]
+    fn split_physical_install_stages_without_publication_then_commits_once() {
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, -0.02, 0.005);
+        let key = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let permit = expect_expert_install(arena.acquire_with_unpublish(key, |_, _| {}).unwrap());
+        let physical = RefCell::new(Vec::new());
+        let prepared = permit
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0xa5; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)?;
+                *physical.borrow_mut() = destination;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(prepared.key(), key);
+        assert_eq!(arena.residency_snapshot().installing_slots, 1);
+        assert_eq!(arena.residency_snapshot().resident_slots, 0);
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 0);
+        assert_eq!(physical.borrow()[..4], 1u32.to_le_bytes());
+
+        let mappings = RefCell::new(Vec::new());
+        let residency = prepared
+            .commit_with_mapping_writer(|offset, entry| {
+                mappings.borrow_mut().push((offset, entry));
+            })
+            .unwrap();
+        assert_eq!(mappings.borrow().len(), 1);
+        assert_eq!(mappings.borrow()[0].1, residency.mapping_entry().unwrap());
+        assert!(arena.contains_exact_residency(7, residency));
+        let snapshot = arena.residency_snapshot();
+        assert_eq!(snapshot.resident_slots, 1);
+        assert_eq!(snapshot.expert_slot_installs, 1);
+        assert_eq!(snapshot.expert_mapping_publications, 1);
+    }
+
+    #[test]
+    fn reversed_stage_completion_preserves_reservation_and_publication_order() {
+        use std::cell::RefCell;
+
+        let arena = test_mutable_expert_arena(2);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let key_a = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let key_b = GpuNativeQ4ExpertKey::new(3, 8, 11);
+        let permit_a =
+            expect_expert_install(arena.acquire_with_unpublish(key_a, |_, _| {}).unwrap());
+        let permit_b =
+            expect_expert_install(arena.acquire_with_unpublish(key_b, |_, _| {}).unwrap());
+        let residency_a = permit_a.reserved_residency();
+        let residency_b = permit_b.reserved_residency();
+        assert_eq!(residency_a.location().slot(), 0);
+        assert_eq!(residency_b.location().slot(), 1);
+        assert_eq!(residency_a.slot_epoch(), 1);
+        assert_eq!(residency_b.slot_epoch(), 1);
+        let stride = arena.geometry().slot_stride_bytes() as u64;
+        assert!(
+            u64::from(residency_a.location().slot()) * stride + stride
+                <= u64::from(residency_b.location().slot()) * stride
+        );
+
+        // Finish B's physical work before A's to model reversed workers.
+        let prepared_b = permit_b
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let prepared_a = permit_a
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let publications = RefCell::new(Vec::new());
+        let committed_a = prepared_a
+            .commit_with_mapping_writer(|_, entry| publications.borrow_mut().push(entry))
+            .unwrap();
+        let committed_b = prepared_b
+            .commit_with_mapping_writer(|_, entry| publications.borrow_mut().push(entry))
+            .unwrap();
+        assert_eq!(
+            publications.borrow().as_slice(),
+            &[
+                committed_a.mapping_entry().unwrap(),
+                committed_b.mapping_entry().unwrap(),
+            ]
+        );
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 2);
+    }
+
+    #[test]
+    fn split_install_widths_one_through_eight_match_sequential_slot_identity_and_order() {
+        for width in 1usize..=8 {
+            let control = test_mutable_expert_arena(width);
+            let treatment = test_mutable_expert_arena(width);
+            let payload = q4_uniform_expert(control.geometry(), 0.01, -0.02, 0.005);
+            let keys = (0..width as u32)
+                .map(|expert_id| GpuNativeQ4ExpertKey::new(3, expert_id, 10 + expert_id as u64))
+                .collect::<Vec<_>>();
+
+            let mut control_residencies = Vec::with_capacity(width);
+            for &key in &keys {
+                let permit = expect_expert_install(
+                    control.acquire_with_unpublish(key, |_, _| {}).unwrap(),
+                );
+                control_residencies.push(
+                    permit
+                        .install_with_checked_physical_writer(
+                            &payload,
+                            |_, _, checked| {
+                                let mut destination =
+                                    vec![0xa5; control.geometry().slot_stride_bytes()];
+                                checked.fill(&mut destination)
+                            },
+                            |_, _| {},
+                        )
+                        .unwrap(),
+                );
+            }
+
+            let permits = keys
+                .iter()
+                .map(|&key| {
+                    expect_expert_install(
+                        treatment.acquire_with_unpublish(key, |_, _| {}).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut prepared = permits
+                .into_iter()
+                .rev()
+                .map(|permit| {
+                    permit
+                        .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                            let mut destination =
+                                vec![0xa5; treatment.geometry().slot_stride_bytes()];
+                            checked.fill(&mut destination)
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            prepared.sort_by_key(|install| install.key().expert_id());
+            let treatment_residencies = prepared
+                .into_iter()
+                .map(|install| install.commit_with_mapping_writer(|_, _| {}).unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(treatment_residencies, control_residencies);
+            assert_eq!(treatment.residency_snapshot(), control.residency_snapshot());
+            for (index, residency) in treatment_residencies.iter().enumerate() {
+                assert_eq!(residency.location().slot(), index as u32);
+                assert_eq!(residency.slot_epoch(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn split_install_failed_and_later_prepared_permits_cancel_without_publication() {
+        use std::cell::Cell;
+
+        let arena = test_mutable_expert_arena(3);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, -0.02, 0.005);
+        let permits = (0..3u32)
+            .map(|expert_id| {
+                expect_expert_install(
+                    arena
+                        .acquire_with_unpublish(
+                            GpuNativeQ4ExpertKey::new(3, expert_id, 10),
+                            |_, _| {},
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let physical_attempts = Cell::new(0u64);
+        let mut results = permits
+            .into_iter()
+            .enumerate()
+            .map(|(index, permit)| {
+                permit.stage_with_checked_physical_writer(&payload, |bank, offset, checked| {
+                    physical_attempts.set(physical_attempts.get() + 1);
+                    if index == 1 {
+                        return Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable {
+                            bank,
+                            offset,
+                            bytes: arena.geometry().slot_stride_bytes() as u64,
+                        });
+                    }
+                    let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                    checked.fill(&mut destination)
+                })
+            })
+            .collect::<Vec<_>>();
+        let first = results.remove(0).unwrap();
+        assert!(matches!(
+            results.remove(0),
+            Err(GpuNativeBootstrapError::ExpertDirectStagingUnavailable { .. })
+        ));
+        let later = results.remove(0).unwrap();
+
+        first.commit_with_mapping_writer(|_, _| {}).unwrap();
+        drop(later);
+        assert_eq!(physical_attempts.get(), 3);
+        let snapshot = arena.residency_snapshot();
+        assert_eq!(snapshot.resident_slots, 1);
+        assert_eq!(snapshot.free_slots, 2);
+        assert_eq!(snapshot.expert_slot_installs, 1);
+        assert_eq!(snapshot.expert_mapping_publications, 1);
+        assert_eq!(snapshot.expert_install_cancellations, 2);
+    }
+
+    #[test]
+    fn split_install_reservation_loss_before_stage_or_commit_never_publishes() {
+        use std::cell::Cell;
+
+        let arena = test_mutable_expert_arena(1);
+        let payload = q4_uniform_expert(arena.geometry(), 0.01, 0.02, 0.005);
+        let old_key = GpuNativeQ4ExpertKey::new(3, 7, 10);
+        let newer_key = GpuNativeQ4ExpertKey::new(3, 7, 11);
+
+        let before_stage =
+            expect_expert_install(arena.acquire_with_unpublish(old_key, |_, _| {}).unwrap());
+        let newer =
+            expect_expert_install(arena.acquire_with_unpublish(newer_key, |_, _| {}).unwrap());
+        let writes = Cell::new(0);
+        assert!(matches!(
+            before_stage.stage_with_checked_physical_writer(&payload, |_, _, _| {
+                writes.set(writes.get() + 1);
+                Ok(())
+            }),
+            Err(GpuNativeBootstrapError::ExpertInstallReservationLost)
+        ));
+        assert_eq!(writes.get(), 0);
+        drop(newer);
+
+        let stage_key = GpuNativeQ4ExpertKey::new(3, 7, 12);
+        let superseding_key = GpuNativeQ4ExpertKey::new(3, 7, 13);
+        let stage_permit =
+            expect_expert_install(arena.acquire_with_unpublish(stage_key, |_, _| {}).unwrap());
+        let prepared = stage_permit
+            .stage_with_checked_physical_writer(&payload, |_, _, checked| {
+                writes.set(writes.get() + 1);
+                let mut destination = vec![0; arena.geometry().slot_stride_bytes()];
+                checked.fill(&mut destination)
+            })
+            .unwrap();
+        let superseding = expect_expert_install(
+            arena
+                .acquire_with_unpublish(superseding_key, |_, _| {})
+                .unwrap(),
+        );
+        let mappings = Cell::new(0);
+        assert_eq!(
+            prepared.commit_with_mapping_writer(|_, _| mappings.set(mappings.get() + 1)),
+            Err(GpuNativeBootstrapError::ExpertInstallReservationLost)
+        );
+        assert_eq!(mappings.get(), 0);
+        assert_eq!(arena.residency_snapshot().resident_slots, 0);
+        assert_eq!(arena.residency_snapshot().expert_mapping_publications, 0);
+        drop(superseding);
+    }
+
+    #[test]
     fn production_physical_install_telemetry_is_compact_and_resettable() {
         let counters = GpuNativeProductionPhysicalInstallCounters::default();
         counters
@@ -10984,6 +11806,7 @@ pub(crate) mod tests {
                 direct_staging_unavailable: 1,
                 direct_staging_allocation_fallbacks: 0,
                 physical_install_failures: 1,
+                ..GpuNativeProductionPhysicalInstallSnapshot::default()
             }
         );
         counters.reset();
@@ -10992,6 +11815,35 @@ pub(crate) mod tests {
             GpuNativeProductionPhysicalInstallSnapshot::default()
         );
         assert!(!NORMAL_PRODUCTION_MEASURES_PHYSICAL_INSTALL_SUBPHASES);
+    }
+
+    #[test]
+    fn production_concurrency_telemetry_distinguishes_singletons_and_parallel_overlap() {
+        let counters = GpuNativeProductionPhysicalInstallCounters::default();
+        counters.record_install_set(1);
+        counters.record_install_set(4);
+        for _ in 0..5 {
+            counters.record_reservation_attempt();
+            counters.record_reservation_success();
+        }
+        let first = counters.begin_stage();
+        let second = counters.begin_stage();
+        second.succeed();
+        first.succeed();
+        let snapshot = counters.snapshot();
+
+        assert_eq!(snapshot.physical_install_sets, 2);
+        assert_eq!(snapshot.physical_install_experts, 5);
+        assert_eq!(snapshot.parallel_eligible_sets, 1);
+        assert_eq!(snapshot.parallel_staging_sets, 1);
+        assert_eq!(snapshot.parallel_staging_experts, 4);
+        assert_eq!(snapshot.singleton_staging_sets, 1);
+        assert_eq!(snapshot.reservation_attempts, 5);
+        assert_eq!(snapshot.reservation_successes, 5);
+        assert_eq!(snapshot.max_in_flight_physical_staging, 2);
+        assert_eq!(snapshot.physical_stage_attempts, 2);
+        assert_eq!(snapshot.physical_stage_completions, 2);
+        assert_eq!(snapshot.physical_stage_failures, 0);
     }
 
     #[test]
