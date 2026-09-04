@@ -6667,6 +6667,7 @@ pub(crate) struct GpuNativeExecutorContext {
     attention_pipelines: GpuNativeAttentionPipelines,
     router_pipeline: GpuNativeRouterPipeline,
     q4_expert_pipelines: GpuNativeQ4ExpertPipelines,
+    q4_route_parallel_pipelines: q4_route_parallel::GpuNativeQ4RouteParallelPipelines,
     status_control_pipeline: GpuNativeStatusControlPipeline,
     greedy_argmax_pipeline: GpuNativeGreedyArgmaxPipeline,
     counters: GpuNativeExecutionCounters,
@@ -6699,6 +6700,11 @@ impl GpuNativeExecutorContext {
         let attention_pipelines = GpuNativeAttentionPipelines::new(&gpu.device);
         let router_pipeline = GpuNativeRouterPipeline::new(&gpu.device);
         let q4_expert_pipelines = GpuNativeQ4ExpertPipelines::try_new(&gpu.device)?;
+        let q4_route_parallel_pipelines =
+            q4_route_parallel::GpuNativeQ4RouteParallelPipelines::create_for_executor(
+                &gpu.device,
+                &q4_expert_pipelines,
+            );
         let status_control_pipeline = GpuNativeStatusControlPipeline::new(&gpu.device);
         let greedy_argmax_pipeline = GpuNativeGreedyArgmaxPipeline::new(&gpu.device);
 
@@ -6713,6 +6719,7 @@ impl GpuNativeExecutorContext {
             attention_pipelines,
             router_pipeline,
             q4_expert_pipelines,
+            q4_route_parallel_pipelines,
             status_control_pipeline,
             greedy_argmax_pipeline,
             counters: GpuNativeExecutionCounters::default(),

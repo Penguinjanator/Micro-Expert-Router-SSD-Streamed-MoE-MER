@@ -64,8 +64,46 @@ pub(crate) struct GpuNativeQ4RouteParallelScratch {
     context_id: u64,
     geometry: GpuNativeQ4ExpertGeometry,
     activation: GpuNativeScratch,
+}
+
+/// Executor-owned route-parallel pipelines. These are invariant across
+/// requests and are created once with the other GPU-native pipelines.
+pub(super) struct GpuNativeQ4RouteParallelPipelines {
     gate_up: wgpu::ComputePipeline,
     down: wgpu::ComputePipeline,
+}
+
+impl GpuNativeQ4RouteParallelPipelines {
+    pub(super) fn create_for_executor(
+        device: &wgpu::Device,
+        q4_expert_pipelines: &GpuNativeQ4ExpertPipelines,
+    ) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pr2c_q4_route_parallel_shader"),
+            source: wgpu::ShaderSource::Wgsl(ROUTE_PARALLEL_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pr2c_q4_route_parallel_layout"),
+            bind_group_layouts: &[&q4_expert_pipelines.expert_bind_group_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
+            }],
+        });
+        let pipeline = |entry_point| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry_point),
+                layout: Some(&layout),
+                module: &module,
+                entry_point,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            })
+        };
+        Self {
+            gate_up: pipeline("q4_expert_gate_up_route_parallel_main"),
+            down: pipeline("q4_expert_down_route_parallel_main"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -138,38 +176,10 @@ impl GpuNativeExecutorContext {
         let gpu = self.authoritative_gpu()?;
         let plan = RouteParallelGeometry::try_new(geometry, &gpu.device.limits())?;
         let activation = self.create_scratch(plan.activation_elements)?;
-        let module = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("pr2c_q4_route_parallel_shader"),
-                source: wgpu::ShaderSource::Wgsl(ROUTE_PARALLEL_SHADER.into()),
-            });
-        let layout = gpu
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("pr2c_q4_route_parallel_layout"),
-                bind_group_layouts: &[&self.q4_expert_pipelines.expert_bind_group_layout],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..GPU_NATIVE_EXPERT_PUSH_CONSTANT_BYTES,
-                }],
-            });
-        let pipeline = |entry_point| {
-            gpu.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(entry_point),
-                    layout: Some(&layout),
-                    module: &module,
-                    entry_point,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                })
-        };
         Ok(GpuNativeQ4RouteParallelScratch {
             context_id: self.context_id,
             geometry,
             activation,
-            gate_up: pipeline("q4_expert_gate_up_route_parallel_main"),
-            down: pipeline("q4_expert_down_route_parallel_main"),
         })
     }
 
@@ -379,7 +389,7 @@ impl GpuNativeExecutorContext {
                     label: Some("gpu_native_q4_expert_gate_up_pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&parallel.gate_up);
+                pass.set_pipeline(&self.q4_route_parallel_pipelines.gate_up);
                 pass.set_bind_group(0, &gate_up_bind_group, &[]);
                 pass.set_push_constants(0, bytemuck::bytes_of(&pc));
                 pass.dispatch_workgroups(gate_up_workgroups, geometry.route_width, 1);
@@ -391,7 +401,7 @@ impl GpuNativeExecutorContext {
                     label: Some("gpu_native_q4_expert_down_pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&parallel.down);
+                pass.set_pipeline(&self.q4_route_parallel_pipelines.down);
                 pass.set_bind_group(0, &down_bind_group, &[]);
                 pass.set_push_constants(0, bytemuck::bytes_of(&pc));
                 pass.dispatch_workgroups(down_workgroups, geometry.route_width, 1);
@@ -584,6 +594,53 @@ mod tests {
                 Err(GpuNativeBootstrapError::ForeignTokenState)
             ));
         }
+    }
+    #[test]
+    fn q4_route_parallel_pipelines_are_executor_owned_not_request_local() {
+        let source = include_str!("q4_route_parallel.rs");
+        let scratch = function(source, "create_q4_route_parallel_scratch");
+        let request = function(
+            include_str!("../../gpu_native_token_loop.rs"),
+            "create_request_state_inner",
+        );
+        for request_local in [&scratch, &request] {
+            for forbidden in [
+                "create_shader_module",
+                "create_pipeline_layout",
+                "create_compute_pipeline",
+            ] {
+                assert!(!request_local.contains(forbidden), "{forbidden}");
+            }
+        }
+        assert!(scratch.contains("self.create_scratch(plan.activation_elements)?"));
+
+        let pipelines = function(source, "create_for_executor");
+        assert_eq!(pipelines.matches("create_shader_module").count(), 1);
+        assert_eq!(pipelines.matches("create_pipeline_layout").count(), 1);
+        assert_eq!(pipelines.matches("create_compute_pipeline").count(), 1);
+        for entry_point in [
+            "q4_expert_gate_up_route_parallel_main",
+            "q4_expert_down_route_parallel_main",
+        ] {
+            assert!(pipelines.contains(entry_point));
+        }
+
+        let executor = include_str!("../gpu_native.rs");
+        let context = executor.find("impl GpuNativeExecutorContext").unwrap();
+        let initialize = function(&executor[context..], "try_new");
+        let q4 = initialize
+            .find("GpuNativeQ4ExpertPipelines::try_new")
+            .unwrap();
+        let parallel = initialize
+            .find("GpuNativeQ4RouteParallelPipelines::create_for_executor")
+            .unwrap();
+        assert!(q4 < parallel);
+        assert_eq!(
+            initialize
+                .matches("GpuNativeQ4RouteParallelPipelines::create_for_executor")
+                .count(),
+            1
+        );
     }
     #[test]
     fn q4_route_parallel_shader_parses_and_validates_without_a_device() {
