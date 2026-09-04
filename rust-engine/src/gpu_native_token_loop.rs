@@ -33,6 +33,19 @@ use crate::gpu_native_residency::GpuNativeTieredResidencyManager;
 use crate::model::RealModel;
 use crate::sampling::SamplingParams;
 
+// Only explicit qualification control may select the frozen serial encoder.
+fn q4_uses_frozen_serial_control(arm: Option<Q4QualificationArm>) -> bool {
+    matches!(arm, Some(Q4QualificationArm::Control))
+}
+
+fn require_q4_route_parallel_scratch(
+    scratch: Option<&GpuNativeQ4RouteParallelScratch>,
+) -> Result<&GpuNativeQ4RouteParallelScratch, GpuNativeTokenLoopError> {
+    scratch.ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
+        detail: "production Q4 route-parallel scratch missing; serial fallback prohibited".into(),
+    })
+}
+
 /// Structured summary of runtime counters across the GPU-native token loop.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuNativeTokenLoopSnapshot {
@@ -1427,13 +1440,15 @@ impl GpuNativeTokenLoop {
             self.executor.create_q4_expert_scratch(expert_geom)?
         };
 
-        let q4_parallel_scratch = match self.q4_qualification.get().map(|o| o.arm) {
-            Some(Q4QualificationArm::Treatment) => Some(
-                self.executor
-                    .create_q4_route_parallel_qualification_scratch(expert_geom)?,
-            ),
-            _ => None,
-        };
+        let q4_parallel_scratch =
+            if q4_uses_frozen_serial_control(self.q4_qualification.get().map(|o| o.arm)) {
+                None
+            } else {
+                Some(
+                    self.executor
+                        .create_q4_route_parallel_scratch(expert_geom)?,
+                )
+            };
         let logits_scratch = self
             .executor
             .create_scratch(self.model_geometry.vocab_size)?;
@@ -2496,45 +2511,31 @@ impl GpuNativeTokenLoop {
                 );
             }
         }
-        if let Some(observation) = self.q4_qualification.get() {
-            let evidence = match observation.arm {
-                Q4QualificationArm::Control => self.executor.encode_q4_expert_serial_qualification(
-                    encoder,
-                    &layer_plan.router_plan,
-                    &request.router_scratch,
-                    arena,
-                    &request.token_state,
-                    &request.expert_scratch,
-                )?,
-                Q4QualificationArm::Treatment => {
-                    let scratch = request.q4_parallel_scratch.as_ref().ok_or_else(|| {
-                        GpuNativeTokenLoopError::InvalidBoundaryReport {
-                            detail: "PR2-C treatment scratch missing; serial fallback prohibited"
-                                .into(),
-                        }
-                    })?;
-                    self.executor
-                        .encode_q4_expert_route_parallel_qualification(
-                            encoder,
-                            &layer_plan.router_plan,
-                            &request.router_scratch,
-                            arena,
-                            &request.token_state,
-                            &request.expert_scratch,
-                            scratch,
-                        )?
-                }
-            };
-            observation.record(evidence);
-        } else {
-            self.executor.encode_q4_expert_arena_combine(
+        let observation = self.q4_qualification.get();
+        let evidence = if q4_uses_frozen_serial_control(observation.map(|o| o.arm)) {
+            self.executor.encode_q4_expert_serial_qualification(
                 encoder,
                 &layer_plan.router_plan,
                 &request.router_scratch,
                 arena,
                 &request.token_state,
                 &request.expert_scratch,
-            )?;
+            )?
+        } else {
+            // Ordinary serving and treatment enter this same production call.
+            let scratch = require_q4_route_parallel_scratch(request.q4_parallel_scratch.as_ref())?;
+            self.executor.encode_q4_expert_route_parallel(
+                encoder,
+                &layer_plan.router_plan,
+                &request.router_scratch,
+                arena,
+                &request.token_state,
+                &request.expert_scratch,
+                scratch,
+            )?
+        };
+        if let Some(observation) = observation {
+            observation.record(evidence);
         }
 
         if let Some(sink) = semantic_sink {
@@ -3284,6 +3285,26 @@ pub(crate) mod tests {
     use crate::gating::{LinearGate, ScoringFunc};
     use crate::model::RealModelConfig;
     use crate::transformer::{LMHead, MultiHeadSelfAttention, RmsNorm, TransformerLayer};
+
+    #[test]
+    fn q4_route_parallel_production_and_treatment_never_select_serial() {
+        assert!(!q4_uses_frozen_serial_control(None));
+        assert!(!q4_uses_frozen_serial_control(Some(
+            Q4QualificationArm::Treatment
+        )));
+        assert!(q4_uses_frozen_serial_control(Some(
+            Q4QualificationArm::Control
+        )));
+    }
+
+    #[test]
+    fn q4_route_parallel_missing_production_scratch_fails_closed() {
+        assert!(matches!(
+            require_q4_route_parallel_scratch(None),
+            Err(GpuNativeTokenLoopError::InvalidBoundaryReport { detail })
+                if detail == "production Q4 route-parallel scratch missing; serial fallback prohibited"
+        ));
+    }
 
     pub(crate) fn make_test_qwen3_moe_config() -> RealModelConfig {
         RealModelConfig {

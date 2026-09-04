@@ -940,9 +940,10 @@ enum Cmd {
         report_out: PathBuf,
     },
 
-    /// PR2-C qualification only: ordinary production remains serial.
-    #[command(name = "qualify-gpu-native-q4-route-parallel")]
-    QualifyGpuNativeQ4RouteParallel {
+    /// PR2-C.1 production qualification: frozen serial control versus the
+    /// ordinary production route-parallel encoder used by treatment.
+    #[command(name = "qualify-gpu-native-q4-route-parallel-production")]
+    QualifyGpuNativeQ4RouteParallelProduction {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -1918,7 +1919,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
-        | Cmd::QualifyGpuNativeQ4RouteParallel { config, .. }
+        | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
@@ -2366,7 +2367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             )
         }
-        Cmd::QualifyGpuNativeQ4RouteParallel {
+        Cmd::QualifyGpuNativeQ4RouteParallelProduction {
             config,
             expected_adapter_name,
             report_out,

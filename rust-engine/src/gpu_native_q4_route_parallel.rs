@@ -1,11 +1,11 @@
-//! PR2-C qualification-only Q4 route scheduling. No production config knob.
+//! PR2-C.1 production qualification of the ordinary Q4 route-parallel encoder. No production config knob.
 use super::*;
 use crate::backend::gpu_native::q4_route_parallel::DispatchEvidence;
 use parking_lot::Mutex;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-q4-route-parallel.v1";
-pub(crate) const MODE: &str = "qualify-gpu-native-q4-route-parallel";
-const BASE_SHA: &str = "e379ae3a11c9b9b5c4d80a6b02fc3414f9a38fe1";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-q4-route-parallel-production.v1";
+pub(crate) const MODE: &str = "qualify-gpu-native-q4-route-parallel-production";
+const BASE_SHA: &str = "6be8881fbae7b2b8a4a8df0a612bf90923a7ef61";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,7 +130,7 @@ async fn run_q4_arm(
     args: &CommandArgs,
     q4_arm: Arm,
 ) -> Result<Q4ArmReport, BenchmarkFailure> {
-    // Both PR2-C arms use the ordinary production source and physical-install
+    // Both PR2-C.1 arms use the ordinary production source and physical-install
     // path. This existing treatment observer changes only qualification tracing.
     let (arm_name, arm) = match q4_arm {
         Arm::Control => (
@@ -378,7 +378,7 @@ async fn run_q4_arm(
         execution_failure = Some(BenchmarkFailure::new(
             "postcondition",
             "missing-final-cache-state",
-            "PR2-C requires final RAM cache identity",
+            "PR2-C.1 requires final RAM cache identity",
         ));
     }
     let shutdown =
@@ -434,13 +434,18 @@ async fn run_q4_arm(
 struct Contract {
     qualification_only: bool,
     production_q4_route_parallel_changed: bool,
-    control_uses_ordinary_serial_production_path: bool,
-    treatment_uses_route_parallel_qualification_path: bool,
+    control_uses_frozen_serial_reference_path: bool,
+    treatment_uses_ordinary_production_route_parallel_path: bool,
     source_acquisition_changed: bool,
     ram_cache_policy_changed: bool,
     physical_residency_changed: bool,
     victim_policy_changed: bool,
     mapping_semantics_changed: bool,
+    logical_admission_changed: bool,
+    prefetch_or_speculation_changed: bool,
+    recovery_semantics_changed: bool,
+    routing_semantics_changed: bool,
+    model_or_workload_changed: bool,
     expert_q4_arithmetic_changed: bool,
     expert_combine_order_changed: bool,
     expert_failure_semantics_changed: bool,
@@ -450,15 +455,20 @@ struct Contract {
 impl Default for Contract {
     fn default() -> Self {
         Self {
-            qualification_only: true,
-            production_q4_route_parallel_changed: false,
-            control_uses_ordinary_serial_production_path: true,
-            treatment_uses_route_parallel_qualification_path: true,
+            qualification_only: false,
+            production_q4_route_parallel_changed: true,
+            control_uses_frozen_serial_reference_path: true,
+            treatment_uses_ordinary_production_route_parallel_path: true,
             source_acquisition_changed: false,
             ram_cache_policy_changed: false,
             physical_residency_changed: false,
             victim_policy_changed: false,
             mapping_semantics_changed: false,
+            logical_admission_changed: false,
+            prefetch_or_speculation_changed: false,
+            recovery_semantics_changed: false,
+            routing_semantics_changed: false,
+            model_or_workload_changed: false,
             expert_q4_arithmetic_changed: false,
             expert_combine_order_changed: false,
             expert_failure_semantics_changed: false,
@@ -470,8 +480,8 @@ impl Default for Contract {
 
 #[derive(Clone, Debug, Default, Serialize)]
 struct MechanismGate {
-    ordinary_serial_production_path_exercised: bool,
-    qualification_route_parallel_path_exercised: bool,
+    control_frozen_serial_path_exercised: bool,
+    treatment_ordinary_production_route_parallel_path_exercised: bool,
     control_dispatch_accounting_exact: bool,
     treatment_dispatch_accounting_exact: bool,
     treatment_route_width_gt_one: bool,
@@ -509,8 +519,8 @@ fn mechanism_gate(c: &Mechanism, t: &Mechanism, d_model: u64, d_ff: u64, k: u64)
         && expected == Some(t.treatment_route_parallel_routes_covered)
         && t.treatment_max_route_width == k;
     let mut gate = MechanismGate {
-        ordinary_serial_production_path_exercised: serial,
-        qualification_route_parallel_path_exercised: parallel,
+        control_frozen_serial_path_exercised: serial,
+        treatment_ordinary_production_route_parallel_path_exercised: parallel,
         control_dispatch_accounting_exact: serial,
         treatment_dispatch_accounting_exact: parallel,
         treatment_route_width_gt_one: t.treatment_max_route_width >= 2,
@@ -541,8 +551,8 @@ fn mechanism_gate(c: &Mechanism, t: &Mechanism, d_model: u64, d_ff: u64, k: u64)
         mechanism_accounting_mismatch_zero: !c.accounting_mismatch && !t.accounting_mismatch,
         passed: false,
     };
-    gate.passed = gate.ordinary_serial_production_path_exercised
-        && gate.qualification_route_parallel_path_exercised
+    gate.passed = gate.control_frozen_serial_path_exercised
+        && gate.treatment_ordinary_production_route_parallel_path_exercised
         && gate.control_dispatch_accounting_exact
         && gate.treatment_dispatch_accounting_exact
         && gate.treatment_route_width_gt_one
@@ -781,7 +791,7 @@ impl Report {
             schema: SCHEMA, mode: MODE, base_sha: BASE_SHA, contract: Contract::default(),
             frozen_workload: frozen_workload(adapter), d_model: 2048, d_ff: 768, layers: 48,
             experts_per_layer: 128, top_k: 8, replacement: "physical-lru-prediction-protected",
-            baseline_observer_contract: "both PR2-C arms enable the existing PR2-B-B treatment observer and use ordinary source/install behavior; nested baseline observer production-change flags describe PR2-B versus its historical baseline, not changes made by PR2-C",
+            baseline_observer_contract: "both PR2-C.1 arms enable the existing PR2-B-B treatment observer and use ordinary source/install behavior; nested baseline observer production-change flags describe PR2-B versus its historical baseline, not changes made by PR2-C.1",
             dispatch_accounting_definition: "host-encoded expert layer executions, including invalid tails and recovery segments; selected_routes_total counts encoded route lanes; accepted selected-route counts and ordered IDs are independently recorded by the existing boundary contract",
             benchmark_complete: false, qualification_pass: false, performance_result: "not_measured",
             failure: None, provenance: None, control: None, treatment: None,
@@ -811,7 +821,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         if report.failure.is_none() {
             report.failure = Some(BenchmarkFailure::new(
                 "qualification",
-                "pr2c-failed",
+                "pr2c1-failed",
                 error.to_string(),
             ));
         }
@@ -824,10 +834,10 @@ async fn run_qualification(
     report: &mut Report,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.report_out.exists() {
-        return Err("PR2-C requires a new report path".into());
+        return Err("PR2-C.1 requires a new report path".into());
     }
     if args.expected_adapter_name != "NVIDIA L4" {
-        return Err("frozen PR2-C adapter must be NVIDIA L4".into());
+        return Err("frozen PR2-C.1 adapter must be NVIDIA L4".into());
     }
     let prepared = prepare(args)?;
     report.provenance = Some(prepared.provenance.clone());
@@ -876,7 +886,7 @@ async fn run_qualification(
         return Err(BenchmarkFailure::new(
             "postcondition",
             "formal-gate-failed",
-            "PR2-C correctness, work or mechanism reconciliation failed",
+            "PR2-C.1 correctness, work or mechanism reconciliation failed",
         )
         .into());
     }
@@ -1040,20 +1050,30 @@ mod tests {
     fn q4_route_parallel_contract_is_explicit_and_performance_independent() {
         let report = Report::pending("NVIDIA L4".into());
         let json = serde_json::to_value(report).unwrap();
+        assert_eq!(
+            json["schema"],
+            "mer.gpu-native-q4-route-parallel-production.v1"
+        );
+        assert_eq!(json["base_sha"], "6be8881fbae7b2b8a4a8df0a612bf90923a7ef61");
         for field in [
-            "qualification_only",
-            "control_uses_ordinary_serial_production_path",
-            "treatment_uses_route_parallel_qualification_path",
+            "production_q4_route_parallel_changed",
+            "control_uses_frozen_serial_reference_path",
+            "treatment_uses_ordinary_production_route_parallel_path",
         ] {
             assert_eq!(json[field], true);
         }
         for field in [
-            "production_q4_route_parallel_changed",
+            "qualification_only",
             "source_acquisition_changed",
             "ram_cache_policy_changed",
             "physical_residency_changed",
             "victim_policy_changed",
             "mapping_semantics_changed",
+            "logical_admission_changed",
+            "prefetch_or_speculation_changed",
+            "recovery_semantics_changed",
+            "routing_semantics_changed",
+            "model_or_workload_changed",
             "expert_q4_arithmetic_changed",
             "expert_combine_order_changed",
             "expert_failure_semantics_changed",
@@ -1075,6 +1095,33 @@ mod tests {
         }
     }
     #[test]
+    fn q4_route_parallel_source_residency_and_configuration_remain_frozen() {
+        use sha2::Digest;
+        for (source, expected) in [
+            (
+                include_str!("engine.rs"),
+                "842f1ff0027b66292a8c429379710ee81d703ae3c455c725275647231ddc4409",
+            ),
+            (
+                include_str!("gpu_native_residency.rs"),
+                "2cb1d408f795b76a48298f47a56393d12b7228e8b8ca9d03172baaa81371f30e",
+            ),
+            (
+                include_str!("config.rs"),
+                "811463154e63bc5fce36e291e3c06df2de9ac289426c3bf8de60e60b7e531de4",
+            ),
+            (
+                include_str!("gpu_native_physical_install_staging.rs"),
+                "bd74830366047f26ab43e1be4a53bad225c7db3331857e2c56b83a5fde06f0bb",
+            ),
+        ] {
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(source.as_bytes())),
+                expected
+            );
+        }
+    }
+    #[test]
     fn q4_route_parallel_cli_is_explicit_and_has_no_workload_overrides() {
         use clap::Parser;
         let arguments = [
@@ -1090,12 +1137,15 @@ mod tests {
         let cli = crate::Cli::try_parse_from(arguments).unwrap();
         assert!(matches!(
             cli.cmd,
-            crate::Cmd::QualifyGpuNativeQ4RouteParallel { .. }
+            crate::Cmd::QualifyGpuNativeQ4RouteParallelProduction { .. }
         ));
         for override_flag in [
             "--top-k",
             "--output-tokens",
             "--warmup-runs",
+            "--measured-runs",
+            "--request-json",
+            "--cache-reset",
             "--parallel",
             "--prompt",
         ] {

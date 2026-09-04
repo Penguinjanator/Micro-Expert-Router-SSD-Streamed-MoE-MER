@@ -1,8 +1,9 @@
-//! Isolated PR2-C route scheduling. Production serial encoding stays in the parent.
+//! Production Q4 route scheduling replicated from the hardware-qualified PR2-C.
+//! The frozen serial control encoder stays unchanged in the parent.
 use super::*;
 
-// Compile treatment as the exact unchanged production shader plus isolated
-// entrypoints. The production shader hash and all historical pins stay intact.
+// Compile the exact qualified shader sources. Historical serial entrypoints
+// and arithmetic pins stay intact for the frozen control.
 const ROUTE_PARALLEL_SHADER: &str = concat!(
     include_str!("../wgpu_shaders/gpu_native_q4_expert.wgsl"),
     include_str!("../wgpu_shaders/gpu_native_q4_expert_route_parallel.wgsl"),
@@ -57,8 +58,8 @@ impl RouteParallelGeometry {
     }
 }
 
-/// Only the treatment owns this storage-only top_k*d_ff activation and its
-/// two pipelines. Locations, outputs, status and combined remain shared scratch.
+/// Production request storage-only top_k*d_ff activation and its two pipelines.
+/// Locations, outputs, status and combined remain shared scratch.
 pub(crate) struct GpuNativeQ4RouteParallelScratch {
     context_id: u64,
     geometry: GpuNativeQ4ExpertGeometry,
@@ -88,8 +89,8 @@ pub(crate) struct DispatchEvidence {
     pub(crate) contain_dispatches: u64,
 }
 
-// Identical, bounded observation cost in both qualifier arms. Ordinary
-// serving does not call this helper or take qualification snapshots.
+// Preserve the qualified bounded counter accounting in the production encoder.
+// Only an installed qualification observer aggregates the returned evidence.
 #[derive(Clone, Copy)]
 struct Q4DispatchCounters {
     resolve: u64,
@@ -130,7 +131,7 @@ impl Q4DispatchCounters {
 }
 
 impl GpuNativeExecutorContext {
-    pub(crate) fn create_q4_route_parallel_qualification_scratch(
+    pub(crate) fn create_q4_route_parallel_scratch(
         &self,
         geometry: GpuNativeQ4ExpertGeometry,
     ) -> Result<GpuNativeQ4RouteParallelScratch, GpuNativeBootstrapError> {
@@ -172,8 +173,8 @@ impl GpuNativeExecutorContext {
         })
     }
 
-    /// Qualification observes the existing production counters surrounding the
-    /// exact ordinary serial encoder. No synthetic serial implementation.
+    /// Control observes the counters surrounding the exact frozen pre-C serial
+    /// encoder. No synthetic serial implementation.
     pub(crate) fn encode_q4_expert_serial_qualification(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -211,7 +212,8 @@ impl GpuNativeExecutorContext {
         })
     }
 
-    pub(crate) fn encode_q4_expert_route_parallel_qualification(
+    /// The single production encoder, also called by qualification treatment.
+    pub(crate) fn encode_q4_expert_route_parallel(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         router_plan: &GpuNativeRouterPlan,
@@ -225,9 +227,12 @@ impl GpuNativeExecutorContext {
         let gpu = self.authoritative_gpu()?;
         let limits = gpu.device.limits();
         let geometry = RouteParallelGeometry::try_new(arena.geometry, &limits)?;
-        if parallel.context_id != self.context_id || parallel.geometry != arena.geometry {
-            return Err(GpuNativeBootstrapError::ForeignTokenState);
-        }
+        validate_route_parallel_scratch_identity(
+            self.context_id,
+            arena.geometry,
+            parallel.context_id,
+            parallel.geometry,
+        )?;
         let mut evidence = DispatchEvidence::default();
         validate_token_state_owner(self.context_id, state.context_id)?;
         let _gate = validate_router_plan_with_registry(
@@ -465,7 +470,7 @@ impl GpuNativeExecutorContext {
         self.counters.record_expert_dispatches(1);
         let delta = Q4DispatchCounters::capture(self).delta(before);
         // Fail mechanism accounting closed if the ordinary counters disagree
-        // with the dispatches actually recorded at the treatment seam.
+        // with the dispatches actually recorded at the production seam.
         evidence.accounting_mismatch = delta.gate_up != evidence.parallel_gate_up_dispatches
             || delta.down != evidence.parallel_down_dispatches
             || delta.resolve != 1
@@ -477,6 +482,18 @@ impl GpuNativeExecutorContext {
         evidence.route_output_bytes = expert_scratch.layout.route_outputs_bytes();
         Ok(evidence)
     }
+}
+
+fn validate_route_parallel_scratch_identity(
+    context_id: u64,
+    geometry: GpuNativeQ4ExpertGeometry,
+    scratch_context_id: u64,
+    scratch_geometry: GpuNativeQ4ExpertGeometry,
+) -> Result<(), GpuNativeBootstrapError> {
+    if scratch_context_id != context_id || scratch_geometry != geometry {
+        return Err(GpuNativeBootstrapError::ForeignTokenState);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -538,6 +555,35 @@ mod tests {
         assert!(RouteParallelGeometry::try_new(g, &limits).is_ok());
         limits.max_compute_workgroups_per_dimension = 0;
         assert!(RouteParallelGeometry::try_new(g, &limits).is_err());
+        for (d_model, d_ff) in [(32, 576), (576, 32)] {
+            let g = GpuNativeQ4ExpertGeometry::try_new(d_model, d_ff, 128, 8).unwrap();
+            limits.max_compute_workgroups_per_dimension = 8;
+            assert!(matches!(
+                RouteParallelGeometry::try_new(g, &limits),
+                Err(GpuNativeBootstrapError::DispatchGeometryUnsupported {
+                    workgroups: 9,
+                    maximum: 8
+                })
+            ));
+        }
+    }
+    #[test]
+    fn q4_route_parallel_foreign_and_mismatched_scratch_fail_closed() {
+        let g = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        assert!(validate_route_parallel_scratch_identity(1, g, 1, g).is_ok());
+        assert!(matches!(
+            validate_route_parallel_scratch_identity(1, g, 2, g),
+            Err(GpuNativeBootstrapError::ForeignTokenState)
+        ));
+        for other in [
+            GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 1).unwrap(),
+            GpuNativeQ4ExpertGeometry::try_new(2048, 800, 128, 8).unwrap(),
+        ] {
+            assert!(matches!(
+                validate_route_parallel_scratch_identity(1, g, 1, other),
+                Err(GpuNativeBootstrapError::ForeignTokenState)
+            ));
+        }
     }
     #[test]
     fn q4_route_parallel_shader_parses_and_validates_without_a_device() {
@@ -606,18 +652,30 @@ mod tests {
     fn q4_route_parallel_keeps_control_path_and_gpu_boundary_contract() {
         let runtime = include_str!("../../gpu_native_token_loop.rs");
         let encoded = function(runtime, "encode_expert_layer_unified");
-        assert!(encoded.contains("Q4QualificationArm::Control =>"));
+        assert!(encoded.contains("if q4_uses_frozen_serial_control(observation.map(|o| o.arm))"));
         assert!(encoded.contains("encode_q4_expert_serial_qualification"));
-        assert!(encoded.contains("encode_q4_expert_route_parallel_qualification"));
-        assert!(
-            encoded.contains("else {\n        self.executor.encode_q4_expert_arena_combine(")
-                || encoded
-                    .contains("else {\n            self.executor.encode_q4_expert_arena_combine(")
+        assert_eq!(
+            encoded.matches(".encode_q4_expert_route_parallel(").count(),
+            1
         );
+        assert!(!encoded.contains("encode_q4_expert_arena_combine"));
+        assert!(!encoded.contains("Q4QualificationArm::Treatment"));
+        let require = encoded.find("require_q4_route_parallel_scratch(").unwrap();
+        assert!(require < encoded.find(".encode_q4_expert_route_parallel(").unwrap());
+        let allocation = function(runtime, "create_request_state_inner");
+        assert!(allocation.contains("if q4_uses_frozen_serial_control("));
+        assert!(allocation.contains("create_q4_route_parallel_scratch(expert_geom)?"));
+        assert!(!allocation.contains("Q4QualificationArm::Treatment"));
         let source = include_str!("q4_route_parallel.rs");
         assert!(function(source, "encode_q4_expert_serial_qualification")
             .contains("self.encode_q4_expert_arena_combine("));
-        let treatment = function(source, "encode_q4_expert_route_parallel_qualification");
+        let treatment = function(source, "encode_q4_expert_route_parallel");
+        assert!(
+            treatment
+                .find("validate_route_parallel_scratch_identity(")
+                .unwrap()
+                < treatment.find("encoder.begin_compute_pass(").unwrap()
+        );
         for forbidden in [
             ".submit(",
             ".poll(",
