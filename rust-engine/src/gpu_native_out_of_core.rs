@@ -47,6 +47,7 @@ const FROZEN_GPU_VRAM_CAPACITY_MB: usize = 2048;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 const PROC_SELF_STATUS: &str = "/proc/self/status";
+const GPU_NATIVE_H2D_EVIDENCE_SOURCE: &str = "GPU-native physical-arena direct staging via Queue::write_buffer_with; legacy gpu_expert_io counters are non-authoritative";
 
 #[derive(Clone, Debug)]
 pub(crate) struct CommandArgs {
@@ -269,8 +270,50 @@ struct BoundedVramEvidence {
     before_execution: GpuNativeTieredResidencySnapshot,
     after_measured: GpuNativeTieredResidencySnapshot,
     measured_delta: GpuNativeResidencyDelta,
-    measured_h2d_uploads: u64,
-    measured_h2d_bytes: u64,
+    measured_h2d: GpuNativeH2dEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct GpuNativeH2dEvidence {
+    evidence_source: &'static str,
+    ram_to_vram_installs: u64,
+    direct_staging_writes: u64,
+    direct_staging_successes: u64,
+    physical_install_completions: u64,
+    physical_slot_bytes_staged: u64,
+    physical_bytes_staged: u64,
+}
+
+impl GpuNativeH2dEvidence {
+    fn from_measured(measured: &PhaseWorkEvidence) -> Self {
+        Self {
+            evidence_source: GPU_NATIVE_H2D_EVIDENCE_SOURCE,
+            ram_to_vram_installs: measured.aggregate.gpu_native_residency.ram_to_vram_installs,
+            direct_staging_writes: measured.source.direct_staging_writes,
+            direct_staging_successes: measured
+                .production_physical_install
+                .direct_staging_successes,
+            physical_install_completions: measured.source.physical_install_completions,
+            physical_slot_bytes_staged: measured.source.physical_slot_bytes_staged,
+            physical_bytes_staged: measured.source.physical_bytes_staged,
+        }
+    }
+
+    fn installs_positive_and_reconciled(self) -> bool {
+        self.ram_to_vram_installs > 0
+            && self.direct_staging_writes > 0
+            && self.direct_staging_successes > 0
+            && self.physical_install_completions > 0
+            && self.ram_to_vram_installs == self.direct_staging_writes
+            && self.direct_staging_writes == self.direct_staging_successes
+            && self.direct_staging_successes == self.physical_install_completions
+    }
+
+    fn bytes_positive_and_reconciled(self) -> bool {
+        self.physical_slot_bytes_staged > 0
+            && self.physical_bytes_staged > 0
+            && self.physical_slot_bytes_staged == self.physical_bytes_staged
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1634,9 +1677,8 @@ fn build_gates(
         demand_source_requests_gt_zero: measured.source.demand_source_requests > 0,
         nvme_reads_gt_zero: measured.source.source_nvme_reads > 0,
         demand_nvme_bytes_gt_zero: measured.source.source_nvme_bytes > 0,
-        h2d_installs_gt_zero: measured.aggregate.gpu_native_residency.ram_to_vram_installs > 0
-            && measured.aggregate.gpu_expert_io.expert_weight_uploads > 0,
-        h2d_bytes_gt_zero: measured.aggregate.gpu_expert_io.expert_weight_upload_bytes > 0,
+        h2d_installs_gt_zero: vram.measured_h2d.installs_positive_and_reconciled(),
+        h2d_bytes_gt_zero: vram.measured_h2d.bytes_positive_and_reconciled(),
         no_degraded_substitution,
         no_full_token_replay,
         no_fatal_or_no_progress,
@@ -1826,16 +1868,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         before_execution: execution.vram_before_execution.clone(),
         after_measured: execution.vram_after_measured.clone(),
         measured_delta: execution.measured.aggregate.gpu_native_residency,
-        measured_h2d_uploads: execution
-            .measured
-            .aggregate
-            .gpu_expert_io
-            .expert_weight_uploads,
-        measured_h2d_bytes: execution
-            .measured
-            .aggregate
-            .gpu_expert_io
-            .expert_weight_upload_bytes,
+        measured_h2d: GpuNativeH2dEvidence::from_measured(&execution.measured),
     };
     let memory_contract = report
         .memory_contract
@@ -2074,6 +2107,71 @@ mod tests {
         assert_eq!(capacities.iter().sum::<usize>(), 384);
         assert_eq!(distributed_cache_capacities(10, 3).unwrap(), vec![4, 3, 3]);
         assert!(distributed_cache_capacities(2, 3).is_err());
+    }
+
+    fn first_hardware_artifact_h2d_evidence() -> GpuNativeH2dEvidence {
+        GpuNativeH2dEvidence {
+            evidence_source: GPU_NATIVE_H2D_EVIDENCE_SOURCE,
+            ram_to_vram_installs: 90_717,
+            direct_staging_writes: 90_717,
+            direct_staging_successes: 90_717,
+            physical_install_completions: 90_717,
+            physical_slot_bytes_staged: 240_782_150_004,
+            physical_bytes_staged: 240_782_150_004,
+        }
+    }
+
+    #[test]
+    fn gpu_native_h2d_gates_accept_direct_staging_when_legacy_gpu_io_is_zero() {
+        let legacy_gpu_io = GpuExpertIoSnapshot::default();
+        assert_eq!(legacy_gpu_io.expert_weight_uploads, 0);
+        assert_eq!(legacy_gpu_io.expert_weight_upload_bytes, 0);
+
+        let evidence = first_hardware_artifact_h2d_evidence();
+        assert!(evidence.installs_positive_and_reconciled());
+        assert!(evidence.bytes_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_install_gate_rejects_zero_ram_to_vram_installs() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.ram_to_vram_installs = 0;
+        assert!(!evidence.installs_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_install_gate_rejects_zero_direct_staging_writes() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.direct_staging_writes = 0;
+        assert!(!evidence.installs_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_install_gate_rejects_zero_direct_staging_successes() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.direct_staging_successes = 0;
+        assert!(!evidence.installs_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_install_gate_rejects_disagreeing_install_counts() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.physical_install_completions -= 1;
+        assert!(!evidence.installs_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_byte_gate_rejects_zero_physical_slot_bytes() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.physical_slot_bytes_staged = 0;
+        assert!(!evidence.bytes_positive_and_reconciled());
+    }
+
+    #[test]
+    fn gpu_native_h2d_byte_gate_rejects_disagreeing_staging_bytes() {
+        let mut evidence = first_hardware_artifact_h2d_evidence();
+        evidence.physical_bytes_staged -= 1;
+        assert!(!evidence.bytes_positive_and_reconciled());
     }
 
     fn passing_gate_inputs() -> GateInputs {
