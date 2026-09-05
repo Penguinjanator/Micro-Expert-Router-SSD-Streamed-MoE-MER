@@ -1649,7 +1649,7 @@ fn build_gates(
     })
 }
 
-fn emit_report(report: &OutOfCoreReport, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn emit_report<T: Serialize>(report: &T, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut json = serde_json::to_vec_pretty(report)?;
     json.push(b'\n');
     if let Some(parent) = path
@@ -1658,7 +1658,12 @@ fn emit_report(report: &OutOfCoreReport, path: &Path) -> Result<(), Box<dyn std:
     {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, json)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write;
+    file.write_all(&json)?;
     eprintln!(
         "GPU-native out-of-core qualification report written to {}",
         path.display()
@@ -1960,6 +1965,25 @@ mod tests {
         assert!(parse_memory_events("max 0\noom 0\n").is_err());
         assert!(parse_memory_events("max 0\noom 0\noom_kill nope\n").is_err());
         assert!(parse_memory_events("max 0\nmax 1\noom 0\noom_kill 0\n").is_err());
+    }
+
+    #[test]
+    fn authoritative_report_refuses_overwrite_and_preserves_original_bytes() {
+        let fixture = TempDir::new("immutable-report");
+        let path = fixture.0.join("nested/report.json");
+        let mut report = serde_json::json!({ "qualification_pass": false });
+
+        emit_report(&report, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(original.last(), Some(&b'\n'));
+
+        report["qualification_pass"] = true.into();
+        let error = emit_report(&report, &path).unwrap_err();
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("existing destination must return an I/O error");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
