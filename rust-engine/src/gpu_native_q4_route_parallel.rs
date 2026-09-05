@@ -42,7 +42,7 @@ pub(crate) struct Observation {
     evidence: Mutex<Mechanism>,
 }
 impl Observation {
-    fn new(arm: Arm) -> Self {
+    pub(crate) fn new(arm: Arm) -> Self {
         Self {
             arm,
             evidence: Mutex::new(Mechanism::default()),
@@ -99,8 +99,30 @@ impl Observation {
         self.evidence.lock().unexpected_status_bits |=
             statuses.iter().fold(final_status, |a, b| a | b) & !4;
     }
-    fn take(&self) -> Mechanism {
+    pub(crate) fn take(&self) -> Mechanism {
         std::mem::take(&mut *self.evidence.lock())
+    }
+}
+
+impl Mechanism {
+    pub(crate) fn unexpected_status_bits(&self) -> u32 {
+        self.unexpected_status_bits
+    }
+
+    pub(crate) fn ordinary_production_route_parallel_exercised(&self) -> bool {
+        let selected = self.expert_layer_executions.checked_mul(self.top_k_max);
+        self.expert_layer_executions > 0
+            && self.selected_routes_total > 0
+            && self.top_k_min == self.top_k_max
+            && self.top_k_max > 1
+            && selected == Some(self.selected_routes_total)
+            && self.control_serial_gate_up_dispatches == 0
+            && self.control_serial_down_dispatches == 0
+            && self.treatment_route_parallel_gate_up_dispatches == self.expert_layer_executions
+            && self.treatment_route_parallel_down_dispatches == self.expert_layer_executions
+            && self.treatment_route_parallel_routes_covered == self.selected_routes_total
+            && self.treatment_max_route_width == self.top_k_max
+            && !self.accounting_mismatch
     }
 }
 
@@ -1108,7 +1130,7 @@ mod tests {
             ),
             (
                 include_str!("config.rs"),
-                "811463154e63bc5fce36e291e3c06df2de9ac289426c3bf8de60e60b7e531de4",
+                "f57f8131c2f37976a5019cd16d9e8fdac83f75379bab324235e27f4a27395428",
             ),
             (
                 include_str!("gpu_native_physical_install_staging.rs"),

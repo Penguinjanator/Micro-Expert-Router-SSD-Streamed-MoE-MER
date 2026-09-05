@@ -145,6 +145,7 @@ pub(crate) mod gpu_native_expert_permutation_semantic_parity;
 pub(crate) mod gpu_native_f32_reference_boundary_audit;
 pub(crate) mod gpu_native_greedy_parity;
 pub(crate) mod gpu_native_layer0_diagnostics;
+pub(crate) mod gpu_native_out_of_core;
 pub(crate) mod gpu_native_physical_install_staging;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
@@ -944,6 +945,18 @@ enum Cmd {
     /// ordinary production route-parallel encoder used by treatment.
     #[command(name = "qualify-gpu-native-q4-route-parallel-production")]
     QualifyGpuNativeQ4RouteParallelProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// PR3-DIFF0 proof that ordinary GPU-native inference remains bounded by
+    /// a constrained cgroup while streaming an expert footprint larger than RAM.
+    #[command(name = "qualify-gpu-native-out-of-core")]
+    QualifyGpuNativeOutOfCore {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -1920,6 +1933,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
+        | Cmd::QualifyGpuNativeOutOfCore { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
@@ -2377,6 +2391,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(crate::gpu_native_physical_install_staging::q4_route_parallel::run_command(
                 crate::gpu_native_physical_install_staging::CommandArgs {
+                    config,
+                    expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::QualifyGpuNativeOutOfCore {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_out_of_core::run_command(
+                crate::gpu_native_out_of_core::CommandArgs {
                     config,
                     expected_adapter_name,
                     report_out,
@@ -16416,6 +16447,46 @@ mod tests {
                 "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
             ))
         );
+    }
+
+    #[test]
+    fn gpu_native_out_of_core_cli_is_frozen_and_has_no_workload_overrides() {
+        let args = [
+            "micro-expert-router",
+            "qualify-gpu-native-out-of-core",
+            "--config",
+            "/home/randyap8/slice11-qwen3-coder-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "pr3-diff0-report.json",
+        ];
+        let cli = <Cli as clap::Parser>::try_parse_from(args).unwrap();
+        match &cli.cmd {
+            Cmd::QualifyGpuNativeOutOfCore {
+                config,
+                expected_adapter_name,
+                report_out,
+            } => {
+                assert_eq!(
+                    config,
+                    &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
+                );
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(report_out, &PathBuf::from("pr3-diff0-report.json"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new(
+                "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+            ))
+        );
+
+        let mut overridden = args.to_vec();
+        overridden.extend(["--output-tokens", "1"]);
+        assert!(<Cli as clap::Parser>::try_parse_from(overridden).is_err());
     }
 
     #[test]

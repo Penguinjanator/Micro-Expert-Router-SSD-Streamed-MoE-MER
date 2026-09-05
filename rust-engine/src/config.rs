@@ -210,7 +210,7 @@ fn default_num_layers() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfigToml {
-    /// LRU cache slots **per layer**.
+    /// Aggregate LRU cache-slot budget, distributed across model layers.
     #[serde(default = "default_cache_slots")]
     pub cache_slots: usize,
 
