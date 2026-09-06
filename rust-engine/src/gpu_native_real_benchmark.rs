@@ -1363,7 +1363,7 @@ fn next_ordinary_step(
 }
 
 #[derive(Clone, Debug)]
-struct RequestSnapshotStart {
+pub(crate) struct RequestSnapshotStart {
     token_loop: GpuNativeTokenLoopSnapshot,
     recovery: GpuNativeRecoverySnapshot,
     routed: RoutedExpertExecutionSnapshot,
@@ -1375,7 +1375,7 @@ struct RequestSnapshotStart {
 }
 
 impl RequestSnapshotStart {
-    fn capture(runtime: &crate::BenchRealRuntime) -> Result<Self, BenchmarkFailure> {
+    pub(crate) fn capture(runtime: &crate::BenchRealRuntime) -> Result<Self, BenchmarkFailure> {
         let token_loop = runtime.gpu_native_token_loop.as_ref().ok_or_else(|| {
             BenchmarkFailure::new(
                 "startup",
@@ -1415,7 +1415,7 @@ impl RequestSnapshotStart {
         })
     }
 
-    fn finish(
+    pub(crate) fn finish(
         self,
         runtime: &crate::BenchRealRuntime,
     ) -> Result<RequestSnapshots, BenchmarkFailure> {
@@ -2904,68 +2904,84 @@ mod tests {
 
     #[test]
     fn cli_parses_required_gpu_native_benchmark_surface() {
-        use clap::Parser as _;
+        std::thread::Builder::new()
+            .name("gpu-native-real-cli-parse".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser as _;
 
-        let cli = crate::Cli::try_parse_from([
-            "micro-expert-router",
-            "bench-gpu-native-real",
-            "--config",
-            "config.toml",
-            "--prompt",
-            "hello",
-            "--output-tokens",
-            "8",
-            "--warmup-runs",
-            "2",
-            "--measured-runs",
-            "3",
-            "--cache-reset",
-            "fresh-runtime",
-            "--greedy",
-            "--expected-adapter-name",
-            "NVIDIA L4",
-            "--report-out",
-            "report.json",
-        ])
-        .unwrap();
-        let crate::Cmd::BenchGpuNativeReal {
-            output_tokens,
-            warmup_runs,
-            measured_runs,
-            cache_reset,
-            greedy,
-            expected_adapter_name,
-            report_out,
-            ..
-        } = cli.cmd
-        else {
-            panic!("expected bench-gpu-native-real command")
-        };
-        assert_eq!(output_tokens, Some(8));
-        assert_eq!(warmup_runs, 2);
-        assert_eq!(measured_runs, 3);
-        assert_eq!(cache_reset, crate::BenchRealCacheReset::FreshRuntime);
-        assert!(greedy);
-        assert_eq!(expected_adapter_name, "NVIDIA L4");
-        assert_eq!(report_out, Some(PathBuf::from("report.json")));
+                let cli = crate::Cli::try_parse_from([
+                    "micro-expert-router",
+                    "bench-gpu-native-real",
+                    "--config",
+                    "config.toml",
+                    "--prompt",
+                    "hello",
+                    "--output-tokens",
+                    "8",
+                    "--warmup-runs",
+                    "2",
+                    "--measured-runs",
+                    "3",
+                    "--cache-reset",
+                    "fresh-runtime",
+                    "--greedy",
+                    "--expected-adapter-name",
+                    "NVIDIA L4",
+                    "--report-out",
+                    "report.json",
+                ])
+                .unwrap();
+                let crate::Cmd::BenchGpuNativeReal {
+                    output_tokens,
+                    warmup_runs,
+                    measured_runs,
+                    cache_reset,
+                    greedy,
+                    expected_adapter_name,
+                    report_out,
+                    ..
+                } = cli.cmd
+                else {
+                    panic!("expected bench-gpu-native-real command")
+                };
+                assert_eq!(output_tokens, Some(8));
+                assert_eq!(warmup_runs, 2);
+                assert_eq!(measured_runs, 3);
+                assert_eq!(cache_reset, crate::BenchRealCacheReset::FreshRuntime);
+                assert!(greedy);
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(report_out, Some(PathBuf::from("report.json")));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
     fn cli_rejects_missing_required_greedy_flag() {
-        use clap::Parser as _;
+        std::thread::Builder::new()
+            .name("gpu-native-real-cli-parse".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                use clap::Parser as _;
 
-        let error = crate::Cli::try_parse_from([
-            "micro-expert-router",
-            "bench-gpu-native-real",
-            "--config",
-            "config.toml",
-            "--prompt",
-            "hello",
-            "--expected-adapter-name",
-            "NVIDIA L4",
-        ])
-        .unwrap_err();
-        assert!(error.to_string().contains("--greedy"));
+                let error = crate::Cli::try_parse_from([
+                    "micro-expert-router",
+                    "bench-gpu-native-real",
+                    "--config",
+                    "config.toml",
+                    "--prompt",
+                    "hello",
+                    "--expected-adapter-name",
+                    "NVIDIA L4",
+                ])
+                .unwrap_err();
+                assert!(error.to_string().contains("--greedy"));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

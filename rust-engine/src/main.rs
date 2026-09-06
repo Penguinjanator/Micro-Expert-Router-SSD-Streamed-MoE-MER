@@ -150,6 +150,7 @@ pub(crate) mod gpu_native_physical_install_staging;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
 pub(crate) mod gpu_native_oracle_routes;
+pub(crate) mod gpu_native_oracle_scheduled_residency;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
@@ -924,6 +925,28 @@ enum Cmd {
         #[arg(long)]
         request_json: PathBuf,
         /// Required destination for the versioned diagnostic JSON artifact.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// ORACLE-0B-S perfect-future source scheduling with either source-only
+    /// treatment or serialized same-queue H2D at a proven token boundary.
+    #[command(name = "qualify-gpu-native-oracle-scheduled-residency")]
+    QualifyGpuNativeOracleScheduledResidency {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Immutable ORACLE-0A v1 route-trace report used as future truth.
+        #[arg(long)]
+        oracle_trace: PathBuf,
+        /// Qualification treatment arm.
+        #[arg(long, value_enum)]
+        treatment_mode:
+            crate::gpu_native_oracle_scheduled_residency::OracleScheduledResidencyMode,
+        /// Maximum concurrent layer-level source batches.
+        #[arg(long, default_value_t = 4)]
+        oracle_source_concurrency: usize,
+        /// Required destination for the versioned ORACLE-0B-S report.
         #[arg(long)]
         report_out: PathBuf,
     },
@@ -1950,6 +1973,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
         | Cmd::TraceGpuNativeOracleRoutes { config, .. }
+        | Cmd::QualifyGpuNativeOracleScheduledResidency { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
         | Cmd::QualifyGpuNativeOutOfCore { config, .. }
@@ -2397,6 +2421,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     progress_watchdog,
                 },
             ))
+        }
+        Cmd::QualifyGpuNativeOracleScheduledResidency {
+            config,
+            oracle_trace,
+            treatment_mode,
+            oracle_source_concurrency,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_oracle_scheduled_residency::run_command(
+                    crate::gpu_native_oracle_scheduled_residency::CommandArgs {
+                        config,
+                        oracle_trace,
+                        treatment_mode,
+                        oracle_source_concurrency,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
         }
         Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
             config,

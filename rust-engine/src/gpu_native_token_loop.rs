@@ -10,7 +10,9 @@ use crate::gpu_native_physical_install_staging::q4_route_parallel::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -131,6 +133,80 @@ fn saturating_micros(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Qualification-only handoff for ORACLE-0B-S. Ordinary token execution
+/// always passes `None`, so no serving path observes this interface.
+pub(crate) trait GpuNativeOracleScheduleHook: Send + Sync {
+    /// Called immediately after the normal command buffer is submitted. The
+    /// hook may start CPU/source work, but it must not mutate physical VRAM.
+    fn on_token_submitted(&self, position: usize);
+
+    /// Called only after the boundary map completed, `Maintain::Wait`
+    /// returned, the report parsed, and the completed token status is clean.
+    fn on_safe_token_boundary<'a>(
+        &'a self,
+        engine: &'a Arc<Engine>,
+        boundary: GpuNativeSafeTokenBoundary,
+        actual_routes: &'a [Vec<u32>],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+fn notify_oracle_token_submitted(hook: Option<&dyn GpuNativeOracleScheduleHook>, position: usize) {
+    if let Some(hook) = hook {
+        hook.on_token_submitted(position);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum GpuNativeTokenCompletionState {
+    SubmissionInFlight,
+    BoundaryMapParsedAfterPoll,
+}
+
+/// Non-cloneable proof that the current token submission has completed and
+/// destructive qualification-only residency mutation is safe. Its fields and
+/// constructor remain private to this module, so callers cannot manufacture a
+/// boundary merely because `Queue::submit` returned.
+pub(crate) struct GpuNativeSafeTokenBoundary {
+    position: usize,
+    authorized_layers: HashSet<usize>,
+}
+
+impl GpuNativeSafeTokenBoundary {
+    fn after_successful_report(position: usize) -> Self {
+        Self {
+            position,
+            authorized_layers: HashSet::new(),
+        }
+    }
+
+    pub(crate) const fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn authorize_layer_once(&mut self, layer_index: usize) -> Result<(), &'static str> {
+        if self.authorized_layers.insert(layer_index) {
+            Ok(())
+        } else {
+            Err("safe-boundary witness was reused for the same layer")
+        }
+    }
+}
+
+fn issue_oracle_safe_boundary(
+    position: usize,
+    completion: GpuNativeTokenCompletionState,
+) -> Result<GpuNativeSafeTokenBoundary, &'static str> {
+    match completion {
+        GpuNativeTokenCompletionState::SubmissionInFlight => {
+            Err("current token submission has not reached its proven completion boundary")
+        }
+        GpuNativeTokenCompletionState::BoundaryMapParsedAfterPoll => Ok(
+            GpuNativeSafeTokenBoundary::after_successful_report(position),
+        ),
+    }
+}
+
 impl GpuNativeTokenLoopCounters {
     fn snapshot(&self) -> GpuNativeTokenLoopSnapshot {
         GpuNativeTokenLoopSnapshot {
@@ -199,6 +275,7 @@ pub enum GpuNativeTokenLoopError {
         actual: usize,
     },
     MapFailed(String),
+    OracleScheduleFailed(String),
 }
 
 impl fmt::Display for GpuNativeTokenLoopError {
@@ -274,6 +351,9 @@ impl fmt::Display for GpuNativeTokenLoopError {
                 "selected expert count mismatch: expected {expected}, got {actual}"
             ),
             Self::MapFailed(detail) => write!(f, "staging buffer map failed: {detail}"),
+            Self::OracleScheduleFailed(detail) => {
+                write!(f, "ORACLE-0B-S scheduling failed: {detail}")
+            }
         }
     }
 }
@@ -1553,8 +1633,10 @@ impl GpuNativeTokenLoop {
         let prefix_count = prompt_ids.len().saturating_sub(1);
         for &token_id in &prompt_ids[..prefix_count] {
             let pos = request.committed_position;
-            self.step_token_unified_inner(engine, request, token_id, pos, false, None, None, None)
-                .await?;
+            self.step_token_unified_inner(
+                engine, request, token_id, pos, false, None, None, None, None,
+            )
+            .await?;
         }
 
         // Final prompt token: evaluate LM-head and sample first completion token
@@ -1567,6 +1649,7 @@ impl GpuNativeTokenLoop {
                 final_prompt,
                 final_prompt_pos,
                 true,
+                None,
                 None,
                 None,
                 None,
@@ -1587,7 +1670,9 @@ impl GpuNativeTokenLoop {
                 break;
             }
             let next_token = self
-                .step_token_unified_inner(engine, request, last_token, pos, true, None, None, None)
+                .step_token_unified_inner(
+                    engine, request, last_token, pos, true, None, None, None, None,
+                )
                 .await?
                 .sampled_token
                 .ok_or_else(|| GpuNativeTokenLoopError::InvalidBoundaryReport {
@@ -1612,7 +1697,35 @@ impl GpuNativeTokenLoop {
         let _guard = self.execution_guard.lock().await;
         let out = self
             .step_token_unified_inner(
-                engine, request, token_id, position, sample, None, None, None,
+                engine, request, token_id, position, sample, None, None, None, None,
+            )
+            .await?;
+        Ok(out.sampled_token)
+    }
+
+    /// ORACLE-0B-S-only token step. The ordinary public step above remains
+    /// byte-for-byte on the no-hook branch.
+    pub(crate) async fn step_token_oracle_scheduled(
+        &self,
+        engine: &Arc<Engine>,
+        request: &mut GpuNativeRequestState,
+        token_id: u32,
+        position: usize,
+        sample: bool,
+        oracle_hook: &dyn GpuNativeOracleScheduleHook,
+    ) -> Result<Option<u32>, GpuNativeTokenLoopError> {
+        let _guard = self.execution_guard.lock().await;
+        let out = self
+            .step_token_unified_inner(
+                engine,
+                request,
+                token_id,
+                position,
+                sample,
+                None,
+                None,
+                None,
+                Some(oracle_hook),
             )
             .await?;
         Ok(out.sampled_token)
@@ -1644,6 +1757,7 @@ impl GpuNativeTokenLoop {
                 position,
                 sample,
                 Some((trace_layout, diagnostic_staging_buffer)),
+                None,
                 None,
                 None,
             )
@@ -1684,6 +1798,7 @@ impl GpuNativeTokenLoop {
                 true,
                 None,
                 Some((trace_layout, diagnostic_staging_buffer)),
+                None,
                 None,
             )
             .await?;
@@ -1734,6 +1849,7 @@ impl GpuNativeTokenLoop {
                     diagnostic_staging_buffer,
                     None,
                 )),
+                None,
             )
             .await?;
         let trace =
@@ -1783,6 +1899,7 @@ impl GpuNativeTokenLoop {
                     diagnostic_staging_buffer,
                     None,
                 )),
+                None,
             )
             .await?;
         let trace = out.semantic_corpus_trace.ok_or_else(|| {
@@ -1836,6 +1953,7 @@ impl GpuNativeTokenLoop {
                     semantic_trace_staging_buffer,
                     None,
                 )),
+                None,
             )
             .await?;
         let full_trace =
@@ -1908,6 +2026,7 @@ impl GpuNativeTokenLoop {
                     diagnostic_staging_buffer,
                     Some(&stage_scratch),
                 )),
+                None,
             )
             .await?;
         let trace = out.q4_expert_stage_trace.ok_or_else(|| {
@@ -2178,6 +2297,7 @@ impl GpuNativeTokenLoop {
             &wgpu::Buffer,
             Option<&GpuNativeScratch>,
         )>,
+        oracle_hook: Option<&dyn GpuNativeOracleScheduleHook>,
     ) -> Result<GpuNativeStepOutput, GpuNativeTokenLoopError> {
         let max_attempts = gpu_native_attempt_bound(self.layers.len())?;
         let mut attempts = 0usize;
@@ -2223,6 +2343,7 @@ impl GpuNativeTokenLoop {
                     sink.as_ref(),
                     router_rank_sink.as_ref(),
                     semantic_sink.as_ref(),
+                    oracle_hook,
                 )?
             } else {
                 self.execute_token_segment_unified(
@@ -2235,6 +2356,7 @@ impl GpuNativeTokenLoop {
                     sink.as_ref(),
                     router_rank_sink.as_ref(),
                     semantic_sink.as_ref(),
+                    oracle_hook,
                 )?
             };
             attempts += 1;
@@ -2401,6 +2523,17 @@ impl GpuNativeTokenLoop {
 
             engine.record_gpu_native_actual_routes(position, &report.selected_ids);
 
+            if let Some(hook) = oracle_hook {
+                let boundary = issue_oracle_safe_boundary(
+                    position,
+                    GpuNativeTokenCompletionState::BoundaryMapParsedAfterPoll,
+                )
+                .expect("successful parsed boundary after Maintain::Wait is a completion proof");
+                hook.on_safe_token_boundary(engine, boundary, &report.selected_ids)
+                    .await
+                    .map_err(GpuNativeTokenLoopError::OracleScheduleFailed)?;
+            }
+
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
                     Some(report.sampled_token)
@@ -2427,7 +2560,7 @@ impl GpuNativeTokenLoop {
         replay: bool,
     ) -> Result<GpuNativeBoundaryReport, GpuNativeTokenLoopError> {
         let output = self.execute_token_attempt_unified(
-            request, token_id, position, sample, replay, None, None, None,
+            request, token_id, position, sample, replay, None, None, None, None,
         )?;
         Ok(output.boundary_report)
     }
@@ -2455,6 +2588,7 @@ impl GpuNativeTokenLoop {
             sample,
             replay,
             Some(&sink),
+            None,
             None,
             None,
         )?;
@@ -2631,6 +2765,7 @@ impl GpuNativeTokenLoop {
         diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
         router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
         semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
+        oracle_hook: Option<&dyn GpuNativeOracleScheduleHook>,
     ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
         let segment = GpuNativeExecutionSegment::fresh(self.layers.len())?;
         self.execute_token_segment_unified(
@@ -2643,6 +2778,7 @@ impl GpuNativeTokenLoop {
             diagnostic_sink,
             router_rank_sink,
             semantic_sink,
+            oracle_hook,
         )
     }
 
@@ -2659,6 +2795,7 @@ impl GpuNativeTokenLoop {
         diagnostic_sink: Option<&GpuNativeDiagnosticSink<'_>>,
         router_rank_sink: Option<&GpuNativeRouterRankDiagnosticSink<'_>>,
         semantic_sink: Option<&GpuNativeExpertPermutationSemanticSink<'_>>,
+        oracle_hook: Option<&dyn GpuNativeOracleScheduleHook>,
     ) -> Result<GpuNativeAttemptOutput, GpuNativeTokenLoopError> {
         if position != request.committed_position {
             return Err(GpuNativeTokenLoopError::PositionMismatch {
@@ -3125,6 +3262,10 @@ impl GpuNativeTokenLoop {
         self.counters
             .queue_submissions
             .fetch_add(1, Ordering::Relaxed);
+        // This callback is deliberately after the one normal submit and
+        // before the blocking boundary poll. It may overlap only NVMe/source
+        // work with current-token GPU execution.
+        notify_oracle_token_submitted(oracle_hook, position);
 
         // ONE map/readback for production boundary report
         let slice = request
@@ -4872,5 +5013,57 @@ pub(crate) mod tests {
         assert_eq!(trace1.status, 0);
         assert_eq!(request_state.committed_position, 2);
         assert!(trace1.post_attention_residual.iter().all(|v| v.is_finite()));
+    }
+
+    struct CountingOracleHook(AtomicU64);
+
+    impl GpuNativeOracleScheduleHook for CountingOracleHook {
+        fn on_token_submitted(&self, _position: usize) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_safe_token_boundary<'a>(
+            &'a self,
+            _engine: &'a Arc<Engine>,
+            _boundary: GpuNativeSafeTokenBoundary,
+            _actual_routes: &'a [Vec<u32>],
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn ordinary_token_path_has_no_oracle_behavior_when_hook_is_absent() {
+        let hook = CountingOracleHook(AtomicU64::new(0));
+        notify_oracle_token_submitted(None, 7);
+        assert_eq!(hook.0.load(Ordering::Relaxed), 0);
+        notify_oracle_token_submitted(Some(&hook), 7);
+        assert_eq!(hook.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn destructive_boundary_cannot_be_issued_while_submission_is_in_flight() {
+        assert!(
+            issue_oracle_safe_boundary(7, GpuNativeTokenCompletionState::SubmissionInFlight)
+                .is_err()
+        );
+        let boundary = issue_oracle_safe_boundary(
+            7,
+            GpuNativeTokenCompletionState::BoundaryMapParsedAfterPoll,
+        )
+        .unwrap();
+        assert_eq!(boundary.position(), 7);
+    }
+
+    #[test]
+    fn safe_boundary_witness_cannot_be_reused_for_one_layer() {
+        let mut boundary = issue_oracle_safe_boundary(
+            3,
+            GpuNativeTokenCompletionState::BoundaryMapParsedAfterPoll,
+        )
+        .unwrap();
+        assert_eq!(boundary.authorize_layer_once(4), Ok(()));
+        assert!(boundary.authorize_layer_once(4).is_err());
+        assert_eq!(boundary.authorize_layer_once(5), Ok(()));
     }
 }

@@ -99,6 +99,10 @@ pub(crate) enum GpuNativeTieredResidencyError {
     PhysicalIdentityCorrupt {
         global_id: u32,
     },
+    UnsafeOracleBoundary {
+        layer_index: usize,
+        detail: String,
+    },
     ResidencyPriorityMismatch,
     Backend(GpuNativeBootstrapError),
 }
@@ -125,6 +129,7 @@ impl fmt::Display for GpuNativeTieredResidencyError {
             Self::NoEvictablePhysicalSlot { layer_index } => write!(f, "layer {layer_index} has no physical victim outside the protected demand set"),
             Self::StalePhysicalRequester { global_id, generation } => write!(f, "stale physical requester for global expert {global_id} generation {generation}"),
             Self::PhysicalIdentityCorrupt { global_id } => write!(f, "GPU-native physical metadata disagrees with the authoritative arena for global expert {global_id}"),
+            Self::UnsafeOracleBoundary { layer_index, detail } => write!(f, "ORACLE-0B-S safe-boundary authorization failed for layer {layer_index}: {detail}"),
             Self::ResidencyPriorityMismatch => f.write_str("residency request used the wrong demand/speculative priority"),
             Self::Backend(error) => write!(f, "GPU-native residency backend error: {error}"),
         }
@@ -350,6 +355,7 @@ impl GpuNativeModelExpertVramPlan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GpuNativeResidencyPriority {
     Demand,
+    OracleSafeBoundary,
     Speculative { score: f64 },
 }
 
@@ -361,6 +367,10 @@ enum DemandPhysicalInstallPath {
 }
 
 const fn ordinary_demand_install_path() -> DemandPhysicalInstallPath {
+    DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+}
+
+const fn oracle_safe_boundary_install_path() -> DemandPhysicalInstallPath {
     DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
 }
 
@@ -808,6 +818,38 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
+    /// ORACLE-0B-S qualification-only destructive replacement. The caller
+    /// must present the non-cloneable witness minted by the token loop after
+    /// the previous token's successful boundary readback. Physical staging is
+    /// exactly the ordinary production concurrent direct-staging path; only
+    /// the demand-request counter is kept separate. The resulting queue writes
+    /// are deliberately left pending: next-token mapping writes follow them,
+    /// then the next token's one normal command-buffer submit orders both sets
+    /// of writes before compute. No extra empty submit is used to flush H2D.
+    pub(crate) fn ensure_oracle_future_set_at_safe_boundary(
+        &self,
+        boundary: &mut crate::gpu_native_token_loop::GpuNativeSafeTokenBoundary,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        boundary
+            .authorize_layer_once(layer_index)
+            .map_err(
+                |detail| GpuNativeTieredResidencyError::UnsafeOracleBoundary {
+                    layer_index,
+                    detail: detail.to_string(),
+                },
+            )?;
+        self.ensure_demand_set_inner::<true>(
+            GpuNativeResidencyPriority::OracleSafeBoundary,
+            layer_index,
+            demands,
+            oracle_safe_boundary_install_path(),
+            Some(observer),
+        )
+    }
+
     /// PR2-B-B.1 control: the exact pre-B-B sequential production direct-
     /// staging path, observed only by the dedicated production qualifier.
     pub(crate) fn ensure_demand_set_physical_install_concurrency_control(
@@ -834,7 +876,10 @@ impl GpuNativeTieredResidencyManager {
         install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        if !matches!(priority, GpuNativeResidencyPriority::Demand) {
+        if !matches!(
+            priority,
+            GpuNativeResidencyPriority::Demand | GpuNativeResidencyPriority::OracleSafeBoundary
+        ) {
             return Err(GpuNativeTieredResidencyError::ResidencyPriorityMismatch);
         }
         let layer =
@@ -876,9 +921,11 @@ impl GpuNativeTieredResidencyManager {
             }
         }
 
-        self.counters
-            .demand_requests
-            .fetch_add(demands.len() as u64, Ordering::Relaxed);
+        if matches!(priority, GpuNativeResidencyPriority::Demand) {
+            self.counters
+                .demand_requests
+                .fetch_add(demands.len() as u64, Ordering::Relaxed);
+        }
         let mut state = layer.state.lock();
         let mut resolved = vec![None; demands.len()];
         let mut misses = Vec::new();
@@ -1742,6 +1789,10 @@ mod tests {
             DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
         );
         assert_eq!(
+            oracle_safe_boundary_install_path(),
+            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+        );
+        assert_eq!(
             production_concurrency_control_path(),
             DemandPhysicalInstallPath::SequentialDirectStagingControl
         );
@@ -1751,6 +1802,30 @@ mod tests {
         );
         assert_ne!(
             production_concurrency_control_path(),
+            speculative_install_path()
+        );
+        assert_ne!(
+            oracle_safe_boundary_install_path(),
+            speculative_install_path()
+        );
+    }
+
+    #[test]
+    fn oracle_direct_staging_uses_the_production_direct_path() {
+        assert_eq!(
+            oracle_safe_boundary_install_path(),
+            ordinary_demand_install_path()
+        );
+        assert_eq!(
+            oracle_safe_boundary_install_path(),
+            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+        );
+    }
+
+    #[test]
+    fn oracle_direct_staging_never_uses_legacy_full_slot_vec_control() {
+        assert_ne!(
+            oracle_safe_boundary_install_path(),
             speculative_install_path()
         );
     }
