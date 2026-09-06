@@ -11,6 +11,7 @@
 
 use crate::backend::gpu_native::{GpuNativePhysicalInstallEvidence, GpuNativeQ4ExpertResidency};
 use crate::backend::GpuDeviceIdentity;
+use crate::buffer_pool::{BufferPool, BufferPoolOrigin};
 use crate::engine::{Engine, RoutedExpertExecutionSnapshot};
 use crate::expert_cache::{ExpertResident, GpuDemandSetAdmission, GpuResident};
 use crate::gpu_native_oracle_routes::{OracleGeometry, OracleRouteRecord, OracleRouteTrace};
@@ -35,10 +36,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v1";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v2";
 pub(crate) const MODE: &str = "qualify-gpu-native-oracle-scheduled-residency";
 const ORACLE_ROUTE_SCHEMA: &str = "mer.gpu-native-oracle-route-trace.v1";
 const ORACLE_ROUTE_COMMAND_SHA: &str = "3576cb893586f5dd3f5c5e7355658762db02b534";
@@ -65,6 +67,8 @@ const FROZEN_OUTPUT_TOKENS: usize = 128;
 const FROZEN_WARMUP_RUNS: usize = 1;
 const FROZEN_MEASURED_RUNS: usize = 3;
 const FROZEN_RAM_CACHE_SLOTS: usize = 384;
+const ORACLE_FUTURE_SOURCE_POOL_SLOTS: usize = EXPECTED_LAYERS * EXPECTED_TOP_K;
+const PREDECESSOR_FIRST_ATTEMPT_CODE_SHA: &str = "d4e34cf302ee7f8d78b45d8e6dd8e7e524e716f3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -371,12 +375,23 @@ struct OracleCounters {
     future_experts_considered: u64,
     source_skipped_physical_current: u64,
     source_ram_hits: u64,
+    source_prefetch_ram_hits: u64,
     source_singleflight_hits: u64,
     source_position_inflight_skips: u64,
     source_reads_started: u64,
     source_reads_completed: u64,
     source_reads_failed: u64,
     source_bytes_read: u64,
+    oracle_source_nvme_reads: u64,
+    oracle_source_bytes: u64,
+    future_experts_deferred_current_demand_overlap: u64,
+    deferred_overlap_resolved_physical: u64,
+    deferred_overlap_resolved_production_ram: u64,
+    residual_boundary_source_reads: u64,
+    residual_boundary_source_failures: u64,
+    residual_boundary_source_bytes: u64,
+    residual_source_wait_us: u64,
+    oracle_source_pool_exhaustion_count: u64,
     source_prefetch_batches_started: u64,
     source_prefetch_batches_completed: u64,
     source_prefetch_batches_skipped_inflight: u64,
@@ -418,8 +433,129 @@ struct OracleCounters {
     background_tasks_drained: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+struct OracleFutureSourcePoolSnapshot {
+    capacity_slots: usize,
+    buffer_size_bytes: usize,
+    allocated_bytes: usize,
+    current_in_use_slots: usize,
+    peak_in_use_slots: usize,
+    exhaustion_count: u64,
+    nvme_reads: u64,
+    nvme_bytes: u64,
+}
+
+/// One bounded, qualification-owned source plane shared by warmup and all
+/// measured requests. It never inserts into the production RAM cache.
+pub(crate) struct OracleFutureSourcePool {
+    pool: BufferPool,
+    peak_in_use_slots: AtomicUsize,
+    exhaustion_count: AtomicU64,
+    nvme_reads: AtomicU64,
+    nvme_bytes: AtomicU64,
+}
+
+impl OracleFutureSourcePool {
+    pub(crate) fn new(capacity: usize, buffer_size: usize, block_align: usize) -> Self {
+        Self {
+            pool: BufferPool::new_qualification_oracle_future_source(
+                capacity,
+                buffer_size,
+                block_align,
+            ),
+            peak_in_use_slots: AtomicUsize::new(0),
+            exhaustion_count: AtomicU64::new(0),
+            nvme_reads: AtomicU64::new(0),
+            nvme_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<crate::buffer_pool::PooledBuffer, String> {
+        let Some(buffer) = self.pool.try_acquire() else {
+            self.exhaustion_count.fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "ORACLE future-source pool exhausted at capacity {}",
+                self.pool.capacity()
+            ));
+        };
+        let current = self
+            .pool
+            .capacity()
+            .saturating_sub(self.pool.primary_available());
+        self.peak_in_use_slots.fetch_max(current, Ordering::Relaxed);
+        Ok(buffer)
+    }
+
+    fn snapshot(&self) -> OracleFutureSourcePoolSnapshot {
+        OracleFutureSourcePoolSnapshot {
+            capacity_slots: self.pool.capacity(),
+            buffer_size_bytes: self.pool.buffer_size(),
+            allocated_bytes: self.pool.allocated_bytes(),
+            current_in_use_slots: self
+                .pool
+                .capacity()
+                .saturating_sub(self.pool.primary_available()),
+            peak_in_use_slots: self.peak_in_use_slots.load(Ordering::Relaxed),
+            exhaustion_count: self.exhaustion_count.load(Ordering::Relaxed),
+            nvme_reads: self.nvme_reads.load(Ordering::Relaxed),
+            nvme_bytes: self.nvme_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_in_use_slots(&self) -> usize {
+        self.snapshot().current_in_use_slots
+    }
+}
+
+#[derive(Debug)]
+enum OracleSourceReadError {
+    PoolExhausted(String),
+    Io(String),
+    Fatal(String),
+}
+
+async fn read_oracle_future_source(
+    engine: &Arc<Engine>,
+    pool: &OracleFutureSourcePool,
+    global_id: u32,
+) -> Result<(Arc<ExpertResident>, usize), OracleSourceReadError> {
+    read_oracle_future_source_from_storage(&engine.core.storage, pool, global_id).await
+}
+
+async fn read_oracle_future_source_from_storage(
+    storage: &Arc<crate::io_provider::NvmeStorage>,
+    pool: &OracleFutureSourcePool,
+    global_id: u32,
+) -> Result<(Arc<ExpertResident>, usize), OracleSourceReadError> {
+    let mut buffer = pool
+        .try_acquire()
+        .map_err(OracleSourceReadError::PoolExhausted)?;
+    let bytes = storage
+        .read_expert(global_id, &mut buffer)
+        .await
+        .map_err(|error| OracleSourceReadError::Io(error.to_string()))?;
+    pool.nvme_reads.fetch_add(1, Ordering::Relaxed);
+    pool.nvme_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    let resident = Arc::new(ExpertResident::new_with_block_align(
+        global_id,
+        buffer,
+        storage.config().block_align,
+    ));
+    if resident.buffer_pool_origin() != BufferPoolOrigin::QualificationOracleFutureSource {
+        return Err(OracleSourceReadError::Fatal(
+            "ORACLE future-source read returned a production-backed resident".into(),
+        ));
+    }
+    Ok((resident, bytes))
+}
+
 fn saturating_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+const fn oracle_future_source_allocated_bytes(expert_file_bytes: usize) -> Option<usize> {
+    ORACLE_FUTURE_SOURCE_POOL_SLOTS.checked_mul(expert_file_bytes)
 }
 
 fn add_counter(target: &mut u64, value: u64) {
@@ -453,8 +589,34 @@ impl Drop for LayerBatchGuard {
 struct PrefetchOutcome {
     target_position: usize,
     residents: HashMap<u32, Arc<ExpertResident>>,
+    successful_ids: Vec<u32>,
+    deferred_overlap_ids: Vec<u32>,
     failed_ids: Vec<u32>,
     fatal_error: Option<String>,
+}
+
+fn validate_retained_source_origins(
+    mode: OracleScheduledResidencyMode,
+    outcome: &PrefetchOutcome,
+) -> Result<(), String> {
+    match mode {
+        OracleScheduledResidencyMode::SourceOnly if !outcome.residents.is_empty() => Err(
+            "source-only retained request-local PRIMARY residents across token execution".into(),
+        ),
+        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+            for (&global_id, resident) in &outcome.residents {
+                if resident.buffer_pool_origin()
+                    != BufferPoolOrigin::QualificationOracleFutureSource
+                {
+                    return Err(format!(
+                        "token-boundary-direct retained production-backed future expert {global_id}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        OracleScheduledResidencyMode::SourceOnly => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -465,7 +627,6 @@ struct SourceReadinessSnapshot {
 
 #[derive(Default)]
 struct SourceReadinessState {
-    physical_ready: HashSet<u32>,
     source_residents_ready: HashSet<u32>,
 }
 
@@ -482,10 +643,6 @@ enum BoundarySourceReadiness {
 }
 
 impl SourceReadiness {
-    fn mark_physical_ready(&self, global_id: u32) {
-        self.state.lock().physical_ready.insert(global_id);
-    }
-
     fn mark_source_resident_ready(&self, global_id: u32) {
         let mut state = self.state.lock();
         state.source_residents_ready.insert(global_id);
@@ -530,8 +687,7 @@ impl SourceReadiness {
                 ));
             }
             let live = current_readiness(global_id)?;
-            let physical_ready = state.physical_ready.contains(&global_id)
-                || live == BoundarySourceReadiness::Physical;
+            let physical_ready = live == BoundarySourceReadiness::Physical;
             let source_ready = state.source_residents_ready.contains(&global_id)
                 || live == BoundarySourceReadiness::SourceResident;
             required_ready += u64::from(physical_ready || source_ready);
@@ -550,29 +706,15 @@ impl SourceReadiness {
 
 struct PrefetchLease {
     outcome: PrefetchOutcome,
-    counters: Arc<Mutex<OracleCounters>>,
     _position_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl PrefetchLease {
-    fn new(
-        outcome: PrefetchOutcome,
-        counters: Arc<Mutex<OracleCounters>>,
-        position_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Self {
+    fn new(outcome: PrefetchOutcome, position_guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         Self {
             outcome,
-            counters,
             _position_guard: position_guard,
         }
-    }
-}
-
-impl Drop for PrefetchLease {
-    fn drop(&mut self) {
-        let mut values = self.counters.lock();
-        values.qualification_owned_current_slots = 0;
-        values.qualification_owned_current_bytes = 0;
     }
 }
 
@@ -582,6 +724,50 @@ enum SourceDisposition {
     RamHit,
     SourceInFlight,
     StartSourceRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectFutureSourceDisposition {
+    AlreadyPhysical,
+    DeferredCurrentDemandOverlap,
+    IsolatedRead,
+}
+
+const fn direct_future_source_disposition(
+    physical_current: bool,
+    overlaps_current_demand: bool,
+) -> DirectFutureSourceDisposition {
+    if physical_current {
+        DirectFutureSourceDisposition::AlreadyPhysical
+    } else if overlaps_current_demand {
+        DirectFutureSourceDisposition::DeferredCurrentDemandOverlap
+    } else {
+        DirectFutureSourceDisposition::IsolatedRead
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectBoundarySourceDisposition {
+    Physical,
+    Isolated,
+    ProductionRam,
+    ResidualRead,
+}
+
+const fn direct_boundary_source_disposition(
+    physical_current: bool,
+    isolated_ready: bool,
+    production_ram_ready: bool,
+) -> DirectBoundarySourceDisposition {
+    if physical_current {
+        DirectBoundarySourceDisposition::Physical
+    } else if isolated_ready {
+        DirectBoundarySourceDisposition::Isolated
+    } else if production_ram_ready {
+        DirectBoundarySourceDisposition::ProductionRam
+    } else {
+        DirectBoundarySourceDisposition::ResidualRead
+    }
 }
 
 const fn source_disposition(
@@ -604,6 +790,9 @@ async fn prefetch_layer_batch(
     engine: Arc<Engine>,
     layer_index: usize,
     local_ids: Vec<u32>,
+    mode: OracleScheduledResidencyMode,
+    current_route_global_ids: Arc<HashSet<u32>>,
+    oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     counters: Arc<Mutex<OracleCounters>>,
     readiness: Arc<SourceReadiness>,
 ) -> PrefetchOutcome {
@@ -637,25 +826,101 @@ async fn prefetch_layer_batch(
                 return outcome;
             }
         };
-        let ram_resident = (!physical_current)
-            .then(|| engine.core.cache.get(global_id))
-            .flatten();
-        let singleflight = !physical_current
-            && ram_resident.is_none()
-            && engine.core.in_flight.contains_key(&global_id);
-        match source_disposition(physical_current, ram_resident.is_some(), singleflight) {
-            SourceDisposition::AlreadyPhysical => {
-                counters.lock().source_skipped_physical_current += 1;
-                readiness.mark_physical_ready(global_id);
-                continue;
+        if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+            match direct_future_source_disposition(
+                physical_current,
+                current_route_global_ids.contains(&global_id),
+            ) {
+                DirectFutureSourceDisposition::AlreadyPhysical => {
+                    counters.lock().source_skipped_physical_current += 1;
+                    outcome.successful_ids.push(global_id);
+                    continue;
+                }
+                DirectFutureSourceDisposition::DeferredCurrentDemandOverlap => {
+                    counters
+                        .lock()
+                        .future_experts_deferred_current_demand_overlap += 1;
+                    outcome.deferred_overlap_ids.push(global_id);
+                    continue;
+                }
+                DirectFutureSourceDisposition::IsolatedRead => {}
             }
+            let Some(pool) = oracle_source_pool.as_ref() else {
+                outcome.fatal_error =
+                    Some("token-boundary-direct has no isolated ORACLE source pool".into());
+                return outcome;
+            };
+            counters.lock().source_reads_started += 1;
+            let started = Instant::now();
+            match read_oracle_future_source(&engine, pool, global_id).await {
+                Ok((resident, bytes)) => {
+                    let pool_snapshot = pool.snapshot();
+                    let mut values = counters.lock();
+                    add_counter(&mut values.source_read_aggregate_us, saturating_us(started));
+                    values.source_reads_completed += 1;
+                    add_counter(&mut values.source_bytes_read, bytes as u64);
+                    values.oracle_source_nvme_reads += 1;
+                    add_counter(&mut values.oracle_source_bytes, bytes as u64);
+                    values.qualification_owned_current_slots =
+                        pool_snapshot.current_in_use_slots as u64;
+                    values.qualification_owned_current_bytes = (pool_snapshot.current_in_use_slots
+                        as u64)
+                        .saturating_mul(pool_snapshot.buffer_size_bytes as u64);
+                    values.qualification_owned_peak_slots = values
+                        .qualification_owned_peak_slots
+                        .max(pool_snapshot.current_in_use_slots as u64);
+                    values.qualification_owned_peak_bytes =
+                        values.qualification_owned_peak_bytes.max(
+                            (pool_snapshot.current_in_use_slots as u64)
+                                .saturating_mul(pool_snapshot.buffer_size_bytes as u64),
+                        );
+                    drop(values);
+                    readiness.mark_source_resident_ready(global_id);
+                    outcome.successful_ids.push(global_id);
+                    outcome.residents.insert(global_id, resident);
+                }
+                Err(OracleSourceReadError::Io(_error)) => {
+                    let mut values = counters.lock();
+                    add_counter(&mut values.source_read_aggregate_us, saturating_us(started));
+                    values.source_reads_failed += 1;
+                    outcome.failed_ids.push(global_id);
+                }
+                Err(OracleSourceReadError::PoolExhausted(error)) => {
+                    let mut values = counters.lock();
+                    values.source_reads_failed += 1;
+                    values.oracle_source_pool_exhaustion_count += 1;
+                    outcome.fatal_error = Some(error);
+                    return outcome;
+                }
+                Err(OracleSourceReadError::Fatal(error)) => {
+                    counters.lock().source_reads_failed += 1;
+                    outcome.fatal_error = Some(error);
+                    return outcome;
+                }
+            }
+            continue;
+        }
+
+        if physical_current {
+            counters.lock().source_skipped_physical_current += 1;
+            outcome.successful_ids.push(global_id);
+            continue;
+        }
+
+        // Source-only intentionally uses the ordinary cache/singleflight
+        // machinery, but never parks the returned PRIMARY Arc in the
+        // position outcome. Once fetch has installed the resident, the cache
+        // is the only long-lived owner and foreground eviction can recycle
+        // the buffer immediately.
+        let ram_resident = engine.core.cache.get(global_id);
+        let singleflight = ram_resident.is_none() && engine.core.in_flight.contains_key(&global_id);
+        match source_disposition(false, ram_resident.is_some(), singleflight) {
             SourceDisposition::RamHit => {
-                counters.lock().source_ram_hits += 1;
-                outcome.residents.insert(
-                    global_id,
-                    ram_resident.expect("RAM-hit disposition has a resident"),
-                );
-                readiness.mark_source_resident_ready(global_id);
+                let mut values = counters.lock();
+                values.source_ram_hits += 1;
+                values.source_prefetch_ram_hits += 1;
+                outcome.successful_ids.push(global_id);
+                drop(ram_resident);
                 continue;
             }
             SourceDisposition::SourceInFlight => {
@@ -664,6 +929,7 @@ async fn prefetch_layer_batch(
             SourceDisposition::StartSourceRead => {
                 counters.lock().source_reads_started += 1;
             }
+            SourceDisposition::AlreadyPhysical => unreachable!("physical current handled above"),
         }
         let started = Instant::now();
         match engine.fetch_with_retry(global_id).await {
@@ -673,18 +939,20 @@ async fn prefetch_layer_batch(
                 add_counter(&mut values.source_read_aggregate_us, elapsed);
                 if !singleflight {
                     values.source_reads_completed += 1;
-                    add_counter(&mut values.source_bytes_read, resident.data().len() as u64);
+                    add_counter(
+                        &mut values.source_bytes_read,
+                        engine.core.storage.config().expert_size as u64,
+                    );
                 }
                 drop(values);
-                readiness.mark_source_resident_ready(global_id);
-                outcome.residents.insert(global_id, resident);
+                outcome.successful_ids.push(global_id);
+                drop(resident);
             }
-            Err(error) => {
+            Err(_error) => {
                 if !singleflight {
                     counters.lock().source_reads_failed += 1;
                 }
                 outcome.failed_ids.push(global_id);
-                let _ = error;
             }
         }
     }
@@ -695,6 +963,9 @@ async fn prefetch_position(
     engine: Arc<Engine>,
     target_position: usize,
     routes: Vec<Vec<u32>>,
+    mode: OracleScheduledResidencyMode,
+    current_route_global_ids: Arc<HashSet<u32>>,
+    oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     concurrency: usize,
     expert_bytes: usize,
     counters: Arc<Mutex<OracleCounters>>,
@@ -707,12 +978,24 @@ async fn prefetch_position(
         let counters = counters.clone();
         let readiness = readiness.clone();
         let semaphore = semaphore.clone();
+        let current_route_global_ids = current_route_global_ids.clone();
+        let oracle_source_pool = oracle_source_pool.clone();
         async move {
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("qualification semaphore remains open");
-            let result = prefetch_layer_batch(engine, layer_index, ids, counters, readiness).await;
+            let result = prefetch_layer_batch(
+                engine,
+                layer_index,
+                ids,
+                mode,
+                current_route_global_ids,
+                oracle_source_pool,
+                counters,
+                readiness,
+            )
+            .await;
             drop(permit);
             result
         }
@@ -730,22 +1013,22 @@ async fn prefetch_position(
             outcome.fatal_error = batch.fatal_error;
         }
         outcome.failed_ids.extend(batch.failed_ids);
+        outcome.successful_ids.extend(batch.successful_ids);
+        outcome
+            .deferred_overlap_ids
+            .extend(batch.deferred_overlap_ids);
         outcome.residents.extend(batch.residents);
     }
     let slots = outcome.residents.len() as u64;
-    let bytes = outcome
-        .residents
-        .values()
-        .map(|resident| resident.data().len() as u64)
-        .sum::<u64>();
+    let bytes = slots.saturating_mul(expert_bytes as u64);
     let mut values = counters.lock();
     add_counter(&mut values.source_prefetch_wall_us, saturating_us(started));
     values.qualification_owned_current_slots = slots;
     values.qualification_owned_current_bytes = bytes;
     values.qualification_owned_peak_slots = values.qualification_owned_peak_slots.max(slots);
     values.qualification_owned_peak_bytes = values.qualification_owned_peak_bytes.max(bytes);
-    if slots > FROZEN_RAM_CACHE_SLOTS as u64
-        || bytes > (FROZEN_RAM_CACHE_SLOTS as u64).saturating_mul(expert_bytes as u64)
+    if slots > ORACLE_FUTURE_SOURCE_POOL_SLOTS as u64
+        || bytes > (ORACLE_FUTURE_SOURCE_POOL_SLOTS as u64).saturating_mul(expert_bytes as u64)
     {
         outcome.fatal_error = Some(format!(
             "qualification temporary source state exceeded bound: slots={slots} bytes={bytes}"
@@ -923,6 +1206,121 @@ fn plan_boundary_replacement(
     })
 }
 
+async fn resolve_direct_sources_at_boundary(
+    engine: &Arc<Engine>,
+    routes: &[Vec<u32>],
+    prefetched: &PrefetchOutcome,
+    pool: &Arc<OracleFutureSourcePool>,
+    counters: &Arc<Mutex<OracleCounters>>,
+) -> Result<HashMap<u32, Arc<ExpertResident>>, String> {
+    validate_retained_source_origins(
+        OracleScheduledResidencyMode::TokenBoundaryDirect,
+        prefetched,
+    )?;
+
+    let manager = engine
+        .core
+        .gpu_native_residency
+        .as_ref()
+        .ok_or("GPU-native residency manager is absent")?;
+    let experts_per_layer = manager.plan().geometry().num_experts() as u32;
+    let deferred = prefetched
+        .deferred_overlap_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut resolved = prefetched.residents.clone();
+    for (layer_index, local_ids) in routes.iter().enumerate() {
+        for global_id in future_global_ids(
+            layer_index,
+            local_ids,
+            manager.plan().num_layers(),
+            experts_per_layer,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            let physical_current = manager
+                .has_current_for_demand(global_id)
+                .map_err(|error| error.to_string())?;
+            let isolated_ready = resolved.contains_key(&global_id);
+            let production_ram = (!physical_current && !isolated_ready)
+                .then(|| engine.core.cache.get(global_id))
+                .flatten();
+            match direct_boundary_source_disposition(
+                physical_current,
+                isolated_ready,
+                production_ram.is_some(),
+            ) {
+                DirectBoundarySourceDisposition::Physical => {
+                    if deferred.contains(&global_id) {
+                        counters.lock().deferred_overlap_resolved_physical += 1;
+                    }
+                    continue;
+                }
+                DirectBoundarySourceDisposition::Isolated => continue,
+                DirectBoundarySourceDisposition::ProductionRam => {
+                    let mut values = counters.lock();
+                    values.source_ram_hits += 1;
+                    if deferred.contains(&global_id) {
+                        values.deferred_overlap_resolved_production_ram += 1;
+                    }
+                    drop(values);
+                    // This PRIMARY Arc is acquired only after current-token
+                    // completion and is released before the next token begins.
+                    resolved.insert(
+                        global_id,
+                        production_ram.expect("production-RAM disposition has a resident"),
+                    );
+                    continue;
+                }
+                DirectBoundarySourceDisposition::ResidualRead => {}
+            }
+
+            let started = Instant::now();
+            let read = read_oracle_future_source(engine, pool, global_id).await;
+            let elapsed = saturating_us(started);
+            let mut values = counters.lock();
+            add_counter(&mut values.residual_source_wait_us, elapsed);
+            match read {
+                Ok((resident, bytes)) => {
+                    values.residual_boundary_source_reads += 1;
+                    values.oracle_source_nvme_reads += 1;
+                    add_counter(&mut values.oracle_source_bytes, bytes as u64);
+                    add_counter(&mut values.residual_boundary_source_bytes, bytes as u64);
+                    drop(values);
+                    resolved.insert(global_id, resident);
+                }
+                Err(OracleSourceReadError::Io(_error)) => {
+                    values.residual_boundary_source_failures += 1;
+                    values.source_failures_degraded_to_demand += 1;
+                    drop(values);
+                    // Correctness remains with the ordinary demand/recovery
+                    // path when an allowed residual source read genuinely
+                    // fails.
+                }
+                Err(OracleSourceReadError::PoolExhausted(error)) => {
+                    values.oracle_source_pool_exhaustion_count += 1;
+                    return Err(error);
+                }
+                Err(OracleSourceReadError::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+    let snapshot = pool.snapshot();
+    let mut values = counters.lock();
+    values.qualification_owned_current_slots = snapshot.current_in_use_slots as u64;
+    values.qualification_owned_current_bytes =
+        (snapshot.current_in_use_slots as u64).saturating_mul(snapshot.buffer_size_bytes as u64);
+    values.qualification_owned_peak_slots = values
+        .qualification_owned_peak_slots
+        .max(snapshot.current_in_use_slots as u64);
+    values.qualification_owned_peak_bytes = values.qualification_owned_peak_bytes.max(
+        (snapshot.current_in_use_slots as u64).saturating_mul(snapshot.buffer_size_bytes as u64),
+    );
+    drop(values);
+    Ok(resolved)
+}
+
 fn prepare_logical_admissions(
     engine: &Arc<Engine>,
     global_ids: &[u32],
@@ -1032,7 +1430,6 @@ fn install_future_at_boundary(
             .iter()
             .any(|global_id| !residents.contains_key(global_id))
         {
-            counters.lock().source_failures_degraded_to_demand += 1;
             continue;
         }
 
@@ -1164,6 +1561,7 @@ struct OracleScheduler {
     mode: OracleScheduledResidencyMode,
     concurrency: usize,
     expert_bytes: usize,
+    oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     source_position_gate: Arc<tokio::sync::Mutex<()>>,
     counters: Arc<Mutex<OracleCounters>>,
     state: Arc<Mutex<SchedulerState>>,
@@ -1254,6 +1652,7 @@ where
         &mut counters.lock(),
         &lease.outcome,
         readiness_at_boundary.source_residents_ready,
+        mode,
     );
     Ok(BoundarySourceResolution::Completed { lease, was_late })
 }
@@ -1263,9 +1662,26 @@ fn release_source_position_lease_before_next_token(
     lease: PrefetchLease,
     source_position_gate: &Arc<tokio::sync::Mutex<()>>,
     state: &Arc<Mutex<SchedulerState>>,
+    oracle_source_pool: Option<&Arc<OracleFutureSourcePool>>,
+    counters: &Arc<Mutex<OracleCounters>>,
 ) -> Result<(), String> {
     drop(lease);
     if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        let pool = oracle_source_pool
+            .ok_or("token-boundary-direct lost its isolated ORACLE source pool")?;
+        let snapshot = pool.snapshot();
+        {
+            let mut values = counters.lock();
+            values.qualification_owned_current_slots = snapshot.current_in_use_slots as u64;
+            values.qualification_owned_current_bytes = (snapshot.current_in_use_slots as u64)
+                .saturating_mul(snapshot.buffer_size_bytes as u64);
+        }
+        if snapshot.current_in_use_slots != 0 {
+            return Err(format!(
+                "prior-position ORACLE source lease retained {} buffers before the next token",
+                snapshot.current_in_use_slots
+            ));
+        }
         let position_guard = source_position_gate.clone().try_lock_owned().map_err(|_| {
             "token-boundary-direct retained the completed position lease before the next token"
                 .to_string()
@@ -1288,12 +1704,14 @@ impl OracleScheduler {
         mode: OracleScheduledResidencyMode,
         concurrency: usize,
         expert_bytes: usize,
+        oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     ) -> Self {
         Self {
             engine,
             mode,
             concurrency,
             expert_bytes,
+            oracle_source_pool,
             source_position_gate: Arc::new(tokio::sync::Mutex::new(())),
             counters: Arc::new(Mutex::new(OracleCounters::default())),
             state: Arc::new(Mutex::new(SchedulerState {
@@ -1317,13 +1735,15 @@ impl OracleScheduler {
                 self.engine.clone(),
                 0,
                 routes,
+                OracleScheduledResidencyMode::SourceOnly,
+                Arc::new(HashSet::new()),
+                None,
                 self.concurrency,
                 self.expert_bytes,
                 self.counters.clone(),
                 readiness,
             )
             .await,
-            self.counters.clone(),
             position_guard,
         );
         if let Some(error) = lease.outcome.fatal_error.as_ref() {
@@ -1331,7 +1751,7 @@ impl OracleScheduler {
             return Err(error);
         }
         let mut values = self.counters.lock();
-        values.initial_position_source_priming_experts = lease.outcome.residents.len() as u64;
+        values.initial_position_source_priming_experts = lease.outcome.successful_ids.len() as u64;
         values.initial_position_source_priming_us = saturating_us(started);
         values.source_failures_degraded_to_demand += lease.outcome.failed_ids.len() as u64;
         drop(values);
@@ -1491,6 +1911,7 @@ impl OracleScheduler {
         let mut values = self.counters.lock();
         values.source_skipped_physical_current += physical;
         values.source_ram_hits += ram;
+        values.source_prefetch_ram_hits += ram;
         values.source_singleflight_hits += singleflight;
         values.source_position_inflight_skips += position_inflight;
         values.source_prefetch_batches_skipped_inflight += routes.len() as u64;
@@ -1581,11 +2002,23 @@ impl OracleScheduler {
         };
 
         if self.mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+            let pool = self
+                .oracle_source_pool
+                .as_ref()
+                .ok_or("token-boundary-direct has no isolated ORACLE source pool")?;
+            let resolved = resolve_direct_sources_at_boundary(
+                &self.engine,
+                &routes,
+                &lease.outcome,
+                pool,
+                &self.counters,
+            )
+            .await?;
             install_future_at_boundary(
                 &self.engine,
                 &mut boundary,
                 &routes,
-                &lease.outcome.residents,
+                &resolved,
                 self.counters.clone(),
             )?;
             let unavailable_after_install = self.future_not_physically_current_count(&routes)?;
@@ -1594,12 +2027,20 @@ impl OracleScheduler {
                 was_late,
                 unavailable_after_install,
             );
+            drop(resolved);
+        } else {
+            validate_retained_source_origins(
+                OracleScheduledResidencyMode::SourceOnly,
+                &lease.outcome,
+            )?;
         }
         release_source_position_lease_before_next_token(
             self.mode,
             lease,
             &self.source_position_gate,
             &self.state,
+            self.oracle_source_pool.as_ref(),
+            &self.counters,
         )
     }
 
@@ -1615,8 +2056,18 @@ impl OracleScheduler {
         }
         let trace = state.cursor.clone().finish()?;
         let mut counters = self.counters.lock().clone();
-        counters.qualification_owned_current_slots = 0;
-        counters.qualification_owned_current_bytes = 0;
+        if let Some(pool) = self.oracle_source_pool.as_ref() {
+            let snapshot = pool.snapshot();
+            counters.qualification_owned_current_slots = snapshot.current_in_use_slots as u64;
+            counters.qualification_owned_current_bytes = (snapshot.current_in_use_slots as u64)
+                .saturating_mul(snapshot.buffer_size_bytes as u64);
+            if snapshot.current_in_use_slots != 0 {
+                return Err(format!(
+                    "ORACLE source pool retained {} leases after request completion",
+                    snapshot.current_in_use_slots
+                ));
+            }
+        }
         Ok((counters, trace))
     }
 }
@@ -1625,9 +2076,12 @@ fn record_completed_source_outcome(
     counters: &mut OracleCounters,
     outcome: &PrefetchOutcome,
     source_residents_ready_at_boundary: u64,
+    mode: OracleScheduledResidencyMode,
 ) {
     counters.source_ready_before_boundary += source_residents_ready_at_boundary;
-    counters.source_failures_degraded_to_demand += outcome.failed_ids.len() as u64;
+    if mode == OracleScheduledResidencyMode::SourceOnly {
+        counters.source_failures_degraded_to_demand += outcome.failed_ids.len() as u64;
+    }
 }
 
 fn record_source_position_considered(counters: &mut OracleCounters, routes: &[Vec<u32>]) {
@@ -1709,7 +2163,23 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
         let counters = self.counters.clone();
         let concurrency = self.concurrency;
         let expert_bytes = self.expert_bytes;
+        let mode = self.mode;
+        let oracle_source_pool = self.oracle_source_pool.clone();
         let target_position = position + 1;
+        let current_routes = match state.cursor.routes_at(position) {
+            Ok(routes) => routes,
+            Err(error) => {
+                state.failure = Some(error);
+                return;
+            }
+        };
+        let current_route_global_ids = match self.required_future_global_ids(&current_routes) {
+            Ok(ids) => Arc::new(ids.into_iter().collect::<HashSet<_>>()),
+            Err(error) => {
+                state.failure = Some(error);
+                return;
+            }
+        };
         let readiness = Arc::new(SourceReadiness::default());
         let handle = match self.source_position_gate.clone().try_lock_owned() {
             Ok(position_guard) => {
@@ -1719,13 +2189,16 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
                         engine,
                         target_position,
                         routes,
+                        mode,
+                        current_route_global_ids,
+                        oracle_source_pool,
                         concurrency,
                         expert_bytes,
                         counters.clone(),
                         readiness_for_task,
                     )
                     .await;
-                    PrefetchLease::new(outcome, counters, position_guard)
+                    PrefetchLease::new(outcome, position_guard)
                 });
                 self.counters.lock().background_tasks_spawned += 1;
                 Some(handle)
@@ -1782,6 +2255,8 @@ struct TreatmentContract {
     production_speculative_residency_used: bool,
     production_direct_staging_used: bool,
     legacy_full_slot_vec_used: bool,
+    future_source_pool_isolated_from_production_primary: bool,
+    production_primary_pool_capacity_unchanged: bool,
 }
 
 const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentContract {
@@ -1801,6 +2276,8 @@ const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentCont
             OracleScheduledResidencyMode::TokenBoundaryDirect
         ),
         legacy_full_slot_vec_used: false,
+        future_source_pool_isolated_from_production_primary: true,
+        production_primary_pool_capacity_unchanged: true,
     }
 }
 
@@ -1824,6 +2301,43 @@ struct FrozenControlReferences {
     oracle_route_command_git_sha: &'static str,
     performance_controls_rerun: bool,
     hardware_results_embedded: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct PredecessorFirstAttemptEvidence {
+    code_sha: &'static str,
+    result: &'static str,
+    failure: &'static str,
+    requested: usize,
+    acquired: usize,
+    interpretation: &'static str,
+    first_attempt_rerun: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct SourceMemoryPlaneEvidence {
+    production_ram_cache_capacity_slots: usize,
+    production_ram_cache_max_resident_bytes: usize,
+    production_primary_pool_capacity_slots: usize,
+    production_primary_headroom_slots: usize,
+    production_primary_pool_available_before_requests: usize,
+    production_primary_pool_available_after_requests: usize,
+    production_primary_pool_buffer_size_bytes: usize,
+    production_primary_pool_allocated_bytes: usize,
+    oracle_source_pool_configured_max_slots: usize,
+    oracle_source_pool_allocated_capacity_slots: usize,
+    oracle_source_pool_buffer_size_bytes: usize,
+    oracle_source_pool_allocated_bytes: usize,
+    oracle_source_pool_current_in_use_slots: usize,
+    oracle_source_pool_peak_in_use_slots: usize,
+    oracle_source_pool_exhaustion_count: u64,
+    oracle_source_nvme_reads: u64,
+    oracle_source_bytes: u64,
+    oracle_source_pool_reused_across_warmup_and_measured_requests: bool,
+    no_oracle_pool_accumulation_across_requests: bool,
+    oracle_source_buffers_released_before_runtime_shutdown: bool,
+    future_source_pool_isolated_from_production_primary: bool,
+    production_primary_pool_capacity_unchanged: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1897,6 +2411,8 @@ struct OracleScheduledResidencyReport {
     physical_slot_plan: PhysicalSlotPlanEvidence,
     frozen_controls: FrozenControlReferences,
     frozen_workload: FrozenWorkloadEvidence,
+    predecessor_first_attempt: PredecessorFirstAttemptEvidence,
+    source_memory_planes: SourceMemoryPlaneEvidence,
     warmup: OracleRunResult,
     measured: Vec<OracleRunResult>,
     aggregate_measured_performance: Aggregate,
@@ -1916,12 +2432,23 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
     add!(future_experts_considered);
     add!(source_skipped_physical_current);
     add!(source_ram_hits);
+    add!(source_prefetch_ram_hits);
     add!(source_singleflight_hits);
     add!(source_position_inflight_skips);
     add!(source_reads_started);
     add!(source_reads_completed);
     add!(source_reads_failed);
     add!(source_bytes_read);
+    add!(oracle_source_nvme_reads);
+    add!(oracle_source_bytes);
+    add!(future_experts_deferred_current_demand_overlap);
+    add!(deferred_overlap_resolved_physical);
+    add!(deferred_overlap_resolved_production_ram);
+    add!(residual_boundary_source_reads);
+    add!(residual_boundary_source_failures);
+    add!(residual_boundary_source_bytes);
+    add!(residual_source_wait_us);
+    add!(oracle_source_pool_exhaustion_count);
     add!(source_prefetch_batches_started);
     add!(source_prefetch_batches_completed);
     add!(source_prefetch_batches_skipped_inflight);
@@ -1973,12 +2500,14 @@ fn validate_oracle_counters(
     counters: &OracleCounters,
     mode: OracleScheduledResidencyMode,
     concurrency: usize,
+    expert_bytes: usize,
 ) -> Result<(), BenchmarkFailure> {
     let classified_source = counters
         .source_skipped_physical_current
-        .saturating_add(counters.source_ram_hits)
+        .saturating_add(counters.source_prefetch_ram_hits)
         .saturating_add(counters.source_singleflight_hits)
         .saturating_add(counters.source_position_inflight_skips)
+        .saturating_add(counters.future_experts_deferred_current_demand_overlap)
         .saturating_add(counters.source_reads_started);
     if counters.future_experts_considered != EXPECTED_SELECTED_IDS as u64
         || classified_source != counters.future_experts_considered
@@ -1999,6 +2528,8 @@ fn validate_oracle_counters(
         || counters.qualification_owned_current_slots != 0
         || counters.qualification_owned_current_bytes != 0
         || counters.qualification_owned_peak_slots > FROZEN_RAM_CACHE_SLOTS as u64
+        || counters.qualification_owned_peak_bytes
+            > (ORACLE_FUTURE_SOURCE_POOL_SLOTS as u64).saturating_mul(expert_bytes as u64)
         || counters.background_tasks_spawned > (EXPECTED_POSITIONS - 1) as u64
         || counters.background_tasks_drained != counters.background_tasks_spawned
         || counters.source_end_of_trace != 1
@@ -2012,7 +2543,10 @@ fn validate_oracle_counters(
     if mode == OracleScheduledResidencyMode::SourceOnly
         && (counters.boundary_replacement_sets_started != 0
             || counters.boundary_physical_installs != 0
-            || counters.boundary_physical_evictions != 0)
+            || counters.boundary_physical_evictions != 0
+            || counters.oracle_source_nvme_reads != 0
+            || counters.oracle_source_bytes != 0
+            || counters.qualification_owned_peak_slots != 0)
     {
         return Err(BenchmarkFailure::new(
             "postcondition",
@@ -2034,6 +2568,19 @@ fn validate_oracle_counters(
             || counters.boundary_physical_evictions > counters.boundary_physical_installs
             || counters.boundary_replacement_sets_completed
                 > counters.boundary_replacement_sets_started
+            || counters.oracle_source_pool_exhaustion_count != 0
+            || counters.oracle_source_bytes
+                != counters
+                    .oracle_source_nvme_reads
+                    .saturating_mul(expert_bytes as u64)
+            || counters.residual_boundary_source_bytes
+                != counters
+                    .residual_boundary_source_reads
+                    .saturating_mul(expert_bytes as u64)
+            || counters
+                .deferred_overlap_resolved_physical
+                .saturating_add(counters.deferred_overlap_resolved_production_ram)
+                > counters.future_experts_deferred_current_demand_overlap
             || (counters.boundary_physical_installs == 0)
                 != (counters.boundary_physical_install_bytes == 0))
     {
@@ -2149,6 +2696,7 @@ async fn execute_oracle_request(
     treatment_mode: OracleScheduledResidencyMode,
     source_concurrency: usize,
     expert_bytes: usize,
+    oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     prompt_ids: &[u32],
     run_index: usize,
 ) -> Result<OracleRunResult, Box<dyn std::error::Error>> {
@@ -2165,6 +2713,7 @@ async fn execute_oracle_request(
         treatment_mode,
         source_concurrency,
         expert_bytes,
+        oracle_source_pool,
     );
     let mut request = token_loop.create_request_state()?;
     let snapshots = RequestSnapshotStart::capture(runtime)?;
@@ -2266,7 +2815,7 @@ async fn execute_oracle_request(
     )?;
     oracle.ordinary_residency_miss_attempts = counters.token_loop_delta.residency_miss_attempts;
     oracle.ordinary_residency_services = counters.token_loop_delta.residency_services;
-    validate_oracle_counters(&oracle, treatment_mode, source_concurrency)?;
+    validate_oracle_counters(&oracle, treatment_mode, source_concurrency, expert_bytes)?;
 
     let output_text = runtime.tokenizer.decode(&generated_ids)?;
     let generated_token_ids_sha256 = crate::greedy_parity::token_ids_sha256(&generated_ids);
@@ -2454,13 +3003,69 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         greedy: true,
     };
 
+    let expected_production_primary_capacity = FROZEN_RAM_CACHE_SLOTS + 1;
+    let expected_oracle_source_allocated_bytes =
+        oracle_future_source_allocated_bytes(spec.cfg.model.expert_size).ok_or_else(|| {
+            artifact_failure(
+                "oracle-source-pool-allocation-overflow",
+                "384-slot ORACLE source allocation exceeds usize",
+            )
+        })?;
+
     let runtime = crate::build_isolated_greedy_runtime(
         &spec,
         crate::RealCliRuntimeMode::IsolatedGpuNativeBenchmark,
         tokenizer,
     )
     .await?;
+    let production_primary_pool_available_before_requests =
+        runtime.engine.core.pool.primary_available();
+    let oracle_allocation_before =
+        crate::buffer_pool::expert_buffer_pool_qualification_oracle_bytes();
+    let oracle_source_pool = match args.treatment_mode {
+        OracleScheduledResidencyMode::SourceOnly => None,
+        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+            Some(Arc::new(OracleFutureSourcePool::new(
+                ORACLE_FUTURE_SOURCE_POOL_SLOTS,
+                spec.cfg.model.expert_size,
+                spec.cfg.storage.block_align,
+            )))
+        }
+    };
     let execution = async {
+        if runtime.engine.core.cache.capacity() != FROZEN_RAM_CACHE_SLOTS
+            || runtime.engine.core.pool.capacity() != expected_production_primary_capacity
+            || runtime.engine.core.pool.shadow_capacity() != 0
+            || runtime.engine.core.pool.origin() != BufferPoolOrigin::Production
+        {
+            return Err(BenchmarkFailure::new(
+                "startup",
+                "production-primary-pool-contract-drift",
+                format!(
+                    "expected production cache/pool/shadow capacities {FROZEN_RAM_CACHE_SLOTS}/{expected_production_primary_capacity}/0, observed {}/{}/{}",
+                    runtime.engine.core.cache.capacity(),
+                    runtime.engine.core.pool.capacity(),
+                    runtime.engine.core.pool.shadow_capacity(),
+                ),
+            )
+            .into());
+        }
+        if let Some(pool) = oracle_source_pool.as_ref() {
+            let snapshot = pool.snapshot();
+            if pool.pool.origin() != BufferPoolOrigin::QualificationOracleFutureSource
+                || snapshot.capacity_slots != ORACLE_FUTURE_SOURCE_POOL_SLOTS
+                || snapshot.buffer_size_bytes != spec.cfg.model.expert_size
+                || snapshot.allocated_bytes != expected_oracle_source_allocated_bytes
+                || snapshot.current_in_use_slots != 0
+            {
+                return Err(BenchmarkFailure::new(
+                    "startup",
+                    "oracle-source-pool-contract-drift",
+                    format!("invalid isolated ORACLE source pool: {snapshot:?}"),
+                )
+                .into());
+            }
+        }
         let validated = validate_runtime(&runtime, &resolved_config_sha256, &oracle.trace)?;
         let warmup = crate::with_progress_timeout(
             format!("{MODE} warmup"),
@@ -2473,6 +3078,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 args.treatment_mode,
                 args.oracle_source_concurrency,
                 spec.cfg.model.expert_size,
+                oracle_source_pool.clone(),
                 &prompt_ids,
                 0,
             ),
@@ -2492,6 +3098,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                         args.treatment_mode,
                         args.oracle_source_concurrency,
                         spec.cfg.model.expert_size,
+                        oracle_source_pool.clone(),
                         &prompt_ids,
                         run_index,
                     ),
@@ -2499,12 +3106,77 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 .await?,
             );
         }
-        Ok::<_, Box<dyn std::error::Error>>((validated, warmup, measured))
+        let production_primary_pool_available_after_requests =
+            runtime.engine.core.pool.primary_available();
+        let pool_snapshot = oracle_source_pool
+            .as_ref()
+            .map(|pool| pool.snapshot())
+            .unwrap_or_default();
+        if pool_snapshot.current_in_use_slots != 0
+            || pool_snapshot.peak_in_use_slots > pool_snapshot.capacity_slots
+            || pool_snapshot.exhaustion_count != 0
+            || pool_snapshot.nvme_bytes
+                != pool_snapshot
+                    .nvme_reads
+                    .saturating_mul(spec.cfg.model.expert_size as u64)
+        {
+            return Err(BenchmarkFailure::new(
+                "postcondition",
+                "oracle-source-pool-reconciliation",
+                format!("isolated ORACLE source pool did not reconcile: {pool_snapshot:?}"),
+            )
+            .into());
+        }
+        let source_memory_planes = SourceMemoryPlaneEvidence {
+            production_ram_cache_capacity_slots: FROZEN_RAM_CACHE_SLOTS,
+            production_ram_cache_max_resident_bytes: expected_oracle_source_allocated_bytes,
+            production_primary_pool_capacity_slots: runtime.engine.core.pool.capacity(),
+            production_primary_headroom_slots: runtime
+                .engine
+                .core
+                .pool
+                .capacity()
+                .saturating_sub(runtime.engine.core.cache.capacity()),
+            production_primary_pool_available_before_requests,
+            production_primary_pool_available_after_requests,
+            production_primary_pool_buffer_size_bytes: runtime.engine.core.pool.buffer_size(),
+            production_primary_pool_allocated_bytes: runtime.engine.core.pool.allocated_bytes(),
+            oracle_source_pool_configured_max_slots: ORACLE_FUTURE_SOURCE_POOL_SLOTS,
+            oracle_source_pool_allocated_capacity_slots: pool_snapshot.capacity_slots,
+            oracle_source_pool_buffer_size_bytes: pool_snapshot.buffer_size_bytes,
+            oracle_source_pool_allocated_bytes: pool_snapshot.allocated_bytes,
+            oracle_source_pool_current_in_use_slots: pool_snapshot.current_in_use_slots,
+            oracle_source_pool_peak_in_use_slots: pool_snapshot.peak_in_use_slots,
+            oracle_source_pool_exhaustion_count: pool_snapshot.exhaustion_count,
+            oracle_source_nvme_reads: pool_snapshot.nvme_reads,
+            oracle_source_bytes: pool_snapshot.nvme_bytes,
+            oracle_source_pool_reused_across_warmup_and_measured_requests: oracle_source_pool
+                .is_some(),
+            no_oracle_pool_accumulation_across_requests: true,
+            oracle_source_buffers_released_before_runtime_shutdown: true,
+            future_source_pool_isolated_from_production_primary: true,
+            production_primary_pool_capacity_unchanged: runtime.engine.core.pool.capacity()
+                == expected_production_primary_capacity,
+        };
+        Ok::<_, Box<dyn std::error::Error>>((validated, warmup, measured, source_memory_planes))
     }
     .await;
+    drop(oracle_source_pool);
+    let oracle_source_pool_released =
+        crate::buffer_pool::expert_buffer_pool_qualification_oracle_bytes()
+            == oracle_allocation_before;
     let shutdown = runtime.shutdown_isolated().await;
-    let (validated, warmup, measured, shutdown) = match (execution, shutdown) {
-        (Ok((validated, warmup, measured)), Ok(shutdown)) => {
+    let (validated, warmup, measured, source_memory_planes, shutdown) = match (execution, shutdown)
+    {
+        (Ok((validated, warmup, measured, source_memory_planes)), Ok(shutdown)) => {
+            if !oracle_source_pool_released {
+                return Err(BenchmarkFailure::new(
+                    "postcondition",
+                    "oracle-source-pool-shutdown-leak",
+                    "qualification-owned ORACLE source allocation survived pre-shutdown release",
+                )
+                .into());
+            }
             if !shutdown.controlled_shutdown_requested || !shutdown.all_runtime_resources_released {
                 return Err(BenchmarkFailure::new(
                     "postcondition",
@@ -2513,7 +3185,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 )
                 .into());
             }
-            (validated, warmup, measured, shutdown)
+            (validated, warmup, measured, source_memory_planes, shutdown)
         }
         (Err(error), Ok(_)) => return Err(error),
         (Ok(_), Err(error)) => return Err(error.into()),
@@ -2589,6 +3261,16 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             shared_runtime_and_cache: true,
             initial_position_priming: "synchronous source-to-RAM priming is included in request/TTFT timing; no position-zero physical oracle install is performed",
         },
+        predecessor_first_attempt: PredecessorFirstAttemptEvidence {
+            code_sha: PREDECESSOR_FIRST_ATTEMPT_CODE_SHA,
+            result: "FAIL",
+            failure: "ProductionBatchPoolUnavailableAfterReservation",
+            requested: 8,
+            acquired: 1,
+            interpretation: "future source retained production-primary buffers across foreground demand",
+            first_attempt_rerun: false,
+        },
+        source_memory_planes,
         correctness: CorrectnessEvidence {
             warmup_matches_measured: all_measured_outputs_identical,
             all_measured_outputs_identical,
@@ -2622,8 +3304,53 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::io_provider::{NvmeStorage, StorageConfig};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
+
+    struct TempSourceDir {
+        path: PathBuf,
+    }
+
+    impl TempSourceDir {
+        fn with_experts(label: &str, count: u32, expert_size: usize) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mer-oracle-source-{label}-{}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            for id in 0..count {
+                std::fs::write(
+                    path.join(format!("expert_{id}.bin")),
+                    vec![id as u8; expert_size],
+                )
+                .unwrap();
+            }
+            Self { path }
+        }
+
+        fn storage(&self, expert_size: usize, block_align: usize) -> Arc<NvmeStorage> {
+            Arc::new(
+                NvmeStorage::new(StorageConfig {
+                    base_path: self.path.clone(),
+                    expert_size,
+                    block_align,
+                    use_direct_io: false,
+                    num_experts_per_layer: None,
+                })
+                .unwrap(),
+            )
+        }
+    }
+
+    impl Drop for TempSourceDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn test_trace(positions: usize) -> Arc<OracleRouteTrace> {
         let geometry = OracleGeometry {
@@ -2682,13 +3409,12 @@ mod tests {
         let source_position_gate = Arc::new(tokio::sync::Mutex::new(()));
         let position_guard = source_position_gate.clone().lock_owned().await;
         let readiness = Arc::new(SourceReadiness::default());
-        let counters_for_task = counters.clone();
         let (send_outcome, receive_outcome) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let outcome = receive_outcome
                 .await
                 .expect("test controls source task completion");
-            PrefetchLease::new(outcome, counters_for_task, position_guard)
+            PrefetchLease::new(outcome, position_guard)
         });
         counters.lock().background_tasks_spawned += 1;
         (
@@ -2774,6 +3500,283 @@ mod tests {
         assert!(OracleScheduledResidencyMode::from_str("overlapped-h2d", false).is_err());
     }
 
+    #[test]
+    fn v2_schema_and_predecessor_failure_contract_are_frozen() {
+        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v2");
+        let predecessor = PredecessorFirstAttemptEvidence {
+            code_sha: PREDECESSOR_FIRST_ATTEMPT_CODE_SHA,
+            result: "FAIL",
+            failure: "ProductionBatchPoolUnavailableAfterReservation",
+            requested: 8,
+            acquired: 1,
+            interpretation:
+                "future source retained production-primary buffers across foreground demand",
+            first_attempt_rerun: false,
+        };
+        let value = serde_json::to_value(predecessor).unwrap();
+        assert_eq!(value["code_sha"], PREDECESSOR_FIRST_ATTEMPT_CODE_SHA);
+        assert_eq!(value["result"], "FAIL");
+        assert_eq!(value["requested"], 8);
+        assert_eq!(value["acquired"], 1);
+        assert_eq!(value["first_attempt_rerun"], false);
+    }
+
+    #[test]
+    fn v2_memory_report_distinguishes_production_and_oracle_planes() {
+        let evidence = SourceMemoryPlaneEvidence {
+            production_ram_cache_capacity_slots: 384,
+            production_ram_cache_max_resident_bytes: 384 * 4096,
+            production_primary_pool_capacity_slots: 385,
+            production_primary_headroom_slots: 1,
+            production_primary_pool_available_before_requests: 1,
+            production_primary_pool_available_after_requests: 1,
+            production_primary_pool_buffer_size_bytes: 4096,
+            production_primary_pool_allocated_bytes: 385 * 4096,
+            oracle_source_pool_configured_max_slots: 384,
+            oracle_source_pool_allocated_capacity_slots: 384,
+            oracle_source_pool_buffer_size_bytes: 4096,
+            oracle_source_pool_allocated_bytes: 384 * 4096,
+            oracle_source_pool_current_in_use_slots: 0,
+            oracle_source_pool_peak_in_use_slots: 384,
+            oracle_source_pool_exhaustion_count: 0,
+            oracle_source_nvme_reads: 4,
+            oracle_source_bytes: 4 * 4096,
+            oracle_source_pool_reused_across_warmup_and_measured_requests: true,
+            no_oracle_pool_accumulation_across_requests: true,
+            oracle_source_buffers_released_before_runtime_shutdown: true,
+            future_source_pool_isolated_from_production_primary: true,
+            production_primary_pool_capacity_unchanged: true,
+        };
+        let value = serde_json::to_value(evidence).unwrap();
+        assert_eq!(value["production_ram_cache_capacity_slots"], 384);
+        assert_eq!(value["production_primary_pool_capacity_slots"], 385);
+        assert_eq!(value["production_primary_headroom_slots"], 1);
+        assert_eq!(value["oracle_source_pool_allocated_capacity_slots"], 384);
+        assert_eq!(value["oracle_source_pool_current_in_use_slots"], 0);
+        assert_eq!(
+            value["oracle_source_pool_reused_across_warmup_and_measured_requests"],
+            true
+        );
+        assert_eq!(
+            value["future_source_pool_isolated_from_production_primary"],
+            true
+        );
+    }
+
+    #[test]
+    fn exact_oracle_source_bound_uses_runtime_expert_file_bytes() {
+        assert_eq!(ORACLE_FUTURE_SOURCE_POOL_SLOTS, 48 * 8);
+        assert_eq!(
+            oracle_future_source_allocated_bytes(2_658_304),
+            Some(1_020_788_736)
+        );
+    }
+
+    #[test]
+    fn retained_source_origin_contract_fails_closed() {
+        let production_pool = BufferPool::new(1, 4096, 4096);
+        let production_resident = Arc::new(ExpertResident::new_with_block_align(
+            7,
+            production_pool.try_acquire().unwrap(),
+            4096,
+        ));
+        let mut outcome = PrefetchOutcome::default();
+        outcome.residents.insert(7, production_resident);
+        assert!(validate_retained_source_origins(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            &outcome,
+        )
+        .is_err());
+        assert!(validate_retained_source_origins(
+            OracleScheduledResidencyMode::SourceOnly,
+            &outcome,
+        )
+        .is_err());
+
+        let oracle_pool = OracleFutureSourcePool::new(1, 4096, 4096);
+        let oracle_resident = Arc::new(ExpertResident::new_with_block_align(
+            8,
+            oracle_pool.try_acquire().unwrap(),
+            4096,
+        ));
+        let mut isolated = PrefetchOutcome::default();
+        isolated.residents.insert(8, oracle_resident);
+        assert!(validate_retained_source_origins(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            &isolated,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn isolated_oracle_retention_preserves_foreground_primary_capacity() {
+        const BUFFER_SIZE: usize = 4096;
+        let production_pool = BufferPool::new(3, BUFFER_SIZE, 4096);
+        let production_cache = crate::expert_cache::ExpertCache::new(2);
+        let insert_primary = |id| {
+            production_cache
+                .insert(Arc::new(ExpertResident::new_with_block_align(
+                    id,
+                    production_pool.try_acquire().unwrap(),
+                    4096,
+                )))
+                .unwrap_or_else(|_| panic!("test production-cache insert failed"));
+        };
+
+        insert_primary(0);
+        insert_primary(1);
+        assert_eq!(production_pool.primary_available(), 1);
+        let retained_victims = [
+            production_cache.get(0).unwrap(),
+            production_cache.get(1).unwrap(),
+        ];
+        drop(production_cache.evict_lru().unwrap());
+        drop(production_cache.evict_lru().unwrap());
+        assert_eq!(
+            production_pool.primary_available(),
+            1,
+            "request-local victim Arcs reproduce the one-headroom-buffer condition"
+        );
+        drop(retained_victims);
+        assert_eq!(production_pool.primary_available(), 3);
+
+        insert_primary(2);
+        insert_primary(3);
+        let oracle_pool = OracleFutureSourcePool::new(1, BUFFER_SIZE, 4096);
+        let retained_oracle = Arc::new(ExpertResident::new_with_block_align(
+            4,
+            oracle_pool.try_acquire().unwrap(),
+            4096,
+        ));
+        drop(production_cache.evict_lru().unwrap());
+        drop(production_cache.evict_lru().unwrap());
+        assert_eq!(production_pool.primary_available(), 3);
+
+        let foreground_a = production_pool.try_acquire().unwrap();
+        let foreground_b = production_pool.try_acquire().unwrap();
+        assert_eq!(production_pool.primary_available(), 1);
+        assert_eq!(oracle_pool.snapshot().current_in_use_slots, 1);
+        drop(foreground_a);
+        drop(foreground_b);
+        drop(retained_oracle);
+        assert_eq!(production_pool.primary_available(), 3);
+        assert_eq!(oracle_pool.snapshot().current_in_use_slots, 0);
+    }
+
+    #[test]
+    fn one_source_pool_is_reused_without_request_accumulation() {
+        let pool = Arc::new(OracleFutureSourcePool::new(2, 4096, 4096));
+        let allocation = Arc::as_ptr(&pool);
+        for _ in 0..(FROZEN_WARMUP_RUNS + FROZEN_MEASURED_RUNS) {
+            let request_pool = pool.clone();
+            assert_eq!(Arc::as_ptr(&request_pool), allocation);
+            let first = request_pool.try_acquire().unwrap();
+            let second = request_pool.try_acquire().unwrap();
+            assert_eq!(request_pool.snapshot().current_in_use_slots, 2);
+            drop(first);
+            drop(second);
+            assert_eq!(request_pool.snapshot().current_in_use_slots, 0);
+        }
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.capacity_slots, 2);
+        assert_eq!(snapshot.allocated_bytes, 2 * 4096);
+        assert_eq!(snapshot.peak_in_use_slots, 2);
+        assert_eq!(snapshot.current_in_use_slots, 0);
+    }
+
+    #[test]
+    fn direct_source_and_boundary_resolution_orders_are_explicit() {
+        assert_eq!(
+            direct_future_source_disposition(true, true),
+            DirectFutureSourceDisposition::AlreadyPhysical
+        );
+        assert_eq!(
+            direct_future_source_disposition(false, true),
+            DirectFutureSourceDisposition::DeferredCurrentDemandOverlap
+        );
+        assert_eq!(
+            direct_future_source_disposition(false, false),
+            DirectFutureSourceDisposition::IsolatedRead
+        );
+        assert_eq!(
+            direct_boundary_source_disposition(true, true, true),
+            DirectBoundarySourceDisposition::Physical
+        );
+        assert_eq!(
+            direct_boundary_source_disposition(false, true, true),
+            DirectBoundarySourceDisposition::Isolated
+        );
+        assert_eq!(
+            direct_boundary_source_disposition(false, false, true),
+            DirectBoundarySourceDisposition::ProductionRam
+        );
+        assert_eq!(
+            direct_boundary_source_disposition(false, false, false),
+            DirectBoundarySourceDisposition::ResidualRead
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_nvme_source_is_isolated_not_cached_and_recycled() {
+        const EXPERT_SIZE: usize = 4096;
+        let dir = TempSourceDir::with_experts("isolated", 2, EXPERT_SIZE);
+        let storage = dir.storage(EXPERT_SIZE, 4096);
+        let production_pool = BufferPool::new(1, EXPERT_SIZE, 4096);
+        let production_cache = crate::expert_cache::ExpertCache::new(2);
+        let production_available = production_pool.primary_available();
+        let oracle_pool = OracleFutureSourcePool::new(2, EXPERT_SIZE, 4096);
+
+        let (resident, bytes) = read_oracle_future_source_from_storage(&storage, &oracle_pool, 0)
+            .await
+            .unwrap();
+        assert_eq!(bytes, EXPERT_SIZE);
+        assert_eq!(
+            resident.buffer_pool_origin(),
+            BufferPoolOrigin::QualificationOracleFutureSource
+        );
+        assert_eq!(production_pool.primary_available(), production_available);
+        assert_eq!(production_cache.len(), 0);
+        assert_eq!(oracle_pool.current_in_use_slots(), 1);
+        let snapshot = oracle_pool.snapshot();
+        assert_eq!(snapshot.capacity_slots, 2);
+        assert_eq!(snapshot.allocated_bytes, 2 * EXPERT_SIZE);
+        assert_eq!(snapshot.peak_in_use_slots, 1);
+        assert_eq!(snapshot.nvme_reads, 1);
+        assert_eq!(snapshot.nvme_bytes, EXPERT_SIZE as u64);
+        drop(resident);
+        assert_eq!(oracle_pool.current_in_use_slots(), 0);
+
+        let (reused, _) = read_oracle_future_source_from_storage(&storage, &oracle_pool, 1)
+            .await
+            .unwrap();
+        assert_eq!(oracle_pool.current_in_use_slots(), 1);
+        drop(reused);
+        assert_eq!(oracle_pool.current_in_use_slots(), 0);
+        assert_eq!(oracle_pool.snapshot().nvme_reads, 2);
+        assert_eq!(production_cache.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_source_pool_exhaustion_fails_closed_without_primary_fallback() {
+        const EXPERT_SIZE: usize = 4096;
+        let dir = TempSourceDir::with_experts("exhaustion", 2, EXPERT_SIZE);
+        let storage = dir.storage(EXPERT_SIZE, 4096);
+        let production_pool = BufferPool::new(1, EXPERT_SIZE, 4096);
+        let oracle_pool = OracleFutureSourcePool::new(1, EXPERT_SIZE, 4096);
+        let (held, _) = read_oracle_future_source_from_storage(&storage, &oracle_pool, 0)
+            .await
+            .unwrap();
+        let error = match read_oracle_future_source_from_storage(&storage, &oracle_pool, 1).await {
+            Ok(_) => panic!("exhausted ORACLE pool must not fall back to PRIMARY"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, OracleSourceReadError::PoolExhausted(_)));
+        assert_eq!(oracle_pool.snapshot().exhaustion_count, 1);
+        assert_eq!(production_pool.primary_available(), 1);
+        drop(held);
+        assert_eq!(oracle_pool.current_in_use_slots(), 0);
+    }
+
     #[tokio::test]
     async fn source_layer_tasks_obey_bounded_concurrency() {
         let concurrency = 3usize;
@@ -2829,6 +3832,12 @@ mod tests {
             serde_json::to_value(direct).unwrap()["late_source_policy"],
             "await-residual-at-safe-boundary"
         );
+        for contract in [source_only, direct] {
+            assert!(!contract.production_predictor_used);
+            assert!(!contract.production_speculative_residency_used);
+            assert!(contract.future_source_pool_isolated_from_production_primary);
+            assert!(contract.production_primary_pool_capacity_unchanged);
+        }
     }
 
     #[tokio::test]
@@ -2878,14 +3887,19 @@ mod tests {
         let state = test_scheduler_state();
         let (active, send_outcome, source_position_gate, readiness) =
             pending_test_prefetch(1, counters.clone()).await;
-        readiness.mark_physical_ready(0);
         readiness.mark_source_resident_ready(1);
         let mut resolving = Box::pin(resolve_source_task_at_boundary(
             OracleScheduledResidencyMode::TokenBoundaryDirect,
             active,
             1,
             vec![0, 1, 2, 3],
-            |_| Ok(BoundarySourceReadiness::Unavailable),
+            |global_id| {
+                Ok(if global_id == 0 {
+                    BoundarySourceReadiness::Physical
+                } else {
+                    BoundarySourceReadiness::Unavailable
+                })
+            },
             counters.clone(),
             state.clone(),
         ));
@@ -2914,11 +3928,14 @@ mod tests {
         assert!(source_position_gate.clone().try_lock_owned().is_err());
         record_direct_late_fallback(&mut counters.lock(), was_late, 0);
         assert_eq!(counters.lock().source_late_degraded_to_demand, 0);
+        let oracle_pool = Arc::new(OracleFutureSourcePool::new(1, 4096, 4096));
         release_source_position_lease_before_next_token(
             OracleScheduledResidencyMode::TokenBoundaryDirect,
             lease,
             &source_position_gate,
             &state,
+            Some(&oracle_pool),
+            &counters,
         )
         .unwrap();
         assert!(source_position_gate.try_lock_owned().is_ok());
@@ -3022,16 +4039,20 @@ mod tests {
         record_direct_late_fallback(&mut counters.lock(), was_late, 1);
         record_demand_readiness(&mut counters.lock(), &[vec![false]]);
         {
-            let values = counters.lock();
-            assert_eq!(values.source_failures_degraded_to_demand, 1);
+            let mut values = counters.lock();
+            assert_eq!(values.source_failures_degraded_to_demand, 0);
+            values.source_failures_degraded_to_demand = 1;
             assert_eq!(values.source_late_degraded_to_demand, 1);
             assert_eq!(values.oracle_demand_fallback, 1);
         }
+        let oracle_pool = Arc::new(OracleFutureSourcePool::new(1, 4096, 4096));
         release_source_position_lease_before_next_token(
             OracleScheduledResidencyMode::TokenBoundaryDirect,
             lease,
             &source_position_gate,
             &state,
+            Some(&oracle_pool),
+            &counters,
         )
         .unwrap();
     }
@@ -3102,7 +4123,12 @@ mod tests {
             ..PrefetchOutcome::default()
         };
         let mut counters = OracleCounters::default();
-        record_completed_source_outcome(&mut counters, &outcome, 0);
+        record_completed_source_outcome(
+            &mut counters,
+            &outcome,
+            0,
+            OracleScheduledResidencyMode::SourceOnly,
+        );
         record_demand_readiness(&mut counters, &[vec![false, false]]);
         assert_eq!(counters.source_failures_degraded_to_demand, 2);
         assert_eq!(counters.oracle_demand_fallback, 1);
@@ -3260,6 +4286,7 @@ mod tests {
             &valid_source_only_counters(),
             OracleScheduledResidencyMode::SourceOnly,
             4,
+            4096,
         )
         .is_ok());
     }
@@ -3269,10 +4296,13 @@ mod tests {
         let mut counters = valid_source_only_counters();
         counters.boundary_replacement_sets_started = 1;
         counters.boundary_physical_installs = 1;
-        assert!(
-            validate_oracle_counters(&counters, OracleScheduledResidencyMode::SourceOnly, 4,)
-                .is_err()
-        );
+        assert!(validate_oracle_counters(
+            &counters,
+            OracleScheduledResidencyMode::SourceOnly,
+            4,
+            4096,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3300,10 +4330,13 @@ mod tests {
     fn qualification_temporary_state_bound_is_fail_closed() {
         let mut counters = valid_source_only_counters();
         counters.qualification_owned_peak_slots = FROZEN_RAM_CACHE_SLOTS as u64 + 1;
-        assert!(
-            validate_oracle_counters(&counters, OracleScheduledResidencyMode::SourceOnly, 4,)
-                .is_err()
-        );
+        assert!(validate_oracle_counters(
+            &counters,
+            OracleScheduledResidencyMode::SourceOnly,
+            4,
+            4096,
+        )
+        .is_err());
     }
 
     #[tokio::test]

@@ -31,8 +31,9 @@ use tokio::sync::Notify;
 
 static EXPERT_BUFFER_POOL_PRIMARY_BYTES: AtomicU64 = AtomicU64::new(0);
 static EXPERT_BUFFER_POOL_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+static EXPERT_BUFFER_POOL_QUALIFICATION_ORACLE_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes allocated by the primary slots of all live expert buffer pools.
+/// Bytes allocated by production-primary slots of all live expert buffer pools.
 pub fn expert_buffer_pool_primary_bytes() -> u64 {
     EXPERT_BUFFER_POOL_PRIMARY_BYTES.load(Ordering::Relaxed)
 }
@@ -42,9 +43,23 @@ pub fn expert_buffer_pool_shadow_bytes() -> u64 {
     EXPERT_BUFFER_POOL_SHADOW_BYTES.load(Ordering::Relaxed)
 }
 
-/// Bytes allocated by every slot of all live expert buffer pools.
+/// Bytes allocated by qualification-only ORACLE future-source pools.
+pub fn expert_buffer_pool_qualification_oracle_bytes() -> u64 {
+    EXPERT_BUFFER_POOL_QUALIFICATION_ORACLE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes allocated by every production and qualification expert-buffer slot.
 pub fn expert_buffer_pool_allocated_bytes() -> u64 {
-    expert_buffer_pool_primary_bytes().saturating_add(expert_buffer_pool_shadow_bytes())
+    expert_buffer_pool_primary_bytes()
+        .saturating_add(expert_buffer_pool_shadow_bytes())
+        .saturating_add(expert_buffer_pool_qualification_oracle_bytes())
+}
+
+/// Source-plane classification carried by every pooled buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BufferPoolOrigin {
+    Production,
+    QualificationOracleFutureSource,
 }
 
 struct Inner {
@@ -63,14 +78,23 @@ struct Inner {
     shadow_slots: usize,
     buffer_size: usize,
     align: usize,
+    origin: BufferPoolOrigin,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         let primary = (self.primary_slots as u64).saturating_mul(self.buffer_size as u64);
         let shadow = (self.shadow_slots as u64).saturating_mul(self.buffer_size as u64);
-        EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_sub(primary, Ordering::Relaxed);
-        EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_sub(shadow, Ordering::Relaxed);
+        match self.origin {
+            BufferPoolOrigin::Production => {
+                EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_sub(primary, Ordering::Relaxed);
+                EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_sub(shadow, Ordering::Relaxed);
+            }
+            BufferPoolOrigin::QualificationOracleFutureSource => {
+                debug_assert_eq!(self.shadow_slots, 0);
+                EXPERT_BUFFER_POOL_QUALIFICATION_ORACLE_BYTES.fetch_sub(primary, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -99,7 +123,47 @@ impl BufferPool {
         buffer_size: usize,
         align: usize,
     ) -> Self {
-        assert!(primary_slots > 0, "primary pool must have at least one slot");
+        Self::new_with_origin(
+            primary_slots,
+            shadow_slots,
+            buffer_size,
+            align,
+            BufferPoolOrigin::Production,
+        )
+    }
+
+    /// Pre-allocate a bounded qualification-only future-source plane.
+    /// Buffers from this pool are structurally distinguishable from the
+    /// production PRIMARY/shadow allocation and are never promoted.
+    pub(crate) fn new_qualification_oracle_future_source(
+        slots: usize,
+        buffer_size: usize,
+        align: usize,
+    ) -> Self {
+        Self::new_with_origin(
+            slots,
+            0,
+            buffer_size,
+            align,
+            BufferPoolOrigin::QualificationOracleFutureSource,
+        )
+    }
+
+    fn new_with_origin(
+        primary_slots: usize,
+        shadow_slots: usize,
+        buffer_size: usize,
+        align: usize,
+        origin: BufferPoolOrigin,
+    ) -> Self {
+        assert!(
+            primary_slots > 0,
+            "primary pool must have at least one slot"
+        );
+        assert!(
+            origin == BufferPoolOrigin::Production || shadow_slots == 0,
+            "qualification ORACLE pools cannot have shadow slots"
+        );
         let mut free = Vec::with_capacity(primary_slots);
         for _ in 0..primary_slots {
             free.push(AlignedBuffer::new(buffer_size, align));
@@ -115,8 +179,16 @@ impl BufferPool {
         };
         let primary_bytes = (primary_slots as u64).saturating_mul(buffer_size as u64);
         let shadow_bytes = (shadow_slots as u64).saturating_mul(buffer_size as u64);
-        EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_add(primary_bytes, Ordering::Relaxed);
-        EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
+        match origin {
+            BufferPoolOrigin::Production => {
+                EXPERT_BUFFER_POOL_PRIMARY_BYTES.fetch_add(primary_bytes, Ordering::Relaxed);
+                EXPERT_BUFFER_POOL_SHADOW_BYTES.fetch_add(shadow_bytes, Ordering::Relaxed);
+            }
+            BufferPoolOrigin::QualificationOracleFutureSource => {
+                EXPERT_BUFFER_POOL_QUALIFICATION_ORACLE_BYTES
+                    .fetch_add(primary_bytes, Ordering::Relaxed);
+            }
+        }
         Self {
             inner: Arc::new(Inner {
                 free: Mutex::new(free),
@@ -127,6 +199,7 @@ impl BufferPool {
                 shadow_slots,
                 buffer_size,
                 align,
+                origin,
             }),
         }
     }
@@ -183,11 +256,17 @@ impl BufferPool {
         let mut out = Vec::with_capacity(self.inner.primary_slots + self.inner.shadow_slots);
         {
             let mut g = self.inner.free.lock();
-            out.extend(g.iter_mut().map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())));
+            out.extend(
+                g.iter_mut()
+                    .map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())),
+            );
         }
         if let Some(s) = &self.inner.shadow {
             let mut g = s.lock();
-            out.extend(g.iter_mut().map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())));
+            out.extend(
+                g.iter_mut()
+                    .map(|b| (b.as_mut_slice().as_mut_ptr(), b.len())),
+            );
         }
         out
     }
@@ -203,9 +282,18 @@ impl BufferPool {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn primary_available(&self) -> usize {
         self.inner.free.lock().len()
+    }
+
+    /// Source-plane classification shared by every buffer in this pool.
+    pub(crate) fn origin(&self) -> BufferPoolOrigin {
+        self.inner.origin
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Try to pop a free **shadow** buffer immediately. Returns `None`
@@ -302,17 +390,26 @@ pub struct PooledBuffer {
 impl PooledBuffer {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.buffer.as_ref().expect("PooledBuffer must hold a buffer until Drop").as_slice()
+        self.buffer
+            .as_ref()
+            .expect("PooledBuffer must hold a buffer until Drop")
+            .as_slice()
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut().expect("PooledBuffer must hold a buffer until Drop").as_mut_slice()
+        self.buffer
+            .as_mut()
+            .expect("PooledBuffer must hold a buffer until Drop")
+            .as_mut_slice()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.buffer.as_ref().expect("PooledBuffer must hold a buffer until Drop").len()
+        self.buffer
+            .as_ref()
+            .expect("PooledBuffer must hold a buffer until Drop")
+            .len()
     }
 
     /// Whether this buffer was acquired from the shadow (speculative)
@@ -323,6 +420,12 @@ impl PooledBuffer {
     #[inline]
     pub fn is_shadow(&self) -> bool {
         self.slot == Slot::Shadow
+    }
+
+    /// Source-plane classification of the pool that owns this buffer.
+    #[inline]
+    pub(crate) fn pool_origin(&self) -> BufferPoolOrigin {
+        self.pool.origin
     }
 }
 
@@ -454,7 +557,9 @@ mod tests {
         // not shadow, so the shadow slot is now exhausted.
         drop(promoted);
         // Primary now has one free buffer (the just-dropped, promoted one).
-        let _p = pool.try_acquire().expect("primary should have the promoted buffer");
+        let _p = pool
+            .try_acquire()
+            .expect("primary should have the promoted buffer");
         // Shadow remains empty because we promoted its only slot.
         assert!(pool.try_acquire_shadow().is_none());
     }
@@ -475,5 +580,30 @@ mod tests {
         let _primary = pool.try_acquire().unwrap();
         let _shadow = pool.try_acquire_shadow().unwrap();
         assert_eq!(pool.allocated_bytes(), 5 * 8192);
+    }
+
+    #[test]
+    fn qualification_oracle_pool_is_structurally_distinct_and_recyclable() {
+        let pool = BufferPool::new_qualification_oracle_future_source(2, 8192, 4096);
+        let clone = pool.clone();
+        assert_eq!(
+            pool.origin(),
+            BufferPoolOrigin::QualificationOracleFutureSource
+        );
+        assert!(pool.same_allocation(&clone));
+        assert_eq!(pool.capacity(), 2);
+        assert_eq!(pool.shadow_capacity(), 0);
+        assert_eq!(pool.allocated_bytes(), 2 * 8192);
+        let first = pool.try_acquire().unwrap();
+        let second = pool.try_acquire().unwrap();
+        assert_eq!(
+            first.pool_origin(),
+            BufferPoolOrigin::QualificationOracleFutureSource
+        );
+        assert_eq!(pool.primary_available(), 0);
+        assert!(pool.try_acquire().is_none());
+        drop(first);
+        drop(second);
+        assert_eq!(pool.primary_available(), pool.capacity());
     }
 }

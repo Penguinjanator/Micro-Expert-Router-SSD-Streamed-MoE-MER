@@ -193,6 +193,14 @@ impl ExpertResident {
         self.buffer.is_shadow()
     }
 
+    /// Source-plane classification of the aligned buffer backing this
+    /// resident. Qualification code uses this to fail closed if a future
+    /// position accidentally retains a production PRIMARY resident.
+    #[inline]
+    pub(crate) fn buffer_pool_origin(&self) -> crate::buffer_pool::BufferPoolOrigin {
+        self.buffer.pool_origin()
+    }
+
     /// Bare weight bytes — i.e. the buffer with any leading Unified
     /// Tensor Header stripped. The vast majority of callers want this.
     ///
@@ -234,7 +242,9 @@ impl ExpertResident {
         bool,
     )
     where
-        F: FnOnce(&[u8]) -> Result<
+        F: FnOnce(
+            &[u8],
+        ) -> Result<
             crate::inference::PreparedQ8_0Expert,
             crate::inference::ExpertWeightsError,
         >,
@@ -254,10 +264,8 @@ impl ExpertResident {
 
 impl Drop for ExpertResident {
     fn drop(&mut self) {
-        RESIDENT_EXPERT_BUFFER_BYTES.fetch_sub(
-            self.buffer.as_slice().len() as u64,
-            Ordering::Relaxed,
-        );
+        RESIDENT_EXPERT_BUFFER_BYTES
+            .fetch_sub(self.buffer.as_slice().len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -468,7 +476,8 @@ impl ExpertCache {
             0
         };
         let mut pre_evicted = None;
-        let effective_len = guard.len()
+        let effective_len = guard
+            .len()
             .saturating_add(self.reserved_slots.load(Ordering::Relaxed));
         if effective_len >= self.capacity && guard.peek(&id).is_none() {
             // Pick the victim under the active policy: strict LRU by
@@ -1128,10 +1137,7 @@ impl GpuExpertCache {
     /// telemetry/recency lookup.
     pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
         let g = self.inner.lock();
-        g.anchor
-            .get(&id)
-            .or_else(|| g.lru.peek(&id))
-            .cloned()
+        g.anchor.get(&id).or_else(|| g.lru.peek(&id)).cloned()
     }
 
     /// Check whether an expert is currently resident in either the
@@ -1261,7 +1267,10 @@ impl GpuExpertCache {
             g.promotion_rearm.remove(&id);
             return GpuHotPromotionOutcome::GenerationExhausted;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         g.promotion_pending.remove(&id);
         g.promotion_rearm.remove(&id);
 
@@ -1411,7 +1420,10 @@ impl GpuExpertCache {
         let Some(generation) = g.allocate_generation() else {
             return false;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         if use_anchor {
             g.anchor.insert(admission.resident.id, admission);
             g.anchor_used_bytes = g
@@ -1489,8 +1501,7 @@ impl GpuExpertCache {
         }
         // Strictly non-evicting: must fit in whatever LRU budget is
         // currently free.
-        if g
-            .lru_used_bytes
+        if g.lru_used_bytes
             .checked_add(bytes)
             .is_none_or(|used| used > self.lru_capacity_bytes)
         {
@@ -1499,7 +1510,10 @@ impl GpuExpertCache {
         let Some(generation) = g.allocate_generation() else {
             return false;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         g.promotion_pending.remove(&admission.resident.id);
         g.promotion_rearm.remove(&admission.resident.id);
         g.lru.put(admission.resident.id, admission);
@@ -2381,7 +2395,10 @@ mod tests {
         let cache = GpuExpertCache::new(20, 0.0, 3);
         assert!(cache.promote_sync(gpu_res(1, 8)));
         assert!(cache.promote_sync(gpu_res(2, 20)));
-        assert!(!cache.contains(1), "id 1 must be rearmed by logical eviction");
+        assert!(
+            !cache.contains(1),
+            "id 1 must be rearmed by logical eviction"
+        );
 
         assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
         assert!(
@@ -2442,7 +2459,10 @@ mod tests {
 
         assert!(cache.current_admission(1).is_some());
         assert!(cache.promote_sync(gpu_res(3, 10)));
-        assert!(!cache.contains(1), "non-mutating lookup must leave id 1 LRU");
+        assert!(
+            !cache.contains(1),
+            "non-mutating lookup must leave id 1 LRU"
+        );
         assert!(cache.contains(2));
         assert!(cache.contains(3));
     }
@@ -2609,7 +2629,10 @@ mod tests {
         assert_eq!(cache.lru_len(), 2);
 
         assert_eq!(cache.demand_admit_lru(gpu_res(9, 40)), Ok(true));
-        assert!(!cache.contains(7), "existing demand lookup must not touch LRU");
+        assert!(
+            !cache.contains(7),
+            "existing demand lookup must not touch LRU"
+        );
         assert!(cache.contains(8));
         assert!(cache.contains(9));
     }
@@ -2668,7 +2691,10 @@ mod tests {
         );
         assert_eq!(cache.demand_admit_lru(gpu_res(4, 40)), Ok(true));
 
-        assert!(!cache.contains(1), "oldest unrelated LRU entry must remain victim");
+        assert!(
+            !cache.contains(1),
+            "oldest unrelated LRU entry must remain victim"
+        );
         assert!(cache.contains(2));
         assert!(cache.contains(3));
         assert!(cache.contains(4));
@@ -2710,7 +2736,10 @@ mod tests {
         assert!(!cache.claim_promotion(7, 99));
 
         assert_eq!(cache.demand_admit_lru(gpu_res(9, 25)), Ok(true));
-        assert!(!cache.contains(7), "Anchor-full attempt must not touch LRU recency");
+        assert!(
+            !cache.contains(7),
+            "Anchor-full attempt must not touch LRU recency"
+        );
         assert!(cache.contains(8));
         assert!(cache.contains(9));
     }
@@ -2865,7 +2894,9 @@ mod tests {
     fn logical_admission_generation_changes_only_after_eviction_and_readmission() {
         let cache = GpuExpertCache::new(16, 0.0, 0);
         assert!(cache.promote_sync(gpu_res(7, 8)));
-        let g1 = cache.current_generation(7).expect("first admission generation");
+        let g1 = cache
+            .current_generation(7)
+            .expect("first admission generation");
         let hit_generation = match cache.get(7) {
             GpuLookup::LruHit(admission) => admission.generation(),
             _ => panic!("expected logical LRU hit"),
@@ -2883,7 +2914,10 @@ mod tests {
     fn promotion_claim_rearms_after_logical_eviction_above_hit_threshold() {
         let cache = GpuExpertCache::new(16, 0.0, 3);
         assert!(cache.promote_sync(gpu_res(7, 8)));
-        assert!(!cache.claim_promotion(7, 99), "admitted id needs no request");
+        assert!(
+            !cache.claim_promotion(7, 99),
+            "admitted id needs no request"
+        );
         assert!(cache.promote_sync(gpu_res(8, 16)));
         assert!(!cache.contains(7));
 
@@ -2891,7 +2925,10 @@ mod tests {
             cache.claim_promotion(7, 99),
             "evicted id can claim again without a fresh RAM-hit edge"
         );
-        assert!(!cache.claim_promotion(7, 100), "only one request may be pending");
+        assert!(
+            !cache.claim_promotion(7, 100),
+            "only one request may be pending"
+        );
         assert!(cache.promote_sync(gpu_res(7, 8)));
         assert!(cache.contains(7));
     }
