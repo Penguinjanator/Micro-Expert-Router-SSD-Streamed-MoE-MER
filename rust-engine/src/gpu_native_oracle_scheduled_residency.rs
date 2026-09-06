@@ -2259,6 +2259,18 @@ struct TreatmentContract {
     production_primary_pool_capacity_unchanged: bool,
 }
 
+const fn uses_isolated_oracle_source_pool(mode: OracleScheduledResidencyMode) -> bool {
+    matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect)
+}
+
+const fn oracle_source_pool_configured_max_slots(mode: OracleScheduledResidencyMode) -> usize {
+    if uses_isolated_oracle_source_pool(mode) {
+        ORACLE_FUTURE_SOURCE_POOL_SLOTS
+    } else {
+        0
+    }
+}
+
 const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentContract {
     TreatmentContract {
         source_overlap: true,
@@ -2276,7 +2288,7 @@ const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentCont
             OracleScheduledResidencyMode::TokenBoundaryDirect
         ),
         legacy_full_slot_vec_used: false,
-        future_source_pool_isolated_from_production_primary: true,
+        future_source_pool_isolated_from_production_primary: uses_isolated_oracle_source_pool(mode),
         production_primary_pool_capacity_unchanged: true,
     }
 }
@@ -2527,7 +2539,7 @@ fn validate_oracle_counters(
             != EXPECTED_SELECTED_IDS as u64
         || counters.qualification_owned_current_slots != 0
         || counters.qualification_owned_current_bytes != 0
-        || counters.qualification_owned_peak_slots > FROZEN_RAM_CACHE_SLOTS as u64
+        || counters.qualification_owned_peak_slots > ORACLE_FUTURE_SOURCE_POOL_SLOTS as u64
         || counters.qualification_owned_peak_bytes
             > (ORACLE_FUTURE_SOURCE_POOL_SLOTS as u64).saturating_mul(expert_bytes as u64)
         || counters.background_tasks_spawned > (EXPECTED_POSITIONS - 1) as u64
@@ -3141,7 +3153,9 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             production_primary_pool_available_after_requests,
             production_primary_pool_buffer_size_bytes: runtime.engine.core.pool.buffer_size(),
             production_primary_pool_allocated_bytes: runtime.engine.core.pool.allocated_bytes(),
-            oracle_source_pool_configured_max_slots: ORACLE_FUTURE_SOURCE_POOL_SLOTS,
+            oracle_source_pool_configured_max_slots: oracle_source_pool_configured_max_slots(
+                args.treatment_mode,
+            ),
             oracle_source_pool_allocated_capacity_slots: pool_snapshot.capacity_slots,
             oracle_source_pool_buffer_size_bytes: pool_snapshot.buffer_size_bytes,
             oracle_source_pool_allocated_bytes: pool_snapshot.allocated_bytes,
@@ -3154,7 +3168,9 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 .is_some(),
             no_oracle_pool_accumulation_across_requests: true,
             oracle_source_buffers_released_before_runtime_shutdown: true,
-            future_source_pool_isolated_from_production_primary: true,
+            future_source_pool_isolated_from_production_primary: uses_isolated_oracle_source_pool(
+                args.treatment_mode,
+            ),
             production_primary_pool_capacity_unchanged: runtime.engine.core.pool.capacity()
                 == expected_production_primary_capacity,
         };
@@ -3484,6 +3500,11 @@ mod tests {
         assert!(!contract.token_boundary_h2d);
         assert!(!contract.production_direct_staging_used);
         assert!(!contract.h2d_compute_overlap_claimed);
+        assert!(!contract.future_source_pool_isolated_from_production_primary);
+        assert_eq!(
+            oracle_source_pool_configured_max_slots(OracleScheduledResidencyMode::SourceOnly),
+            0
+        );
         assert!(contract.demand_fallback);
     }
 
@@ -3523,42 +3544,63 @@ mod tests {
 
     #[test]
     fn v2_memory_report_distinguishes_production_and_oracle_planes() {
-        let evidence = SourceMemoryPlaneEvidence {
-            production_ram_cache_capacity_slots: 384,
-            production_ram_cache_max_resident_bytes: 384 * 4096,
-            production_primary_pool_capacity_slots: 385,
-            production_primary_headroom_slots: 1,
-            production_primary_pool_available_before_requests: 1,
-            production_primary_pool_available_after_requests: 1,
-            production_primary_pool_buffer_size_bytes: 4096,
-            production_primary_pool_allocated_bytes: 385 * 4096,
-            oracle_source_pool_configured_max_slots: 384,
-            oracle_source_pool_allocated_capacity_slots: 384,
-            oracle_source_pool_buffer_size_bytes: 4096,
-            oracle_source_pool_allocated_bytes: 384 * 4096,
-            oracle_source_pool_current_in_use_slots: 0,
-            oracle_source_pool_peak_in_use_slots: 384,
-            oracle_source_pool_exhaustion_count: 0,
-            oracle_source_nvme_reads: 4,
-            oracle_source_bytes: 4 * 4096,
-            oracle_source_pool_reused_across_warmup_and_measured_requests: true,
-            no_oracle_pool_accumulation_across_requests: true,
-            oracle_source_buffers_released_before_runtime_shutdown: true,
-            future_source_pool_isolated_from_production_primary: true,
-            production_primary_pool_capacity_unchanged: true,
+        let evidence_for = |mode| {
+            let isolated = uses_isolated_oracle_source_pool(mode);
+            SourceMemoryPlaneEvidence {
+                production_ram_cache_capacity_slots: 384,
+                production_ram_cache_max_resident_bytes: 384 * 4096,
+                production_primary_pool_capacity_slots: 385,
+                production_primary_headroom_slots: 1,
+                production_primary_pool_available_before_requests: 1,
+                production_primary_pool_available_after_requests: 1,
+                production_primary_pool_buffer_size_bytes: 4096,
+                production_primary_pool_allocated_bytes: 385 * 4096,
+                oracle_source_pool_configured_max_slots: oracle_source_pool_configured_max_slots(
+                    mode,
+                ),
+                oracle_source_pool_allocated_capacity_slots: if isolated { 384 } else { 0 },
+                oracle_source_pool_buffer_size_bytes: if isolated { 4096 } else { 0 },
+                oracle_source_pool_allocated_bytes: if isolated { 384 * 4096 } else { 0 },
+                oracle_source_pool_current_in_use_slots: 0,
+                oracle_source_pool_peak_in_use_slots: if isolated { 384 } else { 0 },
+                oracle_source_pool_exhaustion_count: 0,
+                oracle_source_nvme_reads: if isolated { 4 } else { 0 },
+                oracle_source_bytes: if isolated { 4 * 4096 } else { 0 },
+                oracle_source_pool_reused_across_warmup_and_measured_requests: isolated,
+                no_oracle_pool_accumulation_across_requests: true,
+                oracle_source_buffers_released_before_runtime_shutdown: true,
+                future_source_pool_isolated_from_production_primary: isolated,
+                production_primary_pool_capacity_unchanged: true,
+            }
         };
-        let value = serde_json::to_value(evidence).unwrap();
-        assert_eq!(value["production_ram_cache_capacity_slots"], 384);
-        assert_eq!(value["production_primary_pool_capacity_slots"], 385);
-        assert_eq!(value["production_primary_headroom_slots"], 1);
-        assert_eq!(value["oracle_source_pool_allocated_capacity_slots"], 384);
-        assert_eq!(value["oracle_source_pool_current_in_use_slots"], 0);
+        let source_only =
+            serde_json::to_value(evidence_for(OracleScheduledResidencyMode::SourceOnly)).unwrap();
+        assert_eq!(source_only["oracle_source_pool_configured_max_slots"], 0);
         assert_eq!(
-            value["oracle_source_pool_reused_across_warmup_and_measured_requests"],
+            source_only["oracle_source_pool_allocated_capacity_slots"],
+            0
+        );
+        assert_eq!(
+            source_only["future_source_pool_isolated_from_production_primary"],
+            false
+        );
+
+        let direct = serde_json::to_value(evidence_for(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+        ))
+        .unwrap();
+        assert_eq!(direct["production_ram_cache_capacity_slots"], 384);
+        assert_eq!(direct["production_primary_pool_capacity_slots"], 385);
+        assert_eq!(direct["production_primary_headroom_slots"], 1);
+        assert_eq!(direct["oracle_source_pool_configured_max_slots"], 384);
+        assert_eq!(direct["oracle_source_pool_allocated_capacity_slots"], 384);
+        assert_eq!(direct["oracle_source_pool_current_in_use_slots"], 0);
+        assert_eq!(
+            direct["oracle_source_pool_reused_across_warmup_and_measured_requests"],
             true
         );
         assert_eq!(
-            value["future_source_pool_isolated_from_production_primary"],
+            direct["future_source_pool_isolated_from_production_primary"],
             true
         );
     }
@@ -3832,12 +3874,24 @@ mod tests {
             serde_json::to_value(direct).unwrap()["late_source_policy"],
             "await-residual-at-safe-boundary"
         );
-        for contract in [source_only, direct] {
-            assert!(!contract.production_predictor_used);
-            assert!(!contract.production_speculative_residency_used);
-            assert!(contract.future_source_pool_isolated_from_production_primary);
-            assert!(contract.production_primary_pool_capacity_unchanged);
-        }
+        assert!(!source_only.production_predictor_used);
+        assert!(!source_only.production_speculative_residency_used);
+        assert!(!source_only.future_source_pool_isolated_from_production_primary);
+        assert!(source_only.production_primary_pool_capacity_unchanged);
+        assert_eq!(
+            oracle_source_pool_configured_max_slots(OracleScheduledResidencyMode::SourceOnly),
+            0
+        );
+        assert!(!direct.production_predictor_used);
+        assert!(!direct.production_speculative_residency_used);
+        assert!(direct.future_source_pool_isolated_from_production_primary);
+        assert!(direct.production_primary_pool_capacity_unchanged);
+        assert_eq!(
+            oracle_source_pool_configured_max_slots(
+                OracleScheduledResidencyMode::TokenBoundaryDirect
+            ),
+            ORACLE_FUTURE_SOURCE_POOL_SLOTS
+        );
     }
 
     #[tokio::test]
