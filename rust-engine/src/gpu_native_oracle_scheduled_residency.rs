@@ -32,7 +32,7 @@ use futures::{stream, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,6 +71,22 @@ const FROZEN_RAM_CACHE_SLOTS: usize = 384;
 pub(crate) enum OracleScheduledResidencyMode {
     SourceOnly,
     TokenBoundaryDirect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum LateSourcePolicy {
+    NonblockingDemandFallback,
+    AwaitResidualAtSafeBoundary,
+}
+
+const fn late_source_policy(mode: OracleScheduledResidencyMode) -> LateSourcePolicy {
+    match mode {
+        OracleScheduledResidencyMode::SourceOnly => LateSourcePolicy::NonblockingDemandFallback,
+        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+            LateSourcePolicy::AwaitResidualAtSafeBoundary
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -441,6 +457,97 @@ struct PrefetchOutcome {
     fatal_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SourceReadinessSnapshot {
+    required_ready: u64,
+    source_residents_ready: u64,
+}
+
+#[derive(Default)]
+struct SourceReadinessState {
+    physical_ready: HashSet<u32>,
+    source_residents_ready: HashSet<u32>,
+}
+
+#[derive(Default)]
+struct SourceReadiness {
+    state: Mutex<SourceReadinessState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundarySourceReadiness {
+    Physical,
+    SourceResident,
+    Unavailable,
+}
+
+impl SourceReadiness {
+    fn mark_physical_ready(&self, global_id: u32) {
+        self.state.lock().physical_ready.insert(global_id);
+    }
+
+    fn mark_source_resident_ready(&self, global_id: u32) {
+        let mut state = self.state.lock();
+        state.source_residents_ready.insert(global_id);
+    }
+
+    fn validate_snapshot(
+        snapshot: SourceReadinessSnapshot,
+        required_experts: u64,
+    ) -> Result<SourceReadinessSnapshot, String> {
+        if snapshot.source_residents_ready > snapshot.required_ready
+            || snapshot.required_ready > required_experts
+        {
+            return Err(format!(
+                "future source readiness is inconsistent: required_ready={} source_residents_ready={} required_experts={required_experts}",
+                snapshot.required_ready, snapshot.source_residents_ready
+            ));
+        }
+        Ok(snapshot)
+    }
+
+    fn snapshot_at_boundary<T, F>(
+        &self,
+        handle: &tokio::task::JoinHandle<T>,
+        required_global_ids: &[u32],
+        mut current_readiness: F,
+    ) -> Result<(SourceReadinessSnapshot, bool), String>
+    where
+        F: FnMut(u32) -> Result<BoundarySourceReadiness, String>,
+    {
+        // Source progress updates use this same lock. Holding it across
+        // `is_finished` ties the readiness count to the exact task-finished
+        // decision used at the boundary instead of rescanning a changing cache.
+        let state = self.state.lock();
+        let task_finished = handle.is_finished();
+        let mut required_ready = 0u64;
+        let mut source_residents_ready = 0u64;
+        let mut unique = HashSet::with_capacity(required_global_ids.len());
+        for &global_id in required_global_ids {
+            if !unique.insert(global_id) {
+                return Err(format!(
+                    "future source readiness contains duplicate global expert {global_id}"
+                ));
+            }
+            let live = current_readiness(global_id)?;
+            let physical_ready = state.physical_ready.contains(&global_id)
+                || live == BoundarySourceReadiness::Physical;
+            let source_ready = state.source_residents_ready.contains(&global_id)
+                || live == BoundarySourceReadiness::SourceResident;
+            required_ready += u64::from(physical_ready || source_ready);
+            source_residents_ready += u64::from(source_ready);
+        }
+        let snapshot = SourceReadinessSnapshot {
+            required_ready,
+            source_residents_ready,
+        };
+        Ok((
+            Self::validate_snapshot(snapshot, required_global_ids.len() as u64)?,
+            task_finished,
+        ))
+    }
+}
+
 struct PrefetchLease {
     outcome: PrefetchOutcome,
     counters: Arc<Mutex<OracleCounters>>,
@@ -498,6 +605,7 @@ async fn prefetch_layer_batch(
     layer_index: usize,
     local_ids: Vec<u32>,
     counters: Arc<Mutex<OracleCounters>>,
+    readiness: Arc<SourceReadiness>,
 ) -> PrefetchOutcome {
     let _guard = LayerBatchGuard::enter(counters.clone());
     let mut outcome = PrefetchOutcome::default();
@@ -538,6 +646,7 @@ async fn prefetch_layer_batch(
         match source_disposition(physical_current, ram_resident.is_some(), singleflight) {
             SourceDisposition::AlreadyPhysical => {
                 counters.lock().source_skipped_physical_current += 1;
+                readiness.mark_physical_ready(global_id);
                 continue;
             }
             SourceDisposition::RamHit => {
@@ -546,6 +655,7 @@ async fn prefetch_layer_batch(
                     global_id,
                     ram_resident.expect("RAM-hit disposition has a resident"),
                 );
+                readiness.mark_source_resident_ready(global_id);
                 continue;
             }
             SourceDisposition::SourceInFlight => {
@@ -566,6 +676,7 @@ async fn prefetch_layer_batch(
                     add_counter(&mut values.source_bytes_read, resident.data().len() as u64);
                 }
                 drop(values);
+                readiness.mark_source_resident_ready(global_id);
                 outcome.residents.insert(global_id, resident);
             }
             Err(error) => {
@@ -587,19 +698,21 @@ async fn prefetch_position(
     concurrency: usize,
     expert_bytes: usize,
     counters: Arc<Mutex<OracleCounters>>,
+    readiness: Arc<SourceReadiness>,
 ) -> PrefetchOutcome {
     let started = Instant::now();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let batches = stream::iter(routes.into_iter().enumerate().map(|(layer_index, ids)| {
         let engine = engine.clone();
         let counters = counters.clone();
+        let readiness = readiness.clone();
         let semaphore = semaphore.clone();
         async move {
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("qualification semaphore remains open");
-            let result = prefetch_layer_batch(engine, layer_index, ids, counters).await;
+            let result = prefetch_layer_batch(engine, layer_index, ids, counters, readiness).await;
             drop(permit);
             result
         }
@@ -1027,6 +1140,15 @@ fn install_future_at_boundary(
 struct ActivePrefetch {
     target_position: usize,
     handle: Option<tokio::task::JoinHandle<PrefetchLease>>,
+    readiness: Arc<SourceReadiness>,
+}
+
+enum BoundarySourceResolution {
+    DeferredToDemand,
+    Completed {
+        lease: PrefetchLease,
+        was_late: bool,
+    },
 }
 
 struct SchedulerState {
@@ -1045,6 +1167,118 @@ struct OracleScheduler {
     source_position_gate: Arc<tokio::sync::Mutex<()>>,
     counters: Arc<Mutex<OracleCounters>>,
     state: Arc<Mutex<SchedulerState>>,
+}
+
+async fn resolve_source_task_at_boundary<F>(
+    mode: OracleScheduledResidencyMode,
+    active: ActivePrefetch,
+    expected_target_position: usize,
+    required_global_ids: Vec<u32>,
+    current_readiness: F,
+    counters: Arc<Mutex<OracleCounters>>,
+    state: Arc<Mutex<SchedulerState>>,
+) -> Result<BoundarySourceResolution, String>
+where
+    F: FnMut(u32) -> Result<BoundarySourceReadiness, String> + Send,
+{
+    if active.target_position != expected_target_position {
+        return Err(format!(
+            "future source task targets {}, expected {expected_target_position}",
+            active.target_position
+        ));
+    }
+    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect
+        && !state.lock().background.is_empty()
+    {
+        return Err(
+            "token-boundary-direct retained a previous-position background source task".into(),
+        );
+    }
+
+    let Some(handle) = active.handle else {
+        if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+            return Err(
+                "token-boundary-direct skipped future source because a prior position lease remained in flight"
+                    .into(),
+            );
+        }
+        return Err("source-only position-gate skip was not resolved at the boundary".into());
+    };
+    let required_experts = required_global_ids.len() as u64;
+    let (readiness_at_boundary, task_finished_at_boundary) = active
+        .readiness
+        .snapshot_at_boundary(&handle, &required_global_ids, current_readiness)?;
+    let was_late = !task_finished_at_boundary;
+    let late_experts = required_experts.saturating_sub(readiness_at_boundary.required_ready);
+
+    if was_late {
+        record_source_late(&mut counters.lock(), late_experts, late_source_policy(mode));
+        if mode == OracleScheduledResidencyMode::SourceOnly {
+            let state_for_task = state.clone();
+            let counters_for_task = counters.clone();
+            let discard = tokio::spawn(async move {
+                let joined = handle.await;
+                counters_for_task.lock().background_tasks_drained += 1;
+                match joined {
+                    Ok(lease) => {
+                        if let Some(error) = lease.outcome.fatal_error.as_ref() {
+                            state_for_task.lock().failure = Some(error.clone());
+                        }
+                    }
+                    Err(error) => {
+                        state_for_task.lock().failure =
+                            Some(format!("future source task failed to join: {error}"));
+                    }
+                }
+            });
+            state.lock().background.push(discard);
+            return Ok(BoundarySourceResolution::DeferredToDemand);
+        }
+    }
+
+    let wait_started = Instant::now();
+    let joined = handle.await;
+    add_counter(
+        &mut counters.lock().oracle_wait_before_next_token_us,
+        saturating_us(wait_started),
+    );
+    counters.lock().background_tasks_drained += 1;
+    let lease = joined.map_err(|error| format!("future source task failed to join: {error}"))?;
+    if lease.outcome.target_position != expected_target_position {
+        return Err("completed future source task returned the wrong position".into());
+    }
+    if let Some(error) = lease.outcome.fatal_error.as_ref() {
+        return Err(error.clone());
+    }
+    record_completed_source_outcome(
+        &mut counters.lock(),
+        &lease.outcome,
+        readiness_at_boundary.source_residents_ready,
+    );
+    Ok(BoundarySourceResolution::Completed { lease, was_late })
+}
+
+fn release_source_position_lease_before_next_token(
+    mode: OracleScheduledResidencyMode,
+    lease: PrefetchLease,
+    source_position_gate: &Arc<tokio::sync::Mutex<()>>,
+    state: &Arc<Mutex<SchedulerState>>,
+) -> Result<(), String> {
+    drop(lease);
+    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        let position_guard = source_position_gate.clone().try_lock_owned().map_err(|_| {
+            "token-boundary-direct retained the completed position lease before the next token"
+                .to_string()
+        })?;
+        drop(position_guard);
+        if !state.lock().background.is_empty() {
+            return Err(
+                "token-boundary-direct accumulated a previous-position background source task"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 impl OracleScheduler {
@@ -1077,6 +1311,7 @@ impl OracleScheduler {
         record_source_position_considered(&mut self.counters.lock(), &routes);
         let started = Instant::now();
         let position_guard = self.source_position_gate.clone().lock_owned().await;
+        let readiness = Arc::new(SourceReadiness::default());
         let lease = PrefetchLease::new(
             prefetch_position(
                 self.engine.clone(),
@@ -1085,6 +1320,7 @@ impl OracleScheduler {
                 self.concurrency,
                 self.expert_bytes,
                 self.counters.clone(),
+                readiness,
             )
             .await,
             self.counters.clone(),
@@ -1134,7 +1370,7 @@ impl OracleScheduler {
         Ok(())
     }
 
-    fn late_source_count(&self, routes: &[Vec<u32>]) -> Result<u64, String> {
+    fn future_not_physically_current_count(&self, routes: &[Vec<u32>]) -> Result<u64, String> {
         let manager = self
             .engine
             .core
@@ -1142,7 +1378,59 @@ impl OracleScheduler {
             .as_ref()
             .ok_or("GPU-native residency manager is absent")?;
         let experts_per_layer = manager.plan().geometry().num_experts() as u32;
-        let mut late = 0u64;
+        let mut unavailable = 0u64;
+        for (layer_index, local_ids) in routes.iter().enumerate() {
+            for global_id in future_global_ids(
+                layer_index,
+                local_ids,
+                manager.plan().num_layers(),
+                experts_per_layer,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                if !manager
+                    .has_current_for_demand(global_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    unavailable += 1;
+                }
+            }
+        }
+        Ok(unavailable)
+    }
+
+    fn required_future_global_ids(&self, routes: &[Vec<u32>]) -> Result<Vec<u32>, String> {
+        let manager = self
+            .engine
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or("GPU-native residency manager is absent")?;
+        let experts_per_layer = manager.plan().geometry().num_experts() as u32;
+        let mut required = Vec::with_capacity(routes.iter().map(Vec::len).sum());
+        for (layer_index, local_ids) in routes.iter().enumerate() {
+            required.extend(
+                future_global_ids(
+                    layer_index,
+                    local_ids,
+                    manager.plan().num_layers(),
+                    experts_per_layer,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(required)
+    }
+
+    fn future_source_not_ready_count(&self, routes: &[Vec<u32>]) -> Result<u64, String> {
+        let manager = self
+            .engine
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or("GPU-native residency manager is absent")?;
+        let experts_per_layer = manager.plan().geometry().num_experts() as u32;
+        let mut unavailable = 0u64;
         for (layer_index, local_ids) in routes.iter().enumerate() {
             for global_id in future_global_ids(
                 layer_index,
@@ -1157,11 +1445,11 @@ impl OracleScheduler {
                     .map_err(|error| error.to_string())?
                     && !self.engine.core.cache.contains(global_id)
                 {
-                    late += 1;
+                    unavailable += 1;
                 }
             }
         }
-        Ok(late)
+        Ok(unavailable)
     }
 
     fn record_position_gate_skip(&self, routes: &[Vec<u32>]) -> Result<(), String> {
@@ -1241,77 +1529,78 @@ impl OracleScheduler {
         let active = active.ok_or_else(|| {
             format!("position {position} completed without a scheduled future source task")
         })?;
-        if active.target_position != position + 1 {
-            return Err(format!(
-                "future source task targets {}, expected {}",
-                active.target_position,
-                position + 1
-            ));
+        if self.mode == OracleScheduledResidencyMode::SourceOnly && active.handle.is_none() {
+            if active.target_position != position + 1 {
+                return Err(format!(
+                    "future source task targets {}, expected {}",
+                    active.target_position,
+                    position + 1
+                ));
+            }
+            let late_experts = self.future_source_not_ready_count(&routes)?;
+            record_source_late(
+                &mut self.counters.lock(),
+                late_experts,
+                LateSourcePolicy::NonblockingDemandFallback,
+            );
+            return Ok(());
         }
-        let Some(handle) = active.handle else {
-            let late = self.late_source_count(&routes)?;
-            record_source_late(&mut self.counters.lock(), late);
+        let required_global_ids = self.required_future_global_ids(&routes)?;
+        let manager = self
+            .engine
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or("GPU-native residency manager is absent")?
+            .clone();
+        let engine = self.engine.clone();
+        let BoundarySourceResolution::Completed { lease, was_late } =
+            resolve_source_task_at_boundary(
+                self.mode,
+                active,
+                position + 1,
+                required_global_ids,
+                move |global_id| {
+                    if manager
+                        .has_current_for_demand(global_id)
+                        .map_err(|error| error.to_string())?
+                    {
+                        Ok(BoundarySourceReadiness::Physical)
+                    } else if engine.core.cache.contains(global_id) {
+                        Ok(BoundarySourceReadiness::SourceResident)
+                    } else {
+                        Ok(BoundarySourceReadiness::Unavailable)
+                    }
+                },
+                self.counters.clone(),
+                self.state.clone(),
+            )
+            .await?
+        else {
             return Ok(());
         };
 
-        if !handle.is_finished() {
-            let late = self.late_source_count(&routes)?;
-            {
-                let mut values = self.counters.lock();
-                record_source_late(&mut values, late);
-            }
-            let state_for_task = self.state.clone();
-            let counters_for_task = self.counters.clone();
-            let discard = tokio::spawn(async move {
-                let joined = handle.await;
-                counters_for_task.lock().background_tasks_drained += 1;
-                match joined {
-                    Ok(lease) => {
-                        if let Some(error) = lease.outcome.fatal_error.as_ref() {
-                            state_for_task.lock().failure = Some(error.clone());
-                        }
-                    }
-                    Err(error) => {
-                        state_for_task.lock().failure =
-                            Some(format!("future source task failed to join: {error}"));
-                    }
-                }
-            });
-            self.state.lock().background.push(discard);
-            return Ok(());
-        }
-
-        let wait_started = Instant::now();
-        let joined = handle.await;
-        self.counters.lock().background_tasks_drained += 1;
-        let lease =
-            joined.map_err(|error| format!("future source task failed to join: {error}"))?;
-        let outcome = &lease.outcome;
-        if outcome.target_position != position + 1 {
-            return Err("completed future source task returned the wrong position".into());
-        }
-        if let Some(error) = outcome.fatal_error.as_ref() {
-            return Err(error.clone());
-        }
-        {
-            let mut values = self.counters.lock();
-            record_completed_source_outcome(&mut values, outcome);
-        }
         if self.mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
             install_future_at_boundary(
                 &self.engine,
                 &mut boundary,
                 &routes,
-                &outcome.residents,
+                &lease.outcome.residents,
                 self.counters.clone(),
             )?;
+            let unavailable_after_install = self.future_not_physically_current_count(&routes)?;
+            record_direct_late_fallback(
+                &mut self.counters.lock(),
+                was_late,
+                unavailable_after_install,
+            );
         }
-        add_counter(
-            &mut self.counters.lock().oracle_wait_before_next_token_us,
-            saturating_us(wait_started),
-        );
-        drop(lease);
-        Ok(())
+        release_source_position_lease_before_next_token(
+            self.mode,
+            lease,
+            &self.source_position_gate,
+            &self.state,
+        )
     }
 
     async fn finish_request(&self) -> Result<(OracleCounters, OracleRouteTrace), String> {
@@ -1332,8 +1621,12 @@ impl OracleScheduler {
     }
 }
 
-fn record_completed_source_outcome(counters: &mut OracleCounters, outcome: &PrefetchOutcome) {
-    counters.source_ready_before_boundary += outcome.residents.len() as u64;
+fn record_completed_source_outcome(
+    counters: &mut OracleCounters,
+    outcome: &PrefetchOutcome,
+    source_residents_ready_at_boundary: u64,
+) {
+    counters.source_ready_before_boundary += source_residents_ready_at_boundary;
     counters.source_failures_degraded_to_demand += outcome.failed_ids.len() as u64;
 }
 
@@ -1341,9 +1634,21 @@ fn record_source_position_considered(counters: &mut OracleCounters, routes: &[Ve
     counters.future_experts_considered += routes.iter().map(Vec::len).sum::<usize>() as u64;
 }
 
-fn record_source_late(counters: &mut OracleCounters, late_experts: u64) {
+fn record_source_late(counters: &mut OracleCounters, late_experts: u64, policy: LateSourcePolicy) {
     counters.source_late_at_boundary += late_experts;
-    counters.source_late_degraded_to_demand += 1;
+    if policy == LateSourcePolicy::NonblockingDemandFallback {
+        counters.source_late_degraded_to_demand += 1;
+    }
+}
+
+fn record_direct_late_fallback(
+    counters: &mut OracleCounters,
+    was_late: bool,
+    unavailable_after_install: u64,
+) {
+    if was_late && unavailable_after_install != 0 {
+        counters.source_late_degraded_to_demand += 1;
+    }
 }
 
 fn record_demand_readiness(counters: &mut OracleCounters, current_by_layer: &[Vec<bool>]) {
@@ -1405,8 +1710,10 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
         let concurrency = self.concurrency;
         let expert_bytes = self.expert_bytes;
         let target_position = position + 1;
+        let readiness = Arc::new(SourceReadiness::default());
         let handle = match self.source_position_gate.clone().try_lock_owned() {
             Ok(position_guard) => {
+                let readiness_for_task = readiness.clone();
                 let handle = tokio::spawn(async move {
                     let outcome = prefetch_position(
                         engine,
@@ -1415,6 +1722,7 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
                         concurrency,
                         expert_bytes,
                         counters.clone(),
+                        readiness_for_task,
                     )
                     .await;
                     PrefetchLease::new(outcome, counters, position_guard)
@@ -1423,7 +1731,12 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
                 Some(handle)
             }
             Err(_) => {
-                if let Err(error) = self.record_position_gate_skip(&routes) {
+                if self.mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+                    state.failure = Some(
+                        "token-boundary-direct could not acquire the next position lease after the prior safe boundary"
+                            .into(),
+                    );
+                } else if let Err(error) = self.record_position_gate_skip(&routes) {
                     state.failure = Some(error);
                 }
                 None
@@ -1432,6 +1745,7 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
         state.active = Some(ActivePrefetch {
             target_position,
             handle,
+            readiness,
         });
     }
 
@@ -1457,6 +1771,7 @@ struct PhysicalSlotPlanEvidence {
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TreatmentContract {
     source_overlap: bool,
+    late_source_policy: LateSourcePolicy,
     host_preparation_overlap: bool,
     token_boundary_h2d: bool,
     demand_fallback: bool,
@@ -1472,6 +1787,7 @@ struct TreatmentContract {
 const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentContract {
     TreatmentContract {
         source_overlap: true,
+        late_source_policy: late_source_policy(mode),
         host_preparation_overlap: false,
         token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect),
         demand_fallback: true,
@@ -1712,7 +2028,9 @@ fn validate_oracle_counters(
         ));
     }
     if mode == OracleScheduledResidencyMode::TokenBoundaryDirect
-        && (counters.boundary_direct_staging_writes != counters.boundary_physical_installs
+        && (counters.source_position_inflight_skips != 0
+            || counters.source_prefetch_batches_skipped_inflight != 0
+            || counters.boundary_direct_staging_writes != counters.boundary_physical_installs
             || counters.boundary_physical_evictions > counters.boundary_physical_installs
             || counters.boundary_replacement_sets_completed
                 > counters.boundary_replacement_sets_started
@@ -1722,7 +2040,7 @@ fn validate_oracle_counters(
         return Err(BenchmarkFailure::new(
             "postcondition",
             "oracle-physical-counter-reconciliation",
-            "ORACLE direct staging, install bytes, eviction, or replacement-set counters do not reconcile",
+            "ORACLE direct-mode position leases, direct staging, install bytes, eviction, or replacement-set counters do not reconcile",
         ));
     }
     Ok(())
@@ -2305,6 +2623,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     fn test_trace(positions: usize) -> Arc<OracleRouteTrace> {
         let geometry = OracleGeometry {
@@ -2338,6 +2657,56 @@ mod tests {
             oracle_ready_at_demand: EXPECTED_SELECTED_IDS as u64,
             source_end_of_trace: 1,
             ..OracleCounters::default()
+        }
+    }
+
+    fn test_scheduler_state() -> Arc<Mutex<SchedulerState>> {
+        Arc::new(Mutex::new(SchedulerState {
+            cursor: StrictRouteCursor::new(test_trace(2)),
+            submitted_position: None,
+            active: None,
+            background: Vec::new(),
+            failure: None,
+        }))
+    }
+
+    async fn pending_test_prefetch(
+        target_position: usize,
+        counters: Arc<Mutex<OracleCounters>>,
+    ) -> (
+        ActivePrefetch,
+        tokio::sync::oneshot::Sender<PrefetchOutcome>,
+        Arc<tokio::sync::Mutex<()>>,
+        Arc<SourceReadiness>,
+    ) {
+        let source_position_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let position_guard = source_position_gate.clone().lock_owned().await;
+        let readiness = Arc::new(SourceReadiness::default());
+        let counters_for_task = counters.clone();
+        let (send_outcome, receive_outcome) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let outcome = receive_outcome
+                .await
+                .expect("test controls source task completion");
+            PrefetchLease::new(outcome, counters_for_task, position_guard)
+        });
+        counters.lock().background_tasks_spawned += 1;
+        (
+            ActivePrefetch {
+                target_position,
+                handle: Some(handle),
+                readiness: readiness.clone(),
+            },
+            send_outcome,
+            source_position_gate,
+            readiness,
+        )
+    }
+
+    fn successful_test_outcome(target_position: usize) -> PrefetchOutcome {
+        PrefetchOutcome {
+            target_position,
+            ..PrefetchOutcome::default()
         }
     }
 
@@ -2441,6 +2810,267 @@ mod tests {
     }
 
     #[test]
+    fn treatment_contract_records_distinct_late_source_policies() {
+        let source_only = treatment_contract(OracleScheduledResidencyMode::SourceOnly);
+        let direct = treatment_contract(OracleScheduledResidencyMode::TokenBoundaryDirect);
+        assert_eq!(
+            source_only.late_source_policy,
+            LateSourcePolicy::NonblockingDemandFallback
+        );
+        assert_eq!(
+            direct.late_source_policy,
+            LateSourcePolicy::AwaitResidualAtSafeBoundary
+        );
+        assert_eq!(
+            serde_json::to_value(source_only).unwrap()["late_source_policy"],
+            "nonblocking-demand-fallback"
+        );
+        assert_eq!(
+            serde_json::to_value(direct).unwrap()["late_source_policy"],
+            "await-residual-at-safe-boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_only_unfinished_task_does_not_wait_and_retains_demand_fallback() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let (active, send_outcome, source_position_gate, _) =
+            pending_test_prefetch(1, counters.clone()).await;
+
+        let resolution = tokio::time::timeout(
+            Duration::from_millis(100),
+            resolve_source_task_at_boundary(
+                OracleScheduledResidencyMode::SourceOnly,
+                active,
+                1,
+                vec![0, 1, 2, 3],
+                |_| Ok(BoundarySourceReadiness::Unavailable),
+                counters.clone(),
+                state.clone(),
+            ),
+        )
+        .await
+        .expect("source-only must not wait for an unfinished source task")
+        .unwrap();
+        assert!(matches!(
+            resolution,
+            BoundarySourceResolution::DeferredToDemand
+        ));
+        {
+            let values = counters.lock();
+            assert_eq!(values.source_late_at_boundary, 4);
+            assert_eq!(values.source_late_degraded_to_demand, 1);
+            assert_eq!(values.oracle_wait_before_next_token_us, 0);
+        }
+        record_demand_readiness(&mut counters.lock(), &[vec![false; 4]]);
+        assert_eq!(counters.lock().oracle_demand_fallback, 1);
+
+        assert!(send_outcome.send(successful_test_outcome(1)).is_ok());
+        let mut background = std::mem::take(&mut state.lock().background);
+        drain_background_tasks(&mut background).await.unwrap();
+        assert!(source_position_gate.try_lock_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_boundary_direct_awaits_late_source_records_wait_and_releases_lease() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let (active, send_outcome, source_position_gate, readiness) =
+            pending_test_prefetch(1, counters.clone()).await;
+        readiness.mark_physical_ready(0);
+        readiness.mark_source_resident_ready(1);
+        let mut resolving = Box::pin(resolve_source_task_at_boundary(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            active,
+            1,
+            vec![0, 1, 2, 3],
+            |_| Ok(BoundarySourceReadiness::Unavailable),
+            counters.clone(),
+            state.clone(),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), resolving.as_mut())
+                .await
+                .is_err()
+        );
+        {
+            let values = counters.lock();
+            assert_eq!(values.source_late_at_boundary, 2);
+            assert_eq!(values.source_late_degraded_to_demand, 0);
+            assert_eq!(values.oracle_wait_before_next_token_us, 0);
+        }
+        assert!(send_outcome.send(successful_test_outcome(1)).is_ok());
+        let resolution = tokio::time::timeout(Duration::from_secs(1), resolving)
+            .await
+            .expect("direct mode must finish after the source task completes")
+            .unwrap();
+        let BoundarySourceResolution::Completed { lease, was_late } = resolution else {
+            panic!("direct mode must return the completed source lease");
+        };
+        assert!(was_late);
+        assert!(counters.lock().oracle_wait_before_next_token_us > 0);
+        assert!(source_position_gate.clone().try_lock_owned().is_err());
+        record_direct_late_fallback(&mut counters.lock(), was_late, 0);
+        assert_eq!(counters.lock().source_late_degraded_to_demand, 0);
+        release_source_position_lease_before_next_token(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            lease,
+            &source_position_gate,
+            &state,
+        )
+        .unwrap();
+        assert!(source_position_gate.try_lock_owned().is_ok());
+        assert!(state.lock().background.is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_boundary_direct_rejects_a_previous_position_lease_skip() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let active = ActivePrefetch {
+            target_position: 1,
+            handle: None,
+            readiness: Arc::new(SourceReadiness::default()),
+        };
+        let error = resolve_source_task_at_boundary(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            active,
+            1,
+            vec![0, 1, 2, 3],
+            |_| Ok(BoundarySourceReadiness::Unavailable),
+            counters,
+            state,
+        )
+        .await
+        .err()
+        .expect("direct mode must fail closed instead of accumulating late positions");
+        assert!(error.contains("prior position lease remained in flight"));
+    }
+
+    #[tokio::test]
+    async fn token_boundary_direct_rejects_a_previous_position_background_task() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let (active, send_outcome, source_position_gate, _) =
+            pending_test_prefetch(1, counters.clone()).await;
+        state.lock().background.push(tokio::spawn(async {}));
+
+        let error = match resolve_source_task_at_boundary(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            active,
+            1,
+            vec![0],
+            |_| Ok(BoundarySourceReadiness::Unavailable),
+            counters,
+            state.clone(),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("direct mode must fail closed on a previous background task"),
+        };
+        assert!(error.contains("previous-position background source task"));
+
+        assert!(send_outcome.send(successful_test_outcome(1)).is_ok());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if source_position_gate.clone().try_lock_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached test source task must release its lease");
+        let mut background = std::mem::take(&mut state.lock().background);
+        drain_background_tasks(&mut background).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_late_source_failure_preserves_demand_fallback() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let (active, send_outcome, source_position_gate, _) =
+            pending_test_prefetch(1, counters.clone()).await;
+        let mut resolving = Box::pin(resolve_source_task_at_boundary(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            active,
+            1,
+            vec![7],
+            |_| Ok(BoundarySourceReadiness::Unavailable),
+            counters.clone(),
+            state.clone(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), resolving.as_mut())
+                .await
+                .is_err()
+        );
+        let outcome = PrefetchOutcome {
+            target_position: 1,
+            failed_ids: vec![7],
+            ..PrefetchOutcome::default()
+        };
+        assert!(send_outcome.send(outcome).is_ok());
+        let resolution = resolving.await.unwrap();
+        let BoundarySourceResolution::Completed { lease, was_late } = resolution else {
+            panic!("direct mode must join a source-read failure outcome");
+        };
+        assert!(was_late);
+        record_direct_late_fallback(&mut counters.lock(), was_late, 1);
+        record_demand_readiness(&mut counters.lock(), &[vec![false]]);
+        {
+            let values = counters.lock();
+            assert_eq!(values.source_failures_degraded_to_demand, 1);
+            assert_eq!(values.source_late_degraded_to_demand, 1);
+            assert_eq!(values.oracle_demand_fallback, 1);
+        }
+        release_source_position_lease_before_next_token(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            lease,
+            &source_position_gate,
+            &state,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_source_task_error_still_fails_qualification() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let state = test_scheduler_state();
+        let (active, send_outcome, source_position_gate, _) =
+            pending_test_prefetch(1, counters.clone()).await;
+        let mut resolving = Box::pin(resolve_source_task_at_boundary(
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            active,
+            1,
+            vec![7],
+            |_| Ok(BoundarySourceReadiness::Unavailable),
+            counters,
+            state,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), resolving.as_mut())
+                .await
+                .is_err()
+        );
+        let outcome = PrefetchOutcome {
+            target_position: 1,
+            fatal_error: Some("physical identity corrupt".into()),
+            ..PrefetchOutcome::default()
+        };
+        assert!(send_outcome.send(outcome).is_ok());
+        let error = match resolving.await {
+            Err(error) => error,
+            Ok(_) => panic!("fatal source task error must fail qualification"),
+        };
+        assert_eq!(error, "physical identity corrupt");
+        assert!(source_position_gate.try_lock_owned().is_ok());
+    }
+
+    #[test]
     fn source_deduplication_uses_existing_singleflight() {
         assert_eq!(
             source_disposition(false, false, true),
@@ -2472,7 +3102,7 @@ mod tests {
             ..PrefetchOutcome::default()
         };
         let mut counters = OracleCounters::default();
-        record_completed_source_outcome(&mut counters, &outcome);
+        record_completed_source_outcome(&mut counters, &outcome, 0);
         record_demand_readiness(&mut counters, &[vec![false, false]]);
         assert_eq!(counters.source_failures_degraded_to_demand, 2);
         assert_eq!(counters.oracle_demand_fallback, 1);
@@ -2481,7 +3111,11 @@ mod tests {
     #[test]
     fn source_late_at_boundary_degrades_without_fake_readiness() {
         let mut counters = OracleCounters::default();
-        record_source_late(&mut counters, 8);
+        record_source_late(
+            &mut counters,
+            8,
+            LateSourcePolicy::NonblockingDemandFallback,
+        );
         record_demand_readiness(&mut counters, &[vec![false; 8]]);
         assert_eq!(counters.source_late_at_boundary, 8);
         assert_eq!(counters.source_late_degraded_to_demand, 1);
