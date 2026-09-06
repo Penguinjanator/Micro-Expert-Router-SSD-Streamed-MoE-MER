@@ -149,6 +149,7 @@ pub(crate) mod gpu_native_out_of_core;
 pub(crate) mod gpu_native_physical_install_staging;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
+pub(crate) mod gpu_native_oracle_routes;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
@@ -908,6 +909,23 @@ enum Cmd {
         /// Write the typed JSON benchmark report here instead of stdout.
         #[arg(long)]
         report_out: Option<PathBuf>,
+    },
+
+    /// Capture authoritative ordered route truth from the ordinary production
+    /// GPU-native token loop and run offline capacity/replacement analysis.
+    #[command(name = "trace-gpu-native-oracle-routes")]
+    TraceGpuNativeOracleRoutes {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`
+        /// and the exact requested output-token count. Decoding is always
+        /// greedy and the runtime is always restricted to NVIDIA L4.
+        #[arg(long)]
+        request_json: PathBuf,
+        /// Required destination for the versioned diagnostic JSON artifact.
+        #[arg(long)]
+        report_out: PathBuf,
     },
 
     /// Production-path PR2-A.2 control/treatment qualification. Control
@@ -1931,6 +1949,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
+        | Cmd::TraceGpuNativeOracleRoutes { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
         | Cmd::QualifyGpuNativeOutOfCore { config, .. }
@@ -2357,6 +2376,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_reset,
                     greedy,
                     expected_adapter_name,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::TraceGpuNativeOracleRoutes {
+            config,
+            request_json,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_oracle_routes::run_command(
+                crate::gpu_native_oracle_routes::CommandArgs {
+                    config,
+                    request_json,
                     report_out,
                     progress_watchdog,
                 },

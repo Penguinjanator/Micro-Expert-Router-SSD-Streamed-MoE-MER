@@ -27,9 +27,9 @@ use crate::expert_cache::{
 use crate::gating::Router;
 use crate::gpu_native_residency::{
     global_to_layer_local as gpu_native_global_to_layer_local, GpuNativeDemandExpert,
-    GpuNativePhysicalInstallObserver, GpuNativeResidencyPriority, GpuNativeSpeculativeInstall,
-    GpuNativeSpeculativeProbe, GpuNativeTieredResidencyError, GpuNativeTieredResidencyManager,
-    GpuNativeTieredResidencySnapshot,
+    GpuNativeModelExpertVramPlan, GpuNativePhysicalInstallObserver, GpuNativeResidencyPriority,
+    GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe, GpuNativeTieredResidencyError,
+    GpuNativeTieredResidencyManager, GpuNativeTieredResidencySnapshot,
 };
 use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
@@ -924,6 +924,16 @@ impl QualificationOrderedHasher {
     fn hex(&self) -> String {
         format!("{:x}", self.inner.clone().finalize())
     }
+}
+
+/// Reproduce the historical `selected_route_ids_sha256` framing exactly for
+/// an ordered sequence of already-global expert-id sets.
+pub(crate) fn qualification_ordered_sets_sha256(ordered_sets: &[Vec<u32>]) -> String {
+    let mut hasher = QualificationOrderedHasher::default();
+    for ids in ordered_sets {
+        hasher.record_set(ids);
+    }
+    hasher.hex()
 }
 
 /// Normalize completed source reads into original request order before any
@@ -3233,11 +3243,21 @@ pub struct Engine {
     diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64,
     diagnostic_route_capture_armed: std::sync::atomic::AtomicBool,
     diagnostic_route_capture: parking_lot::Mutex<Option<DiagnosticRouteCaptureArm>>,
+    gpu_native_actual_route_observer_armed: AtomicBool,
+    gpu_native_actual_route_observer:
+        parking_lot::RwLock<Option<Arc<dyn GpuNativeActualRouteObserver>>>,
     gpu_native_demand_source_qualification:
         parking_lot::RwLock<Option<Arc<GpuNativeDemandSourceQualification>>>,
     production_demand_source: Arc<ProductionDemandSourceTelemetry>,
     #[cfg(test)]
     production_batch_test_hooks: parking_lot::Mutex<ProductionBatchTestHooks>,
+}
+
+/// Diagnostic-only consumer for route IDs already present in the ordinary
+/// GPU-native token-loop boundary report. Implementations must observe only;
+/// normal serving and benchmarks never install one.
+pub(crate) trait GpuNativeActualRouteObserver: Send + Sync {
+    fn record_position(&self, position: usize, selected_ids_by_layer: &[Vec<u32>]);
 }
 
 #[cfg(test)]
@@ -3606,6 +3626,8 @@ impl Engine {
             diagnostic_cpu_q4_boundary_emulated_dispatches: AtomicU64::new(0),
             diagnostic_route_capture_armed: std::sync::atomic::AtomicBool::new(false),
             diagnostic_route_capture: parking_lot::Mutex::new(None),
+            gpu_native_actual_route_observer_armed: AtomicBool::new(false),
+            gpu_native_actual_route_observer: parking_lot::RwLock::new(None),
             gpu_native_demand_source_qualification: parking_lot::RwLock::new(None),
             production_demand_source,
             #[cfg(test)]
@@ -4431,6 +4453,44 @@ impl Engine {
             .map(|manager| manager.snapshot())
     }
 
+    pub(crate) fn gpu_native_model_expert_vram_plan_for_budget(
+        &self,
+        total_expert_budget_bytes: u64,
+    ) -> Result<GpuNativeModelExpertVramPlan, GpuNativeDemandResidencyError> {
+        let manager = self
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or(GpuNativeDemandResidencyError::ManagerNotInstalled)?;
+        manager
+            .plan_for_budget(total_expert_budget_bytes)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn install_gpu_native_actual_route_observer(
+        &self,
+        observer: Arc<dyn GpuNativeActualRouteObserver>,
+    ) -> Result<(), String> {
+        let mut slot = self.gpu_native_actual_route_observer.write();
+        if slot.is_some() {
+            return Err("GPU-native actual-route observer is already installed".into());
+        }
+        *slot = Some(observer);
+        self.gpu_native_actual_route_observer_armed
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn clear_gpu_native_actual_route_observer(&self) -> Result<(), String> {
+        self.gpu_native_actual_route_observer_armed
+            .store(false, Ordering::Release);
+        let removed = self.gpu_native_actual_route_observer.write().take();
+        if removed.is_none() {
+            return Err("GPU-native actual-route observer was not installed".into());
+        }
+        Ok(())
+    }
+
     /// Install v2 evidence. Control explicitly forces the legacy sequential
     /// helper; treatment exercises the same ordinary production path used
     /// when no qualifier is active. The dedicated command calls this only on a
@@ -4653,10 +4713,25 @@ impl Engine {
     /// route observation and prefetch infrastructure without requiring CPU hidden state.
     pub(crate) fn record_gpu_native_actual_routes(
         self: &Arc<Self>,
+        position: usize,
         selected_ids_by_layer: &[Vec<u32>],
     ) {
         self.core.governor.refresh();
         let per_layer_opt = self.core.storage.config().num_experts_per_layer;
+
+        if self
+            .gpu_native_actual_route_observer_armed
+            .load(Ordering::Acquire)
+        {
+            if let Some(observer) = self
+                .gpu_native_actual_route_observer
+                .read()
+                .as_ref()
+                .cloned()
+            {
+                observer.record_position(position, selected_ids_by_layer);
+            }
+        }
 
         if let Some(qualification) = self.gpu_native_demand_source_qualification() {
             let per_layer = per_layer_opt.unwrap_or(0);

@@ -670,6 +670,23 @@ impl GpuNativeTieredResidencyManager {
         &self.plan
     }
 
+    /// Re-run the production model-wide slot planner for an alternate expert
+    /// budget without allocating buffers or mutating residency. Qualification
+    /// analyzers use the authoritative executor limits rather than guessing
+    /// per-layer capacities from the budget.
+    pub(crate) fn plan_for_budget(
+        &self,
+        total_expert_budget_bytes: u64,
+    ) -> Result<GpuNativeModelExpertVramPlan, GpuNativeTieredResidencyError> {
+        let limits = self.executor.device_limits()?;
+        GpuNativeModelExpertVramPlan::try_new(
+            self.plan.num_layers(),
+            self.plan.geometry(),
+            total_expert_budget_bytes,
+            &limits,
+        )
+    }
+
     pub(crate) fn arena(&self, layer_index: usize) -> Option<&Arc<GpuNativeQ4ExpertArena>> {
         self.layers.get(layer_index).map(|layer| &layer.arena)
     }

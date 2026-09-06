@@ -2399,7 +2399,7 @@ impl GpuNativeTokenLoop {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            engine.record_gpu_native_actual_routes(&report.selected_ids);
+            engine.record_gpu_native_actual_routes(position, &report.selected_ids);
 
             return Ok(GpuNativeStepOutput {
                 sampled_token: if sample {
