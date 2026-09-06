@@ -381,15 +381,47 @@ struct PolicyCounts {
     compulsory_cold_installs: u64,
 }
 
+impl PolicyCounts {
+    fn checked_accumulate(&mut self, other: Self) -> Result<(), OracleTraceError> {
+        self.route_references = self
+            .route_references
+            .checked_add(other.route_references)
+            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
+        self.cache_hits = self
+            .cache_hits
+            .checked_add(other.cache_hits)
+            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "hit count overflow"))?;
+        self.missing_installs = self
+            .missing_installs
+            .checked_add(other.missing_installs)
+            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "miss count overflow"))?;
+        self.miss_boundaries = self
+            .miss_boundaries
+            .checked_add(other.miss_boundaries)
+            .ok_or_else(|| {
+                OracleTraceError::new("analysis-overflow", "miss-boundary count overflow")
+            })?;
+        self.compulsory_cold_installs = self
+            .compulsory_cold_installs
+            .checked_add(other.compulsory_cold_installs)
+            .ok_or_else(|| {
+                OracleTraceError::new("analysis-overflow", "compulsory miss count overflow")
+            })?;
+        Ok(())
+    }
+}
+
 fn validate_accesses(
     capacity: usize,
     experts: usize,
     accesses: &[Vec<u32>],
 ) -> Result<(), OracleTraceError> {
-    if capacity == 0 {
+    if capacity == 0 || experts == 0 || capacity > experts {
         return Err(OracleTraceError::new(
-            "zero-slot-capacity",
-            "offline residency analysis requires at least one physical slot",
+            "invalid-simulation-capacity",
+            format!(
+                "offline residency analysis requires 1 <= capacity <= experts; observed capacity={capacity} experts={experts}"
+            ),
         ));
     }
     for (position, ids) in accesses.iter().enumerate() {
@@ -415,130 +447,312 @@ fn validate_accesses(
     Ok(())
 }
 
-/// Exact empty-start LRU simulation of production demand-set semantics: hits
-/// are touched in ordered top-k order, the whole set is protected while enough
-/// oldest unprotected residents are evicted, then misses install in route order.
+struct ProductionLruSimulation {
+    capacity: usize,
+    experts: usize,
+    lru: VecDeque<u32>,
+    ever_seen: HashSet<u32>,
+}
+
+impl ProductionLruSimulation {
+    fn try_new(capacity: usize, experts: usize) -> Result<Self, OracleTraceError> {
+        validate_accesses(capacity, experts, &[])?;
+        Ok(Self {
+            capacity,
+            experts,
+            lru: VecDeque::with_capacity(capacity),
+            ever_seen: HashSet::with_capacity(experts),
+        })
+    }
+
+    /// Run one counter scope while preserving physical residency, LRU order,
+    /// and compulsory-use history from every earlier scope.
+    fn run(&mut self, accesses: &[Vec<u32>]) -> Result<PolicyCounts, OracleTraceError> {
+        validate_accesses(self.capacity, self.experts, accesses)?;
+        let mut counts = PolicyCounts::default();
+        for ids in accesses {
+            counts.route_references = counts
+                .route_references
+                .checked_add(ids.len() as u64)
+                .ok_or_else(|| {
+                    OracleTraceError::new("analysis-overflow", "route count overflow")
+                })?;
+            let protected = ids.iter().copied().collect::<HashSet<_>>();
+            let mut misses = Vec::new();
+            for &id in ids {
+                if let Some(index) = self.lru.iter().position(|&resident| resident == id) {
+                    let resident = self.lru.remove(index).expect("located LRU resident");
+                    self.lru.push_back(resident);
+                    counts.cache_hits += 1;
+                } else {
+                    misses.push(id);
+                    counts.missing_installs += 1;
+                    if self.ever_seen.insert(id) {
+                        counts.compulsory_cold_installs += 1;
+                    }
+                }
+            }
+            if !misses.is_empty() {
+                counts.miss_boundaries += 1;
+            }
+            while self.lru.len().saturating_add(misses.len()) > self.capacity {
+                let victim = self
+                    .lru
+                    .iter()
+                    .position(|id| !protected.contains(id))
+                    .ok_or_else(|| {
+                        OracleTraceError::new(
+                            "no-unprotected-lru-victim",
+                            "validated simultaneous set left no legal LRU victim",
+                        )
+                    })?;
+                self.lru.remove(victim);
+            }
+            for id in misses {
+                self.lru.push_back(id);
+            }
+        }
+        Ok(counts)
+    }
+}
+
+struct BeladyMinSimulation {
+    capacity: usize,
+    experts: usize,
+    residents: HashSet<u32>,
+    ever_seen: HashSet<u32>,
+    future: Vec<VecDeque<usize>>,
+    planned_accesses: Vec<Vec<u32>>,
+    next_position: usize,
+}
+
+impl BeladyMinSimulation {
+    fn try_new(
+        capacity: usize,
+        experts: usize,
+        complete_accesses: &[Vec<u32>],
+    ) -> Result<Self, OracleTraceError> {
+        validate_accesses(capacity, experts, complete_accesses)?;
+        let mut future = vec![VecDeque::<usize>::new(); experts];
+        for (position, ids) in complete_accesses.iter().enumerate() {
+            for &id in ids {
+                future[id as usize].push_back(position);
+            }
+        }
+        Ok(Self {
+            capacity,
+            experts,
+            residents: HashSet::with_capacity(capacity),
+            ever_seen: HashSet::with_capacity(experts),
+            future,
+            planned_accesses: complete_accesses.to_vec(),
+            next_position: 0,
+        })
+    }
+
+    /// Run one counter scope without resetting residency or the complete
+    /// future-use index assembled for the whole warmup/measurement lifecycle.
+    fn run(&mut self, accesses: &[Vec<u32>]) -> Result<PolicyCounts, OracleTraceError> {
+        validate_accesses(self.capacity, self.experts, accesses)?;
+        let end = self
+            .next_position
+            .checked_add(accesses.len())
+            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "position overflow"))?;
+        if end > self.planned_accesses.len() {
+            return Err(OracleTraceError::new(
+                "min-sequence-overrun",
+                "MIN counter scope exceeds the complete future-use sequence",
+            ));
+        }
+
+        let mut counts = PolicyCounts::default();
+        for ids in accesses {
+            let position = self.next_position;
+            if self.planned_accesses[position] != *ids {
+                return Err(OracleTraceError::new(
+                    "min-sequence-drift",
+                    format!("MIN scope access differs from planned position {position}"),
+                ));
+            }
+            for &id in ids {
+                let observed = self.future[id as usize].pop_front();
+                if observed != Some(position) {
+                    return Err(OracleTraceError::new(
+                        "future-index-corrupt",
+                        "next-use index did not match the current position",
+                    ));
+                }
+            }
+            counts.route_references = counts
+                .route_references
+                .checked_add(ids.len() as u64)
+                .ok_or_else(|| {
+                    OracleTraceError::new("analysis-overflow", "route count overflow")
+                })?;
+            let protected = ids.iter().copied().collect::<HashSet<_>>();
+            let mut misses = Vec::new();
+            for &id in ids {
+                if self.residents.contains(&id) {
+                    counts.cache_hits += 1;
+                } else {
+                    misses.push(id);
+                    counts.missing_installs += 1;
+                    if self.ever_seen.insert(id) {
+                        counts.compulsory_cold_installs += 1;
+                    }
+                }
+            }
+            if !misses.is_empty() {
+                counts.miss_boundaries += 1;
+            }
+            while self.residents.len().saturating_add(misses.len()) > self.capacity {
+                let victim = self
+                    .residents
+                    .iter()
+                    .copied()
+                    .filter(|id| !protected.contains(id))
+                    .max_by_key(|id| {
+                        (
+                            self.future[*id as usize]
+                                .front()
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                            *id,
+                        )
+                    })
+                    .ok_or_else(|| {
+                        OracleTraceError::new(
+                            "no-unprotected-min-victim",
+                            "validated simultaneous set left no legal MIN victim",
+                        )
+                    })?;
+                self.residents.remove(&victim);
+            }
+            self.residents.extend(misses);
+            self.next_position += 1;
+        }
+        Ok(counts)
+    }
+
+    fn finish(&self) -> Result<(), OracleTraceError> {
+        if self.next_position != self.planned_accesses.len()
+            || self.future.iter().any(|uses| !uses.is_empty())
+        {
+            return Err(OracleTraceError::new(
+                "min-sequence-incomplete",
+                "MIN simulation did not consume its complete future-use sequence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WindowPolicyCounts {
+    uncounted_warmup: PolicyCounts,
+    counted_measurement: PolicyCounts,
+}
+
+fn complete_window_accesses(
+    warmup: &[Vec<u32>],
+    measured: &[Vec<u32>],
+    measured_runs: usize,
+) -> Result<Vec<Vec<u32>>, OracleTraceError> {
+    if measured_runs == 0 {
+        return Err(OracleTraceError::new(
+            "zero-measured-runs",
+            "stateful analysis requires at least one measured route pass",
+        ));
+    }
+    let measured_records = measured
+        .len()
+        .checked_mul(measured_runs)
+        .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
+    let total = warmup
+        .len()
+        .checked_add(measured_records)
+        .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
+    let mut complete = Vec::with_capacity(total);
+    complete.extend_from_slice(warmup);
+    for _ in 0..measured_runs {
+        complete.extend_from_slice(measured);
+    }
+    Ok(complete)
+}
+
+fn simulate_production_lru_window(
+    capacity: usize,
+    experts: usize,
+    warmup: &[Vec<u32>],
+    measured: &[Vec<u32>],
+    measured_runs: usize,
+) -> Result<WindowPolicyCounts, OracleTraceError> {
+    if measured_runs == 0 {
+        return Err(OracleTraceError::new(
+            "zero-measured-runs",
+            "stateful analysis requires at least one measured route pass",
+        ));
+    }
+    let mut state = ProductionLruSimulation::try_new(capacity, experts)?;
+    let uncounted_warmup = state.run(warmup)?;
+    let mut counted_measurement = PolicyCounts::default();
+    for _ in 0..measured_runs {
+        counted_measurement.checked_accumulate(state.run(measured)?)?;
+    }
+    Ok(WindowPolicyCounts {
+        uncounted_warmup,
+        counted_measurement,
+    })
+}
+
+fn simulate_belady_min_window(
+    capacity: usize,
+    experts: usize,
+    warmup: &[Vec<u32>],
+    measured: &[Vec<u32>],
+    measured_runs: usize,
+) -> Result<WindowPolicyCounts, OracleTraceError> {
+    let complete = complete_window_accesses(warmup, measured, measured_runs)?;
+    let mut state = BeladyMinSimulation::try_new(capacity, experts, &complete)?;
+    let uncounted_warmup = state.run(warmup)?;
+    let mut counted_measurement = PolicyCounts::default();
+    for _ in 0..measured_runs {
+        counted_measurement.checked_accumulate(state.run(measured)?)?;
+    }
+    state.finish()?;
+    Ok(WindowPolicyCounts {
+        uncounted_warmup,
+        counted_measurement,
+    })
+}
+
+/// Exact empty-start LRU simulation of one production demand-set pass.
 fn simulate_production_lru(
     capacity: usize,
     experts: usize,
     accesses: &[Vec<u32>],
 ) -> Result<PolicyCounts, OracleTraceError> {
-    validate_accesses(capacity, experts, accesses)?;
-    let mut lru = VecDeque::<u32>::with_capacity(capacity);
-    let mut ever_seen = HashSet::new();
-    let mut counts = PolicyCounts::default();
-    for ids in accesses {
-        counts.route_references = counts
-            .route_references
-            .checked_add(ids.len() as u64)
-            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
-        let protected = ids.iter().copied().collect::<HashSet<_>>();
-        let mut misses = Vec::new();
-        for &id in ids {
-            if let Some(index) = lru.iter().position(|&resident| resident == id) {
-                let resident = lru.remove(index).expect("located LRU resident");
-                lru.push_back(resident);
-                counts.cache_hits += 1;
-            } else {
-                misses.push(id);
-                counts.missing_installs += 1;
-                if ever_seen.insert(id) {
-                    counts.compulsory_cold_installs += 1;
-                }
-            }
-        }
-        if !misses.is_empty() {
-            counts.miss_boundaries += 1;
-        }
-        while lru.len().saturating_add(misses.len()) > capacity {
-            let victim = lru
-                .iter()
-                .position(|id| !protected.contains(id))
-                .ok_or_else(|| {
-                    OracleTraceError::new(
-                        "no-unprotected-lru-victim",
-                        "validated simultaneous set left no legal LRU victim",
-                    )
-                })?;
-            lru.remove(victim);
-        }
-        for id in misses {
-            lru.push_back(id);
-        }
-    }
-    Ok(counts)
+    Ok(simulate_production_lru_window(capacity, experts, &[], accesses, 1)?.counted_measurement)
 }
 
-/// Belady/MIN-style empty-start simulation for simultaneous top-k accesses.
-/// Every current route is protected; among other residents, the expert whose
-/// next route-set use is farthest away (or absent) is evicted.
+/// Empty-start Belady/MIN simulation of one simultaneous-set pass.
 fn simulate_belady_min(
     capacity: usize,
     experts: usize,
     accesses: &[Vec<u32>],
 ) -> Result<PolicyCounts, OracleTraceError> {
-    validate_accesses(capacity, experts, accesses)?;
-    let mut future = vec![VecDeque::<usize>::new(); experts];
-    for (position, ids) in accesses.iter().enumerate() {
-        for &id in ids {
-            future[id as usize].push_back(position);
-        }
-    }
-    let mut residents = HashSet::<u32>::with_capacity(capacity);
-    let mut ever_seen = HashSet::new();
-    let mut counts = PolicyCounts::default();
-    for (position, ids) in accesses.iter().enumerate() {
-        for &id in ids {
-            let observed = future[id as usize].pop_front();
-            if observed != Some(position) {
-                return Err(OracleTraceError::new(
-                    "future-index-corrupt",
-                    "next-use index did not match the current position",
-                ));
-            }
-        }
-        counts.route_references = counts
-            .route_references
-            .checked_add(ids.len() as u64)
-            .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
-        let protected = ids.iter().copied().collect::<HashSet<_>>();
-        let mut misses = Vec::new();
-        for &id in ids {
-            if residents.contains(&id) {
-                counts.cache_hits += 1;
-            } else {
-                misses.push(id);
-                counts.missing_installs += 1;
-                if ever_seen.insert(id) {
-                    counts.compulsory_cold_installs += 1;
-                }
-            }
-        }
-        if !misses.is_empty() {
-            counts.miss_boundaries += 1;
-        }
-        while residents.len().saturating_add(misses.len()) > capacity {
-            let victim = residents
-                .iter()
-                .copied()
-                .filter(|id| !protected.contains(id))
-                .max_by_key(|id| {
-                    (
-                        future[*id as usize].front().copied().unwrap_or(usize::MAX),
-                        *id,
-                    )
-                })
-                .ok_or_else(|| {
-                    OracleTraceError::new(
-                        "no-unprotected-min-victim",
-                        "validated simultaneous set left no legal MIN victim",
-                    )
-                })?;
-            residents.remove(&victim);
-        }
-        residents.extend(misses);
-    }
-    Ok(counts)
+    Ok(simulate_belady_min_window(capacity, experts, &[], accesses, 1)?.counted_measurement)
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct PolicyOracleAnalysis {
+    pub(crate) cache_hits: u64,
+    pub(crate) missing_expert_installs: u64,
+    pub(crate) layer_miss_boundaries: u64,
+    pub(crate) bytes_to_move: u64,
+    pub(crate) compulsory_first_observation_installs: u64,
+    pub(crate) capacity_replacement_installs: u64,
+    pub(crate) resident_route_fraction: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -547,39 +761,31 @@ pub(crate) struct LayerOracleAnalysis {
     pub(crate) physical_expert_slots: usize,
     pub(crate) route_references: u64,
     pub(crate) unique_experts_touched: usize,
-    pub(crate) lru_cache_hits: u64,
-    pub(crate) lru_missing_expert_installs: u64,
-    pub(crate) lru_layer_miss_boundaries: u64,
-    pub(crate) lru_bytes_to_move: u64,
-    pub(crate) minimum_cache_hits: u64,
-    pub(crate) minimum_missing_expert_installs: u64,
-    pub(crate) minimum_layer_miss_boundaries: u64,
-    pub(crate) minimum_bytes_to_move: u64,
-    pub(crate) compulsory_cold_installs: u64,
-    pub(crate) lru_capacity_replacement_installs: u64,
-    pub(crate) minimum_capacity_replacement_installs: u64,
-    pub(crate) lru_resident_route_fraction: f64,
-    pub(crate) maximum_potentially_resident_route_fraction: f64,
+    pub(crate) lru: PolicyOracleAnalysis,
+    pub(crate) minimum: PolicyOracleAnalysis,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct AggregateOracleAnalysis {
     pub(crate) physical_expert_slots: usize,
     pub(crate) route_references: u64,
     pub(crate) unique_experts_touched: usize,
-    pub(crate) lru_cache_hits: u64,
-    pub(crate) lru_missing_expert_installs: u64,
-    pub(crate) lru_layer_miss_boundaries: u64,
-    pub(crate) lru_bytes_to_move: u64,
-    pub(crate) minimum_cache_hits: u64,
-    pub(crate) minimum_missing_expert_installs: u64,
-    pub(crate) minimum_layer_miss_boundaries: u64,
-    pub(crate) minimum_bytes_to_move: u64,
-    pub(crate) compulsory_cold_installs: u64,
-    pub(crate) lru_capacity_replacement_installs: u64,
-    pub(crate) minimum_capacity_replacement_installs: u64,
-    pub(crate) lru_resident_route_fraction: f64,
-    pub(crate) maximum_potentially_resident_route_fraction: f64,
+    pub(crate) lru: PolicyOracleAnalysis,
+    pub(crate) minimum: PolicyOracleAnalysis,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PhaseOracleAnalysis {
+    pub(crate) per_layer: Vec<LayerOracleAnalysis>,
+    pub(crate) aggregate: AggregateOracleAnalysis,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct StatefulWindowOracleAnalysis {
+    pub(crate) warmup_runs: usize,
+    pub(crate) measured_runs: usize,
+    pub(crate) uncounted_warmup: PhaseOracleAnalysis,
+    pub(crate) counted_measurement: PhaseOracleAnalysis,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -592,8 +798,9 @@ pub(crate) struct BudgetOracleAnalysis {
     pub(crate) physical_slot_stride_bytes: u64,
     pub(crate) physical_expert_slots: usize,
     pub(crate) per_layer_physical_expert_slots: Vec<usize>,
-    pub(crate) per_layer: Vec<LayerOracleAnalysis>,
-    pub(crate) aggregate: AggregateOracleAnalysis,
+    pub(crate) cold_start: PhaseOracleAnalysis,
+    pub(crate) first_measured_after_warmup: StatefulWindowOracleAnalysis,
+    pub(crate) frozen_perf_shape: StatefulWindowOracleAnalysis,
 }
 
 fn checked_transfer_bytes(installs: u64, bytes: u64) -> Result<u64, OracleTraceError> {
@@ -610,18 +817,196 @@ fn resident_fraction(hits: u64, references: u64) -> f64 {
     }
 }
 
+fn checked_add_u64(left: u64, right: u64) -> Result<u64, OracleTraceError> {
+    left.checked_add(right)
+        .ok_or_else(|| OracleTraceError::new("analysis-overflow", "counter overflow"))
+}
+
+fn checked_add_usize(left: usize, right: usize) -> Result<usize, OracleTraceError> {
+    left.checked_add(right)
+        .ok_or_else(|| OracleTraceError::new("analysis-overflow", "counter overflow"))
+}
+
+fn analyze_policy(
+    counts: PolicyCounts,
+    slot_stride_bytes: u64,
+    layer_boundaries: usize,
+) -> Result<PolicyOracleAnalysis, OracleTraceError> {
+    if checked_add_u64(counts.cache_hits, counts.missing_installs)? != counts.route_references {
+        return Err(OracleTraceError::new(
+            "analysis-reconciliation",
+            "cache hits plus missing installs do not equal route references",
+        ));
+    }
+    if counts.miss_boundaries > layer_boundaries as u64 {
+        return Err(OracleTraceError::new(
+            "analysis-reconciliation",
+            "layer miss boundaries exceed analyzed layer records",
+        ));
+    }
+    let capacity_replacement_installs = counts
+        .missing_installs
+        .checked_sub(counts.compulsory_cold_installs)
+        .ok_or_else(|| {
+            OracleTraceError::new(
+                "analysis-reconciliation",
+                "compulsory installs exceed total missing installs",
+            )
+        })?;
+    Ok(PolicyOracleAnalysis {
+        cache_hits: counts.cache_hits,
+        missing_expert_installs: counts.missing_installs,
+        layer_miss_boundaries: counts.miss_boundaries,
+        bytes_to_move: checked_transfer_bytes(counts.missing_installs, slot_stride_bytes)?,
+        compulsory_first_observation_installs: counts.compulsory_cold_installs,
+        capacity_replacement_installs,
+        resident_route_fraction: resident_fraction(counts.cache_hits, counts.route_references),
+    })
+}
+
+fn analyze_layer_phase(
+    layer_index: usize,
+    physical_expert_slots: usize,
+    accesses: &[Vec<u32>],
+    lru: PolicyCounts,
+    minimum: PolicyCounts,
+    slot_stride_bytes: u64,
+) -> Result<LayerOracleAnalysis, OracleTraceError> {
+    let expected_references = accesses
+        .iter()
+        .try_fold(0u64, |total, ids| checked_add_u64(total, ids.len() as u64))?;
+    if lru.route_references != expected_references
+        || minimum.route_references != expected_references
+        || lru.compulsory_cold_installs != minimum.compulsory_cold_installs
+        || minimum.missing_installs > lru.missing_installs
+    {
+        return Err(OracleTraceError::new(
+            "analysis-reconciliation",
+            format!("layer {layer_index} LRU/MIN counters disagree with the phase route evidence"),
+        ));
+    }
+    Ok(LayerOracleAnalysis {
+        layer_index,
+        physical_expert_slots,
+        route_references: expected_references,
+        unique_experts_touched: accesses
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len(),
+        lru: analyze_policy(lru, slot_stride_bytes, accesses.len())?,
+        minimum: analyze_policy(minimum, slot_stride_bytes, accesses.len())?,
+    })
+}
+
+fn accumulate_policy(
+    aggregate: &mut PolicyOracleAnalysis,
+    layer: PolicyOracleAnalysis,
+) -> Result<(), OracleTraceError> {
+    aggregate.cache_hits = checked_add_u64(aggregate.cache_hits, layer.cache_hits)?;
+    aggregate.missing_expert_installs = checked_add_u64(
+        aggregate.missing_expert_installs,
+        layer.missing_expert_installs,
+    )?;
+    aggregate.layer_miss_boundaries =
+        checked_add_u64(aggregate.layer_miss_boundaries, layer.layer_miss_boundaries)?;
+    aggregate.bytes_to_move = checked_add_u64(aggregate.bytes_to_move, layer.bytes_to_move)?;
+    aggregate.compulsory_first_observation_installs = checked_add_u64(
+        aggregate.compulsory_first_observation_installs,
+        layer.compulsory_first_observation_installs,
+    )?;
+    aggregate.capacity_replacement_installs = checked_add_u64(
+        aggregate.capacity_replacement_installs,
+        layer.capacity_replacement_installs,
+    )?;
+    Ok(())
+}
+
+fn empty_policy_analysis() -> PolicyOracleAnalysis {
+    PolicyOracleAnalysis {
+        cache_hits: 0,
+        missing_expert_installs: 0,
+        layer_miss_boundaries: 0,
+        bytes_to_move: 0,
+        compulsory_first_observation_installs: 0,
+        capacity_replacement_installs: 0,
+        resident_route_fraction: 1.0,
+    }
+}
+
+fn analyze_phase(
+    per_layer: Vec<LayerOracleAnalysis>,
+    expected_route_references: u64,
+    expected_physical_slots: usize,
+) -> Result<PhaseOracleAnalysis, OracleTraceError> {
+    let mut aggregate = AggregateOracleAnalysis {
+        physical_expert_slots: 0,
+        route_references: 0,
+        unique_experts_touched: 0,
+        lru: empty_policy_analysis(),
+        minimum: empty_policy_analysis(),
+    };
+    for layer in &per_layer {
+        aggregate.physical_expert_slots =
+            checked_add_usize(aggregate.physical_expert_slots, layer.physical_expert_slots)?;
+        aggregate.route_references =
+            checked_add_u64(aggregate.route_references, layer.route_references)?;
+        aggregate.unique_experts_touched = checked_add_usize(
+            aggregate.unique_experts_touched,
+            layer.unique_experts_touched,
+        )?;
+        accumulate_policy(&mut aggregate.lru, layer.lru)?;
+        accumulate_policy(&mut aggregate.minimum, layer.minimum)?;
+    }
+    aggregate.lru.resident_route_fraction =
+        resident_fraction(aggregate.lru.cache_hits, aggregate.route_references);
+    aggregate.minimum.resident_route_fraction =
+        resident_fraction(aggregate.minimum.cache_hits, aggregate.route_references);
+    if aggregate.route_references != expected_route_references
+        || aggregate.physical_expert_slots != expected_physical_slots
+        || aggregate.minimum.missing_expert_installs > aggregate.lru.missing_expert_installs
+    {
+        return Err(OracleTraceError::new(
+            "analysis-reconciliation",
+            "aggregate phase counters disagree with source route or slot evidence",
+        ));
+    }
+    Ok(PhaseOracleAnalysis {
+        per_layer,
+        aggregate,
+    })
+}
+
+fn layer_accesses(trace: &OracleRouteTrace) -> Vec<Vec<Vec<u32>>> {
+    let mut accesses = vec![Vec::<Vec<u32>>::new(); trace.geometry.layers];
+    for record in &trace.records {
+        accesses[record.layer_index].push(record.ordered_selected_expert_ids.clone());
+    }
+    accesses
+}
+
 fn analyze_trace_with_plan(
-    trace: &OracleRouteTrace,
+    warmup_trace: &OracleRouteTrace,
+    measured_trace: &OracleRouteTrace,
     requested_budget_mib: u64,
     plan: &GpuNativeModelExpertVramPlan,
 ) -> Result<BudgetOracleAnalysis, OracleTraceError> {
-    trace.validate()?;
+    warmup_trace.validate()?;
+    measured_trace.validate()?;
+    if warmup_trace.geometry != measured_trace.geometry {
+        return Err(OracleTraceError::new(
+            "warmup-measured-geometry-mismatch",
+            "captured warmup and measured traces use different model geometry",
+        ));
+    }
+    let geometry = measured_trace.geometry;
     let plan_geometry = plan.geometry();
-    if plan.num_layers() != trace.geometry.layers
-        || plan_geometry.num_experts() != trace.geometry.experts
-        || plan_geometry.top_k() != trace.geometry.top_k
-        || plan_geometry.d_model() != trace.geometry.d_model
-        || plan_geometry.d_ff() != trace.geometry.d_ff
+    if plan.num_layers() != geometry.layers
+        || plan_geometry.num_experts() != geometry.experts
+        || plan_geometry.top_k() != geometry.top_k
+        || plan_geometry.d_model() != geometry.d_model
+        || plan_geometry.d_ff() != geometry.d_ff
     {
         return Err(OracleTraceError::new(
             "slot-plan-geometry-mismatch",
@@ -634,102 +1019,111 @@ fn analyze_trace_with_plan(
         .map(|layer| layer.slot_capacity())
         .collect::<Vec<_>>();
     let slot_stride_bytes = plan_geometry.slot_stride_bytes() as u64;
-    let mut accesses = vec![Vec::<Vec<u32>>::new(); trace.geometry.layers];
-    for record in &trace.records {
-        accesses[record.layer_index].push(record.ordered_selected_expert_ids.clone());
+    let warmup_accesses = layer_accesses(warmup_trace);
+    let measured_accesses = layer_accesses(measured_trace);
+    let frozen_measured_references = (measured_trace.total_selected_expert_ids as u64)
+        .checked_mul(3)
+        .ok_or_else(|| OracleTraceError::new("analysis-overflow", "route count overflow"))?;
+
+    let mut cold_layers = Vec::with_capacity(geometry.layers);
+    let mut first_warmup_layers = Vec::with_capacity(geometry.layers);
+    let mut first_measured_layers = Vec::with_capacity(geometry.layers);
+    let mut frozen_warmup_layers = Vec::with_capacity(geometry.layers);
+    let mut frozen_measured_layers = Vec::with_capacity(geometry.layers);
+    for layer_index in 0..geometry.layers {
+        let capacity = capacities[layer_index];
+        let warmup = &warmup_accesses[layer_index];
+        let measured = &measured_accesses[layer_index];
+
+        let cold_lru = simulate_production_lru(capacity, geometry.experts, measured)?;
+        let cold_minimum = simulate_belady_min(capacity, geometry.experts, measured)?;
+        cold_layers.push(analyze_layer_phase(
+            layer_index,
+            capacity,
+            measured,
+            cold_lru,
+            cold_minimum,
+            slot_stride_bytes,
+        )?);
+
+        let first_lru =
+            simulate_production_lru_window(capacity, geometry.experts, warmup, measured, 1)?;
+        let first_minimum =
+            simulate_belady_min_window(capacity, geometry.experts, warmup, measured, 1)?;
+        first_warmup_layers.push(analyze_layer_phase(
+            layer_index,
+            capacity,
+            warmup,
+            first_lru.uncounted_warmup,
+            first_minimum.uncounted_warmup,
+            slot_stride_bytes,
+        )?);
+        first_measured_layers.push(analyze_layer_phase(
+            layer_index,
+            capacity,
+            measured,
+            first_lru.counted_measurement,
+            first_minimum.counted_measurement,
+            slot_stride_bytes,
+        )?);
+
+        let frozen_lru =
+            simulate_production_lru_window(capacity, geometry.experts, warmup, measured, 3)?;
+        let frozen_minimum =
+            simulate_belady_min_window(capacity, geometry.experts, warmup, measured, 3)?;
+        frozen_warmup_layers.push(analyze_layer_phase(
+            layer_index,
+            capacity,
+            warmup,
+            frozen_lru.uncounted_warmup,
+            frozen_minimum.uncounted_warmup,
+            slot_stride_bytes,
+        )?);
+        let frozen_accesses = complete_window_accesses(&[], measured, 3)?;
+        frozen_measured_layers.push(analyze_layer_phase(
+            layer_index,
+            capacity,
+            &frozen_accesses,
+            frozen_lru.counted_measurement,
+            frozen_minimum.counted_measurement,
+            slot_stride_bytes,
+        )?);
     }
 
-    let mut aggregate = AggregateOracleAnalysis::default();
-    let mut per_layer = Vec::with_capacity(trace.geometry.layers);
-    for layer_index in 0..trace.geometry.layers {
-        let capacity = capacities[layer_index];
-        let layer_accesses = &accesses[layer_index];
-        let unique_experts_touched = layer_accesses
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<HashSet<_>>()
-            .len();
-        let lru = simulate_production_lru(capacity, trace.geometry.experts, layer_accesses)?;
-        let minimum = simulate_belady_min(capacity, trace.geometry.experts, layer_accesses)?;
-        if lru.route_references != minimum.route_references
-            || lru.compulsory_cold_installs != minimum.compulsory_cold_installs
-        {
-            return Err(OracleTraceError::new(
-                "analysis-reconciliation",
-                "LRU and MIN simulations disagree on route references or compulsory misses",
-            ));
-        }
-        let layer = LayerOracleAnalysis {
-            layer_index,
-            physical_expert_slots: capacity,
-            route_references: lru.route_references,
-            unique_experts_touched,
-            lru_cache_hits: lru.cache_hits,
-            lru_missing_expert_installs: lru.missing_installs,
-            lru_layer_miss_boundaries: lru.miss_boundaries,
-            lru_bytes_to_move: checked_transfer_bytes(lru.missing_installs, slot_stride_bytes)?,
-            minimum_cache_hits: minimum.cache_hits,
-            minimum_missing_expert_installs: minimum.missing_installs,
-            minimum_layer_miss_boundaries: minimum.miss_boundaries,
-            minimum_bytes_to_move: checked_transfer_bytes(
-                minimum.missing_installs,
-                slot_stride_bytes,
-            )?,
-            compulsory_cold_installs: minimum.compulsory_cold_installs,
-            lru_capacity_replacement_installs: lru
-                .missing_installs
-                .checked_sub(lru.compulsory_cold_installs)
-                .ok_or_else(|| {
-                    OracleTraceError::new(
-                        "analysis-reconciliation",
-                        "LRU compulsory misses exceed total misses",
-                    )
-                })?,
-            minimum_capacity_replacement_installs: minimum
-                .missing_installs
-                .checked_sub(minimum.compulsory_cold_installs)
-                .ok_or_else(|| {
-                    OracleTraceError::new(
-                        "analysis-reconciliation",
-                        "MIN compulsory misses exceed total misses",
-                    )
-                })?,
-            lru_resident_route_fraction: resident_fraction(lru.cache_hits, lru.route_references),
-            maximum_potentially_resident_route_fraction: resident_fraction(
-                minimum.cache_hits,
-                minimum.route_references,
-            ),
-        };
-        aggregate.physical_expert_slots += layer.physical_expert_slots;
-        aggregate.route_references += layer.route_references;
-        aggregate.unique_experts_touched += layer.unique_experts_touched;
-        aggregate.lru_cache_hits += layer.lru_cache_hits;
-        aggregate.lru_missing_expert_installs += layer.lru_missing_expert_installs;
-        aggregate.lru_layer_miss_boundaries += layer.lru_layer_miss_boundaries;
-        aggregate.lru_bytes_to_move += layer.lru_bytes_to_move;
-        aggregate.minimum_cache_hits += layer.minimum_cache_hits;
-        aggregate.minimum_missing_expert_installs += layer.minimum_missing_expert_installs;
-        aggregate.minimum_layer_miss_boundaries += layer.minimum_layer_miss_boundaries;
-        aggregate.minimum_bytes_to_move += layer.minimum_bytes_to_move;
-        aggregate.compulsory_cold_installs += layer.compulsory_cold_installs;
-        aggregate.lru_capacity_replacement_installs += layer.lru_capacity_replacement_installs;
-        aggregate.minimum_capacity_replacement_installs +=
-            layer.minimum_capacity_replacement_installs;
-        per_layer.push(layer);
-    }
-    aggregate.lru_resident_route_fraction =
-        resident_fraction(aggregate.lru_cache_hits, aggregate.route_references);
-    aggregate.maximum_potentially_resident_route_fraction =
-        resident_fraction(aggregate.minimum_cache_hits, aggregate.route_references);
-    if aggregate.route_references != trace.total_selected_expert_ids as u64
-        || aggregate.physical_expert_slots != plan.model_slot_capacity()
-    {
-        return Err(OracleTraceError::new(
-            "analysis-reconciliation",
-            "aggregate route references or slot capacity disagree with source evidence",
-        ));
-    }
+    let expected_slots = plan.model_slot_capacity();
+    let cold_start = analyze_phase(
+        cold_layers,
+        measured_trace.total_selected_expert_ids as u64,
+        expected_slots,
+    )?;
+    let first_measured_after_warmup = StatefulWindowOracleAnalysis {
+        warmup_runs: 1,
+        measured_runs: 1,
+        uncounted_warmup: analyze_phase(
+            first_warmup_layers,
+            warmup_trace.total_selected_expert_ids as u64,
+            expected_slots,
+        )?,
+        counted_measurement: analyze_phase(
+            first_measured_layers,
+            measured_trace.total_selected_expert_ids as u64,
+            expected_slots,
+        )?,
+    };
+    let frozen_perf_shape = StatefulWindowOracleAnalysis {
+        warmup_runs: 1,
+        measured_runs: 3,
+        uncounted_warmup: analyze_phase(
+            frozen_warmup_layers,
+            warmup_trace.total_selected_expert_ids as u64,
+            expected_slots,
+        )?,
+        counted_measurement: analyze_phase(
+            frozen_measured_layers,
+            frozen_measured_references,
+            expected_slots,
+        )?,
+    };
 
     Ok(BudgetOracleAnalysis {
         requested_expert_budget_mib: requested_budget_mib,
@@ -740,8 +1134,9 @@ fn analyze_trace_with_plan(
         physical_slot_stride_bytes: slot_stride_bytes,
         physical_expert_slots: plan.model_slot_capacity(),
         per_layer_physical_expert_slots: capacities,
-        per_layer,
-        aggregate,
+        cold_start,
+        first_measured_after_warmup,
+        frozen_perf_shape,
     })
 }
 
@@ -1306,9 +1701,9 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                         "slot-plan-failed",
                         error.to_string(),
                     )
-                })?;
+            })?;
             analysis.push(
-                analyze_trace_with_plan(&measured.trace, budget_mib, &plan)
+                analyze_trace_with_plan(&warmup.trace, &measured.trace, budget_mib, &plan)
                     .map_err(counter_failure)?,
             );
         }
@@ -1382,8 +1777,8 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             additional_gpu_readback_introduced: false,
             performance_claim_from_trace_run: false,
             production_slot_planner: "GpuNativeModelExpertVramPlan::try_new with authoritative GpuNativeExecutorContext::device_limits",
-            analyzer_initial_residency: "empty per-layer physical arenas",
-            minimum_policy: "simultaneous-set Belady/MIN; current route protected, farthest next-use unprotected resident evicted",
+            analyzer_initial_residency: "cold_start begins empty; first_measured_after_warmup and frozen_perf_shape each begin empty before one uncounted captured warmup and preserve per-policy state through their counted measurements",
+            minimum_policy: "stateful simultaneous-set Belady/MIN; the future-use index spans each complete warmup-plus-measurement window without reset; current route protected, farthest next-use unprotected resident evicted",
         },
         warmup: warmup.evidence,
         measured: measured.evidence,
@@ -1555,16 +1950,149 @@ mod tests {
     }
 
     #[test]
-    fn production_model_slot_planner_reuse_matches_qwen_geometry() {
-        let qwen = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
-        let budget = 15_576 * MIB;
-        let limits = wgpu::Limits {
+    fn warmup_is_uncounted_and_state_persists_through_frozen_repetitions() {
+        let warmup = vec![vec![0], vec![1]];
+        let measured = vec![vec![0], vec![1], vec![2], vec![0], vec![1], vec![2]];
+        let cold_lru = simulate_production_lru(2, 3, &measured).unwrap();
+        let first_lru = simulate_production_lru_window(2, 3, &warmup, &measured, 1).unwrap();
+        let first_minimum = simulate_belady_min_window(2, 3, &warmup, &measured, 1).unwrap();
+        let frozen_lru = simulate_production_lru_window(2, 3, &warmup, &measured, 3).unwrap();
+        let frozen_minimum = simulate_belady_min_window(2, 3, &warmup, &measured, 3).unwrap();
+
+        assert_eq!(first_lru.uncounted_warmup.route_references, 2);
+        assert_eq!(first_lru.counted_measurement.route_references, 6);
+        assert_eq!(first_lru.uncounted_warmup.compulsory_cold_installs, 2);
+        assert_eq!(first_lru.counted_measurement.compulsory_cold_installs, 1);
+        assert!(first_lru.counted_measurement.missing_installs < cold_lru.missing_installs);
+        assert!(
+            first_minimum.counted_measurement.missing_installs
+                <= first_lru.counted_measurement.missing_installs
+        );
+        assert_eq!(first_minimum.counted_measurement.missing_installs, 2);
+
+        assert_eq!(frozen_lru.uncounted_warmup.route_references, 2);
+        assert_eq!(frozen_lru.counted_measurement.route_references, 18);
+        assert_eq!(frozen_lru.counted_measurement.missing_installs, 16);
+        assert!(frozen_lru.counted_measurement.missing_installs < 3 * cold_lru.missing_installs);
+        assert_eq!(frozen_lru.counted_measurement.compulsory_cold_installs, 1);
+        assert!(
+            frozen_minimum.counted_measurement.missing_installs
+                <= frozen_lru.counted_measurement.missing_installs
+        );
+        assert_eq!(frozen_minimum.counted_measurement.missing_installs, 8);
+        assert!(frozen_lru.counted_measurement.miss_boundaries <= 18);
+        assert!(frozen_minimum.counted_measurement.miss_boundaries <= 18);
+
+        // With one future index spanning all three passes, MIN retains expert
+        // 1 at the first pass's final miss because it sees the next pass. A
+        // per-pass future reset would tie-break it away and report 3 misses.
+        let cross_repetition_min =
+            simulate_belady_min_window(2, 3, &[vec![0]], &[vec![1], vec![2]], 3).unwrap();
+        assert_eq!(cross_repetition_min.counted_measurement.missing_installs, 2);
+    }
+
+    fn qwen_limits() -> wgpu::Limits {
+        wgpu::Limits {
             max_push_constant_size: 32,
             max_storage_buffers_per_shader_stage: 8,
             max_compute_workgroup_size_x: 64,
             max_compute_invocations_per_workgroup: 64,
             ..wgpu::Limits::default()
-        };
+        }
+    }
+
+    fn qwen_trace() -> OracleRouteTrace {
+        let mut records = Vec::new();
+        for position in 0..2 {
+            for layer_index in 0..48 {
+                let first_expert = (position * 8) as u32;
+                records.push(OracleRouteRecord {
+                    position,
+                    layer_index,
+                    ordered_selected_expert_ids: (first_expert..first_expert + 8).collect(),
+                });
+            }
+        }
+        OracleRouteTrace::try_new(
+            OracleGeometry {
+                layers: 48,
+                experts: 128,
+                top_k: 8,
+                d_model: 2048,
+                d_ff: 768,
+            },
+            records,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn full_capacity_postwarm_phases_have_zero_measured_misses_and_boundaries() {
+        let qwen = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let plan =
+            GpuNativeModelExpertVramPlan::try_new(48, qwen, 15_576 * MIB, &qwen_limits()).unwrap();
+        let trace = qwen_trace();
+        let analysis = analyze_trace_with_plan(&trace, &trace, 15_576, &plan).unwrap();
+
+        assert!(analysis.cold_start.aggregate.lru.missing_expert_installs > 0);
+        assert_eq!(analysis.first_measured_after_warmup.warmup_runs, 1);
+        assert_eq!(analysis.first_measured_after_warmup.measured_runs, 1);
+        assert_eq!(analysis.frozen_perf_shape.warmup_runs, 1);
+        assert_eq!(analysis.frozen_perf_shape.measured_runs, 3);
+        for phase in [
+            &analysis.first_measured_after_warmup.counted_measurement,
+            &analysis.frozen_perf_shape.counted_measurement,
+        ] {
+            assert_eq!(phase.aggregate.lru.missing_expert_installs, 0);
+            assert_eq!(phase.aggregate.lru.layer_miss_boundaries, 0);
+            assert_eq!(phase.aggregate.minimum.missing_expert_installs, 0);
+            assert_eq!(phase.aggregate.minimum.layer_miss_boundaries, 0);
+            assert!(phase.per_layer.iter().all(|layer| {
+                layer.lru.missing_expert_installs == 0
+                    && layer.lru.layer_miss_boundaries == 0
+                    && layer.minimum.missing_expert_installs == 0
+                    && layer.minimum.layer_miss_boundaries == 0
+            }));
+        }
+        assert_eq!(
+            analysis
+                .first_measured_after_warmup
+                .counted_measurement
+                .aggregate
+                .route_references,
+            trace.total_selected_expert_ids as u64
+        );
+        assert_eq!(
+            analysis
+                .frozen_perf_shape
+                .counted_measurement
+                .aggregate
+                .route_references,
+            3 * trace.total_selected_expert_ids as u64
+        );
+        assert_eq!(
+            analysis
+                .frozen_perf_shape
+                .counted_measurement
+                .aggregate
+                .lru
+                .compulsory_first_observation_installs,
+            0
+        );
+
+        let json = serde_json::to_value(&analysis).unwrap();
+        assert!(json.get("cold_start").is_some());
+        assert!(json.get("first_measured_after_warmup").is_some());
+        assert!(json.get("frozen_perf_shape").is_some());
+        assert!(json.get("per_layer").is_none());
+        assert!(json.get("aggregate").is_none());
+    }
+
+    #[test]
+    fn production_model_slot_planner_reuse_matches_qwen_geometry() {
+        let qwen = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let budget = 15_576 * MIB;
+        let limits = qwen_limits();
         let plan = GpuNativeModelExpertVramPlan::try_new(48, qwen, budget, &limits).unwrap();
         assert_eq!(plan.num_layers(), 48);
         assert_eq!(plan.model_slot_capacity(), 48 * 128);
