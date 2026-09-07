@@ -34,13 +34,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v2";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v3";
 pub(crate) const MODE: &str = "qualify-gpu-native-oracle-scheduled-residency";
 const ORACLE_ROUTE_SCHEMA: &str = "mer.gpu-native-oracle-route-trace.v1";
 const ORACLE_ROUTE_COMMAND_SHA: &str = "3576cb893586f5dd3f5c5e7355658762db02b534";
@@ -69,6 +70,11 @@ const FROZEN_MEASURED_RUNS: usize = 3;
 const FROZEN_RAM_CACHE_SLOTS: usize = 384;
 const ORACLE_FUTURE_SOURCE_POOL_SLOTS: usize = EXPECTED_LAYERS * EXPECTED_TOP_K;
 const PREDECESSOR_FIRST_ATTEMPT_CODE_SHA: &str = "d4e34cf302ee7f8d78b45d8e6dd8e7e524e716f3";
+const PREDECESSOR_SECOND_ATTEMPT_CODE_SHA: &str = "34b55715452acc355fd6dcf21e9c084d038efcd9";
+const PREDECESSOR_SECOND_ATTEMPT_REPORT_SHA256: &str =
+    "a80d79457bb0577bc7231d4567db6126fd1b8b0ccf71b0d5ef73af468a04a6a0";
+const PREDECESSOR_SECOND_ATTEMPT_RUNNER_SHA256: &str =
+    "3e11741e4d7efc58f1ad771d58b810668724968571b881aeb505f1dd2f939c9f";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -396,6 +402,11 @@ struct OracleCounters {
     source_prefetch_batches_completed: u64,
     source_prefetch_batches_skipped_inflight: u64,
     source_prefetch_peak_inflight: u64,
+    source_prefetch_read_batches_with_work: u64,
+    source_prefetch_positions_with_multiple_read_batches: u64,
+    source_prefetch_reads_current_inflight: u64,
+    source_prefetch_reads_peak_inflight: u64,
+    source_prefetch_read_inflight_accounting_errors: u64,
     source_ready_before_boundary: u64,
     source_late_at_boundary: u64,
     source_end_of_trace: u64,
@@ -583,6 +594,96 @@ impl Drop for LayerBatchGuard {
     fn drop(&mut self) {
         self.counters.lock().source_prefetch_batches_completed += 1;
     }
+}
+
+struct DirectFutureReadGuard {
+    counters: Arc<Mutex<OracleCounters>>,
+    entered: bool,
+}
+
+impl DirectFutureReadGuard {
+    fn enter(counters: Arc<Mutex<OracleCounters>>) -> Self {
+        let mut values = counters.lock();
+        let entered = match values.source_prefetch_reads_current_inflight.checked_add(1) {
+            Some(current) => {
+                values.source_prefetch_reads_current_inflight = current;
+                values.source_prefetch_reads_peak_inflight =
+                    values.source_prefetch_reads_peak_inflight.max(current);
+                true
+            }
+            None => {
+                values.source_prefetch_read_inflight_accounting_errors = values
+                    .source_prefetch_read_inflight_accounting_errors
+                    .saturating_add(1);
+                false
+            }
+        };
+        drop(values);
+        Self { counters, entered }
+    }
+}
+
+impl Drop for DirectFutureReadGuard {
+    fn drop(&mut self) {
+        if !self.entered {
+            return;
+        }
+        let mut values = self.counters.lock();
+        match values.source_prefetch_reads_current_inflight.checked_sub(1) {
+            Some(current) => values.source_prefetch_reads_current_inflight = current,
+            None => {
+                values.source_prefetch_read_inflight_accounting_errors = values
+                    .source_prefetch_read_inflight_accounting_errors
+                    .saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn run_bounded_layer_tasks<I, F, Fut, T, A, M>(
+    work: I,
+    concurrency: usize,
+    task_factory: F,
+    mut aggregate: A,
+    mut merge: M,
+) -> Result<A, String>
+where
+    I: IntoIterator,
+    I::Item: Send + 'static,
+    F: Fn(I::Item) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+    M: FnMut(&mut A, T),
+{
+    if concurrency == 0 {
+        return Err("qualification layer-task concurrency must be nonzero".into());
+    }
+
+    let mut work = work.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    for item in work.by_ref().take(concurrency) {
+        let task_factory = task_factory.clone();
+        tasks.spawn(async move { task_factory(item).await });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(value) => merge(&mut aggregate, value),
+            Err(error) => {
+                // A panic or cancellation is a qualification failure. Abort
+                // and resolve every still-owned task so RAII source leases
+                // and inflight guards are released before returning.
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(format!("independent layer source task failed: {error}"));
+            }
+        }
+        if let Some(item) = work.next() {
+            let task_factory = task_factory.clone();
+            tasks.spawn(async move { task_factory(item).await });
+        }
+    }
+    Ok(aggregate)
 }
 
 #[derive(Default)]
@@ -798,6 +899,7 @@ async fn prefetch_layer_batch(
 ) -> PrefetchOutcome {
     let _guard = LayerBatchGuard::enter(counters.clone());
     let mut outcome = PrefetchOutcome::default();
+    let mut direct_read_started_for_batch = false;
     let manager = match engine.core.gpu_native_residency.as_ref() {
         Some(manager) => manager.clone(),
         None => {
@@ -850,9 +952,16 @@ async fn prefetch_layer_batch(
                     Some("token-boundary-direct has no isolated ORACLE source pool".into());
                 return outcome;
             };
+            if !direct_read_started_for_batch {
+                counters.lock().source_prefetch_read_batches_with_work += 1;
+                direct_read_started_for_batch = true;
+            }
             counters.lock().source_reads_started += 1;
             let started = Instant::now();
-            match read_oracle_future_source(&engine, pool, global_id).await {
+            let read_guard = DirectFutureReadGuard::enter(counters.clone());
+            let read = read_oracle_future_source(&engine, pool, global_id).await;
+            drop(read_guard);
+            match read {
                 Ok((resident, bytes)) => {
                     let pool_snapshot = pool.snapshot();
                     let mut values = counters.lock();
@@ -959,6 +1068,18 @@ async fn prefetch_layer_batch(
     outcome
 }
 
+fn merge_prefetch_outcome(outcome: &mut PrefetchOutcome, mut batch: PrefetchOutcome) {
+    if outcome.fatal_error.is_none() {
+        outcome.fatal_error = batch.fatal_error.take();
+    }
+    outcome.failed_ids.append(&mut batch.failed_ids);
+    outcome.successful_ids.append(&mut batch.successful_ids);
+    outcome
+        .deferred_overlap_ids
+        .append(&mut batch.deferred_overlap_ids);
+    outcome.residents.extend(batch.residents);
+}
+
 async fn prefetch_position(
     engine: Arc<Engine>,
     target_position: usize,
@@ -972,52 +1093,111 @@ async fn prefetch_position(
     readiness: Arc<SourceReadiness>,
 ) -> PrefetchOutcome {
     let started = Instant::now();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let batches = stream::iter(routes.into_iter().enumerate().map(|(layer_index, ids)| {
-        let engine = engine.clone();
-        let counters = counters.clone();
-        let readiness = readiness.clone();
-        let semaphore = semaphore.clone();
-        let current_route_global_ids = current_route_global_ids.clone();
-        let oracle_source_pool = oracle_source_pool.clone();
-        async move {
-            let permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("qualification semaphore remains open");
-            let result = prefetch_layer_batch(
-                engine,
-                layer_index,
-                ids,
-                mode,
-                current_route_global_ids,
-                oracle_source_pool,
-                counters,
-                readiness,
-            )
-            .await;
-            drop(permit);
-            result
-        }
-    }))
-    .buffer_unordered(concurrency)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut outcome = PrefetchOutcome {
-        target_position,
-        ..PrefetchOutcome::default()
+    let direct_read_batches_before = if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        counters.lock().source_prefetch_read_batches_with_work
+    } else {
+        0
     };
-    for batch in batches {
-        if outcome.fatal_error.is_none() {
-            outcome.fatal_error = batch.fatal_error;
+    let mut outcome = match mode {
+        OracleScheduledResidencyMode::SourceOnly => {
+            // Preserve the v2 SourceOnly scheduling behavior. Its storage
+            // futures do not use the qualification direct-read path.
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let batches = stream::iter(routes.into_iter().enumerate().map(|(layer_index, ids)| {
+                let engine = engine.clone();
+                let counters = counters.clone();
+                let readiness = readiness.clone();
+                let semaphore = semaphore.clone();
+                let current_route_global_ids = current_route_global_ids.clone();
+                let oracle_source_pool = oracle_source_pool.clone();
+                async move {
+                    let permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("qualification semaphore remains open");
+                    let result = prefetch_layer_batch(
+                        engine,
+                        layer_index,
+                        ids,
+                        mode,
+                        current_route_global_ids,
+                        oracle_source_pool,
+                        counters,
+                        readiness,
+                    )
+                    .await;
+                    drop(permit);
+                    result
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+            let mut outcome = PrefetchOutcome {
+                target_position,
+                ..PrefetchOutcome::default()
+            };
+            for batch in batches {
+                merge_prefetch_outcome(&mut outcome, batch);
+            }
+            outcome
         }
-        outcome.failed_ids.extend(batch.failed_ids);
-        outcome.successful_ids.extend(batch.successful_ids);
-        outcome
-            .deferred_overlap_ids
-            .extend(batch.deferred_overlap_ids);
-        outcome.residents.extend(batch.residents);
+        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+            let task_engine = engine.clone();
+            let task_counters = counters.clone();
+            let task_readiness = readiness.clone();
+            let task_current_route_global_ids = current_route_global_ids.clone();
+            let task_oracle_source_pool = oracle_source_pool.clone();
+            let task_factory = move |(layer_index, ids)| {
+                let engine = task_engine.clone();
+                let counters = task_counters.clone();
+                let readiness = task_readiness.clone();
+                let current_route_global_ids = task_current_route_global_ids.clone();
+                let oracle_source_pool = task_oracle_source_pool.clone();
+                async move {
+                    prefetch_layer_batch(
+                        engine,
+                        layer_index,
+                        ids,
+                        OracleScheduledResidencyMode::TokenBoundaryDirect,
+                        current_route_global_ids,
+                        oracle_source_pool,
+                        counters,
+                        readiness,
+                    )
+                    .await
+                }
+            };
+            match run_bounded_layer_tasks(
+                routes.into_iter().enumerate(),
+                concurrency,
+                task_factory,
+                PrefetchOutcome {
+                    target_position,
+                    ..PrefetchOutcome::default()
+                },
+                merge_prefetch_outcome,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => PrefetchOutcome {
+                    target_position,
+                    fatal_error: Some(error),
+                    ..PrefetchOutcome::default()
+                },
+            }
+        }
+    };
+    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        let mut values = counters.lock();
+        if values
+            .source_prefetch_read_batches_with_work
+            .saturating_sub(direct_read_batches_before)
+            > 1
+        {
+            values.source_prefetch_positions_with_multiple_read_batches += 1;
+        }
     }
     let slots = outcome.residents.len() as u64;
     let bytes = slots.saturating_mul(expert_bytes as u64);
@@ -2245,6 +2425,8 @@ struct PhysicalSlotPlanEvidence {
 struct TreatmentContract {
     source_overlap: bool,
     late_source_policy: LateSourcePolicy,
+    independent_layer_source_tasks: bool,
+    per_layer_storage_batch_read_used: bool,
     host_preparation_overlap: bool,
     token_boundary_h2d: bool,
     demand_fallback: bool,
@@ -2275,6 +2457,11 @@ const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentCont
     TreatmentContract {
         source_overlap: true,
         late_source_policy: late_source_policy(mode),
+        independent_layer_source_tasks: matches!(
+            mode,
+            OracleScheduledResidencyMode::TokenBoundaryDirect
+        ),
+        per_layer_storage_batch_read_used: false,
         host_preparation_overlap: false,
         token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect),
         demand_fallback: true,
@@ -2324,6 +2511,19 @@ struct PredecessorFirstAttemptEvidence {
     acquired: usize,
     interpretation: &'static str,
     first_attempt_rerun: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct PredecessorSecondAttemptEvidence {
+    code_sha: &'static str,
+    result: &'static str,
+    report_sha256: &'static str,
+    runner_sha256: &'static str,
+    configured_source_concurrency: usize,
+    observed_source_prefetch_peak_inflight: u64,
+    decode_tps: f64,
+    ordinary_residency_misses: u64,
+    second_attempt_rerun: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -2424,6 +2624,7 @@ struct OracleScheduledResidencyReport {
     frozen_controls: FrozenControlReferences,
     frozen_workload: FrozenWorkloadEvidence,
     predecessor_first_attempt: PredecessorFirstAttemptEvidence,
+    predecessor_second_attempt: PredecessorSecondAttemptEvidence,
     source_memory_planes: SourceMemoryPlaneEvidence,
     warmup: OracleRunResult,
     measured: Vec<OracleRunResult>,
@@ -2467,6 +2668,13 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
     total.source_prefetch_peak_inflight = total
         .source_prefetch_peak_inflight
         .max(value.source_prefetch_peak_inflight);
+    add!(source_prefetch_read_batches_with_work);
+    add!(source_prefetch_positions_with_multiple_read_batches);
+    total.source_prefetch_reads_current_inflight = value.source_prefetch_reads_current_inflight;
+    total.source_prefetch_reads_peak_inflight = total
+        .source_prefetch_reads_peak_inflight
+        .max(value.source_prefetch_reads_peak_inflight);
+    add!(source_prefetch_read_inflight_accounting_errors);
     add!(source_ready_before_boundary);
     add!(source_late_at_boundary);
     add!(source_end_of_trace);
@@ -2508,12 +2716,75 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
     add!(background_tasks_drained);
 }
 
+fn validate_source_concurrency_mechanism(
+    counters: &OracleCounters,
+    mode: OracleScheduledResidencyMode,
+    concurrency: usize,
+) -> Result<(), BenchmarkFailure> {
+    if mode == OracleScheduledResidencyMode::SourceOnly {
+        if counters.source_prefetch_read_batches_with_work != 0
+            || counters.source_prefetch_positions_with_multiple_read_batches != 0
+            || counters.source_prefetch_reads_current_inflight != 0
+            || counters.source_prefetch_reads_peak_inflight != 0
+            || counters.source_prefetch_read_inflight_accounting_errors != 0
+        {
+            return Err(BenchmarkFailure::new(
+                "postcondition",
+                "source-only-direct-read-accounting",
+                "SourceOnly recorded TokenBoundaryDirect future-read concurrency evidence",
+            ));
+        }
+        return Ok(());
+    }
+
+    if counters.source_prefetch_batches_started != counters.source_prefetch_batches_completed
+        || counters.source_prefetch_read_batches_with_work
+            > counters.source_prefetch_batches_started
+        || (counters.source_prefetch_positions_with_multiple_read_batches != 0
+            && counters.source_prefetch_read_batches_with_work < 2)
+        || counters.source_prefetch_peak_inflight > concurrency as u64
+        || counters.source_prefetch_reads_peak_inflight > concurrency as u64
+        || counters.source_prefetch_reads_current_inflight != 0
+        || counters.source_prefetch_read_inflight_accounting_errors != 0
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "oracle-direct-source-concurrency-accounting",
+            format!(
+                "direct source task/read concurrency did not reconcile at configured concurrency {concurrency}: {counters:?}"
+            ),
+        ));
+    }
+
+    let enough_independent_read_work =
+        counters.source_prefetch_positions_with_multiple_read_batches > 0;
+    if concurrency > 1
+        && enough_independent_read_work
+        && (counters.source_prefetch_peak_inflight <= 1
+            || counters.source_prefetch_reads_peak_inflight <= 1)
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "oracle-direct-source-concurrency-not-observed",
+            format!(
+                "configured direct source concurrency {concurrency} had {} layer batches with direct-read work across {} positions with multiple read-bearing batches, but observed layer/read peaks {}/{}",
+                counters.source_prefetch_read_batches_with_work,
+                counters.source_prefetch_positions_with_multiple_read_batches,
+                counters.source_prefetch_peak_inflight,
+                counters.source_prefetch_reads_peak_inflight,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_oracle_counters(
     counters: &OracleCounters,
     mode: OracleScheduledResidencyMode,
     concurrency: usize,
     expert_bytes: usize,
 ) -> Result<(), BenchmarkFailure> {
+    validate_source_concurrency_mechanism(counters, mode, concurrency)?;
     let classified_source = counters
         .source_skipped_physical_current
         .saturating_add(counters.source_prefetch_ram_hits)
@@ -3286,6 +3557,17 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             interpretation: "future source retained production-primary buffers across foreground demand",
             first_attempt_rerun: false,
         },
+        predecessor_second_attempt: PredecessorSecondAttemptEvidence {
+            code_sha: PREDECESSOR_SECOND_ATTEMPT_CODE_SHA,
+            result: "PASS",
+            report_sha256: PREDECESSOR_SECOND_ATTEMPT_REPORT_SHA256,
+            runner_sha256: PREDECESSOR_SECOND_ATTEMPT_RUNNER_SHA256,
+            configured_source_concurrency: 4,
+            observed_source_prefetch_peak_inflight: 1,
+            decode_tps: 0.8912406378809807,
+            ordinary_residency_misses: 132,
+            second_attempt_rerun: false,
+        },
         source_memory_planes,
         correctness: CorrectnessEvidence {
             warmup_matches_measured: all_measured_outputs_identical,
@@ -3322,7 +3604,7 @@ mod tests {
     use super::*;
     use crate::io_provider::{NvmeStorage, StorageConfig};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct TempSourceDir {
@@ -3399,6 +3681,18 @@ mod tests {
             source_prefetch_peak_inflight: 4,
             oracle_ready_at_demand: EXPECTED_SELECTED_IDS as u64,
             source_end_of_trace: 1,
+            ..OracleCounters::default()
+        }
+    }
+
+    fn valid_direct_source_mechanism_counters() -> OracleCounters {
+        OracleCounters {
+            source_prefetch_batches_started: 2,
+            source_prefetch_batches_completed: 2,
+            source_prefetch_peak_inflight: 2,
+            source_prefetch_read_batches_with_work: 2,
+            source_prefetch_positions_with_multiple_read_batches: 1,
+            source_prefetch_reads_peak_inflight: 2,
             ..OracleCounters::default()
         }
     }
@@ -3497,6 +3791,8 @@ mod tests {
     #[test]
     fn source_only_contract_never_mutates_physical_residency() {
         let contract = treatment_contract(OracleScheduledResidencyMode::SourceOnly);
+        assert!(!contract.independent_layer_source_tasks);
+        assert!(!contract.per_layer_storage_batch_read_used);
         assert!(!contract.token_boundary_h2d);
         assert!(!contract.production_direct_staging_used);
         assert!(!contract.h2d_compute_overlap_claimed);
@@ -3522,9 +3818,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_schema_and_predecessor_failure_contract_are_frozen() {
-        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v2");
-        let predecessor = PredecessorFirstAttemptEvidence {
+    fn v3_schema_and_predecessor_attempt_contracts_are_frozen() {
+        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v3");
+        let first = PredecessorFirstAttemptEvidence {
             code_sha: PREDECESSOR_FIRST_ATTEMPT_CODE_SHA,
             result: "FAIL",
             failure: "ProductionBatchPoolUnavailableAfterReservation",
@@ -3534,16 +3830,44 @@ mod tests {
                 "future source retained production-primary buffers across foreground demand",
             first_attempt_rerun: false,
         };
-        let value = serde_json::to_value(predecessor).unwrap();
-        assert_eq!(value["code_sha"], PREDECESSOR_FIRST_ATTEMPT_CODE_SHA);
-        assert_eq!(value["result"], "FAIL");
-        assert_eq!(value["requested"], 8);
-        assert_eq!(value["acquired"], 1);
-        assert_eq!(value["first_attempt_rerun"], false);
+        let first = serde_json::to_value(first).unwrap();
+        assert_eq!(first["code_sha"], PREDECESSOR_FIRST_ATTEMPT_CODE_SHA);
+        assert_eq!(first["result"], "FAIL");
+        assert_eq!(first["requested"], 8);
+        assert_eq!(first["acquired"], 1);
+        assert_eq!(first["first_attempt_rerun"], false);
+
+        let second = serde_json::to_value(PredecessorSecondAttemptEvidence {
+            code_sha: PREDECESSOR_SECOND_ATTEMPT_CODE_SHA,
+            result: "PASS",
+            report_sha256: PREDECESSOR_SECOND_ATTEMPT_REPORT_SHA256,
+            runner_sha256: PREDECESSOR_SECOND_ATTEMPT_RUNNER_SHA256,
+            configured_source_concurrency: 4,
+            observed_source_prefetch_peak_inflight: 1,
+            decode_tps: 0.8912406378809807,
+            ordinary_residency_misses: 132,
+            second_attempt_rerun: false,
+        })
+        .unwrap();
+        assert_eq!(second["code_sha"], PREDECESSOR_SECOND_ATTEMPT_CODE_SHA);
+        assert_eq!(second["result"], "PASS");
+        assert_eq!(
+            second["report_sha256"],
+            PREDECESSOR_SECOND_ATTEMPT_REPORT_SHA256
+        );
+        assert_eq!(
+            second["runner_sha256"],
+            PREDECESSOR_SECOND_ATTEMPT_RUNNER_SHA256
+        );
+        assert_eq!(second["configured_source_concurrency"], 4);
+        assert_eq!(second["observed_source_prefetch_peak_inflight"], 1);
+        assert_eq!(second["decode_tps"], 0.8912406378809807);
+        assert_eq!(second["ordinary_residency_misses"], 132);
+        assert_eq!(second["second_attempt_rerun"], false);
     }
 
     #[test]
-    fn v2_memory_report_distinguishes_production_and_oracle_planes() {
+    fn v3_memory_report_distinguishes_production_and_oracle_planes() {
         let evidence_for = |mode| {
             let isolated = uses_isolated_oracle_source_pool(mode);
             SourceMemoryPlaneEvidence {
@@ -3819,30 +4143,106 @@ mod tests {
         assert_eq!(oracle_pool.current_in_use_slots(), 0);
     }
 
-    #[tokio::test]
-    async fn source_layer_tasks_obey_bounded_concurrency() {
-        let concurrency = 3usize;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_layer_task_helper_overlaps_bounds_joins_and_releases_leases() {
+        let concurrency = 4usize;
         let counters = Arc::new(Mutex::new(OracleCounters::default()));
-        let mut tasks = Vec::new();
-        for _ in 0..12 {
-            let semaphore = semaphore.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+        let pool = Arc::new(OracleFutureSourcePool::new(concurrency, 4096, 4096));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let task_factory = {
             let counters = counters.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = semaphore.acquire_owned().await.unwrap();
-                let _guard = LayerBatchGuard::enter(counters);
-                for _ in 0..4 {
-                    tokio::task::yield_now().await;
+            let barrier = barrier.clone();
+            let pool = pool.clone();
+            let completed = completed.clone();
+            move |target_position| {
+                let counters = counters.clone();
+                let barrier = barrier.clone();
+                let pool = pool.clone();
+                let completed = completed.clone();
+                async move {
+                    let _guard = LayerBatchGuard::enter(counters);
+                    let lease = pool.try_acquire().unwrap();
+                    barrier.wait().await;
+                    drop(lease);
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    PrefetchOutcome {
+                        target_position,
+                        ..PrefetchOutcome::default()
+                    }
                 }
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
+            }
+        };
+        let outcomes = run_bounded_layer_tasks(
+            0..8,
+            concurrency,
+            task_factory,
+            Vec::new(),
+            |outcomes, outcome| outcomes.push(outcome),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 8);
+        assert_eq!(completed.load(Ordering::Relaxed), 8);
         let values = counters.lock();
-        assert_eq!(values.source_prefetch_batches_started, 12);
-        assert_eq!(values.source_prefetch_batches_completed, 12);
+        assert_eq!(values.source_prefetch_batches_started, 8);
+        assert_eq!(values.source_prefetch_batches_completed, 8);
+        assert!(values.source_prefetch_peak_inflight > 1);
         assert!(values.source_prefetch_peak_inflight <= concurrency as u64);
+        drop(values);
+        assert_eq!(pool.current_in_use_slots(), 0);
+        assert_eq!(pool.snapshot().exhaustion_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_layer_task_helper_propagates_failure_and_drains_owned_tasks() {
+        let concurrency = 4usize;
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+        let pool = Arc::new(OracleFutureSourcePool::new(concurrency, 4096, 4096));
+        let task_factory = {
+            let counters = counters.clone();
+            let barrier = barrier.clone();
+            let pool = pool.clone();
+            move |layer_index| {
+                let counters = counters.clone();
+                let barrier = barrier.clone();
+                let pool = pool.clone();
+                async move {
+                    let _guard = LayerBatchGuard::enter(counters);
+                    let lease = pool.try_acquire().unwrap();
+                    barrier.wait().await;
+                    if layer_index == 0 {
+                        panic!("deterministic qualification child failure");
+                    }
+                    drop(lease);
+                    PrefetchOutcome::default()
+                }
+            }
+        };
+        let error = run_bounded_layer_tasks(
+            0..8,
+            concurrency,
+            task_factory,
+            Vec::new(),
+            |outcomes, outcome| outcomes.push(outcome),
+        )
+        .await
+        .err()
+        .expect("child panic must fail the scheduling helper");
+
+        assert!(error.contains("independent layer source task failed"));
+        let values = counters.lock();
+        assert_eq!(
+            values.source_prefetch_batches_started,
+            values.source_prefetch_batches_completed
+        );
+        assert!(values.source_prefetch_peak_inflight > 1);
+        assert!(values.source_prefetch_peak_inflight <= concurrency as u64);
+        drop(values);
+        assert_eq!(pool.current_in_use_slots(), 0);
+        assert_eq!(pool.snapshot().exhaustion_count, 0);
     }
 
     #[tokio::test]
@@ -3858,6 +4258,8 @@ mod tests {
     fn treatment_contract_records_distinct_late_source_policies() {
         let source_only = treatment_contract(OracleScheduledResidencyMode::SourceOnly);
         let direct = treatment_contract(OracleScheduledResidencyMode::TokenBoundaryDirect);
+        assert!(!source_only.independent_layer_source_tasks);
+        assert!(!source_only.per_layer_storage_batch_read_used);
         assert_eq!(
             source_only.late_source_policy,
             LateSourcePolicy::NonblockingDemandFallback
@@ -3882,6 +4284,8 @@ mod tests {
             oracle_source_pool_configured_max_slots(OracleScheduledResidencyMode::SourceOnly),
             0
         );
+        assert!(direct.independent_layer_source_tasks);
+        assert!(!direct.per_layer_storage_batch_read_used);
         assert!(!direct.production_predictor_used);
         assert!(!direct.production_speculative_residency_used);
         assert!(direct.future_source_pool_isolated_from_production_primary);
@@ -4346,6 +4750,123 @@ mod tests {
     }
 
     #[test]
+    fn direct_source_concurrency_mechanism_gates_are_fail_closed() {
+        let valid = valid_direct_source_mechanism_counters();
+        assert!(validate_source_concurrency_mechanism(
+            &valid,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_ok());
+
+        let mut layer_peak_one = valid.clone();
+        layer_peak_one.source_prefetch_peak_inflight = 1;
+        assert!(validate_source_concurrency_mechanism(
+            &layer_peak_one,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        let mut read_peak_one = valid.clone();
+        read_peak_one.source_prefetch_reads_peak_inflight = 1;
+        assert!(validate_source_concurrency_mechanism(
+            &read_peak_one,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        for peak in 2..=4 {
+            let mut observed = valid.clone();
+            observed.source_prefetch_peak_inflight = peak;
+            observed.source_prefetch_reads_peak_inflight = peak;
+            assert!(validate_source_concurrency_mechanism(
+                &observed,
+                OracleScheduledResidencyMode::TokenBoundaryDirect,
+                4,
+            )
+            .is_ok());
+        }
+
+        let mut layer_over_bound = valid.clone();
+        layer_over_bound.source_prefetch_peak_inflight = 5;
+        assert!(validate_source_concurrency_mechanism(
+            &layer_over_bound,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        let mut read_over_bound = valid.clone();
+        read_over_bound.source_prefetch_reads_peak_inflight = 5;
+        assert!(validate_source_concurrency_mechanism(
+            &read_over_bound,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        let mut current_nonzero = valid.clone();
+        current_nonzero.source_prefetch_reads_current_inflight = 1;
+        assert!(validate_source_concurrency_mechanism(
+            &current_nonzero,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        let mut accounting_error = valid.clone();
+        accounting_error.source_prefetch_read_inflight_accounting_errors = 1;
+        assert!(validate_source_concurrency_mechanism(
+            &accounting_error,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+
+        let mut incomplete_batch = valid;
+        incomplete_batch.source_prefetch_batches_completed = 1;
+        assert!(validate_source_concurrency_mechanism(
+            &incomplete_batch,
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            4,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_only_does_not_require_direct_read_concurrency() {
+        let counters = OracleCounters {
+            source_prefetch_batches_started: 1,
+            source_prefetch_batches_completed: 1,
+            source_prefetch_peak_inflight: 1,
+            ..OracleCounters::default()
+        };
+        assert!(validate_source_concurrency_mechanism(
+            &counters,
+            OracleScheduledResidencyMode::SourceOnly,
+            4,
+        )
+        .is_ok());
+        assert!(
+            !treatment_contract(OracleScheduledResidencyMode::SourceOnly)
+                .independent_layer_source_tasks
+        );
+    }
+
+    #[test]
+    fn direct_future_read_guard_records_underflow_as_an_accounting_error() {
+        let counters = Arc::new(Mutex::new(OracleCounters::default()));
+        let guard = DirectFutureReadGuard::enter(counters.clone());
+        counters.lock().source_prefetch_reads_current_inflight = 0;
+        drop(guard);
+        let counters = counters.lock();
+        assert_eq!(counters.source_prefetch_reads_current_inflight, 0);
+        assert_eq!(counters.source_prefetch_read_inflight_accounting_errors, 1);
+    }
+
+    #[test]
     fn source_only_counter_validation_rejects_physical_mutation() {
         let mut counters = valid_source_only_counters();
         counters.boundary_replacement_sets_started = 1;
@@ -4362,6 +4883,8 @@ mod tests {
     #[test]
     fn serialized_h2d_contract_uses_one_ordered_queue_without_flush_submit() {
         let contract = treatment_contract(OracleScheduledResidencyMode::TokenBoundaryDirect);
+        assert!(contract.independent_layer_source_tasks);
+        assert!(!contract.per_layer_storage_batch_read_used);
         assert!(contract.token_boundary_h2d);
         assert!(contract.same_ordered_queue);
         assert!(contract.production_direct_staging_used);
