@@ -2274,6 +2274,26 @@ pub(crate) struct GpuNativePhysicalInstallEvidence {
     pub(crate) individual_physical_stage_us: u64,
 }
 
+impl GpuNativePhysicalInstallEvidence {
+    fn direct_stage<const NO_ZERO_FILL: bool>(
+        geometry: GpuNativeQ4ExpertGeometry,
+        prepare_us: u64,
+        queue_staging_us: u64,
+    ) -> Self {
+        let upload_bytes = geometry.slot_stride_bytes as u64;
+        Self {
+            direct_staging_writes: 1,
+            physical_slot_bytes_staged: upload_bytes,
+            physical_slot_zero_fill_bytes: if NO_ZERO_FILL { 0 } else { upload_bytes },
+            physical_slot_epoch_write_bytes: GPU_NATIVE_EXPERT_SLOT_EPOCH_BYTES as u64,
+            physical_slot_payload_copy_bytes: geometry.logical_expert_bytes as u64,
+            physical_slot_prepare_us: prepare_us,
+            physical_queue_staging_us: queue_staging_us,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum GpuNativePhysicalSlotFillPolicy {
@@ -2292,8 +2312,8 @@ pub(crate) struct GpuNativeQ4ExpertPreparedInstall<'a, B = wgpu::Buffer> {
 }
 
 /// Compact cumulative telemetry for the ordinary production demand-install
-/// implementation. Setup uploads, the explicit qualifier control, and the
-/// unchanged speculative Vec path do not contribute to these counters.
+/// implementation and the concurrent full-zero control. Setup uploads, the
+/// legacy/sequential controls, and speculation do not contribute to these counters.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct GpuNativeProductionPhysicalInstallSnapshot {
     pub(crate) physical_install_sets: u64,
@@ -2652,7 +2672,7 @@ fn physical_q4_expert_slot(
 }
 
 /// The single checked physical-slot byte-layout contract shared by setup,
-/// legacy Vec staging, and ordinary production direct WGPU staging.
+/// legacy Vec staging, and the explicit full-zero direct-staging control.
 fn fill_physical_q4_expert_slot(
     geometry: GpuNativeQ4ExpertGeometry,
     logical_id: u32,
@@ -2710,10 +2730,10 @@ impl<'a> CheckedPhysicalQ4ExpertSlot<'a> {
         Ok(())
     }
 
-    /// ORACLE qualification only. The ordinary full-zero fill above is kept
-    /// unchanged. Reuse its validated payload/epoch and require complete
-    /// destination coverage before writing even the first epoch byte.
-    fn fill_qualification_no_zero_fill(
+    /// Shared production/qualification complete overwrite. Reuse the validated
+    /// payload/epoch and require complete destination coverage before writing
+    /// even the first epoch byte. Future padded slots must use full-zero fill.
+    fn fill_complete_overwrite_no_zero(
         self,
         destination: &mut [u8],
     ) -> Result<(), GpuNativeBootstrapError> {
@@ -7600,11 +7620,27 @@ impl GpuNativeExecutorContext {
         permit: GpuNativeQ4ExpertInstallPermit<'a>,
         payload: &[u8],
     ) -> Result<GpuNativeQ4ExpertPreparedInstall<'a>, GpuNativeBootstrapError> {
-        self.stage_q4_expert_residency_inner::<false, true, false>(permit, payload)
+        self.stage_q4_expert_residency_inner::<false, true, true>(permit, payload)
             .map(|(prepared, _)| prepared)
     }
 
     pub(crate) fn stage_q4_expert_residency_production_observed<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        self.stage_q4_expert_residency_inner::<true, true, true>(permit, payload)
+    }
+
+    /// Concurrent full-zero qualification control. It shares production's
+    /// staging transaction, counters, and ordered commit; only host fill differs.
+    pub(crate) fn stage_q4_expert_residency_full_zero_control_observed<'a>(
         &self,
         permit: GpuNativeQ4ExpertInstallPermit<'a>,
         payload: &[u8],
@@ -7649,8 +7685,8 @@ impl GpuNativeExecutorContext {
         self.stage_q4_expert_residency_inner::<true, true, true>(permit, payload)
     }
 
-    /// `MEASURE=false` removes subphase timers from normal serving. Only the
-    /// explicit ORACLE qualification wrapper selects `NO_ZERO_FILL=true`.
+    /// `MEASURE=false` removes subphase timers from normal serving. Both
+    /// production and historical ORACLE treatment use `NO_ZERO_FILL=true`.
     fn stage_q4_expert_residency_inner<
         'a,
         const MEASURE: bool,
@@ -7699,7 +7735,7 @@ impl GpuNativeExecutorContext {
             }
             let fill_started = MEASURE.then(Instant::now);
             if NO_ZERO_FILL {
-                checked.fill_qualification_no_zero_fill(view.as_mut())?;
+                checked.fill_complete_overwrite_no_zero(view.as_mut())?;
             } else {
                 checked.fill(view.as_mut())?;
             }
@@ -7720,19 +7756,11 @@ impl GpuNativeExecutorContext {
                 }
                 Ok((
                     prepared,
-                    GpuNativePhysicalInstallEvidence {
-                        full_slot_vec_materializations: 0,
-                        direct_staging_writes: 1,
-                        physical_slot_bytes_staged: upload_bytes,
-                        physical_slot_zero_fill_bytes: if NO_ZERO_FILL { 0 } else { upload_bytes },
-                        physical_slot_epoch_write_bytes: GPU_NATIVE_EXPERT_SLOT_EPOCH_BYTES as u64,
-                        physical_slot_payload_copy_bytes: arena.geometry.logical_expert_bytes
-                            as u64,
-                        physical_slot_prepare_us: prepare_us.get(),
-                        physical_queue_staging_us: queue_staging_us.get(),
-                        mapping_publication_us: 0,
-                        individual_physical_stage_us: 0,
-                    },
+                    GpuNativePhysicalInstallEvidence::direct_stage::<NO_ZERO_FILL>(
+                        arena.geometry,
+                        prepare_us.get(),
+                        queue_staging_us.get(),
+                    ),
                 ))
             }
             Err(error) => {
@@ -11296,6 +11324,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn production_no_zero_and_full_zero_control_evidence_preserve_staged_bytes() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let production = GpuNativePhysicalInstallEvidence::direct_stage::<true>(geometry, 7, 11);
+        let control = GpuNativePhysicalInstallEvidence::direct_stage::<false>(geometry, 7, 11);
+        assert_eq!(production.physical_slot_zero_fill_bytes, 0);
+        assert_eq!(control.physical_slot_zero_fill_bytes, 2_654_212);
+        for evidence in [production, control] {
+            assert_eq!(evidence.direct_staging_writes, 1);
+            assert_eq!(evidence.full_slot_vec_materializations, 0);
+            assert_eq!(evidence.physical_slot_epoch_write_bytes, 4);
+            assert_eq!(evidence.physical_slot_payload_copy_bytes, 2_654_208);
+            assert_eq!(evidence.physical_slot_bytes_staged, 2_654_212);
+        }
+        assert_eq!(
+            production,
+            GpuNativePhysicalInstallEvidence {
+                physical_slot_zero_fill_bytes: 0,
+                ..control
+            }
+        );
+    }
+
+    #[test]
     fn qualification_no_zero_fill_frozen_geometry_overwrites_every_sentinel_byte() {
         let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
         assert_eq!(geometry.payload_offset_bytes(), 4);
@@ -11318,7 +11369,7 @@ pub(crate) mod tests {
             let mut treatment = vec![0xa5; geometry.slot_stride_bytes()];
             CheckedPhysicalQ4ExpertSlot::new(geometry, 7, epoch, &payload)
                 .unwrap()
-                .fill_qualification_no_zero_fill(&mut treatment)
+                .fill_complete_overwrite_no_zero(&mut treatment)
                 .unwrap();
             assert_eq!(treatment.len(), payload_end);
             assert_eq!(&treatment[..4], &epoch.to_le_bytes());
@@ -11339,7 +11390,7 @@ pub(crate) mod tests {
             let mut destination = vec![0xa5; destination_bytes];
             let checked = CheckedPhysicalQ4ExpertSlot::new(geometry, 7, 1, &payload).unwrap();
             assert!(matches!(
-                checked.fill_qualification_no_zero_fill(&mut destination),
+                checked.fill_complete_overwrite_no_zero(&mut destination),
                 Err(GpuNativeBootstrapError::ExpertPhysicalSlotDestinationLength { .. })
             ));
             assert!(destination.iter().all(|&byte| byte == 0xa5));
@@ -11353,7 +11404,7 @@ pub(crate) mod tests {
         let mut destination = vec![0xa5; padded.slot_stride_bytes()];
         let checked = CheckedPhysicalQ4ExpertSlot::new(padded, 7, 1, &payload).unwrap();
         assert!(matches!(
-            checked.fill_qualification_no_zero_fill(&mut destination),
+            checked.fill_complete_overwrite_no_zero(&mut destination),
             Err(GpuNativeBootstrapError::ExpertPhysicalSlotDestinationLength { .. })
         ));
         assert!(destination.iter().all(|&byte| byte == 0xa5));
@@ -11388,7 +11439,7 @@ pub(crate) mod tests {
                                         vec![0xa5; arena.geometry().slot_stride_bytes()];
                                     if no_zero_fill {
                                         checked
-                                            .fill_qualification_no_zero_fill(&mut destination)?;
+                                            .fill_complete_overwrite_no_zero(&mut destination)?;
                                     } else {
                                         checked.fill(&mut destination)?;
                                     }

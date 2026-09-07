@@ -1022,6 +1022,18 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Production zero-fill qualification: concurrent full-zero control versus
+    /// ordinary production concurrent complete overwrite with no explicit zero.
+    #[command(name = "qualify-gpu-native-physical-zero-fill-production")]
+    QualifyGpuNativePhysicalZeroFillProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
     /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
     QualifyHybridQ4 {
@@ -1979,6 +1991,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativeOutOfCore { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
+        | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2525,6 +2538,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(
                 crate::gpu_native_physical_install_staging::run_concurrency_command(
+                    crate::gpu_native_physical_install_staging::CommandArgs {
+                        config,
+                        expected_adapter_name,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
+        }
+        Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_physical_install_staging::zero_fill_production::run_command(
                     crate::gpu_native_physical_install_staging::CommandArgs {
                         config,
                         expected_adapter_name,
@@ -16598,6 +16630,46 @@ mod tests {
                 );
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(report_out, &PathBuf::from("pr2bb-report.json"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new(
+                "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+            ))
+        );
+    }
+
+    #[test]
+    fn gpu_native_physical_zero_fill_production_cli_parses_qualified_command() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-physical-zero-fill-production",
+            "--config",
+            "/home/randyap8/slice11-qwen3-coder-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "physical-zero-fill-production-report.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+                config,
+                expected_adapter_name,
+                report_out,
+            } => {
+                assert_eq!(
+                    config,
+                    &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
+                );
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(
+                    report_out,
+                    &PathBuf::from("physical-zero-fill-production-report.json")
+                );
             }
             _ => panic!("unexpected command variant"),
         }

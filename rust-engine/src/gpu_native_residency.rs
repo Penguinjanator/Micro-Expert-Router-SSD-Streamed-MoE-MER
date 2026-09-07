@@ -362,7 +362,8 @@ pub(crate) enum GpuNativeResidencyPriority {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DemandPhysicalInstallPath {
-    ProductionConcurrentDirectStaging,
+    ProductionConcurrentDirectStaging, // Complete overwrite, no explicit zero fill.
+    QualificationConcurrentDirectStagingFullZero,
     QualificationConcurrentDirectStagingNoZeroFill,
     SequentialDirectStagingControl,
     LegacyFullSlotVecControl,
@@ -377,7 +378,7 @@ const fn oracle_safe_boundary_install_path(
 ) -> DemandPhysicalInstallPath {
     match fill_policy {
         GpuNativePhysicalSlotFillPolicy::FullSlotZero => {
-            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
         }
         GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill => {
             DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
@@ -829,11 +830,29 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
+    /// Same concurrent reserve/stage/commit transaction as production, with
+    /// explicit full-slot zero writes for the zero-fill production qualifier.
+    pub(crate) fn ensure_demand_set_full_zero_control_observed(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        self.ensure_demand_set_inner::<true>(
+            priority,
+            layer_index,
+            demands,
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero,
+            Some(observer),
+        )
+    }
+
     /// ORACLE-0B-S qualification-only destructive replacement. The caller
     /// must present the non-cloneable witness minted by the token loop after
     /// the previous token's successful boundary readback. Physical staging is
-    /// the ordinary production concurrent direct-staging path for full-zero
-    /// control, or the same transaction with qualification no-zero fill.
+    /// the shared concurrent direct-staging transaction with an explicit
+    /// full-zero control or historical qualification no-zero fill.
     /// The demand-request counter is kept separate. The resulting queue writes
     /// are deliberately left pending: next-token mapping writes follow them,
     /// then the next token's one normal command-buffer submit orders both sets
@@ -975,10 +994,11 @@ impl GpuNativeTieredResidencyManager {
         if matches!(
             install_path,
             DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
                 | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
         ) {
             if install_path
-                == DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
+                == DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
             {
                 self.install_parallel_physical_misses_locked::<true, true>(
                     demands,
@@ -1050,7 +1070,7 @@ impl GpuNativeTieredResidencyManager {
     fn install_parallel_physical_misses_locked<
         'a,
         const OBSERVE: bool,
-        const NO_ZERO_FILL: bool,
+        const FULL_ZERO_CONTROL: bool,
     >(
         &self,
         demands: &[GpuNativeDemandExpert],
@@ -1232,9 +1252,9 @@ impl GpuNativeTieredResidencyManager {
                     .record_physical_stage_started();
             }
             let stage_started = OBSERVE.then(Instant::now);
-            let result = if NO_ZERO_FILL {
+            let result = if FULL_ZERO_CONTROL {
                 self.executor
-                    .stage_q4_expert_residency_qualification_no_zero_fill(
+                    .stage_q4_expert_residency_full_zero_control_observed(
                         reserved.permit,
                         reserved.resident.data(),
                     )
@@ -1683,6 +1703,7 @@ impl GpuNativeTieredResidencyManager {
                             .executor
                             .install_q4_expert_residency_legacy_observed(permit, resident.data()),
                         DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
                         | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill => {
                             unreachable!("ordinary production installs use the split transaction")
                         }
@@ -1716,6 +1737,7 @@ impl GpuNativeTieredResidencyManager {
                             unreachable!("sequential control is qualifier-only")
                         }
                         DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
                         | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill => {
                             unreachable!("ordinary production installs use the split transaction")
                         }
@@ -1840,7 +1862,7 @@ mod tests {
         );
         assert_eq!(
             oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
-            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
         );
         assert_eq!(
             production_concurrency_control_path(),
@@ -1861,14 +1883,14 @@ mod tests {
     }
 
     #[test]
-    fn oracle_direct_staging_uses_the_production_direct_path() {
-        assert_eq!(
+    fn oracle_full_zero_control_is_explicit_and_concurrent() {
+        assert_ne!(
             oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
             ordinary_demand_install_path()
         );
         assert_eq!(
             oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
-            DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
         );
     }
 
@@ -1892,16 +1914,20 @@ mod tests {
         assert_ne!(treatment, ordinary_demand_install_path());
         assert_ne!(treatment, production_concurrency_control_path());
         assert_ne!(treatment, speculative_install_path());
-        // The production wrappers must keep the full-zero specialization;
-        // only the named qualification wrapper may specialize it to true.
+        // Production and historical treatment share checked no-zero staging;
+        // the concurrent control alone explicitly selects full zero fill.
         let backend = include_str!("backend/gpu_native.rs");
         for (wrapper, specialization) in [
             (
                 "stage_q4_expert_residency_production<'a>",
-                "::<false, true, false>",
+                "::<false, true, true>",
             ),
             (
                 "stage_q4_expert_residency_production_observed<'a>",
+                "::<true, true, true>",
+            ),
+            (
+                "stage_q4_expert_residency_full_zero_control_observed<'a>",
                 "::<true, true, false>",
             ),
             (
@@ -2132,7 +2158,7 @@ mod tests {
         assert_eq!(stage.matches("reserved.resident.data()").count(), 3);
         let production = stage.split("} else if OBSERVE {").nth(1).unwrap();
         assert_eq!(production.matches("reserved.resident.data()").count(), 2);
-        assert!(stage.contains("stage_q4_expert_residency_qualification_no_zero_fill("));
+        assert!(stage.contains("stage_q4_expert_residency_full_zero_control_observed("));
         assert!(stage.contains("stage_q4_expert_residency_production_observed("));
         assert!(stage.contains(".stage_q4_expert_residency_production("));
         assert!(!stage.contains("admission.resident()"));

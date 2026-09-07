@@ -2764,7 +2764,9 @@ const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentCont
         extra_flush_submit: false,
         production_predictor_used: false,
         production_speculative_residency_used: false,
-        production_direct_staging_used: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
+        // FullSlotZero now selects the explicit concurrent control; only the
+        // historical no-zero arm matches ordinary production's fill policy.
+        production_direct_staging_used: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill),
         legacy_full_slot_vec_used: false,
         future_source_pool_isolated_from_production_primary: uses_isolated_oracle_source_pool(mode),
         production_primary_pool_capacity_unchanged: true,
@@ -4267,7 +4269,7 @@ mod tests {
                 .unwrap()
                 .remove("production_direct_staging_used")
                 .unwrap(),
-            true
+            false
         );
         assert_eq!(
             treatment
@@ -4275,7 +4277,7 @@ mod tests {
                 .unwrap()
                 .remove("production_direct_staging_used")
                 .unwrap(),
-            false
+            true
         );
         assert_eq!(control, treatment);
         for mode in [logical_only_mode(), no_zero_fill_mode()] {
@@ -6015,7 +6017,7 @@ mod tests {
         assert!(!contract.per_layer_storage_batch_read_used);
         assert!(contract.token_boundary_h2d);
         assert!(contract.same_ordered_queue);
-        assert!(contract.production_direct_staging_used);
+        assert!(!contract.production_direct_staging_used);
         assert!(!contract.extra_flush_submit);
         assert!(!contract.h2d_compute_overlap_claimed);
     }
