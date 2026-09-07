@@ -1763,6 +1763,16 @@ fn oldest_unprotected<T>(cache: &LruCache<u32, T>, protected: &HashSet<u32>) -> 
 }
 
 #[cfg(test)]
+pub(crate) fn validate_qualification_physical_source_for_test(
+    gpu_cache: &GpuExpertCache,
+    global_id: u32,
+    resident: &Arc<ExpertResident>,
+    admission: &GpuAdmission,
+) -> Result<(), GpuNativeTieredResidencyError> {
+    validate_physical_install_source(gpu_cache, global_id, resident, admission)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
@@ -1963,6 +1973,85 @@ mod tests {
                 generation: admission.generation(),
             })
         );
+    }
+
+    #[test]
+    fn qualification_logical_only_physical_validation_uses_real_source_and_rejects_stale_or_wrong_ids(
+    ) {
+        let cache = GpuExpertCache::new(8, 0.0, 0);
+        let audit = Arc::new(AtomicU64::new(0));
+        let pool = BufferPool::new_qualification_oracle_future_source(2, 8, 4);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer
+            .as_mut_slice()
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let resident = Arc::new(ExpertResident::new(7, buffer));
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new_qualification_logical_only(
+                7,
+                resident.data().len(),
+                crate::inference::WeightDtype::Q4_0,
+                audit.clone(),
+            )))
+            .unwrap();
+        let admission = cache.current_admission(7).unwrap();
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Ok(())
+        );
+        let demand = GpuNativeDemandExpert::install(7, resident.clone(), admission.clone());
+        match &demand {
+            GpuNativeDemandExpert::Install {
+                resident: source,
+                admission: logical,
+                ..
+            } => {
+                assert!(Arc::ptr_eq(source, &resident));
+                assert_eq!(source.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(logical.generation(), admission.generation());
+            }
+            _ => panic!("install must carry the real source"),
+        }
+        let wrong = Arc::new(ExpertResident::new(8, pool.try_acquire().unwrap()));
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &wrong, &admission),
+            Err(GpuNativeTieredResidencyError::DemandSourceIdentityMismatch { global_id: 7 })
+        );
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![0; 8])))
+            .unwrap();
+        assert!(matches!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale { .. })
+        ));
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn qualification_logical_only_physical_stage_source_witness() {
+        // Both actual production stage calls consume the ExpertResident field
+        // of ReservedPhysicalInstall. Pin this narrow source-selection contract
+        // without changing the frozen engine/hash witnesses or requiring a GPU.
+        let source = include_str!("gpu_native_residency.rs");
+        let stage = source
+            .split("let stage_one = |reserved:")
+            .nth(1)
+            .unwrap()
+            .split("let parallel_stage_started =")
+            .next()
+            .unwrap();
+        assert_eq!(stage.matches("reserved.resident.data()").count(), 2);
+        assert!(stage.contains("stage_q4_expert_residency_production_observed("));
+        assert!(stage.contains(".stage_q4_expert_residency_production("));
+        assert!(!stage.contains("admission.resident()"));
+        let owners = source
+            .split("struct ReservedPhysicalInstall<'a> {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(owners.contains("resident: Arc<ExpertResident>"));
     }
 
     #[test]

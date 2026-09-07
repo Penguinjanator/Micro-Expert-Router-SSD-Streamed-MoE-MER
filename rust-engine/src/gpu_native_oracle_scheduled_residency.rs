@@ -9,11 +9,13 @@
 //! next token's commands on the same queue. This module never claims H2D
 //! overlap and never uses the production predictor/speculative path.
 
-use crate::backend::gpu_native::{GpuNativePhysicalInstallEvidence, GpuNativeQ4ExpertResidency};
+use crate::backend::gpu_native::{
+    GpuNativePhysicalInstallEvidence, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertResidency,
+};
 use crate::backend::GpuDeviceIdentity;
 use crate::buffer_pool::{BufferPool, BufferPoolOrigin};
 use crate::engine::{Engine, RoutedExpertExecutionSnapshot};
-use crate::expert_cache::{ExpertResident, GpuDemandSetAdmission, GpuResident};
+use crate::expert_cache::{ExpertResident, GpuDemandSetAdmission, GpuExpertCache, GpuResident};
 use crate::gpu_native_oracle_routes::{OracleGeometry, OracleRouteRecord, OracleRouteTrace};
 use crate::gpu_native_real_benchmark::{
     Aggregate, BenchmarkFailure, BenchmarkProvenance, PerRunResult, ProductionConfiguration,
@@ -41,8 +43,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v3";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v4";
 pub(crate) const MODE: &str = "qualify-gpu-native-oracle-scheduled-residency";
+const FROZEN_PAYLOAD_CONTROL_SHA: &str = "4eb143b34b00826e2031b313f3734bace18a7ecc";
+const FROZEN_PAYLOAD_CONTROL_TREE: &str = "37600e48e6dc3552f4a5b33e643351d4243280f5";
 const ORACLE_ROUTE_SCHEMA: &str = "mer.gpu-native-oracle-route-trace.v1";
 const ORACLE_ROUTE_COMMAND_SHA: &str = "3576cb893586f5dd3f5c5e7355658762db02b534";
 const EXPECTED_ORDERED_ROUTE_SHA256: &str =
@@ -81,6 +85,23 @@ const PREDECESSOR_SECOND_ATTEMPT_RUNNER_SHA256: &str =
 pub(crate) enum OracleScheduledResidencyMode {
     SourceOnly,
     TokenBoundaryDirect,
+    TokenBoundaryDirectLogicalOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum LogicalPayloadMode {
+    Materialized,
+    QualificationLogicalOnly,
+}
+
+const fn logical_payload_mode(mode: OracleScheduledResidencyMode) -> LogicalPayloadMode {
+    match mode {
+        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+            LogicalPayloadMode::QualificationLogicalOnly
+        }
+        _ => LogicalPayloadMode::Materialized,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -93,7 +114,8 @@ enum LateSourcePolicy {
 const fn late_source_policy(mode: OracleScheduledResidencyMode) -> LateSourcePolicy {
     match mode {
         OracleScheduledResidencyMode::SourceOnly => LateSourcePolicy::NonblockingDemandFallback,
-        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+        OracleScheduledResidencyMode::TokenBoundaryDirect
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
             LateSourcePolicy::AwaitResidualAtSafeBoundary
         }
     }
@@ -376,6 +398,20 @@ impl StrictRouteCursor {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 struct OracleCounters {
+    logical_materializations: u64,
+    logical_materialization_bytes: u64,
+    logical_only_admissions: u64,
+    logical_only_charged_bytes: u64,
+    logical_expected_payload_bytes: u64,
+    logical_only_data_accesses: u64,
+    logical_admission_transactions: u64,
+    logical_admissions_returned: u64,
+    logical_new_generations: u64,
+    logical_current_generations_validated: u64,
+    logical_newly_admitted_bytes: u64,
+    logical_gpu_used_bytes_before: u64,
+    logical_gpu_used_bytes_after: u64,
+    logical_gpu_evicted_bytes: u64,
     initial_position_source_priming_experts: u64,
     initial_position_source_priming_us: u64,
     future_experts_considered: u64,
@@ -415,6 +451,8 @@ struct OracleCounters {
     boundary_replacement_sets_started: u64,
     boundary_replacement_sets_completed: u64,
     boundary_physical_installs: u64,
+    boundary_physical_install_order_checks: u64,
+    boundary_physical_install_order_errors: u64,
     boundary_physical_install_bytes: u64,
     boundary_physical_evictions: u64,
     boundary_physical_reinstalls: u64,
@@ -704,7 +742,8 @@ fn validate_retained_source_origins(
         OracleScheduledResidencyMode::SourceOnly if !outcome.residents.is_empty() => Err(
             "source-only retained request-local PRIMARY residents across token execution".into(),
         ),
-        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+        OracleScheduledResidencyMode::TokenBoundaryDirect
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
             for (&global_id, resident) in &outcome.residents {
                 if resident.buffer_pool_origin()
                     != BufferPoolOrigin::QualificationOracleFutureSource
@@ -928,7 +967,7 @@ async fn prefetch_layer_batch(
                 return outcome;
             }
         };
-        if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        if uses_isolated_oracle_source_pool(mode) {
             match direct_future_source_disposition(
                 physical_current,
                 current_route_global_ids.contains(&global_id),
@@ -1093,7 +1132,7 @@ async fn prefetch_position(
     readiness: Arc<SourceReadiness>,
 ) -> PrefetchOutcome {
     let started = Instant::now();
-    let direct_read_batches_before = if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+    let direct_read_batches_before = if uses_isolated_oracle_source_pool(mode) {
         counters.lock().source_prefetch_read_batches_with_work
     } else {
         0
@@ -1142,7 +1181,8 @@ async fn prefetch_position(
             }
             outcome
         }
-        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+        OracleScheduledResidencyMode::TokenBoundaryDirect
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
             let task_engine = engine.clone();
             let task_counters = counters.clone();
             let task_readiness = readiness.clone();
@@ -1189,7 +1229,7 @@ async fn prefetch_position(
             }
         }
     };
-    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+    if uses_isolated_oracle_source_pool(mode) {
         let mut values = counters.lock();
         if values
             .source_prefetch_read_batches_with_work
@@ -1220,6 +1260,32 @@ async fn prefetch_position(
 
 struct OracleBoundaryObserver {
     counters: Arc<Mutex<OracleCounters>>,
+    expected_installs: Vec<(u32, u64)>,
+    completed_installs: Mutex<usize>,
+    layer_index: usize,
+    experts_per_layer: u32,
+    slot_bytes: u64,
+}
+
+impl OracleBoundaryObserver {
+    fn record_install_identity(
+        &self,
+        global_id: u32,
+        key: GpuNativeQ4ExpertKey,
+        physical_bytes: u64,
+    ) {
+        let mut completed = self.completed_installs.lock();
+        let matches = self.expected_installs.get(*completed)
+            == Some(&(global_id, key.logical_generation()))
+            && key.layer_index() == self.layer_index
+            && key.expert_id() == global_id % self.experts_per_layer
+            && physical_bytes == self.slot_bytes;
+        *completed += 1;
+        drop(completed);
+        let mut values = self.counters.lock();
+        values.boundary_physical_install_order_checks += 1;
+        values.boundary_physical_install_order_errors += u64::from(!matches);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1258,11 +1324,16 @@ impl GpuNativePhysicalInstallObserver for OracleBoundaryObserver {
 
     fn record_physical_install_completion(
         &self,
-        _global_id: u32,
-        _residency: GpuNativeQ4ExpertResidency,
+        global_id: u32,
+        residency: GpuNativeQ4ExpertResidency,
         evidence: GpuNativePhysicalInstallEvidence,
         _physical_install_total_us: u64,
     ) {
+        self.record_install_identity(
+            global_id,
+            residency.key(),
+            evidence.physical_slot_bytes_staged,
+        );
         let mut values = self.counters.lock();
         values.boundary_physical_installs += 1;
         add_counter(
@@ -1502,31 +1573,111 @@ async fn resolve_direct_sources_at_boundary(
 }
 
 fn prepare_logical_admissions(
-    engine: &Arc<Engine>,
+    gpu: &GpuExpertCache,
+    dtype: crate::inference::WeightDtype,
     global_ids: &[u32],
     residents: &HashMap<u32, Arc<ExpertResident>>,
+    mode: OracleScheduledResidencyMode,
+    counters: &Mutex<OracleCounters>,
+    data_accesses: &Arc<AtomicU64>,
 ) -> Result<Vec<crate::expert_cache::GpuAdmission>, String> {
-    let gpu = engine.execution_context().gpu_expert_cache().clone();
     let mut payloads = HashMap::with_capacity(global_ids.len());
     for attempt in 0..2 {
+        let used_before = gpu.used_bytes();
         match gpu
             .demand_admit_set(global_ids, &payloads)
             .map_err(|error| error.to_string())?
         {
-            GpuDemandSetAdmission::Ready { admissions, .. } => return Ok(admissions),
+            GpuDemandSetAdmission::Ready {
+                admissions,
+                newly_admitted,
+            } => {
+                // Boundary execution is serialized and selected IDs are protected.
+                // Validate the returned order, ordinary generation, and exact
+                // payload charge without ever reading GpuResident::data().
+                if admissions.len() != global_ids.len() || newly_admitted != payloads.len() {
+                    return Err(
+                        "ORACLE logical admission count changed during boundary preparation".into(),
+                    );
+                }
+                for (&id, admission) in global_ids.iter().zip(&admissions) {
+                    let source = residents
+                        .get(&id)
+                        .ok_or("ORACLE admission source disappeared")?;
+                    if admission.resident().id != id
+                        || !gpu.contains_generation(id, admission.generation())
+                        || admission.generation() == 0
+                        || admission.byte_len() != source.data().len()
+                        || crate::backend::GpuStorage::byte_len(admission.resident().as_ref())
+                            != source.data().len()
+                    {
+                        return Err(
+                            "ORACLE logical admission identity/generation/byte charge mismatch"
+                                .into(),
+                        );
+                    }
+                }
+                let new_bytes = payloads
+                    .values()
+                    .map(|payload| payload.byte_len() as u64)
+                    .sum::<u64>();
+                let used_after = gpu.used_bytes();
+                let evicted_bytes = used_before
+                    .checked_add(new_bytes)
+                    .and_then(|sum| sum.checked_sub(used_after))
+                    .ok_or("ORACLE logical GPU byte accounting underflow/overflow")?;
+                if used_after > gpu.capacity_bytes() as u64 {
+                    return Err("ORACLE logical GPU admission exceeded unchanged capacity".into());
+                }
+                let mut values = counters.lock();
+                values.logical_admission_transactions += 1;
+                values.logical_admissions_returned += admissions.len() as u64;
+                values.logical_current_generations_validated += admissions.len() as u64;
+                values.logical_new_generations += newly_admitted as u64;
+                values.logical_newly_admitted_bytes += new_bytes;
+                values.logical_gpu_used_bytes_before += used_before;
+                values.logical_gpu_used_bytes_after += used_after;
+                values.logical_gpu_evicted_bytes += evicted_bytes;
+                return Ok(admissions);
+            }
             GpuDemandSetAdmission::PayloadRequired(missing) if attempt == 0 => {
                 for global_id in missing {
                     let resident = residents.get(&global_id).ok_or_else(|| {
                         format!("future source for global expert {global_id} is not ready")
                     })?;
-                    payloads.insert(
-                        global_id,
-                        Arc::new(GpuResident::new_with_dtype(
-                            global_id,
-                            resident.data().to_vec(),
-                            engine.core.options.dtype,
-                        )),
-                    );
+                    let charged_bytes = resident.data().len();
+                    if resident.id != global_id || charged_bytes == 0 {
+                        return Err(
+                            "ORACLE logical source identity or byte charge is invalid".into()
+                        );
+                    }
+                    let payload = match logical_payload_mode(mode) {
+                        LogicalPayloadMode::Materialized => {
+                            let payload = GpuResident::new_with_dtype(
+                                global_id,
+                                resident.data().to_vec(),
+                                dtype,
+                            );
+                            let mut values = counters.lock();
+                            values.logical_materializations += 1;
+                            values.logical_materialization_bytes += charged_bytes as u64;
+                            payload
+                        }
+                        LogicalPayloadMode::QualificationLogicalOnly => {
+                            let payload = GpuResident::new_qualification_logical_only(
+                                global_id,
+                                charged_bytes,
+                                dtype,
+                                data_accesses.clone(),
+                            );
+                            let mut values = counters.lock();
+                            values.logical_only_admissions += 1;
+                            values.logical_only_charged_bytes += charged_bytes as u64;
+                            payload
+                        }
+                    };
+                    counters.lock().logical_expected_payload_bytes += charged_bytes as u64;
+                    payloads.insert(global_id, Arc::new(payload));
                 }
             }
             GpuDemandSetAdmission::PayloadRequired(missing) => {
@@ -1545,6 +1696,8 @@ fn install_future_at_boundary(
     routes: &[Vec<u32>],
     residents: &HashMap<u32, Arc<ExpertResident>>,
     counters: Arc<Mutex<OracleCounters>>,
+    mode: OracleScheduledResidencyMode,
+    data_accesses: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let manager = engine
         .core
@@ -1560,9 +1713,6 @@ fn install_future_at_boundary(
         ));
     }
     let before = manager.snapshot();
-    let observer = OracleBoundaryObserver {
-        counters: counters.clone(),
-    };
     let experts_per_layer = manager.plan().geometry().num_experts() as u32;
     for (layer_index, local_ids) in routes.iter().enumerate() {
         counters.lock().future_physical_sets_considered += 1;
@@ -1618,7 +1768,15 @@ fn install_future_at_boundary(
             .protect_demand_set(&missing)
             .map_err(|error| error.to_string())?;
         let host_started = Instant::now();
-        let admissions = match prepare_logical_admissions(engine, &missing, residents) {
+        let admissions = match prepare_logical_admissions(
+            &gpu,
+            engine.core.options.dtype,
+            &missing,
+            residents,
+            mode,
+            &counters,
+            data_accesses,
+        ) {
             Ok(admissions) => admissions,
             Err(error) => {
                 let mut values = counters.lock();
@@ -1664,6 +1822,17 @@ fn install_future_at_boundary(
                 }
             })
             .collect::<Vec<_>>();
+        let observer = OracleBoundaryObserver {
+            counters: counters.clone(),
+            expected_installs: missing
+                .iter()
+                .map(|id| (*id, admissions_by_id[id].generation()))
+                .collect(),
+            completed_installs: Mutex::new(0),
+            layer_index,
+            experts_per_layer,
+            slot_bytes: manager.plan().geometry().slot_stride_bytes() as u64,
+        };
         counters.lock().boundary_replacement_sets_started += 1;
         let evictions_before = counters.lock().boundary_physical_evictions;
         match manager.ensure_oracle_future_set_at_safe_boundary(
@@ -1675,6 +1844,13 @@ fn install_future_at_boundary(
             Ok(_) => {
                 let mut values = counters.lock();
                 values.boundary_replacement_sets_completed += 1;
+                if *observer.completed_installs.lock() != missing.len()
+                    || values.boundary_physical_install_order_errors != 0
+                {
+                    return Err(
+                        "ORACLE physical install count/order/generation/bytes mismatch".into(),
+                    );
+                }
                 let observed_evictions = values
                     .boundary_physical_evictions
                     .saturating_sub(evictions_before);
@@ -1744,6 +1920,7 @@ struct OracleScheduler {
     oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
     source_position_gate: Arc<tokio::sync::Mutex<()>>,
     counters: Arc<Mutex<OracleCounters>>,
+    logical_data_accesses: Arc<AtomicU64>,
     state: Arc<Mutex<SchedulerState>>,
 }
 
@@ -1765,16 +1942,14 @@ where
             active.target_position
         ));
     }
-    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect
-        && !state.lock().background.is_empty()
-    {
+    if uses_isolated_oracle_source_pool(mode) && !state.lock().background.is_empty() {
         return Err(
             "token-boundary-direct retained a previous-position background source task".into(),
         );
     }
 
     let Some(handle) = active.handle else {
-        if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        if uses_isolated_oracle_source_pool(mode) {
             return Err(
                 "token-boundary-direct skipped future source because a prior position lease remained in flight"
                     .into(),
@@ -1846,7 +2021,7 @@ fn release_source_position_lease_before_next_token(
     counters: &Arc<Mutex<OracleCounters>>,
 ) -> Result<(), String> {
     drop(lease);
-    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+    if uses_isolated_oracle_source_pool(mode) {
         let pool = oracle_source_pool
             .ok_or("token-boundary-direct lost its isolated ORACLE source pool")?;
         let snapshot = pool.snapshot();
@@ -1885,6 +2060,7 @@ impl OracleScheduler {
         concurrency: usize,
         expert_bytes: usize,
         oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
+        logical_data_accesses: Arc<AtomicU64>,
     ) -> Self {
         Self {
             engine,
@@ -1894,6 +2070,7 @@ impl OracleScheduler {
             oracle_source_pool,
             source_position_gate: Arc::new(tokio::sync::Mutex::new(())),
             counters: Arc::new(Mutex::new(OracleCounters::default())),
+            logical_data_accesses,
             state: Arc::new(Mutex::new(SchedulerState {
                 cursor: StrictRouteCursor::new(trace),
                 submitted_position: None,
@@ -2181,7 +2358,7 @@ impl OracleScheduler {
             return Ok(());
         };
 
-        if self.mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+        if uses_isolated_oracle_source_pool(self.mode) {
             let pool = self
                 .oracle_source_pool
                 .as_ref()
@@ -2200,6 +2377,8 @@ impl OracleScheduler {
                 &routes,
                 &resolved,
                 self.counters.clone(),
+                self.mode,
+                &self.logical_data_accesses,
             )?;
             let unavailable_after_install = self.future_not_physically_current_count(&routes)?;
             record_direct_late_fallback(
@@ -2236,6 +2415,7 @@ impl OracleScheduler {
         }
         let trace = state.cursor.clone().finish()?;
         let mut counters = self.counters.lock().clone();
+        counters.logical_only_data_accesses = self.logical_data_accesses.load(Ordering::Relaxed);
         if let Some(pool) = self.oracle_source_pool.as_ref() {
             let snapshot = pool.snapshot();
             counters.qualification_owned_current_slots = snapshot.current_in_use_slots as u64;
@@ -2384,7 +2564,7 @@ impl GpuNativeOracleScheduleHook for OracleScheduler {
                 Some(handle)
             }
             Err(_) => {
-                if self.mode == OracleScheduledResidencyMode::TokenBoundaryDirect {
+                if uses_isolated_oracle_source_pool(self.mode) {
                     state.failure = Some(
                         "token-boundary-direct could not acquire the next position lease after the prior safe boundary"
                             .into(),
@@ -2423,6 +2603,10 @@ struct PhysicalSlotPlanEvidence {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TreatmentContract {
+    logical_payload_mode: LogicalPayloadMode,
+    logical_capacity_accounting: &'static str,
+    physical_byte_source: &'static str,
+    logical_only_data_access_policy: &'static str,
     source_overlap: bool,
     late_source_policy: LateSourcePolicy,
     independent_layer_source_tasks: bool,
@@ -2442,7 +2626,11 @@ struct TreatmentContract {
 }
 
 const fn uses_isolated_oracle_source_pool(mode: OracleScheduledResidencyMode) -> bool {
-    matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect)
+    matches!(
+        mode,
+        OracleScheduledResidencyMode::TokenBoundaryDirect
+            | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+    )
 }
 
 const fn oracle_source_pool_configured_max_slots(mode: OracleScheduledResidencyMode) -> usize {
@@ -2455,25 +2643,23 @@ const fn oracle_source_pool_configured_max_slots(mode: OracleScheduledResidencyM
 
 const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentContract {
     TreatmentContract {
+        logical_payload_mode: logical_payload_mode(mode),
+        logical_capacity_accounting: "sum of successful boundary admission transaction snapshots: before + newly charged bytes = after + evicted bytes; intervening ordinary demand is excluded",
+        physical_byte_source: "GpuNativeDemandExpert::Install resident: Arc<ExpertResident>; production staging reads ExpertResident::data()",
+        logical_only_data_access_policy: "increment run-scoped audit and panic; any nonzero audit rejects qualification including caught panics",
         source_overlap: true,
         late_source_policy: late_source_policy(mode),
-        independent_layer_source_tasks: matches!(
-            mode,
-            OracleScheduledResidencyMode::TokenBoundaryDirect
-        ),
+        independent_layer_source_tasks: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
         per_layer_storage_batch_read_used: false,
         host_preparation_overlap: false,
-        token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect),
+        token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
         demand_fallback: true,
         h2d_compute_overlap_claimed: false,
         same_ordered_queue: true,
         extra_flush_submit: false,
         production_predictor_used: false,
         production_speculative_residency_used: false,
-        production_direct_staging_used: matches!(
-            mode,
-            OracleScheduledResidencyMode::TokenBoundaryDirect
-        ),
+        production_direct_staging_used: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
         legacy_full_slot_vec_used: false,
         future_source_pool_isolated_from_production_primary: uses_isolated_oracle_source_pool(mode),
         production_primary_pool_capacity_unchanged: true,
@@ -2496,6 +2682,8 @@ struct FrozenWorkloadEvidence {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct FrozenControlReferences {
+    logical_payload_control_git_sha: &'static str,
+    logical_payload_control_tree_sha: &'static str,
     frozen_parent_git_sha: &'static str,
     oracle_route_command_git_sha: &'static str,
     performance_controls_rerun: bool,
@@ -2618,6 +2806,7 @@ struct OracleScheduledResidencyReport {
     request: RequestEvidence,
     production_configuration: ProductionConfiguration,
     treatment_mode: OracleScheduledResidencyMode,
+    logical_payload_mode: LogicalPayloadMode,
     oracle_source_concurrency: usize,
     treatment_contract: TreatmentContract,
     physical_slot_plan: PhysicalSlotPlanEvidence,
@@ -2640,6 +2829,20 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
             total.$field = total.$field.saturating_add(value.$field)
         };
     }
+    add!(logical_materializations);
+    add!(logical_materialization_bytes);
+    add!(logical_only_admissions);
+    add!(logical_only_charged_bytes);
+    add!(logical_expected_payload_bytes);
+    add!(logical_only_data_accesses);
+    add!(logical_admission_transactions);
+    add!(logical_admissions_returned);
+    add!(logical_new_generations);
+    add!(logical_current_generations_validated);
+    add!(logical_newly_admitted_bytes);
+    add!(logical_gpu_used_bytes_before);
+    add!(logical_gpu_used_bytes_after);
+    add!(logical_gpu_evicted_bytes);
     add!(initial_position_source_priming_experts);
     add!(initial_position_source_priming_us);
     add!(future_experts_considered);
@@ -2683,6 +2886,8 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
     add!(boundary_replacement_sets_started);
     add!(boundary_replacement_sets_completed);
     add!(boundary_physical_installs);
+    add!(boundary_physical_install_order_checks);
+    add!(boundary_physical_install_order_errors);
     add!(boundary_physical_install_bytes);
     add!(boundary_physical_evictions);
     add!(boundary_physical_reinstalls);
@@ -2778,13 +2983,68 @@ fn validate_source_concurrency_mechanism(
     Ok(())
 }
 
+fn validate_logical_payload_counters(
+    counters: &OracleCounters,
+    mode: OracleScheduledResidencyMode,
+) -> Result<(), BenchmarkFailure> {
+    let c = counters;
+    let before_plus_new = c
+        .logical_gpu_used_bytes_before
+        .checked_add(c.logical_newly_admitted_bytes);
+    let after_plus_evicted = c
+        .logical_gpu_used_bytes_after
+        .checked_add(c.logical_gpu_evicted_bytes);
+    let fail = || {
+        BenchmarkFailure::new("postcondition", "oracle-logical-payload-reconciliation",
+        format!("ORACLE logical payload, charge, generation or data-access evidence did not reconcile: {c:?}"))
+    };
+    if c.logical_only_data_accesses != 0
+        || c.logical_admissions_returned != c.logical_current_generations_validated
+        || before_plus_new.is_none()
+        || before_plus_new != after_plus_evicted
+        || c.logical_materialization_bytes
+            .checked_add(c.logical_only_charged_bytes)
+            != Some(c.logical_expected_payload_bytes)
+    {
+        return Err(fail());
+    }
+    match logical_payload_mode(mode) {
+        LogicalPayloadMode::Materialized => {
+            if c.logical_only_admissions != 0 || c.logical_only_charged_bytes != 0 {
+                return Err(fail());
+            }
+        }
+        LogicalPayloadMode::QualificationLogicalOnly => {
+            if c.logical_materializations != 0
+                || c.logical_materialization_bytes != 0
+                || c.logical_only_admissions == 0
+                || c.logical_only_charged_bytes == 0
+                || c.logical_only_admissions != c.logical_new_generations
+                || c.logical_only_charged_bytes != c.logical_newly_admitted_bytes
+                || c.logical_admission_transactions == 0
+                || c.logical_admissions_returned < c.logical_new_generations
+                || c.logical_admissions_returned != c.boundary_physical_installs
+                || c.boundary_physical_install_order_checks != c.boundary_physical_installs
+                || c.boundary_physical_install_order_errors != 0
+                || c.boundary_stale_generation != 0
+                || c.boundary_install_failures != 0
+            {
+                return Err(fail());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_oracle_counters(
     counters: &OracleCounters,
     mode: OracleScheduledResidencyMode,
     concurrency: usize,
     expert_bytes: usize,
 ) -> Result<(), BenchmarkFailure> {
+    validate_logical_only_concurrency(mode, concurrency)?;
     validate_source_concurrency_mechanism(counters, mode, concurrency)?;
+    validate_logical_payload_counters(counters, mode)?;
     let classified_source = counters
         .source_skipped_physical_current
         .saturating_add(counters.source_prefetch_ram_hits)
@@ -2844,7 +3104,7 @@ fn validate_oracle_counters(
             "ORACLE token-boundary treatment materialized a legacy full-slot Vec",
         ));
     }
-    if mode == OracleScheduledResidencyMode::TokenBoundaryDirect
+    if uses_isolated_oracle_source_pool(mode)
         && (counters.source_position_inflight_skips != 0
             || counters.source_prefetch_batches_skipped_inflight != 0
             || counters.boundary_direct_staging_writes != counters.boundary_physical_installs
@@ -2980,6 +3240,7 @@ async fn execute_oracle_request(
     source_concurrency: usize,
     expert_bytes: usize,
     oracle_source_pool: Option<Arc<OracleFutureSourcePool>>,
+    logical_data_accesses: Arc<AtomicU64>,
     prompt_ids: &[u32],
     run_index: usize,
 ) -> Result<OracleRunResult, Box<dyn std::error::Error>> {
@@ -2997,6 +3258,7 @@ async fn execute_oracle_request(
         source_concurrency,
         expert_bytes,
         oracle_source_pool,
+        logical_data_accesses,
     );
     let mut request = token_loop.create_request_state()?;
     let snapshots = RequestSnapshotStart::capture(runtime)?;
@@ -3182,6 +3444,19 @@ fn emit_report(
     Ok(())
 }
 
+fn validate_logical_only_concurrency(
+    mode: OracleScheduledResidencyMode,
+    concurrency: usize,
+) -> Result<(), BenchmarkFailure> {
+    if mode == OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly && concurrency != 4 {
+        return Err(artifact_failure(
+            "logical-only-requires-frozen-c4",
+            "logical-only payload treatment requires unchanged --oracle-source-concurrency=4",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.oracle_source_concurrency == 0 || args.oracle_source_concurrency > EXPECTED_LAYERS {
         return Err(artifact_failure(
@@ -3193,6 +3468,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         )
         .into());
     }
+    validate_logical_only_concurrency(args.treatment_mode, args.oracle_source_concurrency)?;
     let oracle = load_oracle_artifact(&args.oracle_trace)?;
     let build = crate::qualification::BuildProvenance::embedded();
     crate::gpu_native_real_benchmark::validate_preflight_provenance(&build)?;
@@ -3307,7 +3583,8 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         crate::buffer_pool::expert_buffer_pool_qualification_oracle_bytes();
     let oracle_source_pool = match args.treatment_mode {
         OracleScheduledResidencyMode::SourceOnly => None,
-        OracleScheduledResidencyMode::TokenBoundaryDirect => {
+        OracleScheduledResidencyMode::TokenBoundaryDirect
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
             Some(Arc::new(OracleFutureSourcePool::new(
                 ORACLE_FUTURE_SOURCE_POOL_SLOTS,
                 spec.cfg.model.expert_size,
@@ -3315,6 +3592,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             )))
         }
     };
+    let logical_data_accesses = Arc::new(AtomicU64::new(0));
     let execution = async {
         if runtime.engine.core.cache.capacity() != FROZEN_RAM_CACHE_SLOTS
             || runtime.engine.core.pool.capacity() != expected_production_primary_capacity
@@ -3362,6 +3640,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                 args.oracle_source_concurrency,
                 spec.cfg.model.expert_size,
                 oracle_source_pool.clone(),
+                logical_data_accesses.clone(),
                 &prompt_ids,
                 0,
             ),
@@ -3382,6 +3661,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
                         args.oracle_source_concurrency,
                         spec.cfg.model.expert_size,
                         oracle_source_pool.clone(),
+                        logical_data_accesses.clone(),
                         &prompt_ids,
                         run_index,
                     ),
@@ -3512,6 +3792,13 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         )
         .into());
     }
+    if logical_data_accesses.load(Ordering::Relaxed) != 0 {
+        return Err(artifact_failure(
+            "logical-only-payload-data-access",
+            "qualification logical-only payload data was accessed",
+        )
+        .into());
+    }
     let report = OracleScheduledResidencyReport {
         schema: SCHEMA,
         mode: MODE,
@@ -3527,10 +3814,13 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         request,
         production_configuration,
         treatment_mode: args.treatment_mode,
+        logical_payload_mode: logical_payload_mode(args.treatment_mode),
         oracle_source_concurrency: args.oracle_source_concurrency,
         treatment_contract: treatment_contract(args.treatment_mode),
         physical_slot_plan: validated.physical_slot_plan,
         frozen_controls: FrozenControlReferences {
+            logical_payload_control_git_sha: FROZEN_PAYLOAD_CONTROL_SHA,
+            logical_payload_control_tree_sha: FROZEN_PAYLOAD_CONTROL_TREE,
             frozen_parent_git_sha: ORACLE_ROUTE_COMMAND_SHA,
             oracle_route_command_git_sha: ORACLE_ROUTE_COMMAND_SHA,
             performance_controls_rerun: false,
@@ -3746,6 +4036,383 @@ mod tests {
         }
     }
 
+    fn logical_only_mode() -> OracleScheduledResidencyMode {
+        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+    }
+
+    #[test]
+    fn logical_only_contract_changes_payload_mode_and_preserves_direct_source_and_boundary_contract(
+    ) {
+        assert_eq!(
+            OracleScheduledResidencyMode::from_str("token-boundary-direct-logical-only", false)
+                .unwrap(),
+            logical_only_mode()
+        );
+        let control = OracleScheduledResidencyMode::TokenBoundaryDirect;
+        assert_eq!(
+            logical_payload_mode(control),
+            LogicalPayloadMode::Materialized
+        );
+        let mut control_json = serde_json::to_value(treatment_contract(control)).unwrap();
+        let mut treatment_json =
+            serde_json::to_value(treatment_contract(logical_only_mode())).unwrap();
+        assert_eq!(
+            control_json
+                .as_object_mut()
+                .unwrap()
+                .remove("logical_payload_mode")
+                .unwrap(),
+            "materialized"
+        );
+        assert_eq!(
+            treatment_json
+                .as_object_mut()
+                .unwrap()
+                .remove("logical_payload_mode")
+                .unwrap(),
+            "qualification-logical-only"
+        );
+        assert_eq!(control_json, treatment_json);
+        assert_eq!(
+            oracle_source_pool_configured_max_slots(logical_only_mode()),
+            384
+        );
+        assert!(validate_logical_only_concurrency(logical_only_mode(), 4).is_ok());
+        for concurrency in [1, 2, 3, 8] {
+            assert!(validate_logical_only_concurrency(logical_only_mode(), concurrency).is_err());
+            assert!(validate_logical_only_concurrency(control, concurrency).is_ok());
+        }
+    }
+
+    #[test]
+    fn logical_only_oracle_preparation_matches_control_and_releases_real_source_leases() {
+        use crate::inference::WeightDtype;
+        let pool = OracleFutureSourcePool::new(2, 72, 8);
+        let mut residents = HashMap::new();
+        for id in [2, 1] {
+            // A real UTH header proves the logical charge is the stripped
+            // ExpertResident payload length, not the larger source-pool slot.
+            let mut bytes = Vec::new();
+            crate::tensor_header::TensorHeader::for_swiglu_expert(WeightDtype::Q4_0, 32, 32)
+                .write_padded(8, &mut bytes);
+            bytes.extend_from_slice(&[id as u8; 8]);
+            assert_eq!(bytes.len(), 72);
+            let mut buffer = pool.try_acquire().unwrap();
+            buffer.as_mut_slice().copy_from_slice(&bytes);
+            let source = Arc::new(ExpertResident::new_with_block_align(id, buffer, 8));
+            assert_eq!(source.data().len(), 8);
+            residents.insert(id, source);
+        }
+        let weak = residents.values().map(Arc::downgrade).collect::<Vec<_>>();
+        let caches = [
+            GpuExpertCache::new(16, 0.0, 0),
+            GpuExpertCache::new(16, 0.0, 0),
+        ];
+        let mut signatures = Vec::new();
+        let mut retained = Vec::new();
+        for (index, mode) in [
+            OracleScheduledResidencyMode::TokenBoundaryDirect,
+            logical_only_mode(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let audit = Arc::new(AtomicU64::new(0));
+            let counters = Mutex::new(OracleCounters::default());
+            let admissions = prepare_logical_admissions(
+                &caches[index],
+                WeightDtype::Q4_0,
+                &[2, 1],
+                &residents,
+                mode,
+                &counters,
+                &audit,
+            )
+            .unwrap();
+            for admission in &admissions {
+                let id = admission.resident().id;
+                let source = &residents[&id];
+                crate::gpu_native_residency::validate_qualification_physical_source_for_test(
+                    &caches[index],
+                    id,
+                    source,
+                    admission,
+                )
+                .unwrap();
+                let demand = GpuNativeDemandExpert::install(id, source.clone(), admission.clone());
+                match demand {
+                    GpuNativeDemandExpert::Install { resident, .. } => {
+                        assert!(Arc::ptr_eq(&resident, source));
+                        assert_eq!(resident.data().as_ptr(), source.data().as_ptr());
+                    }
+                    _ => panic!("expected physical install source"),
+                }
+                if index == 0 {
+                    assert_eq!(admission.resident().data(), source.data());
+                    assert_ne!(admission.resident().data().as_ptr(), source.data().as_ptr());
+                }
+                assert_eq!(Arc::strong_count(source), 1);
+            }
+            let repeated = prepare_logical_admissions(
+                &caches[index],
+                WeightDtype::Q4_0,
+                &[1, 2],
+                &residents,
+                mode,
+                &counters,
+                &audit,
+            )
+            .unwrap();
+            assert_eq!(repeated[0].generation(), admissions[1].generation());
+            let c = counters.lock();
+            assert_eq!(c.logical_expected_payload_bytes, 16);
+            assert_eq!(c.logical_newly_admitted_bytes, 16);
+            assert_eq!(c.logical_new_generations, 2);
+            assert_eq!(c.logical_current_generations_validated, 4);
+            assert_eq!(c.logical_gpu_used_bytes_before, 16);
+            assert_eq!(c.logical_gpu_used_bytes_after, 32);
+            assert_eq!(c.logical_gpu_evicted_bytes, 0);
+            assert_eq!(c.logical_materializations, if index == 0 { 2 } else { 0 });
+            assert_eq!(
+                c.logical_materialization_bytes,
+                if index == 0 { 16 } else { 0 }
+            );
+            assert_eq!(c.logical_only_admissions, if index == 1 { 2 } else { 0 });
+            assert_eq!(
+                c.logical_only_charged_bytes,
+                if index == 1 { 16 } else { 0 }
+            );
+            assert_eq!(audit.load(Ordering::Relaxed), 0);
+            signatures.push((
+                admissions
+                    .iter()
+                    .map(|a| (a.resident().id, a.generation(), a.byte_len()))
+                    .collect::<Vec<_>>(),
+                caches[index].used_bytes(),
+            ));
+            retained.extend(admissions);
+        }
+        assert_eq!(signatures[0], signatures[1]);
+        drop(residents);
+        assert!(weak.iter().all(|source| source.upgrade().is_none()));
+        assert_eq!(pool.snapshot().current_in_use_slots, 0);
+        assert_eq!(pool.snapshot().exhaustion_count, 0);
+        assert_eq!(
+            retained.len(),
+            4,
+            "logical admissions remain alive after all source leases return"
+        );
+    }
+
+    #[test]
+    fn logical_only_cache_cannot_accumulate_isolated_source_pool_leases() {
+        use crate::inference::WeightDtype;
+        let pool = OracleFutureSourcePool::new(1, 8, 8);
+        let cache = GpuExpertCache::new(400 * 8, 0.0, 0);
+        let counters = Mutex::new(OracleCounters::default());
+        let audit = Arc::new(AtomicU64::new(0));
+        for id in 0..400 {
+            let mut buffer = pool.try_acquire().unwrap();
+            buffer.as_mut_slice().fill(id as u8);
+            let source = Arc::new(ExpertResident::new(id, buffer));
+            let weak = Arc::downgrade(&source);
+            let residents = HashMap::from([(id, source)]);
+            prepare_logical_admissions(
+                &cache,
+                WeightDtype::Q4_0,
+                &[id],
+                &residents,
+                logical_only_mode(),
+                &counters,
+                &audit,
+            )
+            .unwrap();
+            drop(residents);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(pool.snapshot().current_in_use_slots, 0);
+        }
+        assert_eq!(cache.used_bytes(), 400 * 8);
+        assert_eq!(pool.snapshot().peak_in_use_slots, 1);
+        assert_eq!(pool.snapshot().exhaustion_count, 0);
+        assert_eq!(pool.snapshot().nvme_reads, 0);
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+    }
+
+    fn valid_logical_only_counters() -> OracleCounters {
+        OracleCounters {
+            logical_only_admissions: 2,
+            logical_only_charged_bytes: 16,
+            logical_expected_payload_bytes: 16,
+            logical_admission_transactions: 1,
+            logical_admissions_returned: 2,
+            logical_new_generations: 2,
+            logical_current_generations_validated: 2,
+            logical_newly_admitted_bytes: 16,
+            logical_gpu_used_bytes_before: 8,
+            logical_gpu_used_bytes_after: 16,
+            logical_gpu_evicted_bytes: 8,
+            boundary_physical_installs: 2,
+            boundary_physical_install_order_checks: 2,
+            ..OracleCounters::default()
+        }
+    }
+
+    #[test]
+    fn logical_only_payload_gates_reject_each_counter_violation_and_caught_data_access() {
+        let good = valid_logical_only_counters();
+        validate_logical_payload_counters(&good, logical_only_mode()).unwrap();
+        assert!(
+            validate_logical_payload_counters(&OracleCounters::default(), logical_only_mode())
+                .is_err()
+        );
+        let corruptions: &[fn(&mut OracleCounters)] = &[
+            |c| c.logical_materializations = 1,
+            |c| c.logical_materialization_bytes = 8,
+            |c| c.logical_only_admissions = 0,
+            |c| c.logical_only_charged_bytes = 0,
+            |c| c.logical_expected_payload_bytes += 1,
+            |c| c.logical_only_data_accesses = 1,
+            |c| c.logical_admission_transactions = 0,
+            |c| c.logical_admissions_returned += 1,
+            |c| c.logical_new_generations += 1,
+            |c| c.logical_current_generations_validated -= 1,
+            |c| c.logical_newly_admitted_bytes += 1,
+            |c| c.logical_gpu_used_bytes_before += 1,
+            |c| c.logical_gpu_used_bytes_after += 1,
+            |c| c.logical_gpu_evicted_bytes += 1,
+            |c| {
+                c.logical_gpu_used_bytes_before = u64::MAX;
+                c.logical_gpu_used_bytes_after = u64::MAX;
+            },
+            |c| c.boundary_physical_installs -= 1,
+            |c| c.boundary_physical_install_order_checks -= 1,
+            |c| c.boundary_physical_install_order_errors = 1,
+            |c| c.boundary_stale_generation = 1,
+            |c| c.boundary_install_failures = 1,
+        ];
+        for corrupt in corruptions {
+            let mut bad = good.clone();
+            corrupt(&mut bad);
+            assert!(
+                validate_logical_payload_counters(&bad, logical_only_mode()).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        let audit = Arc::new(AtomicU64::new(0));
+        let resident = GpuResident::new_qualification_logical_only(
+            1,
+            8,
+            crate::inference::WeightDtype::Q4_0,
+            audit.clone(),
+        );
+        assert!(std::panic::catch_unwind(|| resident.data()).is_err());
+        drop(resident);
+        let mut caught = good;
+        caught.logical_only_data_accesses = audit.load(Ordering::Relaxed);
+        assert!(validate_logical_payload_counters(&caught, logical_only_mode()).is_err());
+    }
+
+    #[test]
+    fn logical_only_completion_audit_rejects_install_order_identity_generation_and_byte_drift() {
+        let make = || OracleBoundaryObserver {
+            counters: Arc::new(Mutex::new(OracleCounters::default())),
+            expected_installs: vec![(130, 7), (129, 8)],
+            completed_installs: Mutex::new(0),
+            layer_index: 1,
+            experts_per_layer: 128,
+            slot_bytes: 12,
+        };
+        let good = make();
+        good.record_install_identity(130, GpuNativeQ4ExpertKey::new(1, 2, 7), 12);
+        good.record_install_identity(129, GpuNativeQ4ExpertKey::new(1, 1, 8), 12);
+        assert_eq!(*good.completed_installs.lock(), 2);
+        assert_eq!(
+            good.counters.lock().boundary_physical_install_order_checks,
+            2
+        );
+        assert_eq!(
+            good.counters.lock().boundary_physical_install_order_errors,
+            0
+        );
+        for (id, layer, expert, generation, bytes) in [
+            (129, 1, 1, 8, 12), // valid second identity presented out of order
+            (130, 0, 2, 7, 12), // wrong layer
+            (130, 1, 3, 7, 12), // wrong local expert
+            (130, 1, 2, 9, 12), // wrong logical generation
+            (130, 1, 2, 7, 8),  // wrong physical slot byte count
+        ] {
+            let bad = make();
+            bad.record_install_identity(
+                id,
+                GpuNativeQ4ExpertKey::new(layer, expert, generation),
+                bytes,
+            );
+            assert_eq!(
+                bad.counters.lock().boundary_physical_install_order_errors,
+                1
+            );
+        }
+        good.record_install_identity(129, GpuNativeQ4ExpertKey::new(1, 1, 8), 12);
+        assert_eq!(
+            good.counters.lock().boundary_physical_install_order_errors,
+            1,
+            "extra install fails closed"
+        );
+    }
+
+    #[test]
+    fn logical_only_inherits_source_pool_and_c4_fail_closed_gates() {
+        let mut good = valid_source_only_counters();
+        accumulate_oracle(&mut good, &valid_logical_only_counters());
+        good.boundary_direct_staging_writes = 2;
+        good.boundary_physical_install_bytes = 24;
+        validate_oracle_counters(&good, logical_only_mode(), 4, 8).unwrap();
+        for corrupt in [
+            (|c: &mut OracleCounters| c.qualification_owned_peak_slots = 385)
+                as fn(&mut OracleCounters),
+            |c| c.qualification_owned_current_slots = 1,
+            |c| c.oracle_source_pool_exhaustion_count = 1,
+            |c| c.source_prefetch_peak_inflight = 5,
+            |c| c.source_prefetch_reads_peak_inflight = 5,
+            |c| c.source_prefetch_reads_current_inflight = 1,
+            |c| c.source_reads_started += 1,
+            |c| c.oracle_source_nvme_reads += 1,
+            |c| c.boundary_full_slot_vec_materializations = 1,
+        ] {
+            let mut bad = good.clone();
+            corrupt(&mut bad);
+            assert!(validate_oracle_counters(&bad, logical_only_mode(), 4, 8).is_err());
+        }
+        let c4 = valid_direct_source_mechanism_counters();
+        validate_source_concurrency_mechanism(&c4, logical_only_mode(), 4).unwrap();
+        let mut serialized = c4;
+        serialized.source_prefetch_reads_peak_inflight = 1;
+        assert!(
+            validate_source_concurrency_mechanism(&serialized, logical_only_mode(), 4).is_err()
+        );
+    }
+
+    #[test]
+    fn logical_only_counter_aggregation_preserves_all_added_evidence() {
+        let one = valid_logical_only_counters();
+        let mut total = OracleCounters::default();
+        accumulate_oracle(&mut total, &one);
+        accumulate_oracle(&mut total, &one);
+        let one_json = serde_json::to_value(one).unwrap();
+        let total_json = serde_json::to_value(total.clone()).unwrap();
+        for (name, value) in one_json.as_object().unwrap() {
+            if name.starts_with("logical_") || name.starts_with("boundary_physical_install_order_")
+            {
+                assert_eq!(
+                    total_json[name].as_u64().unwrap(),
+                    value.as_u64().unwrap() * 2,
+                    "{name}"
+                );
+            }
+        }
+        validate_logical_payload_counters(&total, logical_only_mode()).unwrap();
+    }
+
     #[test]
     fn exact_route_cursor_progression() {
         let trace = test_trace(3);
@@ -3818,8 +4485,8 @@ mod tests {
     }
 
     #[test]
-    fn v3_schema_and_predecessor_attempt_contracts_are_frozen() {
-        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v3");
+    fn v4_schema_and_predecessor_attempt_contracts_are_frozen() {
+        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v4");
         let first = PredecessorFirstAttemptEvidence {
             code_sha: PREDECESSOR_FIRST_ATTEMPT_CODE_SHA,
             result: "FAIL",
