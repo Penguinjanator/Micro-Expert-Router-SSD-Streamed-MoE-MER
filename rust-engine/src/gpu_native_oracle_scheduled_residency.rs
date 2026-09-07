@@ -10,7 +10,8 @@
 //! overlap and never uses the production predictor/speculative path.
 
 use crate::backend::gpu_native::{
-    GpuNativePhysicalInstallEvidence, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertResidency,
+    GpuNativePhysicalInstallEvidence, GpuNativePhysicalSlotFillPolicy, GpuNativeQ4ExpertGeometry,
+    GpuNativeQ4ExpertKey, GpuNativeQ4ExpertResidency,
 };
 use crate::backend::GpuDeviceIdentity;
 use crate::buffer_pool::{BufferPool, BufferPoolOrigin};
@@ -43,7 +44,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v4";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-oracle-scheduled-residency.v5";
 pub(crate) const MODE: &str = "qualify-gpu-native-oracle-scheduled-residency";
 const FROZEN_PAYLOAD_CONTROL_SHA: &str = "4eb143b34b00826e2031b313f3734bace18a7ecc";
 const FROZEN_PAYLOAD_CONTROL_TREE: &str = "37600e48e6dc3552f4a5b33e643351d4243280f5";
@@ -86,6 +87,7 @@ pub(crate) enum OracleScheduledResidencyMode {
     SourceOnly,
     TokenBoundaryDirect,
     TokenBoundaryDirectLogicalOnly,
+    TokenBoundaryDirectLogicalOnlyNoZeroFill,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -97,10 +99,22 @@ enum LogicalPayloadMode {
 
 const fn logical_payload_mode(mode: OracleScheduledResidencyMode) -> LogicalPayloadMode {
     match mode {
-        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             LogicalPayloadMode::QualificationLogicalOnly
         }
         _ => LogicalPayloadMode::Materialized,
+    }
+}
+
+const fn physical_fill_policy(
+    mode: OracleScheduledResidencyMode,
+) -> GpuNativePhysicalSlotFillPolicy {
+    match mode {
+        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
+            GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill
+        }
+        _ => GpuNativePhysicalSlotFillPolicy::FullSlotZero,
     }
 }
 
@@ -115,7 +129,8 @@ const fn late_source_policy(mode: OracleScheduledResidencyMode) -> LateSourcePol
     match mode {
         OracleScheduledResidencyMode::SourceOnly => LateSourcePolicy::NonblockingDemandFallback,
         OracleScheduledResidencyMode::TokenBoundaryDirect
-        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             LateSourcePolicy::AwaitResidualAtSafeBoundary
         }
     }
@@ -454,6 +469,17 @@ struct OracleCounters {
     boundary_physical_install_order_checks: u64,
     boundary_physical_install_order_errors: u64,
     boundary_physical_install_bytes: u64,
+    physical_slot_zero_fill_bytes: u64,
+    physical_slot_epoch_write_bytes: u64,
+    physical_slot_payload_copy_bytes: u64,
+    physical_slot_prepare_us: u64,
+    physical_queue_staging_us: u64,
+    mapping_publication_us: u64,
+    individual_physical_stage_us: u64,
+    physical_install_total_us: u64,
+    physical_install_evidence_errors: u64,
+    physical_install_timing_errors: u64,
+
     boundary_physical_evictions: u64,
     boundary_physical_reinstalls: u64,
     boundary_stale_generation: u64,
@@ -743,7 +769,8 @@ fn validate_retained_source_origins(
             "source-only retained request-local PRIMARY residents across token execution".into(),
         ),
         OracleScheduledResidencyMode::TokenBoundaryDirect
-        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             for (&global_id, resident) in &outcome.residents {
                 if resident.buffer_pool_origin()
                     != BufferPoolOrigin::QualificationOracleFutureSource
@@ -1182,7 +1209,8 @@ async fn prefetch_position(
             outcome
         }
         OracleScheduledResidencyMode::TokenBoundaryDirect
-        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             let task_engine = engine.clone();
             let task_counters = counters.clone();
             let task_readiness = readiness.clone();
@@ -1265,6 +1293,64 @@ struct OracleBoundaryObserver {
     layer_index: usize,
     experts_per_layer: u32,
     slot_bytes: u64,
+    payload_bytes: u64,
+    fill_policy: GpuNativePhysicalSlotFillPolicy,
+}
+
+fn record_physical_work_evidence(
+    counters: &mut OracleCounters,
+    fill_policy: GpuNativePhysicalSlotFillPolicy,
+    slot_bytes: u64,
+    payload_bytes: u64,
+    evidence: GpuNativePhysicalInstallEvidence,
+    total_us: u64,
+) {
+    let expected_zero_bytes = match fill_policy {
+        GpuNativePhysicalSlotFillPolicy::FullSlotZero => slot_bytes,
+        GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill => 0,
+    };
+    let bytes_match = evidence.physical_slot_bytes_staged == slot_bytes
+        && evidence.physical_slot_zero_fill_bytes == expected_zero_bytes
+        && evidence.physical_slot_epoch_write_bytes == 4
+        && evidence.physical_slot_payload_copy_bytes == payload_bytes
+        && evidence.direct_staging_writes == 1
+        && evidence.full_slot_vec_materializations == 0
+        && (fill_policy != GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill
+            || payload_bytes.checked_add(4) == Some(slot_bytes));
+    add_counter(
+        &mut counters.physical_install_evidence_errors,
+        u64::from(!bytes_match),
+    );
+
+    // Subphase timers are disjoint, individually rounded-down microseconds.
+    // Compare against their enclosing existing timers without tolerances or
+    // any cross-arm performance requirement. Zero-duration samples are valid.
+    let stage_us = evidence.individual_physical_stage_us;
+    let timings_match = evidence
+        .physical_slot_prepare_us
+        .checked_add(evidence.physical_queue_staging_us)
+        .is_some_and(|subphases| subphases <= stage_us)
+        && total_us
+            .checked_sub(stage_us)
+            .is_some_and(|commit_us| evidence.mapping_publication_us <= commit_us)
+        && total_us != u64::MAX;
+    add_counter(
+        &mut counters.physical_install_timing_errors,
+        u64::from(!timings_match),
+    );
+    macro_rules! add_evidence {
+        ($field:ident) => {
+            add_counter(&mut counters.$field, evidence.$field);
+        };
+    }
+    add_evidence!(physical_slot_zero_fill_bytes);
+    add_evidence!(physical_slot_epoch_write_bytes);
+    add_evidence!(physical_slot_payload_copy_bytes);
+    add_evidence!(physical_slot_prepare_us);
+    add_evidence!(physical_queue_staging_us);
+    add_evidence!(mapping_publication_us);
+    add_evidence!(individual_physical_stage_us);
+    add_counter(&mut counters.physical_install_total_us, total_us);
 }
 
 impl OracleBoundaryObserver {
@@ -1327,7 +1413,7 @@ impl GpuNativePhysicalInstallObserver for OracleBoundaryObserver {
         global_id: u32,
         residency: GpuNativeQ4ExpertResidency,
         evidence: GpuNativePhysicalInstallEvidence,
-        _physical_install_total_us: u64,
+        physical_install_total_us: u64,
     ) {
         self.record_install_identity(
             global_id,
@@ -1335,6 +1421,15 @@ impl GpuNativePhysicalInstallObserver for OracleBoundaryObserver {
             evidence.physical_slot_bytes_staged,
         );
         let mut values = self.counters.lock();
+        // Reuse the existing install-completion lock and existing timers.
+        record_physical_work_evidence(
+            &mut values,
+            self.fill_policy,
+            self.slot_bytes,
+            self.payload_bytes,
+            evidence,
+            physical_install_total_us,
+        );
         values.boundary_physical_installs += 1;
         add_counter(
             &mut values.boundary_physical_install_bytes,
@@ -1832,6 +1927,8 @@ fn install_future_at_boundary(
             layer_index,
             experts_per_layer,
             slot_bytes: manager.plan().geometry().slot_stride_bytes() as u64,
+            payload_bytes: manager.plan().geometry().logical_expert_bytes() as u64,
+            fill_policy: physical_fill_policy(mode),
         };
         counters.lock().boundary_replacement_sets_started += 1;
         let evictions_before = counters.lock().boundary_physical_evictions;
@@ -1839,6 +1936,7 @@ fn install_future_at_boundary(
             boundary,
             layer_index,
             &demands,
+            physical_fill_policy(mode),
             &observer,
         ) {
             Ok(_) => {
@@ -2603,6 +2701,9 @@ struct PhysicalSlotPlanEvidence {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TreatmentContract {
+    physical_fill_policy: GpuNativePhysicalSlotFillPolicy,
+    physical_zero_fill_accounting: &'static str,
+    concurrent_direct_staging_used: bool,
     logical_payload_mode: LogicalPayloadMode,
     logical_capacity_accounting: &'static str,
     physical_byte_source: &'static str,
@@ -2630,6 +2731,7 @@ const fn uses_isolated_oracle_source_pool(mode: OracleScheduledResidencyMode) ->
         mode,
         OracleScheduledResidencyMode::TokenBoundaryDirect
             | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+            | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill
     )
 }
 
@@ -2643,16 +2745,19 @@ const fn oracle_source_pool_configured_max_slots(mode: OracleScheduledResidencyM
 
 const fn treatment_contract(mode: OracleScheduledResidencyMode) -> TreatmentContract {
     TreatmentContract {
+        physical_fill_policy: physical_fill_policy(mode),
+        physical_zero_fill_accounting: "explicit host fill bytes only; epoch and payload writes counted separately; physical staged/H2D bytes are unchanged",
+        concurrent_direct_staging_used: uses_isolated_oracle_source_pool(mode),
         logical_payload_mode: logical_payload_mode(mode),
         logical_capacity_accounting: "sum of successful boundary admission transaction snapshots: before + newly charged bytes = after + evicted bytes; intervening ordinary demand is excluded",
         physical_byte_source: "GpuNativeDemandExpert::Install resident: Arc<ExpertResident>; production staging reads ExpertResident::data()",
         logical_only_data_access_policy: "increment run-scoped audit and panic; any nonzero audit rejects qualification including caught panics",
         source_overlap: true,
         late_source_policy: late_source_policy(mode),
-        independent_layer_source_tasks: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
+        independent_layer_source_tasks: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill),
         per_layer_storage_batch_read_used: false,
         host_preparation_overlap: false,
-        token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly),
+        token_boundary_h2d: matches!(mode, OracleScheduledResidencyMode::TokenBoundaryDirect | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill),
         demand_fallback: true,
         h2d_compute_overlap_claimed: false,
         same_ordered_queue: true,
@@ -2889,6 +2994,17 @@ fn accumulate_oracle(total: &mut OracleCounters, value: &OracleCounters) {
     add!(boundary_physical_install_order_checks);
     add!(boundary_physical_install_order_errors);
     add!(boundary_physical_install_bytes);
+    add!(physical_slot_zero_fill_bytes);
+    add!(physical_slot_epoch_write_bytes);
+    add!(physical_slot_payload_copy_bytes);
+    add!(physical_slot_prepare_us);
+    add!(physical_queue_staging_us);
+    add!(mapping_publication_us);
+    add!(individual_physical_stage_us);
+    add!(physical_install_total_us);
+    add!(physical_install_evidence_errors);
+    add!(physical_install_timing_errors);
+
     add!(boundary_physical_evictions);
     add!(boundary_physical_reinstalls);
     add!(boundary_stale_generation);
@@ -3036,6 +3152,70 @@ fn validate_logical_payload_counters(
     Ok(())
 }
 
+fn frozen_physical_geometry() -> GpuNativeQ4ExpertGeometry {
+    GpuNativeQ4ExpertGeometry::try_new(
+        EXPECTED_D_MODEL,
+        EXPECTED_D_FF,
+        EXPECTED_EXPERTS,
+        EXPECTED_TOP_K,
+    )
+    .expect("frozen ORACLE Q4 geometry is valid")
+}
+
+fn validate_physical_work_counters(
+    c: &OracleCounters,
+    mode: OracleScheduledResidencyMode,
+) -> Result<(), BenchmarkFailure> {
+    if logical_payload_mode(mode) != LogicalPayloadMode::QualificationLogicalOnly {
+        return Ok(());
+    }
+    let geometry = frozen_physical_geometry();
+    let slot_bytes = geometry.slot_stride_bytes() as u64;
+    let payload_bytes = geometry.logical_expert_bytes() as u64;
+    let installs = c.boundary_physical_installs;
+    let expected_staged = installs.checked_mul(slot_bytes);
+    let expected_zero = match physical_fill_policy(mode) {
+        GpuNativePhysicalSlotFillPolicy::FullSlotZero => expected_staged,
+        GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill => Some(0),
+    };
+    let stage_subphases = c
+        .physical_slot_prepare_us
+        .checked_add(c.physical_queue_staging_us);
+    let total_us = c
+        .individual_physical_stage_us
+        .checked_add(c.token_boundary_commit_us);
+    if installs == 0
+        || expected_staged.is_none()
+        || expected_staged != Some(c.boundary_physical_install_bytes)
+        || expected_zero != Some(c.physical_slot_zero_fill_bytes)
+        || installs.checked_mul(4) != Some(c.physical_slot_epoch_write_bytes)
+        || installs.checked_mul(payload_bytes) != Some(c.physical_slot_payload_copy_bytes)
+        || c.boundary_direct_staging_writes != installs
+        || c.boundary_full_slot_vec_materializations != 0
+        || c.boundary_physical_install_order_checks != installs
+        || c.boundary_physical_install_order_errors != 0
+        || c.boundary_stale_generation != 0
+        || c.boundary_install_failures != 0
+        || c.logical_only_data_accesses != 0
+        || c.physical_install_evidence_errors != 0
+        || c.physical_install_timing_errors != 0
+        || !stage_subphases.is_some_and(|us| us <= c.individual_physical_stage_us)
+        || c.mapping_publication_us > c.token_boundary_commit_us
+        || total_us.is_none()
+        || total_us == Some(u64::MAX)
+        || total_us != Some(c.physical_install_total_us)
+    {
+        return Err(BenchmarkFailure::new(
+            "postcondition",
+            "oracle-physical-work-reconciliation",
+            format!(
+                "ORACLE physical byte work, install or timing evidence did not reconcile: {c:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_oracle_counters(
     counters: &OracleCounters,
     mode: OracleScheduledResidencyMode,
@@ -3045,6 +3225,7 @@ fn validate_oracle_counters(
     validate_logical_only_concurrency(mode, concurrency)?;
     validate_source_concurrency_mechanism(counters, mode, concurrency)?;
     validate_logical_payload_counters(counters, mode)?;
+    validate_physical_work_counters(counters, mode)?;
     let classified_source = counters
         .source_skipped_physical_current
         .saturating_add(counters.source_prefetch_ram_hits)
@@ -3448,7 +3629,9 @@ fn validate_logical_only_concurrency(
     mode: OracleScheduledResidencyMode,
     concurrency: usize,
 ) -> Result<(), BenchmarkFailure> {
-    if mode == OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly && concurrency != 4 {
+    if logical_payload_mode(mode) == LogicalPayloadMode::QualificationLogicalOnly
+        && concurrency != 4
+    {
         return Err(artifact_failure(
             "logical-only-requires-frozen-c4",
             "logical-only payload treatment requires unchanged --oracle-source-concurrency=4",
@@ -3584,7 +3767,8 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     let oracle_source_pool = match args.treatment_mode {
         OracleScheduledResidencyMode::SourceOnly => None,
         OracleScheduledResidencyMode::TokenBoundaryDirect
-        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly => {
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
+        | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             Some(Arc::new(OracleFutureSourcePool::new(
                 ORACLE_FUTURE_SOURCE_POOL_SLOTS,
                 spec.cfg.model.expert_size,
@@ -3776,6 +3960,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
     for run in &measured {
         accumulate_oracle(&mut aggregate_oracle, &run.oracle);
     }
+    validate_physical_work_counters(&aggregate_oracle, args.treatment_mode)?;
     let all_measured_outputs_identical = measured.iter().all(|run| {
         run.correctness.generated_token_ids_sha256 == warmup.correctness.generated_token_ids_sha256
             && run.correctness.generated_text_sha256 == warmup.correctness.generated_text_sha256
@@ -4040,6 +4225,278 @@ mod tests {
         OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnly
     }
 
+    fn no_zero_fill_mode() -> OracleScheduledResidencyMode {
+        OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill
+    }
+
+    #[test]
+    fn no_zero_fill_contract_preserves_logical_only_frozen_c4_source_and_boundary() {
+        assert_eq!(
+            OracleScheduledResidencyMode::from_str(
+                "token-boundary-direct-logical-only-no-zero-fill",
+                false,
+            )
+            .unwrap(),
+            no_zero_fill_mode()
+        );
+        assert_eq!(
+            serde_json::to_value(no_zero_fill_mode()).unwrap(),
+            "token-boundary-direct-logical-only-no-zero-fill"
+        );
+        let mut control = serde_json::to_value(treatment_contract(logical_only_mode())).unwrap();
+        let mut treatment = serde_json::to_value(treatment_contract(no_zero_fill_mode())).unwrap();
+        assert_eq!(
+            control
+                .as_object_mut()
+                .unwrap()
+                .remove("physical_fill_policy")
+                .unwrap(),
+            "full-slot-zero"
+        );
+        assert_eq!(
+            treatment
+                .as_object_mut()
+                .unwrap()
+                .remove("physical_fill_policy")
+                .unwrap(),
+            "qualification-no-zero-fill"
+        );
+        assert_eq!(
+            control
+                .as_object_mut()
+                .unwrap()
+                .remove("production_direct_staging_used")
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            treatment
+                .as_object_mut()
+                .unwrap()
+                .remove("production_direct_staging_used")
+                .unwrap(),
+            false
+        );
+        assert_eq!(control, treatment);
+        for mode in [logical_only_mode(), no_zero_fill_mode()] {
+            assert_eq!(
+                logical_payload_mode(mode),
+                LogicalPayloadMode::QualificationLogicalOnly
+            );
+            assert_eq!(
+                late_source_policy(mode),
+                LateSourcePolicy::AwaitResidualAtSafeBoundary
+            );
+            assert_eq!(oracle_source_pool_configured_max_slots(mode), 384);
+            assert!(treatment_contract(mode).concurrent_direct_staging_used);
+            validate_logical_only_concurrency(mode, 4).unwrap();
+            for concurrency in [0, 1, 2, 3, 5, 8, 48, usize::MAX] {
+                assert!(validate_logical_only_concurrency(mode, concurrency).is_err());
+            }
+            validate_source_concurrency_mechanism(
+                &valid_direct_source_mechanism_counters(),
+                mode,
+                4,
+            )
+            .unwrap();
+            let mut serialized = valid_direct_source_mechanism_counters();
+            serialized.source_prefetch_reads_peak_inflight = 1;
+            assert!(validate_source_concurrency_mechanism(&serialized, mode, 4).is_err());
+        }
+    }
+
+    fn set_valid_physical_work_counters(
+        c: &mut OracleCounters,
+        mode: OracleScheduledResidencyMode,
+    ) {
+        let n = c.boundary_physical_installs;
+        c.boundary_direct_staging_writes = n;
+        c.boundary_physical_install_bytes = n * 2_654_212;
+        c.physical_slot_zero_fill_bytes = if mode == no_zero_fill_mode() {
+            0
+        } else {
+            n * 2_654_212
+        };
+        c.physical_slot_epoch_write_bytes = n * 4;
+        c.physical_slot_payload_copy_bytes = n * 2_654_208;
+        c.physical_slot_prepare_us = n * 6;
+        c.physical_queue_staging_us = n * 3;
+        c.mapping_publication_us = n * 2;
+        c.individual_physical_stage_us = n * 11;
+        c.token_boundary_commit_us = n * 5;
+        c.physical_install_total_us = n * 16;
+    }
+
+    #[test]
+    fn no_zero_fill_physical_work_reconciliation_rejects_corrupted_bytes_timings_and_installs() {
+        let corruptions: &[fn(&mut OracleCounters)] = &[
+            |c| c.physical_slot_zero_fill_bytes += 1,
+            |c| c.physical_slot_payload_copy_bytes += 1,
+            |c| c.physical_slot_epoch_write_bytes += 1,
+            |c| c.boundary_physical_install_bytes += 1,
+            |c| c.boundary_direct_staging_writes -= 1,
+            |c| c.boundary_physical_installs = u64::MAX,
+            |c| c.boundary_physical_install_order_checks -= 1,
+            |c| c.boundary_physical_install_order_errors = 1,
+            |c| c.boundary_stale_generation = 1,
+            |c| c.boundary_install_failures = 1,
+            |c| c.logical_only_data_accesses = 1,
+            |c| c.boundary_full_slot_vec_materializations = 1,
+            |c| c.physical_install_evidence_errors = 1,
+            |c| c.physical_install_timing_errors = 1,
+            |c| c.physical_slot_prepare_us = c.individual_physical_stage_us + 1,
+            |c| c.physical_queue_staging_us = u64::MAX,
+            |c| c.mapping_publication_us = c.token_boundary_commit_us + 1,
+            |c| c.individual_physical_stage_us += 1,
+            |c| c.token_boundary_commit_us += 1,
+            |c| c.physical_install_total_us += 1,
+        ];
+        for mode in [logical_only_mode(), no_zero_fill_mode()] {
+            let mut good = valid_source_only_counters();
+            accumulate_oracle(&mut good, &valid_logical_only_counters());
+            set_valid_physical_work_counters(&mut good, mode);
+            validate_oracle_counters(&good, mode, 4, 8).unwrap();
+            for corrupt in corruptions {
+                let mut bad = good.clone();
+                corrupt(&mut bad);
+                assert!(
+                    validate_oracle_counters(&bad, mode, 4, 8).is_err(),
+                    "accepted {mode:?}: {bad:?}"
+                );
+            }
+            let mut wrong_arm = good;
+            wrong_arm.physical_slot_zero_fill_bytes = if mode == no_zero_fill_mode() {
+                2 * 2_654_212
+            } else {
+                0
+            };
+            assert!(validate_physical_work_counters(&wrong_arm, mode).is_err());
+        }
+    }
+
+    #[test]
+    fn no_zero_fill_completion_evidence_and_aggregation_preserve_exact_host_work_and_h2d() {
+        for mode in [logical_only_mode(), no_zero_fill_mode()] {
+            let policy = physical_fill_policy(mode);
+            let evidence = GpuNativePhysicalInstallEvidence {
+                direct_staging_writes: 1,
+                physical_slot_bytes_staged: 2_654_212,
+                physical_slot_zero_fill_bytes: if mode == no_zero_fill_mode() {
+                    0
+                } else {
+                    2_654_212
+                },
+                physical_slot_epoch_write_bytes: 4,
+                physical_slot_payload_copy_bytes: 2_654_208,
+                physical_slot_prepare_us: 6,
+                physical_queue_staging_us: 3,
+                mapping_publication_us: 2,
+                individual_physical_stage_us: 11,
+                ..GpuNativePhysicalInstallEvidence::default()
+            };
+            let mut observed = OracleCounters::default();
+            record_physical_work_evidence(
+                &mut observed,
+                policy,
+                2_654_212,
+                2_654_208,
+                evidence,
+                16,
+            );
+            assert_eq!(observed.physical_install_evidence_errors, 0);
+            assert_eq!(observed.physical_install_timing_errors, 0);
+            assert_eq!(
+                observed.physical_slot_zero_fill_bytes,
+                evidence.physical_slot_zero_fill_bytes
+            );
+            assert_eq!(observed.physical_slot_epoch_write_bytes, 4);
+            assert_eq!(observed.physical_slot_payload_copy_bytes, 2_654_208);
+            assert_eq!(observed.physical_slot_prepare_us, 6);
+            assert_eq!(observed.physical_queue_staging_us, 3);
+            assert_eq!(observed.mapping_publication_us, 2);
+            assert_eq!(observed.individual_physical_stage_us, 11);
+            assert_eq!(observed.physical_install_total_us, 16);
+            for corrupt in [
+                (|e: &mut GpuNativePhysicalInstallEvidence| e.physical_slot_zero_fill_bytes += 1)
+                    as fn(&mut GpuNativePhysicalInstallEvidence),
+                |e| e.physical_slot_epoch_write_bytes += 1,
+                |e| e.physical_slot_payload_copy_bytes += 1,
+                |e| e.physical_slot_bytes_staged += 1,
+                |e| e.direct_staging_writes = 0,
+                |e| e.full_slot_vec_materializations = 1,
+            ] {
+                let mut bad_evidence = evidence;
+                corrupt(&mut bad_evidence);
+                let mut bad = OracleCounters::default();
+                record_physical_work_evidence(
+                    &mut bad,
+                    policy,
+                    2_654_212,
+                    2_654_208,
+                    bad_evidence,
+                    16,
+                );
+                assert_eq!(bad.physical_install_evidence_errors, 1);
+            }
+            for corrupt in [
+                (|e: &mut GpuNativePhysicalInstallEvidence| e.physical_slot_prepare_us = 12)
+                    as fn(&mut GpuNativePhysicalInstallEvidence),
+                |e| e.physical_queue_staging_us = u64::MAX,
+                |e| e.mapping_publication_us = 6,
+                |e| e.individual_physical_stage_us = 17,
+            ] {
+                let mut bad_evidence = evidence;
+                corrupt(&mut bad_evidence);
+                let mut bad = OracleCounters::default();
+                record_physical_work_evidence(
+                    &mut bad,
+                    policy,
+                    2_654_212,
+                    2_654_208,
+                    bad_evidence,
+                    16,
+                );
+                assert_eq!(bad.physical_install_timing_errors, 1);
+            }
+            let mut one = valid_logical_only_counters();
+            set_valid_physical_work_counters(&mut one, mode);
+            let mut total = OracleCounters::default();
+            accumulate_oracle(&mut total, &one);
+            accumulate_oracle(&mut total, &one);
+            validate_physical_work_counters(&total, mode).unwrap();
+            let one_json = serde_json::to_value(one).unwrap();
+            let total_json = serde_json::to_value(total).unwrap();
+            for (name, value) in one_json.as_object().unwrap() {
+                if name.starts_with("physical_")
+                    || name == "mapping_publication_us"
+                    || name == "individual_physical_stage_us"
+                    || name == "token_boundary_commit_us"
+                    || name.starts_with("boundary_physical_")
+                {
+                    assert_eq!(
+                        total_json[name].as_u64().unwrap(),
+                        value.as_u64().unwrap() * 2,
+                        "{name}"
+                    );
+                }
+            }
+            let mut frozen = valid_logical_only_counters();
+            frozen.boundary_physical_installs = 89_676;
+            frozen.boundary_physical_install_order_checks = 89_676;
+            set_valid_physical_work_counters(&mut frozen, mode);
+            validate_physical_work_counters(&frozen, mode).unwrap();
+            assert_eq!(frozen.boundary_physical_install_bytes, 238_019_115_312);
+            assert_eq!(
+                frozen.physical_slot_zero_fill_bytes,
+                if mode == no_zero_fill_mode() {
+                    0
+                } else {
+                    238_019_115_312
+                }
+            );
+        }
+    }
+
     #[test]
     fn logical_only_contract_changes_payload_mode_and_preserves_direct_source_and_boundary_contract(
     ) {
@@ -4107,12 +4564,14 @@ mod tests {
         let caches = [
             GpuExpertCache::new(16, 0.0, 0),
             GpuExpertCache::new(16, 0.0, 0),
+            GpuExpertCache::new(16, 0.0, 0),
         ];
         let mut signatures = Vec::new();
         let mut retained = Vec::new();
         for (index, mode) in [
             OracleScheduledResidencyMode::TokenBoundaryDirect,
             logical_only_mode(),
+            no_zero_fill_mode(),
         ]
         .into_iter()
         .enumerate()
@@ -4177,10 +4636,10 @@ mod tests {
                 c.logical_materialization_bytes,
                 if index == 0 { 16 } else { 0 }
             );
-            assert_eq!(c.logical_only_admissions, if index == 1 { 2 } else { 0 });
+            assert_eq!(c.logical_only_admissions, if index != 0 { 2 } else { 0 });
             assert_eq!(
                 c.logical_only_charged_bytes,
-                if index == 1 { 16 } else { 0 }
+                if index != 0 { 16 } else { 0 }
             );
             assert_eq!(audit.load(Ordering::Relaxed), 0);
             signatures.push((
@@ -4193,13 +4652,14 @@ mod tests {
             retained.extend(admissions);
         }
         assert_eq!(signatures[0], signatures[1]);
+        assert_eq!(signatures[1], signatures[2]);
         drop(residents);
         assert!(weak.iter().all(|source| source.upgrade().is_none()));
         assert_eq!(pool.snapshot().current_in_use_slots, 0);
         assert_eq!(pool.snapshot().exhaustion_count, 0);
         assert_eq!(
             retained.len(),
-            4,
+            6,
             "logical admissions remain alive after all source leases return"
         );
     }
@@ -4321,6 +4781,8 @@ mod tests {
             layer_index: 1,
             experts_per_layer: 128,
             slot_bytes: 12,
+            payload_bytes: 8,
+            fill_policy: GpuNativePhysicalSlotFillPolicy::FullSlotZero,
         };
         let good = make();
         good.record_install_identity(130, GpuNativeQ4ExpertKey::new(1, 2, 7), 12);
@@ -4364,8 +4826,7 @@ mod tests {
     fn logical_only_inherits_source_pool_and_c4_fail_closed_gates() {
         let mut good = valid_source_only_counters();
         accumulate_oracle(&mut good, &valid_logical_only_counters());
-        good.boundary_direct_staging_writes = 2;
-        good.boundary_physical_install_bytes = 24;
+        set_valid_physical_work_counters(&mut good, logical_only_mode());
         validate_oracle_counters(&good, logical_only_mode(), 4, 8).unwrap();
         for corrupt in [
             (|c: &mut OracleCounters| c.qualification_owned_peak_slots = 385)
@@ -4485,8 +4946,8 @@ mod tests {
     }
 
     #[test]
-    fn v4_schema_and_predecessor_attempt_contracts_are_frozen() {
-        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v4");
+    fn v5_schema_and_predecessor_attempt_contracts_are_frozen() {
+        assert_eq!(SCHEMA, "mer.gpu-native-oracle-scheduled-residency.v5");
         let first = PredecessorFirstAttemptEvidence {
             code_sha: PREDECESSOR_FIRST_ATTEMPT_CODE_SHA,
             result: "FAIL",
