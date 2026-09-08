@@ -9,9 +9,10 @@
 
 use crate::backend::gpu_native::{
     GpuNativeBootstrapError, GpuNativeExecutorContext, GpuNativePhysicalInstallEvidence,
-    GpuNativeProductionPhysicalInstallSnapshot, GpuNativeQ4ExpertAcquire, GpuNativeQ4ExpertArena,
-    GpuNativeQ4ExpertGeometry, GpuNativeQ4ExpertKey, GpuNativeQ4ExpertPreparedInstall,
-    GpuNativeQ4ExpertResidency, GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
+    GpuNativePhysicalSlotFillPolicy, GpuNativeProductionPhysicalInstallSnapshot,
+    GpuNativeQ4ExpertAcquire, GpuNativeQ4ExpertArena, GpuNativeQ4ExpertGeometry,
+    GpuNativeQ4ExpertKey, GpuNativeQ4ExpertPreparedInstall, GpuNativeQ4ExpertResidency,
+    GpuNativeQ4ExpertRetire, GpuNativeQ4ExpertVramPlan,
 };
 use crate::expert_cache::{ExpertResident, GpuAdmission, GpuExpertCache};
 use lru::LruCache;
@@ -99,6 +100,10 @@ pub(crate) enum GpuNativeTieredResidencyError {
     PhysicalIdentityCorrupt {
         global_id: u32,
     },
+    UnsafeOracleBoundary {
+        layer_index: usize,
+        detail: String,
+    },
     ResidencyPriorityMismatch,
     Backend(GpuNativeBootstrapError),
 }
@@ -125,6 +130,7 @@ impl fmt::Display for GpuNativeTieredResidencyError {
             Self::NoEvictablePhysicalSlot { layer_index } => write!(f, "layer {layer_index} has no physical victim outside the protected demand set"),
             Self::StalePhysicalRequester { global_id, generation } => write!(f, "stale physical requester for global expert {global_id} generation {generation}"),
             Self::PhysicalIdentityCorrupt { global_id } => write!(f, "GPU-native physical metadata disagrees with the authoritative arena for global expert {global_id}"),
+            Self::UnsafeOracleBoundary { layer_index, detail } => write!(f, "ORACLE-0B-S safe-boundary authorization failed for layer {layer_index}: {detail}"),
             Self::ResidencyPriorityMismatch => f.write_str("residency request used the wrong demand/speculative priority"),
             Self::Backend(error) => write!(f, "GPU-native residency backend error: {error}"),
         }
@@ -350,18 +356,34 @@ impl GpuNativeModelExpertVramPlan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GpuNativeResidencyPriority {
     Demand,
+    OracleSafeBoundary,
     Speculative { score: f64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DemandPhysicalInstallPath {
-    ProductionConcurrentDirectStaging,
+    ProductionConcurrentDirectStaging, // Complete overwrite, no explicit zero fill.
+    QualificationConcurrentDirectStagingFullZero,
+    QualificationConcurrentDirectStagingNoZeroFill,
     SequentialDirectStagingControl,
     LegacyFullSlotVecControl,
 }
 
 const fn ordinary_demand_install_path() -> DemandPhysicalInstallPath {
     DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+}
+
+const fn oracle_safe_boundary_install_path(
+    fill_policy: GpuNativePhysicalSlotFillPolicy,
+) -> DemandPhysicalInstallPath {
+    match fill_policy {
+        GpuNativePhysicalSlotFillPolicy::FullSlotZero => {
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+        }
+        GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill => {
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
+        }
+    }
 }
 
 const fn production_concurrency_control_path() -> DemandPhysicalInstallPath {
@@ -670,6 +692,23 @@ impl GpuNativeTieredResidencyManager {
         &self.plan
     }
 
+    /// Re-run the production model-wide slot planner for an alternate expert
+    /// budget without allocating buffers or mutating residency. Qualification
+    /// analyzers use the authoritative executor limits rather than guessing
+    /// per-layer capacities from the budget.
+    pub(crate) fn plan_for_budget(
+        &self,
+        total_expert_budget_bytes: u64,
+    ) -> Result<GpuNativeModelExpertVramPlan, GpuNativeTieredResidencyError> {
+        let limits = self.executor.device_limits()?;
+        GpuNativeModelExpertVramPlan::try_new(
+            self.plan.num_layers(),
+            self.plan.geometry(),
+            total_expert_budget_bytes,
+            &limits,
+        )
+    }
+
     pub(crate) fn arena(&self, layer_index: usize) -> Option<&Arc<GpuNativeQ4ExpertArena>> {
         self.layers.get(layer_index).map(|layer| &layer.arena)
     }
@@ -791,6 +830,58 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
+    /// Same concurrent reserve/stage/commit transaction as production, with
+    /// explicit full-slot zero writes for the zero-fill production qualifier.
+    pub(crate) fn ensure_demand_set_full_zero_control_observed(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        self.ensure_demand_set_inner::<true>(
+            priority,
+            layer_index,
+            demands,
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero,
+            Some(observer),
+        )
+    }
+
+    /// ORACLE-0B-S qualification-only destructive replacement. The caller
+    /// must present the non-cloneable witness minted by the token loop after
+    /// the previous token's successful boundary readback. Physical staging is
+    /// the shared concurrent direct-staging transaction with an explicit
+    /// full-zero control or historical qualification no-zero fill.
+    /// The demand-request counter is kept separate. The resulting queue writes
+    /// are deliberately left pending: next-token mapping writes follow them,
+    /// then the next token's one normal command-buffer submit orders both sets
+    /// of writes before compute. No extra empty submit is used to flush H2D.
+    pub(crate) fn ensure_oracle_future_set_at_safe_boundary(
+        &self,
+        boundary: &mut crate::gpu_native_token_loop::GpuNativeSafeTokenBoundary,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        fill_policy: GpuNativePhysicalSlotFillPolicy,
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        boundary
+            .authorize_layer_once(layer_index)
+            .map_err(
+                |detail| GpuNativeTieredResidencyError::UnsafeOracleBoundary {
+                    layer_index,
+                    detail: detail.to_string(),
+                },
+            )?;
+        self.ensure_demand_set_inner::<true>(
+            GpuNativeResidencyPriority::OracleSafeBoundary,
+            layer_index,
+            demands,
+            oracle_safe_boundary_install_path(fill_policy),
+            Some(observer),
+        )
+    }
+
     /// PR2-B-B.1 control: the exact pre-B-B sequential production direct-
     /// staging path, observed only by the dedicated production qualifier.
     pub(crate) fn ensure_demand_set_physical_install_concurrency_control(
@@ -817,7 +908,10 @@ impl GpuNativeTieredResidencyManager {
         install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
-        if !matches!(priority, GpuNativeResidencyPriority::Demand) {
+        if !matches!(
+            priority,
+            GpuNativeResidencyPriority::Demand | GpuNativeResidencyPriority::OracleSafeBoundary
+        ) {
             return Err(GpuNativeTieredResidencyError::ResidencyPriorityMismatch);
         }
         let layer =
@@ -859,9 +953,11 @@ impl GpuNativeTieredResidencyManager {
             }
         }
 
-        self.counters
-            .demand_requests
-            .fetch_add(demands.len() as u64, Ordering::Relaxed);
+        if matches!(priority, GpuNativeResidencyPriority::Demand) {
+            self.counters
+                .demand_requests
+                .fetch_add(demands.len() as u64, Ordering::Relaxed);
+        }
         let mut state = layer.state.lock();
         let mut resolved = vec![None; demands.len()];
         let mut misses = Vec::new();
@@ -898,15 +994,30 @@ impl GpuNativeTieredResidencyManager {
         if matches!(
             install_path,
             DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+                | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
         ) {
-            self.install_parallel_physical_misses_locked::<OBSERVE>(
-                demands,
-                &misses,
-                layer,
-                &mut state,
-                &mut resolved,
-                observer,
-            )?;
+            if install_path
+                == DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+            {
+                self.install_parallel_physical_misses_locked::<true, true>(
+                    demands,
+                    &misses,
+                    layer,
+                    &mut state,
+                    &mut resolved,
+                    observer,
+                )?;
+            } else {
+                self.install_parallel_physical_misses_locked::<OBSERVE, false>(
+                    demands,
+                    &misses,
+                    layer,
+                    &mut state,
+                    &mut resolved,
+                    observer,
+                )?;
+            }
         } else {
             let transaction_started = (OBSERVE && !misses.is_empty()).then(Instant::now);
             if OBSERVE && !misses.is_empty() {
@@ -956,7 +1067,11 @@ impl GpuNativeTieredResidencyManager {
             .collect()
     }
 
-    fn install_parallel_physical_misses_locked<'a, const OBSERVE: bool>(
+    fn install_parallel_physical_misses_locked<
+        'a,
+        const OBSERVE: bool,
+        const FULL_ZERO_CONTROL: bool,
+    >(
         &self,
         demands: &[GpuNativeDemandExpert],
         misses: &[usize],
@@ -1137,7 +1252,13 @@ impl GpuNativeTieredResidencyManager {
                     .record_physical_stage_started();
             }
             let stage_started = OBSERVE.then(Instant::now);
-            let result = if OBSERVE {
+            let result = if FULL_ZERO_CONTROL {
+                self.executor
+                    .stage_q4_expert_residency_full_zero_control_observed(
+                        reserved.permit,
+                        reserved.resident.data(),
+                    )
+            } else if OBSERVE {
                 self.executor.stage_q4_expert_residency_production_observed(
                     reserved.permit,
                     reserved.resident.data(),
@@ -1148,9 +1269,10 @@ impl GpuNativeTieredResidencyManager {
                     .map(|prepared| (prepared, GpuNativePhysicalInstallEvidence::default()))
             };
             match result {
-                Ok((prepared, evidence)) => {
+                Ok((prepared, mut evidence)) => {
                     let individual_stage_us = stage_started.map_or(0, qualification_elapsed_us);
                     if OBSERVE {
+                        evidence.individual_physical_stage_us = individual_stage_us;
                         observer
                             .expect("observed production install has an observer")
                             .record_physical_stage_completed(evidence, individual_stage_us);
@@ -1580,7 +1702,9 @@ impl GpuNativeTieredResidencyManager {
                         DemandPhysicalInstallPath::LegacyFullSlotVecControl => self
                             .executor
                             .install_q4_expert_residency_legacy_observed(permit, resident.data()),
-                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging => {
+                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill => {
                             unreachable!("ordinary production installs use the split transaction")
                         }
                     };
@@ -1612,7 +1736,9 @@ impl GpuNativeTieredResidencyManager {
                         DemandPhysicalInstallPath::SequentialDirectStagingControl => {
                             unreachable!("sequential control is qualifier-only")
                         }
-                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging => {
+                        DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+                        | DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill => {
                             unreachable!("ordinary production installs use the split transaction")
                         }
                     };
@@ -1699,6 +1825,16 @@ fn oldest_unprotected<T>(cache: &LruCache<u32, T>, protected: &HashSet<u32>) -> 
 }
 
 #[cfg(test)]
+pub(crate) fn validate_qualification_physical_source_for_test(
+    gpu_cache: &GpuExpertCache,
+    global_id: u32,
+    resident: &Arc<ExpertResident>,
+    admission: &GpuAdmission,
+) -> Result<(), GpuNativeTieredResidencyError> {
+    validate_physical_install_source(gpu_cache, global_id, resident, admission)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
@@ -1725,6 +1861,10 @@ mod tests {
             DemandPhysicalInstallPath::ProductionConcurrentDirectStaging
         );
         assert_eq!(
+            oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+        );
+        assert_eq!(
             production_concurrency_control_path(),
             DemandPhysicalInstallPath::SequentialDirectStagingControl
         );
@@ -1736,6 +1876,83 @@ mod tests {
             production_concurrency_control_path(),
             speculative_install_path()
         );
+        assert_ne!(
+            oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
+            speculative_install_path()
+        );
+    }
+
+    #[test]
+    fn oracle_full_zero_control_is_explicit_and_concurrent() {
+        assert_ne!(
+            oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
+            ordinary_demand_install_path()
+        );
+        assert_eq!(
+            oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingFullZero
+        );
+    }
+
+    #[test]
+    fn oracle_direct_staging_never_uses_legacy_full_slot_vec_control() {
+        assert_ne!(
+            oracle_safe_boundary_install_path(GpuNativePhysicalSlotFillPolicy::FullSlotZero),
+            speculative_install_path()
+        );
+    }
+
+    #[test]
+    fn oracle_no_zero_fill_is_a_qualification_only_concurrent_path() {
+        let treatment = oracle_safe_boundary_install_path(
+            GpuNativePhysicalSlotFillPolicy::QualificationNoZeroFill,
+        );
+        assert_eq!(
+            treatment,
+            DemandPhysicalInstallPath::QualificationConcurrentDirectStagingNoZeroFill
+        );
+        assert_ne!(treatment, ordinary_demand_install_path());
+        assert_ne!(treatment, production_concurrency_control_path());
+        assert_ne!(treatment, speculative_install_path());
+        // Production and historical treatment share checked no-zero staging;
+        // the concurrent control alone explicitly selects full zero fill.
+        let backend = include_str!("backend/gpu_native.rs");
+        for (wrapper, specialization) in [
+            (
+                "stage_q4_expert_residency_production<'a>",
+                "::<false, true, true>",
+            ),
+            (
+                "stage_q4_expert_residency_production_observed<'a>",
+                "::<true, true, true>",
+            ),
+            (
+                "stage_q4_expert_residency_full_zero_control_observed<'a>",
+                "::<true, true, false>",
+            ),
+            (
+                "stage_q4_expert_residency_qualification<'a>",
+                "::<true, false, false>",
+            ),
+            (
+                "stage_q4_expert_residency_qualification_no_zero_fill<'a>",
+                "::<true, true, true>",
+            ),
+        ] {
+            let body = backend
+                .split(&format!("pub(crate) fn {wrapper}"))
+                .nth(1)
+                .unwrap()
+                .split("\n    }")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains(&format!(
+                    "stage_q4_expert_residency_inner{specialization}(permit, payload)"
+                )),
+                "{wrapper}"
+            );
+        }
     }
 
     #[test]
@@ -1871,6 +2088,88 @@ mod tests {
                 generation: admission.generation(),
             })
         );
+    }
+
+    #[test]
+    fn qualification_logical_only_physical_validation_uses_real_source_and_rejects_stale_or_wrong_ids(
+    ) {
+        let cache = GpuExpertCache::new(8, 0.0, 0);
+        let audit = Arc::new(AtomicU64::new(0));
+        let pool = BufferPool::new_qualification_oracle_future_source(2, 8, 4);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer
+            .as_mut_slice()
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let resident = Arc::new(ExpertResident::new(7, buffer));
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new_qualification_logical_only(
+                7,
+                resident.data().len(),
+                crate::inference::WeightDtype::Q4_0,
+                audit.clone(),
+            )))
+            .unwrap();
+        let admission = cache.current_admission(7).unwrap();
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Ok(())
+        );
+        let demand = GpuNativeDemandExpert::install(7, resident.clone(), admission.clone());
+        match &demand {
+            GpuNativeDemandExpert::Install {
+                resident: source,
+                admission: logical,
+                ..
+            } => {
+                assert!(Arc::ptr_eq(source, &resident));
+                assert_eq!(source.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(logical.generation(), admission.generation());
+            }
+            _ => panic!("install must carry the real source"),
+        }
+        let wrong = Arc::new(ExpertResident::new(8, pool.try_acquire().unwrap()));
+        assert_eq!(
+            validate_physical_install_source(&cache, 7, &wrong, &admission),
+            Err(GpuNativeTieredResidencyError::DemandSourceIdentityMismatch { global_id: 7 })
+        );
+        cache
+            .demand_admit_lru(Arc::new(GpuResident::new(8, vec![0; 8])))
+            .unwrap();
+        assert!(matches!(
+            validate_physical_install_source(&cache, 7, &resident, &admission),
+            Err(GpuNativeTieredResidencyError::LogicalAdmissionStale { .. })
+        ));
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn qualification_logical_only_physical_stage_source_witness() {
+        // Both production calls and the new qualification call consume the
+        // ExpertResident field of ReservedPhysicalInstall. Pin this contract
+        // without changing the frozen engine/hash witnesses or requiring a GPU.
+        let source = include_str!("gpu_native_residency.rs");
+        let stage = source
+            .split("let stage_one = |reserved:")
+            .nth(1)
+            .unwrap()
+            .split("let parallel_stage_started =")
+            .next()
+            .unwrap();
+        assert_eq!(stage.matches("reserved.resident.data()").count(), 3);
+        let production = stage.split("} else if OBSERVE {").nth(1).unwrap();
+        assert_eq!(production.matches("reserved.resident.data()").count(), 2);
+        assert!(stage.contains("stage_q4_expert_residency_full_zero_control_observed("));
+        assert!(stage.contains("stage_q4_expert_residency_production_observed("));
+        assert!(stage.contains(".stage_q4_expert_residency_production("));
+        assert!(!stage.contains("admission.resident()"));
+        let owners = source
+            .split("struct ReservedPhysicalInstall<'a> {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(owners.contains("resident: Arc<ExpertResident>"));
     }
 
     #[test]

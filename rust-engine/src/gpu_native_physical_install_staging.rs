@@ -2,6 +2,9 @@
 //! staging. Control explicitly forces the legacy Vec writer; treatment uses
 //! the ordinary production demand-install path in a fresh runtime.
 
+#[path = "gpu_native_physical_zero_fill_production.rs"]
+pub(crate) mod zero_fill_production;
+
 #[path = "gpu_native_q4_route_parallel.rs"]
 pub(crate) mod q4_route_parallel;
 
@@ -333,7 +336,7 @@ struct ConcurrencyTimingDefinitions {
 fn concurrency_timing_definitions() -> ConcurrencyTimingDefinitions {
     ConcurrencyTimingDefinitions {
         common: TimingDefinitions {
-            physical_slot_prepare_us: "sum of qualification-only per-expert canonical validation plus unchanged whole-slot zero/fill time",
+            physical_slot_prepare_us: "sum of qualification-only per-expert canonical validation plus arm-specific physical-slot fill time",
             physical_queue_staging_us: "sum of qualification-only Queue::write_buffer_with view acquisition plus Drop scheduling time",
             mapping_publication_us: "ordered logical mapping Queue::write_buffer time after all treatment staging jobs finish",
             physical_install_total_us: CONCURRENCY_PHYSICAL_INSTALL_TOTAL_DEFINITION,
@@ -847,6 +850,7 @@ fn benchmark_report(prepared: &Prepared) -> BenchmarkReport {
 enum PhysicalInstallQualificationRun {
     Staging(GpuNativePhysicalInstallStagingQualificationArm),
     Concurrency(crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm),
+    ZeroFillProduction(crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm),
 }
 
 struct PhysicalInstallArmRun {
@@ -861,10 +865,12 @@ fn concurrency_common_snapshot(
 ) -> GpuNativePhysicalInstallStagingQualificationSnapshot {
     GpuNativePhysicalInstallStagingQualificationSnapshot {
         arm: match source.arm {
-            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Control => {
+            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Control
+            | crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl => {
                 GpuNativePhysicalInstallStagingQualificationArm::Control
             }
-            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment => {
+            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
+            | crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment => {
                 GpuNativePhysicalInstallStagingQualificationArm::Treatment
             }
         },
@@ -920,29 +926,28 @@ async fn run_physical_install_arm(
     args: &CommandArgs,
     run: PhysicalInstallQualificationRun,
 ) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
+    use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm as ConcurrentArm;
     let (arm_name, arm) = match run {
-        PhysicalInstallQualificationRun::Staging(
-            GpuNativePhysicalInstallStagingQualificationArm::Control,
-        )
-        | PhysicalInstallQualificationRun::Concurrency(
-            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Control,
-        ) => (
-            "control",
-            GpuNativePhysicalInstallStagingQualificationArm::Control,
-        ),
-        PhysicalInstallQualificationRun::Staging(
-            GpuNativePhysicalInstallStagingQualificationArm::Treatment,
-        )
-        | PhysicalInstallQualificationRun::Concurrency(
-            crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment,
-        ) => (
-            "treatment",
-            GpuNativePhysicalInstallStagingQualificationArm::Treatment,
-        ),
+        PhysicalInstallQualificationRun::Staging(arm) => match arm {
+            GpuNativePhysicalInstallStagingQualificationArm::Control => ("control", arm),
+            GpuNativePhysicalInstallStagingQualificationArm::Treatment => ("treatment", arm),
+        },
+        PhysicalInstallQualificationRun::Concurrency(arm)
+        | PhysicalInstallQualificationRun::ZeroFillProduction(arm) => match arm {
+            ConcurrentArm::Control | ConcurrentArm::ConcurrentFullZeroControl => (
+                "control",
+                GpuNativePhysicalInstallStagingQualificationArm::Control,
+            ),
+            ConcurrentArm::Treatment | ConcurrentArm::ProductionNoZeroFillTreatment => (
+                "treatment",
+                GpuNativePhysicalInstallStagingQualificationArm::Treatment,
+            ),
+        },
     };
     let mode_name = match run {
         PhysicalInstallQualificationRun::Staging(_) => PRODUCTION_MODE,
         PhysicalInstallQualificationRun::Concurrency(_) => CONCURRENCY_MODE,
+        PhysicalInstallQualificationRun::ZeroFillProduction(_) => zero_fill_production::MODE,
     };
     let mut benchmark = benchmark_report(prepared);
     let runtime = crate::gpu_native_real_benchmark::construct_runtime(
@@ -957,7 +962,8 @@ async fn run_physical_install_arm(
         PhysicalInstallQualificationRun::Staging(arm) => runtime
             .engine
             .enable_gpu_native_physical_install_staging_qualification(arm),
-        PhysicalInstallQualificationRun::Concurrency(arm) => runtime
+        PhysicalInstallQualificationRun::Concurrency(arm)
+        | PhysicalInstallQualificationRun::ZeroFillProduction(arm) => runtime
         .engine
             .enable_gpu_native_physical_install_concurrency_qualification(arm),
     };
@@ -1052,7 +1058,8 @@ async fn run_physical_install_arm(
             .engine
             .gpu_native_physical_install_staging_qualification_snapshot();
             }
-            PhysicalInstallQualificationRun::Concurrency(_) => {
+            PhysicalInstallQualificationRun::Concurrency(_)
+            | PhysicalInstallQualificationRun::ZeroFillProduction(_) => {
                 warmup_concurrency = runtime
                     .engine
                     .gpu_native_physical_install_concurrency_qualification_snapshot();
@@ -1156,7 +1163,8 @@ async fn run_physical_install_arm(
                 .gpu_native_physical_install_staging_qualification_snapshot(),
             None,
         ),
-        PhysicalInstallQualificationRun::Concurrency(_) => {
+        PhysicalInstallQualificationRun::Concurrency(_)
+        | PhysicalInstallQualificationRun::ZeroFillProduction(_) => {
             let concurrency = runtime
                 .engine
                 .gpu_native_physical_install_concurrency_qualification_snapshot();
@@ -2316,7 +2324,7 @@ pub(crate) async fn run_concurrency_command(
             logical_expert_bytes: 2_654_208,
             slot_stride_bytes: 2_654_212,
             physical_tail_bytes: 0,
-            destination_fill_zero_unchanged: true,
+            destination_fill_zero_unchanged: false,
         },
         timing_definitions: concurrency_timing_definitions(),
         benchmark_complete: false,

@@ -149,6 +149,8 @@ pub(crate) mod gpu_native_out_of_core;
 pub(crate) mod gpu_native_physical_install_staging;
 pub(crate) mod gpu_native_q4_expert_stage_attribution;
 pub(crate) mod gpu_native_demand_source_concurrency;
+pub(crate) mod gpu_native_oracle_routes;
+pub(crate) mod gpu_native_oracle_scheduled_residency;
 pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
@@ -910,6 +912,45 @@ enum Cmd {
         report_out: Option<PathBuf>,
     },
 
+    /// Capture authoritative ordered route truth from the ordinary production
+    /// GPU-native token loop and run offline capacity/replacement analysis.
+    #[command(name = "trace-gpu-native-oracle-routes")]
+    TraceGpuNativeOracleRoutes {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// OpenAI-style request JSON containing `prompt` or chat `messages`
+        /// and the exact requested output-token count. Decoding is always
+        /// greedy and the runtime is always restricted to NVIDIA L4.
+        #[arg(long)]
+        request_json: PathBuf,
+        /// Required destination for the versioned diagnostic JSON artifact.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// ORACLE-0B-S perfect-future source scheduling with either source-only
+    /// treatment or serialized same-queue H2D at a proven token boundary.
+    #[command(name = "qualify-gpu-native-oracle-scheduled-residency")]
+    QualifyGpuNativeOracleScheduledResidency {
+        /// Path to the strict production GPU-native TOML config.
+        #[arg(long)]
+        config: PathBuf,
+        /// Immutable ORACLE-0A v1 route-trace report used as future truth.
+        #[arg(long)]
+        oracle_trace: PathBuf,
+        /// Qualification treatment arm.
+        #[arg(long, value_enum)]
+        treatment_mode:
+            crate::gpu_native_oracle_scheduled_residency::OracleScheduledResidencyMode,
+        /// Maximum concurrent layer-level source batches.
+        #[arg(long, default_value_t = 4)]
+        oracle_source_concurrency: usize,
+        /// Required destination for the versioned ORACLE-0B-S report.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
     /// Production-path PR2-A.2 control/treatment qualification. Control
     /// forces the legacy exact sequential source helper; treatment exercises
     /// the same ordinary production batching seam used by normal serving.
@@ -977,6 +1018,18 @@ enum Cmd {
         #[arg(long)]
         expected_adapter_name: String,
         /// Required destination for the typed production-v1 qualification report.
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Production zero-fill qualification: concurrent full-zero control versus
+    /// ordinary production concurrent complete overwrite with no explicit zero.
+    #[command(name = "qualify-gpu-native-physical-zero-fill-production")]
+    QualifyGpuNativePhysicalZeroFillProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
         #[arg(long)]
         report_out: PathBuf,
     },
@@ -1931,11 +1984,14 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
+        | Cmd::TraceGpuNativeOracleRoutes { config, .. }
+        | Cmd::QualifyGpuNativeOracleScheduledResidency { config, .. }
         | Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativeQ4RouteParallelProduction { config, .. }
         | Cmd::QualifyGpuNativeOutOfCore { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
+        | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2362,6 +2418,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             ))
         }
+        Cmd::TraceGpuNativeOracleRoutes {
+            config,
+            request_json,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(crate::gpu_native_oracle_routes::run_command(
+                crate::gpu_native_oracle_routes::CommandArgs {
+                    config,
+                    request_json,
+                    report_out,
+                    progress_watchdog,
+                },
+            ))
+        }
+        Cmd::QualifyGpuNativeOracleScheduledResidency {
+            config,
+            oracle_trace,
+            treatment_mode,
+            oracle_source_concurrency,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_oracle_scheduled_residency::run_command(
+                    crate::gpu_native_oracle_scheduled_residency::CommandArgs {
+                        config,
+                        oracle_trace,
+                        treatment_mode,
+                        oracle_source_concurrency,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
+        }
         Cmd::QualifyGpuNativeDemandSourceConcurrencyProduction {
             config,
             expected_adapter_name,
@@ -2442,6 +2538,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(
                 crate::gpu_native_physical_install_staging::run_concurrency_command(
+                    crate::gpu_native_physical_install_staging::CommandArgs {
+                        config,
+                        expected_adapter_name,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
+        }
+        Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_physical_install_staging::zero_fill_production::run_command(
                     crate::gpu_native_physical_install_staging::CommandArgs {
                         config,
                         expected_adapter_name,
@@ -16515,6 +16630,46 @@ mod tests {
                 );
                 assert_eq!(expected_adapter_name, "NVIDIA L4");
                 assert_eq!(report_out, &PathBuf::from("pr2bb-report.json"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+        assert_eq!(
+            super::startup_config_path(&cli.cmd),
+            Some(Path::new(
+                "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+            ))
+        );
+    }
+
+    #[test]
+    fn gpu_native_physical_zero_fill_production_cli_parses_qualified_command() {
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "micro-expert-router",
+            "qualify-gpu-native-physical-zero-fill-production",
+            "--config",
+            "/home/randyap8/slice11-qwen3-coder-gpu-native.toml",
+            "--expected-adapter-name",
+            "NVIDIA L4",
+            "--report-out",
+            "physical-zero-fill-production-report.json",
+        ])
+        .unwrap();
+
+        match &cli.cmd {
+            Cmd::QualifyGpuNativePhysicalZeroFillProduction {
+                config,
+                expected_adapter_name,
+                report_out,
+            } => {
+                assert_eq!(
+                    config,
+                    &PathBuf::from("/home/randyap8/slice11-qwen3-coder-gpu-native.toml")
+                );
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+                assert_eq!(
+                    report_out,
+                    &PathBuf::from("physical-zero-fill-production-report.json")
+                );
             }
             _ => panic!("unexpected command variant"),
         }

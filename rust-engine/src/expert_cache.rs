@@ -193,6 +193,14 @@ impl ExpertResident {
         self.buffer.is_shadow()
     }
 
+    /// Source-plane classification of the aligned buffer backing this
+    /// resident. Qualification code uses this to fail closed if a future
+    /// position accidentally retains a production PRIMARY resident.
+    #[inline]
+    pub(crate) fn buffer_pool_origin(&self) -> crate::buffer_pool::BufferPoolOrigin {
+        self.buffer.pool_origin()
+    }
+
     /// Bare weight bytes — i.e. the buffer with any leading Unified
     /// Tensor Header stripped. The vast majority of callers want this.
     ///
@@ -234,7 +242,9 @@ impl ExpertResident {
         bool,
     )
     where
-        F: FnOnce(&[u8]) -> Result<
+        F: FnOnce(
+            &[u8],
+        ) -> Result<
             crate::inference::PreparedQ8_0Expert,
             crate::inference::ExpertWeightsError,
         >,
@@ -254,10 +264,8 @@ impl ExpertResident {
 
 impl Drop for ExpertResident {
     fn drop(&mut self) {
-        RESIDENT_EXPERT_BUFFER_BYTES.fetch_sub(
-            self.buffer.as_slice().len() as u64,
-            Ordering::Relaxed,
-        );
+        RESIDENT_EXPERT_BUFFER_BYTES
+            .fetch_sub(self.buffer.as_slice().len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -468,7 +476,8 @@ impl ExpertCache {
             0
         };
         let mut pre_evicted = None;
-        let effective_len = guard.len()
+        let effective_len = guard
+            .len()
             .saturating_add(self.reserved_slots.load(Ordering::Relaxed));
         if effective_len >= self.capacity && guard.peek(&id).is_none() {
             // Pick the victim under the active policy: strict LRU by
@@ -656,17 +665,23 @@ impl ExpertCache {
 // Phase 2 — logical GPU expert admission: Segmented Hybrid Policy.
 // =====================================================================
 
-/// One host-side logical GPU admission. The payload remains a `Vec<u8>` in
-/// process memory; physical routed-expert device buffers are owned and
-/// accounted by `GpuBackend`'s physical registry.
+/// Host bytes are optional only for the private ORACLE qualification path.
+/// The logical-only variant owns a byte charge and a small access audit; it
+/// cannot retain expert bytes, an ExpertResident, or a source-pool lease.
+enum GpuResidentHostPayload {
+    Materialized(Vec<u8>),
+    QualificationLogicalOnly {
+        charged_bytes: usize,
+        data_accesses: Arc<AtomicU64>,
+    },
+}
+
+/// One host-side logical GPU admission. Production constructors retain the
+/// supplied Vec unchanged; physical device buffers are owned by the backend.
 pub struct GpuResident {
     pub id: u32,
-    /// Host payload retained by the logical admission policy.
-    bytes: Vec<u8>,
-    /// On-disk encoding of `bytes`. `F32` residents feed the dense
-    /// matmul pipeline; `Q4_0` residents stay in native GGUF blocks
-    /// and feed the inline-dequant pipeline (`matmul_q4_0.wgsl`) —
-    /// see `GpuBackend::expert_matmul`.
+    payload: GpuResidentHostPayload,
+    /// Native on-disk encoding, preserved even for a logical-only admission.
     dtype: crate::inference::WeightDtype,
 }
 
@@ -674,7 +689,7 @@ impl GpuResident {
     pub fn new(id: u32, bytes: Vec<u8>) -> Self {
         Self {
             id,
-            bytes,
+            payload: GpuResidentHostPayload::Materialized(bytes),
             dtype: crate::inference::WeightDtype::F32,
         }
     }
@@ -684,31 +699,69 @@ impl GpuResident {
     /// matmul pipeline (e.g. Q4_0 inline dequant) without guessing
     /// from the byte length.
     pub fn new_with_dtype(id: u32, bytes: Vec<u8>, dtype: crate::inference::WeightDtype) -> Self {
-        Self { id, bytes, dtype }
+        Self {
+            id,
+            payload: GpuResidentHostPayload::Materialized(bytes),
+            dtype,
+        }
+    }
+
+    /// ORACLE qualification only: charge the ordinary logical cache without
+    /// copying or retaining source bytes. The run-owned audit survives cache
+    /// eviction and spans warmup and measured requests. It owns no source data.
+    pub(crate) fn new_qualification_logical_only(
+        id: u32,
+        charged_bytes: usize,
+        dtype: crate::inference::WeightDtype,
+        data_accesses: Arc<AtomicU64>,
+    ) -> Self {
+        assert!(
+            charged_bytes > 0,
+            "qualification logical-only admission requires a positive byte charge"
+        );
+        Self {
+            id,
+            payload: GpuResidentHostPayload::QualificationLogicalOnly {
+                charged_bytes,
+                data_accesses,
+            },
+            dtype,
+        }
     }
 
     /// Bare weight bytes ready for `run_inference_*`.
+    /// Logical-only qualification admissions are never a physical byte source.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        &self.bytes
+        match &self.payload {
+            GpuResidentHostPayload::Materialized(bytes) => bytes,
+            GpuResidentHostPayload::QualificationLogicalOnly { data_accesses, .. } => {
+                data_accesses.fetch_add(1, Ordering::Relaxed);
+                panic!("qualification logical-only GpuResident has no payload bytes; physical staging must use ExpertResident::data()");
+            }
+        }
     }
 
-    /// Native encoding of [`GpuResident::data`].
     #[inline]
     pub fn dtype(&self) -> crate::inference::WeightDtype {
         self.dtype
     }
 
-    /// Size of the logical host payload admitted for future GPU upload.
+    /// Logical capacity charge, independent of host payload materialization.
     #[inline]
     pub fn byte_len(&self) -> usize {
-        self.bytes.len()
+        match &self.payload {
+            GpuResidentHostPayload::Materialized(bytes) => bytes.len(),
+            GpuResidentHostPayload::QualificationLogicalOnly { charged_bytes, .. } => {
+                *charged_bytes
+            }
+        }
     }
 }
 
 impl crate::backend::GpuStorage for GpuResident {
     fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.byte_len()
     }
     fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
         None // GpuResident is host-side only; VRAM lives in VramExpertEntry
@@ -1128,10 +1181,7 @@ impl GpuExpertCache {
     /// telemetry/recency lookup.
     pub fn current_admission(&self, id: u32) -> Option<GpuAdmission> {
         let g = self.inner.lock();
-        g.anchor
-            .get(&id)
-            .or_else(|| g.lru.peek(&id))
-            .cloned()
+        g.anchor.get(&id).or_else(|| g.lru.peek(&id)).cloned()
     }
 
     /// Check whether an expert is currently resident in either the
@@ -1261,7 +1311,10 @@ impl GpuExpertCache {
             g.promotion_rearm.remove(&id);
             return GpuHotPromotionOutcome::GenerationExhausted;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         g.promotion_pending.remove(&id);
         g.promotion_rearm.remove(&id);
 
@@ -1411,7 +1464,10 @@ impl GpuExpertCache {
         let Some(generation) = g.allocate_generation() else {
             return false;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         if use_anchor {
             g.anchor.insert(admission.resident.id, admission);
             g.anchor_used_bytes = g
@@ -1489,8 +1545,7 @@ impl GpuExpertCache {
         }
         // Strictly non-evicting: must fit in whatever LRU budget is
         // currently free.
-        if g
-            .lru_used_bytes
+        if g.lru_used_bytes
             .checked_add(bytes)
             .is_none_or(|used| used > self.lru_capacity_bytes)
         {
@@ -1499,7 +1554,10 @@ impl GpuExpertCache {
         let Some(generation) = g.allocate_generation() else {
             return false;
         };
-        let admission = GpuAdmission { resident, generation };
+        let admission = GpuAdmission {
+            resident,
+            generation,
+        };
         g.promotion_pending.remove(&admission.resident.id);
         g.promotion_rearm.remove(&admission.resident.id);
         g.lru.put(admission.resident.id, admission);
@@ -2151,6 +2209,187 @@ mod tests {
     }
 
     #[test]
+    fn production_gpu_resident_constructors_preserve_materialized_vec_ownership() {
+        use crate::inference::WeightDtype;
+        for dtype in [None, Some(WeightDtype::Q4_0)] {
+            let mut bytes = Vec::with_capacity(32);
+            bytes.extend_from_slice(&[3, 1, 4, 1, 5]);
+            let pointer = bytes.as_ptr();
+            let capacity = bytes.capacity();
+            let resident = match dtype {
+                None => GpuResident::new(17, bytes),
+                Some(dtype) => GpuResident::new_with_dtype(17, bytes, dtype),
+            };
+            assert_eq!(resident.id, 17);
+            assert_eq!(resident.dtype(), dtype.unwrap_or(WeightDtype::F32));
+            assert_eq!(resident.data(), &[3, 1, 4, 1, 5]);
+            assert_eq!(resident.data().as_ptr(), pointer);
+            assert_eq!(resident.byte_len(), 5);
+            assert_eq!(crate::backend::GpuStorage::byte_len(&resident), 5);
+            match &resident.payload {
+                GpuResidentHostPayload::Materialized(bytes) => {
+                    assert_eq!(bytes.capacity(), capacity)
+                }
+                _ => panic!("production constructor changed payload representation"),
+            }
+        }
+        assert!(GpuResident::new(0, Vec::new()).data().is_empty());
+    }
+
+    #[test]
+    fn qualification_logical_only_has_no_payload_allocation_and_data_access_fails_closed() {
+        let audit = Arc::new(AtomicU64::new(0));
+        let resident = GpuResident::new_qualification_logical_only(
+            17,
+            usize::MAX,
+            crate::inference::WeightDtype::Q4_0,
+            audit.clone(),
+        );
+        // Even an impossible allocation size is only metadata. This variant
+        // contains no Vec, ExpertResident, PooledBuffer, or source-owning Arc.
+        assert!(matches!(
+            &resident.payload,
+            GpuResidentHostPayload::QualificationLogicalOnly {
+                charged_bytes: usize::MAX,
+                ..
+            }
+        ));
+        assert!(std::mem::size_of::<GpuResident>() <= 64);
+        assert_eq!(resident.byte_len(), usize::MAX);
+        assert_eq!(crate::backend::GpuStorage::byte_len(&resident), usize::MAX);
+        assert_eq!(resident.id, 17);
+        assert_eq!(resident.dtype(), crate::inference::WeightDtype::Q4_0);
+        let failure = std::panic::catch_unwind(|| resident.data()).unwrap_err();
+        let message = failure.downcast_ref::<&str>().copied().unwrap();
+        assert!(message.contains("qualification logical-only GpuResident has no payload bytes"));
+        assert_eq!(audit.load(Ordering::Relaxed), 1);
+        drop(resident);
+        assert_eq!(
+            audit.load(Ordering::Relaxed),
+            1,
+            "audit survives eviction/drop"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "qualification logical-only admission requires a positive byte charge"
+    )]
+    fn qualification_logical_only_rejects_zero_charge() {
+        GpuResident::new_qualification_logical_only(
+            1,
+            0,
+            crate::inference::WeightDtype::F32,
+            Arc::new(AtomicU64::new(0)),
+        );
+    }
+
+    #[test]
+    fn qualification_logical_only_cache_charge_generation_lru_and_protection_match_materialized() {
+        let caches = [
+            Arc::new(GpuExpertCache::new(16, 0.0, 0)),
+            Arc::new(GpuExpertCache::new(16, 0.0, 0)),
+        ];
+        let audit = Arc::new(AtomicU64::new(0));
+        let source = |id, only| {
+            Arc::new(if only {
+                GpuResident::new_qualification_logical_only(
+                    id,
+                    8,
+                    crate::inference::WeightDtype::F32,
+                    audit.clone(),
+                )
+            } else {
+                GpuResident::new(id, vec![id as u8; 8])
+            })
+        };
+        let mut observations = Vec::new();
+        for (only, cache) in caches.iter().enumerate() {
+            let mut history = Vec::new();
+            for ids in [vec![2, 1], vec![1], vec![3], vec![2]] {
+                let sources = ids.iter().map(|&id| (id, source(id, only == 1))).collect();
+                let (admissions, newly) =
+                    ready_demand_set(cache.demand_admit_set(&ids, &sources).unwrap());
+                assert_eq!(
+                    admissions
+                        .iter()
+                        .map(|a| a.resident().id)
+                        .collect::<Vec<_>>(),
+                    ids
+                );
+                assert!(admissions.iter().all(|a| a.byte_len() == 8
+                    && cache.contains_generation(a.resident().id, a.generation())));
+                history.push((
+                    newly,
+                    cache.used_bytes(),
+                    admissions
+                        .iter()
+                        .map(|a| a.generation())
+                        .collect::<Vec<_>>(),
+                    cache
+                        .inner
+                        .lock()
+                        .lru
+                        .iter()
+                        .map(|(id, a)| (*id, a.generation()))
+                        .collect::<Vec<_>>(),
+                ));
+                if ids == [1] {
+                    assert!(cache.get(1).is_hit());
+                }
+            }
+            // ID 1 was most recently touched, so 3 first evicted 2. Readmission
+            // of 2 gets a fresh ordinary generation and then evicts 1.
+            assert_eq!(history[0].2, vec![1, 2]);
+            assert_eq!(history[1].2, vec![2]);
+            assert_eq!(
+                history[2].3.iter().map(|x| x.0).collect::<Vec<_>>(),
+                vec![3, 1]
+            );
+            assert_eq!(history[3].2, vec![4]);
+            let _protection = cache.protect_demand_set(&[3, 2]).unwrap();
+            let before = cache.used_bytes();
+            assert!(matches!(
+                cache.demand_admit_set(&[4], &HashMap::from([(4, source(4, only == 1))])),
+                Err(GpuDemandAdmissionError::ProtectedDemandCapacity { .. })
+            ));
+            assert_eq!(cache.used_bytes(), before);
+            observations.push(history);
+        }
+        assert_eq!(observations[0], observations[1]);
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn qualification_logical_only_generation_exhaustion_and_capacity_fail_closed() {
+        let cache = GpuExpertCache::new(8, 0.0, 0);
+        let audit = Arc::new(AtomicU64::new(0));
+        let make = |id, bytes| {
+            Arc::new(GpuResident::new_qualification_logical_only(
+                id,
+                bytes,
+                crate::inference::WeightDtype::Q4_0,
+                audit.clone(),
+            ))
+        };
+        assert!(matches!(
+            cache.demand_admit_set(&[1], &HashMap::from([(1, make(1, 9))])),
+            Err(GpuDemandAdmissionError::PayloadExceedsLruCapacity {
+                bytes: 9,
+                capacity: 8
+            })
+        ));
+        cache.inner.lock().next_generation = u64::MAX;
+        assert!(matches!(
+            cache.demand_admit_set(&[1], &HashMap::from([(1, make(1, 8))])),
+            Err(GpuDemandAdmissionError::GenerationExhausted)
+        ));
+        assert_eq!(cache.used_bytes(), 0);
+        assert!(!cache.contains(1));
+        assert_eq!(audit.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn all_current_demand_set_is_hit_only_and_preserves_identity() {
         let cache = Arc::new(GpuExpertCache::new(16, 0.0, 0));
         assert_eq!(cache.demand_admit_lru(gpu_res(1, 8)), Ok(true));
@@ -2381,7 +2620,10 @@ mod tests {
         let cache = GpuExpertCache::new(20, 0.0, 3);
         assert!(cache.promote_sync(gpu_res(1, 8)));
         assert!(cache.promote_sync(gpu_res(2, 20)));
-        assert!(!cache.contains(1), "id 1 must be rearmed by logical eviction");
+        assert!(
+            !cache.contains(1),
+            "id 1 must be rearmed by logical eviction"
+        );
 
         assert!(!cache.try_promote_lru_no_evict(gpu_res(1, 8)));
         assert!(
@@ -2442,7 +2684,10 @@ mod tests {
 
         assert!(cache.current_admission(1).is_some());
         assert!(cache.promote_sync(gpu_res(3, 10)));
-        assert!(!cache.contains(1), "non-mutating lookup must leave id 1 LRU");
+        assert!(
+            !cache.contains(1),
+            "non-mutating lookup must leave id 1 LRU"
+        );
         assert!(cache.contains(2));
         assert!(cache.contains(3));
     }
@@ -2609,7 +2854,10 @@ mod tests {
         assert_eq!(cache.lru_len(), 2);
 
         assert_eq!(cache.demand_admit_lru(gpu_res(9, 40)), Ok(true));
-        assert!(!cache.contains(7), "existing demand lookup must not touch LRU");
+        assert!(
+            !cache.contains(7),
+            "existing demand lookup must not touch LRU"
+        );
         assert!(cache.contains(8));
         assert!(cache.contains(9));
     }
@@ -2668,7 +2916,10 @@ mod tests {
         );
         assert_eq!(cache.demand_admit_lru(gpu_res(4, 40)), Ok(true));
 
-        assert!(!cache.contains(1), "oldest unrelated LRU entry must remain victim");
+        assert!(
+            !cache.contains(1),
+            "oldest unrelated LRU entry must remain victim"
+        );
         assert!(cache.contains(2));
         assert!(cache.contains(3));
         assert!(cache.contains(4));
@@ -2710,7 +2961,10 @@ mod tests {
         assert!(!cache.claim_promotion(7, 99));
 
         assert_eq!(cache.demand_admit_lru(gpu_res(9, 25)), Ok(true));
-        assert!(!cache.contains(7), "Anchor-full attempt must not touch LRU recency");
+        assert!(
+            !cache.contains(7),
+            "Anchor-full attempt must not touch LRU recency"
+        );
         assert!(cache.contains(8));
         assert!(cache.contains(9));
     }
@@ -2865,7 +3119,9 @@ mod tests {
     fn logical_admission_generation_changes_only_after_eviction_and_readmission() {
         let cache = GpuExpertCache::new(16, 0.0, 0);
         assert!(cache.promote_sync(gpu_res(7, 8)));
-        let g1 = cache.current_generation(7).expect("first admission generation");
+        let g1 = cache
+            .current_generation(7)
+            .expect("first admission generation");
         let hit_generation = match cache.get(7) {
             GpuLookup::LruHit(admission) => admission.generation(),
             _ => panic!("expected logical LRU hit"),
@@ -2883,7 +3139,10 @@ mod tests {
     fn promotion_claim_rearms_after_logical_eviction_above_hit_threshold() {
         let cache = GpuExpertCache::new(16, 0.0, 3);
         assert!(cache.promote_sync(gpu_res(7, 8)));
-        assert!(!cache.claim_promotion(7, 99), "admitted id needs no request");
+        assert!(
+            !cache.claim_promotion(7, 99),
+            "admitted id needs no request"
+        );
         assert!(cache.promote_sync(gpu_res(8, 16)));
         assert!(!cache.contains(7));
 
@@ -2891,7 +3150,10 @@ mod tests {
             cache.claim_promotion(7, 99),
             "evicted id can claim again without a fresh RAM-hit edge"
         );
-        assert!(!cache.claim_promotion(7, 100), "only one request may be pending");
+        assert!(
+            !cache.claim_promotion(7, 100),
+            "only one request may be pending"
+        );
         assert!(cache.promote_sync(gpu_res(7, 8)));
         assert!(cache.contains(7));
     }
