@@ -155,6 +155,7 @@ pub(crate) mod gpu_native_real_benchmark;
 pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
+pub(crate) mod gpu_native_source_to_upload_copy_elision;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
@@ -1053,6 +1054,21 @@ enum Cmd {
         iterations: usize,
         #[arg(long, default_value_t = 3)]
         warmup_iterations: usize,
+    },
+
+    /// Standalone full-file O_DIRECT into mapped WGPU upload feasibility.
+    #[command(name = "diagnose-gpu-native-source-to-upload-copy-elision")]
+    DiagnoseGpuNativeSourceToUploadCopyElision {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value = "NVIDIA L4")]
+        expected_adapter_name: String,
+        #[arg(long, default_value_t = 3)]
+        warmup_iterations: usize,
+        #[arg(long, default_value_t = 128)]
+        iterations: usize,
+        #[arg(long)]
+        report_out: PathBuf,
     },
 
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
@@ -2179,6 +2195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Cmd::QualifyGpuNativeQ4GreedyParity { .. }
             | Cmd::DiagnoseHybridQ4GreedyDivergence { .. }
             | Cmd::DiagnoseGpuNativeRouterRankDivergence { .. }
+            | Cmd::DiagnoseGpuNativeSourceToUploadCopyElision { .. }
             | Cmd::GreedyParityHybridWorkerInternal { .. }
             | Cmd::GreedyParityLogitWorkerInternal { .. }
     ) && !run_gpu_requested
@@ -2615,6 +2632,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         standalone_only,
                         iterations,
                         warmup_iterations,
+                    },
+                ),
+            )
+        }
+        Cmd::DiagnoseGpuNativeSourceToUploadCopyElision {
+            config,
+            expected_adapter_name,
+            warmup_iterations,
+            iterations,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_source_to_upload_copy_elision::run_command(
+                    crate::gpu_native_source_to_upload_copy_elision::Args {
+                        config,
+                        expected_adapter_name,
+                        warmup_iterations,
+                        iterations,
+                        report_out,
                     },
                 ),
             )
