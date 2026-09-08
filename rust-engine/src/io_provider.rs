@@ -1351,6 +1351,100 @@ impl NvmeStorage {
         Ok(total)
     }
 
+    /// Qualification-only external destinations, with the production per-file
+    /// scheduler: resolve every fd, one blocking donation, scoped OS threads,
+    /// existing per-expert retries, and errors collected in original slot order.
+    /// There is no packed, buffered, or allocation fallback.
+    pub(crate) async fn read_experts_batch_into_aligned_slices(
+        &self,
+        ids: &[u32],
+        destinations: &mut [&mut [u8]],
+    ) -> io::Result<usize> {
+        if self.is_packed()
+            || ids.len() != destinations.len()
+            || self.cfg.expert_size != 2_658_304
+            || self.cfg.block_align != 4096
+            || destinations.iter().any(|dst| {
+                dst.len() != self.cfg.expert_size
+                    || dst.len() % self.cfg.block_align != 0
+                    || dst.as_ptr() as usize % self.cfg.block_align != 0
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "qualification requires unpacked full-file 4096-aligned external destinations",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut files: Vec<Arc<File>> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            files.push(self.fd_for(id)?);
+        }
+        // Prove O_DIRECT on the actual Arc<File> passed to the retry helper;
+        // cache churn cannot substitute a different fd after this check.
+        for file in &files {
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: files owns this live fd; F_GETFL has no third argument.
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if flags & libc::O_DIRECT == 0
+                    || file.metadata()?.len() != self.cfg.expert_size as u64
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "qualification source fd must be O_DIRECT and exactly one full expert",
+                    ));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = file;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "qualification direct source requires Linux O_DIRECT",
+                ));
+            }
+        }
+        let id_vec: Vec<u32> = ids.to_vec();
+        tokio::task::block_in_place(|| -> io::Result<usize> {
+            if id_vec.len() == 1 {
+                return self.read_at_with_retries(&files[0], id_vec[0], 0, destinations[0]);
+            }
+            let results: Vec<io::Result<usize>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = files
+                    .iter()
+                    .zip(destinations.iter_mut())
+                    .zip(id_vec.iter())
+                    .map(|((file, dst), &id)| {
+                        let dst: &mut [u8] = dst;
+                        scope.spawn(move || self.read_at_with_retries(file, id, 0, dst))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .zip(id_vec.iter())
+                    .map(|(h, &id)| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(io::Error::other(format!(
+                                "read_experts_batch worker panicked reading expert {id}"
+                            )))
+                        })
+                    })
+                    .collect()
+            });
+            let mut total = 0usize;
+            for result in results {
+                total += result?;
+            }
+            Ok(total)
+        })
+    }
+
     /// **Tier 2.** Packed-blob sibling of [`Self::read_experts_batch`].
     ///
     /// Resolves every requested expert to its `(offset, len)` slot in the
@@ -3372,5 +3466,64 @@ mod source_to_upload_tests {
             assert!(s.files.lock().is_empty());
         }
         std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_upload_external_batch_rejects_bad_destinations_before_fd_or_io() {
+        let dir = directory();
+        let storage = NvmeStorage::new(StorageConfig {
+            base_path: dir.clone(),
+            expert_size: 2_658_304,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: None,
+        })
+        .unwrap();
+        let pool = crate::buffer_pool::BufferPool::new(1, 2_658_304 + 4096, 4096);
+        let mut buffer = pool.try_acquire().unwrap();
+        for (offset, len) in [(0, 2_658_303), (1, 2_658_304), (0, 2_654_208)] {
+            let mut destinations = vec![&mut buffer.as_mut_slice()[offset..offset + len]];
+            let error = storage
+                .read_experts_batch_into_aligned_slices(&[999], &mut destinations)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let error = storage
+            .read_experts_batch_into_aligned_slices(&[1], &mut [])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    #[test]
+    fn source_upload_batch_preserves_production_scoped_thread_and_retry_shape() {
+        let source = include_str!("io_provider.rs");
+        let production = source
+            .split("pub async fn read_experts_batch(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) async fn read_experts_batch_into_aligned_slices")
+            .next()
+            .unwrap();
+        let treatment = source
+            .split("pub(crate) async fn read_experts_batch_into_aligned_slices(")
+            .nth(1)
+            .unwrap()
+            .split("/// **Tier 2.**")
+            .next()
+            .unwrap();
+        for body in [production, treatment] {
+            assert_eq!(body.matches("tokio::task::block_in_place(").count(), 1);
+            assert_eq!(body.matches("std::thread::scope(").count(), 1);
+            assert!(body.contains("scope.spawn("));
+            assert!(body.contains("read_at_with_retries("));
+            assert!(
+                body.find("files.push(self.fd_for(id)?)").unwrap()
+                    < body.find("tokio::task::block_in_place(").unwrap()
+            );
+            assert!(body.contains(".zip(id_vec.iter())"));
+            assert!(body.contains("h.join()"));
+        }
+        assert!(!treatment.contains("read_expert("));
+        assert!(!treatment.contains("spawn_blocking"));
     }
 }
