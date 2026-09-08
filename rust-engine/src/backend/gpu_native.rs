@@ -2268,6 +2268,12 @@ pub(crate) struct GpuNativePhysicalInstallEvidence {
     pub(crate) physical_slot_epoch_write_bytes: u64,
     pub(crate) physical_slot_payload_copy_bytes: u64,
     pub(crate) physical_slot_prepare_us: u64,
+    pub(crate) physical_slot_validation_us: u64,
+    pub(crate) physical_slot_epoch_write_us: u64,
+    pub(crate) physical_slot_payload_copy_us: u64,
+    pub(crate) physical_slot_prepare_residual_us: u64,
+    pub(crate) physical_slot_subphase_observations: u64,
+    pub(crate) physical_slot_timing_accounting_errors: u64,
     pub(crate) physical_queue_staging_us: u64,
     pub(crate) mapping_publication_us: u64,
     /// Existing residency stage timer, carried to the completion observer.
@@ -2275,6 +2281,28 @@ pub(crate) struct GpuNativePhysicalInstallEvidence {
 }
 
 impl GpuNativePhysicalInstallEvidence {
+    /// A failed decomposition is retained as an accounting error, never hidden
+    /// by a saturating subtraction or allowed to change install recovery.
+    fn observe_no_zero(&mut self, outer_validation_us: u64, observed: PhysicalSlotObservation) {
+        self.physical_slot_subphase_observations = 1;
+        let validation = observed
+            .validation_us()
+            .and_then(|v| outer_validation_us.checked_add(v));
+        let epoch = observed.epoch_write_us();
+        let payload = observed.payload_copy_us();
+        self.physical_slot_validation_us = validation.unwrap_or(u64::MAX);
+        self.physical_slot_epoch_write_us = epoch.unwrap_or(u64::MAX);
+        self.physical_slot_payload_copy_us = payload.unwrap_or(u64::MAX);
+        match validation
+            .and_then(|v| v.checked_add(epoch?))
+            .and_then(|v| v.checked_add(payload?))
+            .and_then(|parts| self.physical_slot_prepare_us.checked_sub(parts))
+        {
+            Some(residual) => self.physical_slot_prepare_residual_us = residual,
+            None => self.physical_slot_timing_accounting_errors = 1,
+        }
+    }
+
     fn direct_stage<const NO_ZERO_FILL: bool>(
         geometry: GpuNativeQ4ExpertGeometry,
         prepare_us: u64,
@@ -2683,14 +2711,33 @@ fn fill_physical_q4_expert_slot(
     CheckedPhysicalQ4ExpertSlot::new(geometry, logical_id, slot_epoch, payload)?.fill(destination)
 }
 
-struct CheckedPhysicalQ4ExpertSlot<'a> {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PhysicalSlotObservation {
+    pub(crate) validation: std::time::Duration,
+    pub(crate) epoch_write: std::time::Duration,
+    pub(crate) payload_copy: std::time::Duration,
+}
+
+impl PhysicalSlotObservation {
+    fn validation_us(self) -> Option<u64> {
+        u64::try_from(self.validation.as_micros()).ok()
+    }
+    fn epoch_write_us(self) -> Option<u64> {
+        u64::try_from(self.epoch_write.as_micros()).ok()
+    }
+    fn payload_copy_us(self) -> Option<u64> {
+        u64::try_from(self.payload_copy.as_micros()).ok()
+    }
+}
+
+pub(crate) struct CheckedPhysicalQ4ExpertSlot<'a> {
     geometry: GpuNativeQ4ExpertGeometry,
     slot_epoch: u32,
     payload: &'a [u8],
 }
 
 impl<'a> CheckedPhysicalQ4ExpertSlot<'a> {
-    fn new(
+    pub(crate) fn new(
         geometry: GpuNativeQ4ExpertGeometry,
         logical_id: u32,
         slot_epoch: u32,
@@ -2730,18 +2777,17 @@ impl<'a> CheckedPhysicalQ4ExpertSlot<'a> {
         Ok(())
     }
 
-    /// Shared production/qualification complete overwrite. Reuse the validated
-    /// payload/epoch and require complete destination coverage before writing
-    /// even the first epoch byte. Future padded slots must use full-zero fill.
-    fn fill_complete_overwrite_no_zero(
-        self,
-        destination: &mut [u8],
-    ) -> Result<(), GpuNativeBootstrapError> {
-        if destination.len() != self.geometry.slot_stride_bytes {
+    /// The same checked coverage contract is used by ordinary and observed
+    /// complete overwrite. All checks finish before the first destination write.
+    fn complete_overwrite_range(
+        &self,
+        destination_len: usize,
+    ) -> Result<std::ops::Range<usize>, GpuNativeBootstrapError> {
+        if destination_len != self.geometry.slot_stride_bytes {
             return Err(
                 GpuNativeBootstrapError::ExpertPhysicalSlotDestinationLength {
                     expected: self.geometry.slot_stride_bytes,
-                    actual: destination.len(),
+                    actual: destination_len,
                 },
             );
         }
@@ -2749,19 +2795,49 @@ impl<'a> CheckedPhysicalQ4ExpertSlot<'a> {
         let payload_end = payload_start
             .checked_add(self.geometry.logical_expert_bytes)
             .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
-        if payload_end != destination.len() {
+        if payload_end != destination_len {
             return Err(
                 GpuNativeBootstrapError::ExpertPhysicalSlotDestinationLength {
                     expected: payload_end,
-                    actual: destination.len(),
+                    actual: destination_len,
                 },
             );
         }
+        Ok(payload_start..payload_end)
+    }
+
+    fn fill_complete_overwrite_no_zero(
+        self,
+        destination: &mut [u8],
+    ) -> Result<(), GpuNativeBootstrapError> {
+        let range = self.complete_overwrite_range(destination.len())?;
         destination[..GPU_NATIVE_EXPERT_SLOT_EPOCH_BYTES]
             .copy_from_slice(&self.slot_epoch.to_le_bytes());
-        destination[payload_start..payload_end]
-            .copy_from_slice(&self.payload[..self.geometry.logical_expert_bytes]);
+        destination[range].copy_from_slice(&self.payload[..self.geometry.logical_expert_bytes]);
         Ok(())
+    }
+
+    /// Only the MEASURE=true specialization and the standalone diagnostic call
+    /// this observed equivalent. No allocation, submission, poll, or readback.
+    pub(crate) fn fill_complete_overwrite_no_zero_observed(
+        self,
+        destination: &mut [u8],
+    ) -> Result<PhysicalSlotObservation, GpuNativeBootstrapError> {
+        let started = Instant::now();
+        let range = self.complete_overwrite_range(destination.len())?;
+        let validation = started.elapsed();
+        let started = Instant::now();
+        destination[..GPU_NATIVE_EXPERT_SLOT_EPOCH_BYTES]
+            .copy_from_slice(&self.slot_epoch.to_le_bytes());
+        let epoch_write = started.elapsed();
+        let started = Instant::now();
+        destination[range].copy_from_slice(&self.payload[..self.geometry.logical_expert_bytes]);
+        let payload_copy = started.elapsed();
+        Ok(PhysicalSlotObservation {
+            validation,
+            epoch_write,
+            payload_copy,
+        })
     }
 }
 
@@ -7611,6 +7687,7 @@ impl GpuNativeExecutorContext {
                 physical_queue_staging_us: queue_staging_us.get(),
                 mapping_publication_us: mapping_us.get(),
                 individual_physical_stage_us: 0,
+                ..GpuNativePhysicalInstallEvidence::default()
             },
         ))
     }
@@ -7711,11 +7788,14 @@ impl GpuNativeExecutorContext {
         let arena = permit.arena;
         let upload_bytes = arena.geometry.slot_stride_bytes as u64;
         let prepare_us = std::cell::Cell::new(0u64);
+        let outer_validation_us = std::cell::Cell::new(0u64);
+        let observation = std::cell::Cell::new(PhysicalSlotObservation::default());
         let queue_staging_us = std::cell::Cell::new(0u64);
         let validate_started = MEASURE.then(Instant::now);
         let result = permit.stage_with_checked_physical_writer(payload, |bank, offset, checked| {
             if let Some(started) = validate_started {
                 prepare_us.set(elapsed_us(started));
+                outer_validation_us.set(prepare_us.get());
             }
             let size = wgpu::BufferSize::new(upload_bytes)
                 .expect("validated physical expert slot is nonempty");
@@ -7735,7 +7815,12 @@ impl GpuNativeExecutorContext {
             }
             let fill_started = MEASURE.then(Instant::now);
             if NO_ZERO_FILL {
-                checked.fill_complete_overwrite_no_zero(view.as_mut())?;
+                if MEASURE {
+                    observation
+                        .set(checked.fill_complete_overwrite_no_zero_observed(view.as_mut())?);
+                } else {
+                    checked.fill_complete_overwrite_no_zero(view.as_mut())?;
+                }
             } else {
                 checked.fill(view.as_mut())?;
             }
@@ -7754,14 +7839,15 @@ impl GpuNativeExecutorContext {
                 if let Some(stage_guard) = stage_guard {
                     stage_guard.succeed();
                 }
-                Ok((
-                    prepared,
-                    GpuNativePhysicalInstallEvidence::direct_stage::<NO_ZERO_FILL>(
-                        arena.geometry,
-                        prepare_us.get(),
-                        queue_staging_us.get(),
-                    ),
-                ))
+                let mut evidence = GpuNativePhysicalInstallEvidence::direct_stage::<NO_ZERO_FILL>(
+                    arena.geometry,
+                    prepare_us.get(),
+                    queue_staging_us.get(),
+                );
+                if MEASURE && NO_ZERO_FILL {
+                    evidence.observe_no_zero(outer_validation_us.get(), observation.get());
+                }
+                Ok((prepared, evidence))
             }
             Err(error) => {
                 if RECORD_PRODUCTION
@@ -7952,6 +8038,7 @@ impl GpuNativeExecutorContext {
                 physical_queue_staging_us: queue_staging_us.get(),
                 mapping_publication_us: mapping_us.get(),
                 individual_physical_stage_us: 0,
+                ..GpuNativePhysicalInstallEvidence::default()
             },
         ))
     }
@@ -11321,6 +11408,121 @@ pub(crate) mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn payload_copy_observed_no_zero_matches_ordinary_frozen_geometry() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        assert_eq!(
+            (
+                geometry.payload_offset_bytes(),
+                geometry.logical_expert_bytes(),
+                geometry.slot_stride_bytes()
+            ),
+            (4, 2_654_208, 2_654_212)
+        );
+        let payload: Vec<u8> = (0..geometry.logical_expert_bytes())
+            .map(|i| (i % 251) as u8)
+            .collect();
+        for epoch in [1, 0x12345678, u32::MAX] {
+            let mut ordinary = vec![0xa5; geometry.slot_stride_bytes()];
+            let mut observed = ordinary.clone();
+            CheckedPhysicalQ4ExpertSlot::new(geometry, 0, epoch, &payload)
+                .unwrap()
+                .fill_complete_overwrite_no_zero(&mut ordinary)
+                .unwrap();
+            let started = Instant::now();
+            let times = CheckedPhysicalQ4ExpertSlot::new(geometry, 0, epoch, &payload)
+                .unwrap()
+                .fill_complete_overwrite_no_zero_observed(&mut observed)
+                .unwrap();
+            assert!(times.validation + times.epoch_write + times.payload_copy <= started.elapsed());
+            assert_eq!(observed, ordinary);
+            assert_eq!(&observed[..4], &epoch.to_le_bytes());
+            assert_eq!(&observed[4..], payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn payload_copy_observed_rejects_all_incomplete_coverage_before_writing() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let payload = vec![0x37; geometry.logical_expert_bytes()];
+        let padded = GpuNativeQ4ExpertGeometry {
+            slot_stride_bytes: geometry.slot_stride_bytes() + 4,
+            ..geometry
+        };
+        for (g, length) in [
+            (geometry, geometry.slot_stride_bytes() - 4),
+            (geometry, geometry.slot_stride_bytes() + 4),
+            (padded, padded.slot_stride_bytes()),
+        ] {
+            let mut destination = vec![0xa5; length];
+            assert!(CheckedPhysicalQ4ExpertSlot::new(g, 0, 1, &payload)
+                .unwrap()
+                .fill_complete_overwrite_no_zero_observed(&mut destination)
+                .is_err());
+            assert!(destination.iter().all(|b| *b == 0xa5));
+        }
+    }
+
+    #[test]
+    fn payload_copy_evidence_residual_is_checked_and_overflow_is_visible() {
+        let geometry = GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8).unwrap();
+        let observed = PhysicalSlotObservation {
+            validation: std::time::Duration::from_micros(2),
+            epoch_write: std::time::Duration::from_micros(1),
+            payload_copy: std::time::Duration::from_micros(5),
+        };
+        let mut valid = GpuNativePhysicalInstallEvidence::direct_stage::<true>(geometry, 12, 3);
+        valid.observe_no_zero(2, observed);
+        assert_eq!(valid.physical_slot_validation_us, 4);
+        assert_eq!(valid.physical_slot_prepare_residual_us, 2);
+        assert_eq!(valid.physical_slot_timing_accounting_errors, 0);
+        for (outer, broad) in [(0, 7), (u64::MAX, u64::MAX)] {
+            let mut invalid =
+                GpuNativePhysicalInstallEvidence::direct_stage::<true>(geometry, broad, 0);
+            invalid.observe_no_zero(outer, observed);
+            assert_eq!(invalid.physical_slot_timing_accounting_errors, 1);
+        }
+    }
+
+    #[test]
+    fn payload_copy_normal_path_has_no_subphase_timers_or_queue_behavior_hooks() {
+        let source = include_str!("gpu_native.rs");
+        let ordinary = source
+            .split("    fn fill_complete_overwrite_no_zero(\n")
+            .nth(1)
+            .unwrap()
+            .split("    pub(crate) fn fill_complete_overwrite_no_zero_observed")
+            .next()
+            .unwrap();
+        assert!(!ordinary.contains("Instant::"));
+        assert!(!ordinary.contains("elapsed("));
+        assert!(!ordinary.contains("Vec::"));
+        let production = source
+            .split("    pub(crate) fn stage_q4_expert_residency_production<'a>(")
+            .nth(1)
+            .unwrap()
+            .split("    pub(crate) fn")
+            .next()
+            .unwrap();
+        assert!(production.contains("stage_q4_expert_residency_inner::<false, true, true>"));
+        let stage = source
+            .split("    fn stage_q4_expert_residency_inner<\n")
+            .nth(1)
+            .unwrap()
+            .split("    pub(crate) fn commit_q4_expert_residency_production")
+            .next()
+            .unwrap();
+        assert!(stage
+            .split_whitespace()
+            .collect::<String>()
+            .contains("ifMEASURE{observation.set("));
+        assert_eq!(stage.matches(".write_buffer_with(").count(), 1);
+        assert_eq!(stage.matches("drop(view)").count(), 1);
+        for forbidden in [".submit(", ".poll(", "map_async", "payload_copy::"] {
+            assert!(!stage.contains(forbidden));
+        }
     }
 
     #[test]

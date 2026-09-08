@@ -2,6 +2,9 @@
 //! staging. Control explicitly forces the legacy Vec writer; treatment uses
 //! the ordinary production demand-install path in a fresh runtime.
 
+#[path = "gpu_native_physical_staging_payload_copy.rs"]
+pub(crate) mod payload_copy;
+
 #[path = "gpu_native_physical_zero_fill_production.rs"]
 pub(crate) mod zero_fill_production;
 
@@ -915,6 +918,11 @@ fn concurrency_common_snapshot(
         mapping_publications: source.mapping_publications,
         mapping_unpublications: source.mapping_unpublications,
         physical_slot_prepare_us: source.physical_slot_prepare_us,
+        physical_slot_validation_us: source.physical_slot_validation_us,
+        physical_slot_epoch_write_us: source.physical_slot_epoch_write_us,
+        physical_slot_payload_copy_us: source.physical_slot_payload_copy_us,
+        physical_slot_prepare_residual_us: source.physical_slot_prepare_residual_us,
+        physical_slot_subphase_observations: source.physical_slot_subphase_observations,
         physical_queue_staging_us: source.physical_queue_staging_us,
         mapping_publication_us: source.mapping_publication_us,
         physical_install_total_us: source.physical_install_total_us,
@@ -925,6 +933,15 @@ async fn run_physical_install_arm(
     prepared: &Prepared,
     args: &CommandArgs,
     run: PhysicalInstallQualificationRun,
+) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
+    run_physical_install_arm_inner(prepared, args, run, None).await
+}
+
+async fn run_physical_install_arm_inner(
+    prepared: &Prepared,
+    args: &CommandArgs,
+    run: PhysicalInstallQualificationRun,
+    diagnostic_mode: Option<&'static str>,
 ) -> Result<PhysicalInstallArmRun, BenchmarkFailure> {
     use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationArm as ConcurrentArm;
     let (arm_name, arm) = match run {
@@ -944,11 +961,11 @@ async fn run_physical_install_arm(
             ),
         },
     };
-    let mode_name = match run {
+    let mode_name = diagnostic_mode.unwrap_or(match run {
         PhysicalInstallQualificationRun::Staging(_) => PRODUCTION_MODE,
         PhysicalInstallQualificationRun::Concurrency(_) => CONCURRENCY_MODE,
         PhysicalInstallQualificationRun::ZeroFillProduction(_) => zero_fill_production::MODE,
-    };
+    });
     let mut benchmark = benchmark_report(prepared);
     let runtime = crate::gpu_native_real_benchmark::construct_runtime(
         &prepared.spec,

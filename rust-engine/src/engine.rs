@@ -575,6 +575,11 @@ pub(crate) struct GpuNativePhysicalInstallStagingQualificationSnapshot {
     pub(crate) mapping_publications: u64,
     pub(crate) mapping_unpublications: u64,
     pub(crate) physical_slot_prepare_us: u64,
+    pub(crate) physical_slot_validation_us: u64,
+    pub(crate) physical_slot_epoch_write_us: u64,
+    pub(crate) physical_slot_payload_copy_us: u64,
+    pub(crate) physical_slot_prepare_residual_us: u64,
+    pub(crate) physical_slot_subphase_observations: u64,
     pub(crate) physical_queue_staging_us: u64,
     pub(crate) mapping_publication_us: u64,
     pub(crate) physical_install_total_us: u64,
@@ -631,6 +636,11 @@ pub(crate) struct GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
     pub(crate) mapping_publications: u64,
     pub(crate) mapping_unpublications: u64,
     pub(crate) physical_slot_prepare_us: u64,
+    pub(crate) physical_slot_validation_us: u64,
+    pub(crate) physical_slot_epoch_write_us: u64,
+    pub(crate) physical_slot_payload_copy_us: u64,
+    pub(crate) physical_slot_prepare_residual_us: u64,
+    pub(crate) physical_slot_subphase_observations: u64,
     pub(crate) physical_queue_staging_us: u64,
     pub(crate) mapping_publication_us: u64,
     pub(crate) physical_install_total_us: u64,
@@ -1039,6 +1049,11 @@ struct GpuNativeDemandSourceQualification {
     mapping_publications: AtomicU64,
     mapping_unpublications: AtomicU64,
     physical_slot_prepare_us: AtomicU64,
+    physical_slot_validation_us: AtomicU64,
+    physical_slot_epoch_write_us: AtomicU64,
+    physical_slot_payload_copy_us: AtomicU64,
+    physical_slot_prepare_residual_us: AtomicU64,
+    physical_slot_subphase_observations: AtomicU64,
     physical_queue_staging_us: AtomicU64,
     mapping_publication_us: AtomicU64,
     physical_install_total_us: AtomicU64,
@@ -1140,6 +1155,11 @@ impl GpuNativeDemandSourceQualification {
             mapping_publications: AtomicU64::new(0),
             mapping_unpublications: AtomicU64::new(0),
             physical_slot_prepare_us: AtomicU64::new(0),
+            physical_slot_validation_us: AtomicU64::new(0),
+            physical_slot_epoch_write_us: AtomicU64::new(0),
+            physical_slot_payload_copy_us: AtomicU64::new(0),
+            physical_slot_prepare_residual_us: AtomicU64::new(0),
+            physical_slot_subphase_observations: AtomicU64::new(0),
             physical_queue_staging_us: AtomicU64::new(0),
             mapping_publication_us: AtomicU64::new(0),
             physical_install_total_us: AtomicU64::new(0),
@@ -1361,6 +1381,17 @@ impl GpuNativeDemandSourceQualification {
             mapping_publications: self.mapping_publications.load(Ordering::Relaxed),
             mapping_unpublications: self.mapping_unpublications.load(Ordering::Relaxed),
             physical_slot_prepare_us: self.physical_slot_prepare_us.load(Ordering::Relaxed),
+            physical_slot_validation_us: self.physical_slot_validation_us.load(Ordering::Relaxed),
+            physical_slot_epoch_write_us: self.physical_slot_epoch_write_us.load(Ordering::Relaxed),
+            physical_slot_payload_copy_us: self
+                .physical_slot_payload_copy_us
+                .load(Ordering::Relaxed),
+            physical_slot_prepare_residual_us: self
+                .physical_slot_prepare_residual_us
+                .load(Ordering::Relaxed),
+            physical_slot_subphase_observations: self
+                .physical_slot_subphase_observations
+                .load(Ordering::Relaxed),
             physical_queue_staging_us: self.physical_queue_staging_us.load(Ordering::Relaxed),
             mapping_publication_us: self.mapping_publication_us.load(Ordering::Relaxed),
             physical_install_total_us: self.physical_install_total_us.load(Ordering::Relaxed),
@@ -1444,6 +1475,11 @@ impl GpuNativeDemandSourceQualification {
             mapping_publications: self.mapping_publications.load(Ordering::Relaxed),
             mapping_unpublications: self.mapping_unpublications.load(Ordering::Relaxed),
             physical_slot_prepare_us: self.physical_slot_prepare_us.load(Ordering::Relaxed),
+            physical_slot_validation_us: self.physical_slot_validation_us.load(Ordering::Relaxed),
+            physical_slot_epoch_write_us: self.physical_slot_epoch_write_us.load(Ordering::Relaxed),
+            physical_slot_payload_copy_us: self.physical_slot_payload_copy_us.load(Ordering::Relaxed),
+            physical_slot_prepare_residual_us: self.physical_slot_prepare_residual_us.load(Ordering::Relaxed),
+            physical_slot_subphase_observations: self.physical_slot_subphase_observations.load(Ordering::Relaxed),
             physical_queue_staging_us: self.physical_queue_staging_us.load(Ordering::Relaxed),
             mapping_publication_us: self.mapping_publication_us.load(Ordering::Relaxed),
             physical_install_total_us: self.physical_install_total_us.load(Ordering::Relaxed),
@@ -1509,6 +1545,96 @@ pub(crate) fn empty_physical_zero_fill_test_snapshot(
         .physical_install_concurrency_snapshot()
 }
 
+impl GpuNativeDemandSourceQualification {
+    fn record_slot_attribution(&self, evidence: GpuNativePhysicalInstallEvidence) {
+        for (counter, bytes) in [
+            (
+                &self.physical_slot_bytes_staged,
+                evidence.physical_slot_bytes_staged,
+            ),
+            (
+                &self.physical_slot_zero_fill_bytes,
+                evidence.physical_slot_zero_fill_bytes,
+            ),
+            (
+                &self.physical_slot_epoch_write_bytes,
+                evidence.physical_slot_epoch_write_bytes,
+            ),
+            (
+                &self.physical_slot_payload_copy_bytes,
+                evidence.physical_slot_payload_copy_bytes,
+            ),
+        ] {
+            if counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    total.checked_add(bytes)
+                })
+                .is_err()
+            {
+                self.evidence_accounting_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let observed = evidence.physical_slot_subphase_observations;
+        let parts = evidence
+            .physical_slot_validation_us
+            .checked_add(evidence.physical_slot_epoch_write_us)
+            .and_then(|v| v.checked_add(evidence.physical_slot_payload_copy_us));
+        let decomposition_valid = if observed == 1 {
+            evidence.direct_staging_writes == 1
+                && evidence.physical_slot_zero_fill_bytes == 0
+                && parts.and_then(|v| v.checked_add(evidence.physical_slot_prepare_residual_us))
+                    == Some(evidence.physical_slot_prepare_us)
+        } else {
+            observed == 0 && parts == Some(0) && evidence.physical_slot_prepare_residual_us == 0
+        };
+        if !decomposition_valid || evidence.physical_slot_timing_accounting_errors != 0 {
+            self.timing_accounting_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        for (counter, value) in [
+            (
+                &self.physical_slot_validation_us,
+                evidence.physical_slot_validation_us,
+            ),
+            (
+                &self.physical_slot_epoch_write_us,
+                evidence.physical_slot_epoch_write_us,
+            ),
+            (
+                &self.physical_slot_payload_copy_us,
+                evidence.physical_slot_payload_copy_us,
+            ),
+            (
+                &self.physical_slot_prepare_residual_us,
+                evidence.physical_slot_prepare_residual_us,
+            ),
+            (
+                &self.physical_slot_subphase_observations,
+                evidence.physical_slot_subphase_observations,
+            ),
+            (
+                &self.physical_slot_prepare_us,
+                evidence.physical_slot_prepare_us,
+            ),
+            (
+                &self.physical_queue_staging_us,
+                evidence.physical_queue_staging_us,
+            ),
+        ] {
+            if counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    total.checked_add(value)
+                })
+                .is_err()
+            {
+                self.timing_accounting_errors
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
     fn record_physical_victim(&self, global_id: u32) {
         self.physical_victim_ids.lock().record_id(global_id);
@@ -1556,37 +1682,8 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
             .fetch_add(evidence.full_slot_vec_materializations, Ordering::Relaxed);
         self.direct_staging_writes
             .fetch_add(evidence.direct_staging_writes, Ordering::Relaxed);
-        self.physical_slot_bytes_staged
-            .fetch_add(evidence.physical_slot_bytes_staged, Ordering::Relaxed);
-        for (counter, bytes) in [
-            (
-                &self.physical_slot_zero_fill_bytes,
-                evidence.physical_slot_zero_fill_bytes,
-            ),
-            (
-                &self.physical_slot_epoch_write_bytes,
-                evidence.physical_slot_epoch_write_bytes,
-            ),
-            (
-                &self.physical_slot_payload_copy_bytes,
-                evidence.physical_slot_payload_copy_bytes,
-            ),
-        ] {
-            if counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                    total.checked_add(bytes)
-                })
-                .is_err()
-            {
-                self.evidence_accounting_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
         self.mapping_publications.fetch_add(1, Ordering::Relaxed);
-        self.physical_slot_prepare_us
-            .fetch_add(evidence.physical_slot_prepare_us, Ordering::Relaxed);
-        self.physical_queue_staging_us
-            .fetch_add(evidence.physical_queue_staging_us, Ordering::Relaxed);
+        self.record_slot_attribution(evidence);
         self.mapping_publication_us
             .fetch_add(evidence.mapping_publication_us, Ordering::Relaxed);
         self.physical_install_total_us
@@ -9254,6 +9351,71 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn payload_copy_observer_aggregates_bytes_timings_and_detects_mismatch_and_overflow() {
+        let state = GpuNativeDemandSourceQualification::new_physical_install_concurrency(
+            GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment,
+            385,
+            0,
+        );
+        let evidence = GpuNativePhysicalInstallEvidence {
+            direct_staging_writes: 1,
+            physical_slot_bytes_staged: 2_654_212,
+            physical_slot_epoch_write_bytes: 4,
+            physical_slot_payload_copy_bytes: 2_654_208,
+            physical_slot_validation_us: 2,
+            physical_slot_epoch_write_us: 1,
+            physical_slot_payload_copy_us: 5,
+            physical_slot_prepare_residual_us: 2,
+            physical_slot_prepare_us: 10,
+            physical_queue_staging_us: 3,
+            physical_slot_subphase_observations: 1,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            state.record_slot_attribution(evidence);
+        }
+        let s = state.physical_install_concurrency_snapshot();
+        assert_eq!(s.physical_slot_subphase_observations, 3);
+        assert_eq!(s.physical_slot_epoch_write_bytes, 3 * 4);
+        assert_eq!(s.physical_slot_payload_copy_bytes, 3 * 2_654_208);
+        assert_eq!(s.physical_slot_bytes_staged, 3 * 2_654_212);
+        assert_eq!(
+            (
+                s.physical_slot_validation_us,
+                s.physical_slot_epoch_write_us,
+                s.physical_slot_payload_copy_us,
+                s.physical_slot_prepare_residual_us,
+                s.physical_slot_prepare_us,
+                s.physical_queue_staging_us
+            ),
+            (6, 3, 15, 6, 30, 9)
+        );
+        assert_eq!(s.timing_accounting_errors, 0);
+        state.record_slot_attribution(GpuNativePhysicalInstallEvidence {
+            physical_slot_prepare_residual_us: 1,
+            ..evidence
+        });
+        assert_eq!(
+            state
+                .physical_install_concurrency_snapshot()
+                .timing_accounting_errors,
+            1
+        );
+        state
+            .physical_slot_payload_copy_us
+            .store(u64::MAX, Ordering::Relaxed);
+        state
+            .physical_slot_payload_copy_bytes
+            .store(u64::MAX, Ordering::Relaxed);
+        state.record_slot_attribution(evidence);
+        let s = state.physical_install_concurrency_snapshot();
+        assert_eq!(s.timing_accounting_errors, 2);
+        assert_eq!(s.evidence_accounting_errors, 1);
+        assert_eq!(s.physical_slot_payload_copy_us, u64::MAX);
+        assert_eq!(s.physical_slot_payload_copy_bytes, u64::MAX);
     }
 
     #[test]
