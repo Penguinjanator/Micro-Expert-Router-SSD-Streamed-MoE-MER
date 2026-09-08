@@ -36,7 +36,10 @@ struct PairMechanismGate {
     passed: bool,
 }
 
-fn install_accounting_exact(s: &Snapshot, p: &GpuNativeProductionPhysicalInstallSnapshot) -> bool {
+pub(super) fn install_accounting_exact(
+    s: &Snapshot,
+    p: &GpuNativeProductionPhysicalInstallSnapshot,
+) -> bool {
     let installs = s.physical_install_completions;
     installs > 0
         && production_concurrency_exercised(p)
@@ -71,7 +74,7 @@ fn install_accounting_exact(s: &Snapshot, p: &GpuNativeProductionPhysicalInstall
         && s.max_in_flight_physical_staging >= 2
 }
 
-fn bytes_exact(s: &Snapshot) -> bool {
+pub(super) fn bytes_exact(s: &Snapshot) -> bool {
     let installs = s.physical_install_completions;
     installs.checked_mul(EPOCH_BYTES) == Some(s.physical_slot_epoch_write_bytes)
         && installs.checked_mul(LOGICAL_EXPERT_BYTES) == Some(s.physical_slot_payload_copy_bytes)
@@ -79,7 +82,7 @@ fn bytes_exact(s: &Snapshot) -> bool {
         && s.physical_bytes_staged == s.physical_slot_bytes_staged
 }
 
-fn failures_zero(s: &Snapshot) -> bool {
+pub(super) fn failures_zero(s: &Snapshot) -> bool {
     s.reservation_failures == 0
         && s.direct_staging_failures == 0
         && s.physical_stage_failures == 0
@@ -93,7 +96,7 @@ fn failures_zero(s: &Snapshot) -> bool {
         && s.single_request_stream
 }
 
-fn timing_accounting_exact(s: &Snapshot) -> bool {
+pub(super) fn timing_accounting_exact(s: &Snapshot) -> bool {
     s.sum_individual_physical_stage_us
         .checked_add(s.physical_ordered_commit_us)
         == Some(s.physical_install_total_us)
@@ -251,7 +254,7 @@ fn work_pair_exact(c: &ArmWorkEvidence, t: &ArmWorkEvidence) -> bool {
         && c.token_loop.boundary_readbacks == t.token_loop.boundary_readbacks
 }
 
-fn work_errors_zero(w: &ArmWorkEvidence) -> bool {
+pub(super) fn work_errors_zero(w: &ArmWorkEvidence) -> bool {
     w.gpu_native_residency.stale_generation_rejections == 0
         && w.token_loop.fatal_failures == 0
         && w.token_loop.no_progress_failures == 0

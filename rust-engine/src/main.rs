@@ -1034,6 +1034,27 @@ enum Cmd {
         report_out: PathBuf,
     },
 
+    /// Diagnostic host-copy discriminator plus frozen one-arm production attribution.
+    #[command(name = "diagnose-gpu-native-physical-staging-payload-copy")]
+    DiagnoseGpuNativePhysicalStagingPayloadCopy {
+        #[arg(
+            long,
+            default_value = "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value = "NVIDIA L4")]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+        /// Run only the standalone RAM/WGPU discriminator, without loading a model.
+        #[arg(long)]
+        standalone_only: bool,
+        #[arg(long, default_value_t = 20)]
+        iterations: usize,
+        #[arg(long, default_value_t = 3)]
+        warmup_iterations: usize,
+    },
+
     /// Qualify strict real-checkpoint inference with CPU dense/attention/KV/
     /// router/head planes and native-Q4_0 routed experts on a hardware GPU.
     QualifyHybridQ4 {
@@ -1981,6 +2002,11 @@ fn parse_autotune_probe_output(
 
 fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
     match cmd {
+        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+            config,
+            standalone_only: false,
+            ..
+        } => Some(config.as_path()),
         Cmd::Serve { config }
         | Cmd::BenchReal { config, .. }
         | Cmd::BenchGpuNativeReal { config, .. }
@@ -2562,6 +2588,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         expected_adapter_name,
                         report_out,
                         progress_watchdog,
+                    },
+                ),
+            )
+        }
+        Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+            config,
+            expected_adapter_name,
+            report_out,
+            standalone_only,
+            iterations,
+            warmup_iterations,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_physical_install_staging::payload_copy::run_command(
+                    crate::gpu_native_physical_install_staging::payload_copy::Args {
+                        common: crate::gpu_native_physical_install_staging::CommandArgs {
+                            config,
+                            expected_adapter_name,
+                            report_out,
+                            progress_watchdog,
+                        },
+                        standalone_only,
+                        iterations,
+                        warmup_iterations,
                     },
                 ),
             )
@@ -16638,6 +16691,50 @@ mod tests {
             Some(Path::new(
                 "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
             ))
+        );
+    }
+
+    #[test]
+    fn payload_copy_cli_is_explicit_and_standalone_skips_model_config() {
+        let cli = Cli::try_parse_from([
+            "mer",
+            "diagnose-gpu-native-physical-staging-payload-copy",
+            "--report-out",
+            "report.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            startup_config_path(&cli.cmd),
+            Some(Path::new(
+                "/home/randyap8/slice11-qwen3-coder-gpu-native.toml"
+            ))
+        );
+        match cli.cmd {
+            Cmd::DiagnoseGpuNativePhysicalStagingPayloadCopy {
+                standalone_only,
+                iterations,
+                warmup_iterations,
+                expected_adapter_name,
+                ..
+            } => {
+                assert!(!standalone_only);
+                assert_eq!((iterations, warmup_iterations), (20, 3));
+                assert_eq!(expected_adapter_name, "NVIDIA L4");
+            }
+            _ => panic!("wrong command"),
+        }
+        let cli = Cli::try_parse_from([
+            "mer",
+            "diagnose-gpu-native-physical-staging-payload-copy",
+            "--standalone-only",
+            "--report-out",
+            "report.json",
+        ])
+        .unwrap();
+        assert!(startup_config_path(&cli.cmd).is_none());
+        assert!(
+            Cli::try_parse_from(["mer", "diagnose-gpu-native-physical-staging-payload-copy"])
+                .is_err()
         );
     }
 
