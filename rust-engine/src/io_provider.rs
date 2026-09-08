@@ -1173,6 +1173,72 @@ impl NvmeStorage {
         Ok(n)
     }
 
+    /// Diagnostic-only arbitrary destination seam. Validate before resolving
+    /// any fd or entering I/O; ordinary `read_expert` remains unchanged.
+    pub(crate) async fn read_expert_into_aligned_slice(
+        &self,
+        expert_id: u32,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        if dst.len() != self.cfg.expert_size
+            || dst.is_empty()
+            || !self.cfg.block_align.is_power_of_two()
+            || dst.len() % self.cfg.block_align != 0
+            || dst.as_ptr() as usize % self.cfg.block_align != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "diagnostic destination must be one full expert and block aligned",
+            ));
+        }
+        let (file, offset) = if let Some(packed) = &self.packed {
+            let entry = packed.entry(expert_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("expert {expert_id} is not present in the packed blob manifest"),
+                )
+            })?;
+            (packed.file().clone(), entry.offset)
+        } else {
+            (self.fd_for(expert_id)?, 0)
+        };
+        tokio::task::block_in_place(|| self.read_at_with_retries(&file, expert_id, offset, dst))
+    }
+
+    /// Inspect the actual cached per-file fd used by the standalone diagnostic.
+    /// Its exclusively owned storage has no concurrent readers or fd eviction
+    /// between this probe and the read of the same expert. No fallback opens.
+    /// Returns (F_GETFL flags, O_DIRECT observed, actual full-file length).
+    pub(crate) fn source_to_upload_fd_evidence(
+        &self,
+        expert_id: u32,
+    ) -> io::Result<(i32, bool, u64)> {
+        if self.is_packed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source-to-upload diagnostic requires one file per expert",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let file = self.fd_for(expert_id)?;
+            // SAFETY: fd_for owns a live File, and F_GETFL has no third argument.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((flags, flags & libc::O_DIRECT != 0, file.metadata()?.len()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expert_id;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "actual O_DIRECT fd evidence requires Linux",
+            ))
+        }
+    }
+
     /// Batched read: fill `bufs[i]` with the bytes of `ids[i]`, all in
     /// one blocking-donation. The two slices must have the same length.
     ///
@@ -3137,5 +3203,174 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod source_to_upload_tests {
+    use super::*;
+    use crate::aligned_buffer::AlignedBuffer;
+    use crate::buffer_pool::BufferPool;
+
+    fn directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mer-source-to-upload-storage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn storage(path: &Path) -> NvmeStorage {
+        NvmeStorage::new(StorageConfig {
+            base_path: path.to_path_buf(),
+            expert_size: 4096,
+            block_align: 4096,
+            use_direct_io: false,
+            num_experts_per_layer: Some(8),
+        })
+        .unwrap()
+    }
+
+    // Current-thread runtime also proves these checks precede block_in_place.
+    #[tokio::test]
+    async fn source_to_upload_wrong_length_rejected_before_fd_or_io() {
+        let path = directory();
+        let s = storage(&path);
+        let mut dst = AlignedBuffer::new(8192, 4096);
+        for len in [0, 4095, 4097, 8192] {
+            let e = s
+                .read_expert_into_aligned_slice(17, &mut dst.as_mut_slice()[..len])
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(s.files.lock().is_empty());
+            assert!(s.breakers.read().is_empty());
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_to_upload_misaligned_slice_rejected_before_fd_or_io() {
+        let path = directory();
+        let s = storage(&path);
+        let mut dst = AlignedBuffer::new(8192, 4096);
+        let e = s
+            .read_expert_into_aligned_slice(17, &mut dst.as_mut_slice()[1..4097])
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(s.files.lock().is_empty());
+        assert!(s.breakers.read().is_empty());
+        assert!(!s.is_drive_unavailable(17));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_arbitrary_slice_matches_production_resolution() {
+        let path = directory();
+        std::fs::write(path.join("expert_2_1.bin"), vec![91; 4096]).unwrap();
+        let mut dst = AlignedBuffer::new(8192, 4096);
+        let pool = BufferPool::new(1, 4096, 4096);
+        let mut reference = pool.acquire().await;
+        for expected in [91, 37] {
+            if expected == 37 {
+                std::fs::write(path.join("expert_17.bin"), vec![37; 4096]).unwrap();
+            }
+            let s = storage(&path);
+            assert_eq!(s.read_expert(17, &mut reference).await.unwrap(), 4096);
+            let subrange = &mut dst.as_mut_slice()[4096..8192];
+            assert_eq!(
+                s.read_expert_into_aligned_slice(17, subrange)
+                    .await
+                    .unwrap(),
+                4096
+            );
+            assert_eq!(subrange, reference.as_slice());
+            assert!(subrange.iter().all(|b| *b == expected));
+            assert!(dst.as_slice()[..4096].iter().all(|b| *b == 0));
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_slice_reuses_packed_offset_but_fd_evidence_rejects_packed() {
+        let path = directory();
+        let blob_path = path.join("experts.blob");
+        let manifest_path = path.join("manifest.json");
+        std::fs::write(&blob_path, [vec![19; 4096], vec![83; 4096]].concat()).unwrap();
+        crate::packed_storage::PackedManifest::uniform(vec![9, 17], 4096, 4096)
+            .write_to(&manifest_path)
+            .unwrap();
+        let packed =
+            crate::packed_storage::PackedBlob::open(&blob_path, &manifest_path, false).unwrap();
+        let s = storage(&path).with_packed_blob(Arc::new(packed));
+        let mut dst = AlignedBuffer::new(4096, 4096);
+        assert_eq!(
+            s.read_expert_into_aligned_slice(17, dst.as_mut_slice())
+                .await
+                .unwrap(),
+            4096
+        );
+        assert!(dst.as_slice().iter().all(|b| *b == 83));
+        assert_eq!(
+            s.source_to_upload_fd_evidence(17).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            s.read_expert_into_aligned_slice(99, dst.as_mut_slice())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_to_upload_short_reads_use_existing_breakers_without_fallback() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), [1]).unwrap();
+        let s = storage(&path);
+        let mut dst = AlignedBuffer::new(4096, 4096);
+        for _ in 0..STORAGE_BREAKER_THRESHOLD {
+            assert!(s
+                .read_expert_into_aligned_slice(17, dst.as_mut_slice())
+                .await
+                .is_err());
+        }
+        assert!(s.is_expert_unavailable(17));
+        assert!(s.is_drive_unavailable(17));
+        let pool = BufferPool::new(1, 4096, 4096);
+        let mut buf = pool.acquire().await;
+        assert!(s.read_expert(17, &mut buf).await.is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_to_upload_fd_evidence_is_platform_honest() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), vec![0; 4096]).unwrap();
+        let s = storage(&path);
+        #[cfg(target_os = "linux")]
+        {
+            let (flags, direct, len) = s.source_to_upload_fd_evidence(17).unwrap();
+            assert!(!direct);
+            assert_eq!(flags & libc::O_DIRECT, 0);
+            assert_eq!(len, 4096);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                s.source_to_upload_fd_evidence(17).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            assert!(s.files.lock().is_empty());
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
