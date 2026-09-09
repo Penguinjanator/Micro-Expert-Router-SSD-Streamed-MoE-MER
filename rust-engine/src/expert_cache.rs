@@ -55,6 +55,10 @@ fn store_heat_f64(a: &AtomicU64, v: f64) {
 pub struct ExpertResident {
     pub id: u32,
     pub buffer: PooledBuffer,
+    /// Qualification-only bytes. The ordinary pool lease is retained solely
+    /// for identical source capacity/backpressure and is never a byte source
+    /// for this representation. Production constructors leave this absent.
+    qualification_shared_payload: Option<Arc<[u8]>>,
     /// Byte offset within `buffer` at which the bare weight payload
     /// begins. `0` for legacy blobs and synthetic fixtures (no UTH);
     /// `UTH_BYTES + page padding` for `gguf-convert` blobs.
@@ -128,6 +132,7 @@ impl ExpertResident {
         Self {
             id,
             buffer,
+            qualification_shared_payload: None,
             payload_offset,
             mixed_layout,
             hits: AtomicU64::new(0),
@@ -137,6 +142,33 @@ impl ExpertResident {
             heat_bits: AtomicU64::new(0.0f64.to_bits()),
             heat_last_epoch: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn new_qualification_shared(
+        id: u32,
+        capacity_lease: PooledBuffer,
+        payload: Arc<[u8]>,
+    ) -> Self {
+        assert!(!payload.is_empty());
+        // Do not parse the unused capacity lease as a source file.
+        RESIDENT_EXPERT_BUFFER_BYTES.fetch_add(capacity_lease.len() as u64, Ordering::Relaxed);
+        Self {
+            id,
+            buffer: capacity_lease,
+            qualification_shared_payload: Some(payload),
+            payload_offset: 0,
+            mixed_layout: None,
+            hits: AtomicU64::new(0),
+            q4_0_padded: OnceCell::new(),
+            #[cfg(feature = "q8-candle-reference")]
+            q8_0_qmm: OnceCell::new(),
+            heat_bits: AtomicU64::new(0.0f64.to_bits()),
+            heat_last_epoch: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn qualification_shared_payload(&self) -> Option<&Arc<[u8]>> {
+        self.qualification_shared_payload.as_ref()
     }
 
     /// Parsed UTH2 layout for mixed-projection experts.
@@ -197,8 +229,12 @@ impl ExpertResident {
     /// resident. Qualification code uses this to fail closed if a future
     /// position accidentally retains a production PRIMARY resident.
     #[inline]
-    pub(crate) fn buffer_pool_origin(&self) -> crate::buffer_pool::BufferPoolOrigin {
-        self.buffer.pool_origin()
+    pub(crate) fn buffer_pool_origin(&self) -> Option<crate::buffer_pool::BufferPoolOrigin> {
+        // None is the distinct materialized shared source backing. In
+        // particular it cannot satisfy ORACLE's future-source pool witness.
+        self.qualification_shared_payload
+            .is_none()
+            .then(|| self.buffer.pool_origin())
     }
 
     /// Bare weight bytes — i.e. the buffer with any leading Unified
@@ -208,6 +244,9 @@ impl ExpertResident {
     /// so the UTH is **not** reparsed on each call.
     #[inline]
     pub fn data(&self) -> &[u8] {
+        if let Some(payload) = self.qualification_shared_payload.as_ref() {
+            return payload;
+        }
         &self.buffer.as_slice()[self.payload_offset..]
     }
 
@@ -670,6 +709,7 @@ impl ExpertCache {
 /// cannot retain expert bytes, an ExpertResident, or a source-pool lease.
 enum GpuResidentHostPayload {
     Materialized(Vec<u8>),
+    QualificationShared(Arc<[u8]>),
     QualificationLogicalOnly {
         charged_bytes: usize,
         data_accesses: Arc<AtomicU64>,
@@ -686,6 +726,25 @@ pub struct GpuResident {
 }
 
 impl GpuResident {
+    pub(crate) fn new_qualification_shared(
+        id: u32,
+        bytes: Arc<[u8]>,
+        dtype: crate::inference::WeightDtype,
+    ) -> Self {
+        Self {
+            id,
+            payload: GpuResidentHostPayload::QualificationShared(bytes),
+            dtype,
+        }
+    }
+
+    pub(crate) fn qualification_shared_payload(&self) -> Option<&Arc<[u8]>> {
+        match &self.payload {
+            GpuResidentHostPayload::QualificationShared(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
     pub fn new(id: u32, bytes: Vec<u8>) -> Self {
         Self {
             id,
@@ -735,6 +794,7 @@ impl GpuResident {
     pub fn data(&self) -> &[u8] {
         match &self.payload {
             GpuResidentHostPayload::Materialized(bytes) => bytes,
+            GpuResidentHostPayload::QualificationShared(bytes) => bytes,
             GpuResidentHostPayload::QualificationLogicalOnly { data_accesses, .. } => {
                 data_accesses.fetch_add(1, Ordering::Relaxed);
                 panic!("qualification logical-only GpuResident has no payload bytes; physical staging must use ExpertResident::data()");
@@ -752,6 +812,7 @@ impl GpuResident {
     pub fn byte_len(&self) -> usize {
         match &self.payload {
             GpuResidentHostPayload::Materialized(bytes) => bytes.len(),
+            GpuResidentHostPayload::QualificationShared(bytes) => bytes.len(),
             GpuResidentHostPayload::QualificationLogicalOnly { charged_bytes, .. } => {
                 *charged_bytes
             }
@@ -3156,5 +3217,113 @@ mod tests {
         );
         assert!(cache.promote_sync(gpu_res(7, 8)));
         assert!(cache.contains(7));
+    }
+    #[test]
+    fn source_upload_shared_host_and_logical_residents_own_exact_same_bytes() {
+        let pool = BufferPool::new(2, 4096, 4096);
+        let shared: Arc<[u8]> = Arc::from([3u8, 1, 4, 1, 5].as_slice());
+        let host = ExpertResident::new_qualification_shared(
+            17,
+            pool.try_acquire().unwrap(),
+            shared.clone(),
+        );
+        let logical = GpuResident::new_qualification_shared(
+            17,
+            shared.clone(),
+            crate::inference::WeightDtype::Q4_0,
+        );
+        assert_eq!(host.id, 17);
+        assert_eq!(host.payload_offset, 0);
+        assert_eq!(host.data(), shared.as_ref());
+        assert_eq!(logical.data(), shared.as_ref());
+        assert!(Arc::ptr_eq(
+            host.qualification_shared_payload().unwrap(),
+            logical.qualification_shared_payload().unwrap()
+        ));
+        assert_eq!(logical.byte_len(), 5);
+        assert_eq!(logical.dtype(), crate::inference::WeightDtype::Q4_0);
+        assert_eq!(host.buffer_pool_origin(), None);
+        assert_eq!(pool.primary_available(), 1);
+        drop(host);
+        assert_eq!(pool.primary_available(), 2);
+        assert_eq!(logical.data(), &[3, 1, 4, 1, 5]);
+    }
+    #[test]
+    fn source_upload_ordinary_pool_and_vec_representations_are_unchanged() {
+        let pool = BufferPool::new(1, 4096, 4096);
+        let mut buffer = pool.try_acquire().unwrap();
+        buffer.as_mut_slice().fill(23);
+        let ptr = buffer.as_slice().as_ptr();
+        let host = ExpertResident::new(2, buffer);
+        assert!(host.qualification_shared_payload().is_none());
+        assert_eq!(host.data().as_ptr(), ptr);
+        assert_eq!(
+            host.buffer_pool_origin(),
+            Some(crate::buffer_pool::BufferPoolOrigin::Production)
+        );
+        let bytes = vec![9, 8, 7];
+        let ptr = bytes.as_ptr();
+        let gpu = GpuResident::new(2, bytes);
+        assert!(matches!(
+            gpu.payload,
+            GpuResidentHostPayload::Materialized(_)
+        ));
+        assert_eq!(gpu.data().as_ptr(), ptr);
+        assert!(gpu.qualification_shared_payload().is_none());
+        drop(host);
+        assert_eq!(pool.primary_available(), 1);
+    }
+    #[test]
+    fn source_upload_shared_cache_has_identical_insert_victim_and_pool_lifecycle() {
+        fn run(shared: bool) -> (Vec<u32>, Vec<u32>, usize) {
+            let pool = BufferPool::new(4, 4096, 4096);
+            let cache = ExpertCache::new(2);
+            let mut victims = vec![];
+            for id in [0, 1, 2, 0, 3] {
+                let buffer = pool.try_acquire().unwrap();
+                let resident = Arc::new(if shared {
+                    ExpertResident::new_qualification_shared(
+                        id,
+                        buffer,
+                        Arc::from([id as u8; 8].as_slice()),
+                    )
+                } else {
+                    ExpertResident::new(id, buffer)
+                });
+                if let Some(victim) = cache.insert(resident).ok().unwrap() {
+                    victims.push(victim.id);
+                }
+                if id == 1 {
+                    cache.get(0);
+                }
+            }
+            (victims, cache.resident_ids(), pool.primary_available())
+        }
+        assert_eq!(run(false), run(true));
+    }
+    #[test]
+    fn source_upload_shared_logical_admission_charges_payload_and_keeps_generation() {
+        let cache = GpuExpertCache::new(32, 0.0, 0);
+        let bytes: Arc<[u8]> = Arc::from([1u8; 8].as_slice());
+        let resident = Arc::new(GpuResident::new_qualification_shared(
+            2,
+            bytes.clone(),
+            crate::inference::WeightDtype::Q4_0,
+        ));
+        let mut payloads = HashMap::new();
+        payloads.insert(2, resident);
+        let GpuDemandSetAdmission::Ready { admissions, .. } =
+            cache.demand_admit_set(&[2], &payloads).unwrap()
+        else {
+            panic!("admission")
+        };
+        assert_eq!(cache.used_bytes(), 8);
+        assert_eq!(admissions[0].byte_len(), 8);
+        let current = cache.current_admission(2).unwrap();
+        assert_eq!(current.generation(), admissions[0].generation());
+        assert!(Arc::ptr_eq(
+            current.resident().qualification_shared_payload().unwrap(),
+            &bytes
+        ));
     }
 }

@@ -89,6 +89,9 @@ fn elapsed_us(started: Instant) -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GpuNativeBootstrapError {
     GpuBackendUnavailable,
+    QualificationSourceUpload {
+        detail: String,
+    },
     DeviceLost {
         detail: String,
     },
@@ -520,6 +523,7 @@ pub(crate) enum GpuNativeBootstrapError {
 impl fmt::Display for GpuNativeBootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::QualificationSourceUpload { detail } => write!(f, "source/upload qualification: {detail}"),
             Self::GpuBackendUnavailable => write!(
                 f,
                 "GPU-native execution requires the authoritative production GPU backend"
@@ -7863,6 +7867,84 @@ impl GpuNativeExecutorContext {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn stage_q4_expert_source_upload<'a>(
+        &self,
+        permit: GpuNativeQ4ExpertInstallPermit<'a>,
+        payload: &[u8],
+        lease: crate::gpu_native_source_upload::Lease,
+        copies: &crate::gpu_native_source_upload::CopySet<'_>,
+    ) -> Result<
+        (
+            GpuNativeQ4ExpertPreparedInstall<'a>,
+            GpuNativePhysicalInstallEvidence,
+        ),
+        GpuNativeBootstrapError,
+    > {
+        use crate::gpu_native_source_upload::PAYLOAD;
+        let started = Instant::now();
+        let gpu = self.authoritative_gpu()?;
+        let arena = permit.arena;
+        if arena.context_id != self.context_id || lease.context_id() != self.context_id {
+            return Err(GpuNativeBootstrapError::ForeignExpertArena);
+        }
+        let geometry = arena.geometry;
+        if geometry.d_model() != 2048
+            || geometry.d_ff() != 768
+            || geometry.num_experts() != 128
+            || geometry.top_k() != 8
+            || geometry.logical_expert_bytes != PAYLOAD
+            || geometry.payload_offset_bytes() != 4
+            || geometry.slot_stride_bytes != PAYLOAD + 4
+        {
+            return Err(GpuNativeBootstrapError::QualificationSourceUpload {
+                detail: "fused physical Q4 geometry mismatch".into(),
+            });
+        }
+        let stage = self.production_physical_install.begin_stage();
+        let mut lease = Some(lease);
+        let prepared =
+            permit.stage_with_checked_physical_writer(payload, |bank, offset, checked| {
+                let destination = arena.banks.get(bank as usize).ok_or_else(|| {
+                    GpuNativeBootstrapError::QualificationSourceUpload {
+                        detail: "invalid destination bank".into(),
+                    }
+                })?;
+                let lease = lease.take().expect("one checked writer invocation");
+                lease.copy_source_offset().map_err(|detail| {
+                    GpuNativeBootstrapError::QualificationSourceUpload { detail }
+                })?;
+                let payload_offset = offset
+                    .checked_add(4)
+                    .ok_or(GpuNativeBootstrapError::ExpertArenaBudgetOverflow)?;
+                if payload_offset
+                    .checked_add(PAYLOAD as u64)
+                    .is_none_or(|end| end > destination.size())
+                {
+                    return Err(GpuNativeBootstrapError::QualificationSourceUpload {
+                        detail: "invalid physical upload slot range".into(),
+                    });
+                }
+                // Only the exact epoch goes through queue staging. The payload is
+                // encoded from the authoritative, already-unmapped source lease.
+                gpu.queue
+                    .write_buffer(destination, offset, &checked.slot_epoch.to_le_bytes());
+                copies
+                    .encode(lease, &gpu.device, destination, payload_offset)
+                    .map_err(|detail| GpuNativeBootstrapError::QualificationSourceUpload { detail })
+            })?;
+        stage.succeed();
+        Ok((
+            prepared,
+            GpuNativePhysicalInstallEvidence {
+                physical_slot_bytes_staged: (PAYLOAD + 4) as u64,
+                physical_slot_epoch_write_bytes: 4,
+                physical_slot_prepare_us: elapsed_us(started),
+                // CPU payload-copy bytes and direct queue payload writes are zero.
+                ..GpuNativePhysicalInstallEvidence::default()
+            },
+        ))
     }
 
     pub(crate) fn commit_q4_expert_residency_production(

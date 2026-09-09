@@ -617,7 +617,7 @@ async fn read_oracle_future_source_from_storage(
         buffer,
         storage.config().block_align,
     ));
-    if resident.buffer_pool_origin() != BufferPoolOrigin::QualificationOracleFutureSource {
+    if resident.buffer_pool_origin() != Some(BufferPoolOrigin::QualificationOracleFutureSource) {
         return Err(OracleSourceReadError::Fatal(
             "ORACLE future-source read returned a production-backed resident".into(),
         ));
@@ -773,7 +773,7 @@ fn validate_retained_source_origins(
         | OracleScheduledResidencyMode::TokenBoundaryDirectLogicalOnlyNoZeroFill => {
             for (&global_id, resident) in &outcome.residents {
                 if resident.buffer_pool_origin()
-                    != BufferPoolOrigin::QualificationOracleFutureSource
+                    != Some(BufferPoolOrigin::QualificationOracleFutureSource)
                 {
                     return Err(format!(
                         "token-boundary-direct retained production-backed future expert {global_id}"
@@ -5228,7 +5228,7 @@ mod tests {
         assert_eq!(bytes, EXPERT_SIZE);
         assert_eq!(
             resident.buffer_pool_origin(),
-            BufferPoolOrigin::QualificationOracleFutureSource
+            Some(BufferPoolOrigin::QualificationOracleFutureSource)
         );
         assert_eq!(production_pool.primary_available(), production_available);
         assert_eq!(production_cache.len(), 0);

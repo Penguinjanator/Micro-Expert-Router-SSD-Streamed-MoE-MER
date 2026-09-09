@@ -398,6 +398,9 @@ const fn speculative_install_path() -> DemandPhysicalInstallPath {
 /// already-committed physical events in their production order, except that a
 /// direct-staging unavailability is recorded explicitly before failing.
 pub(crate) trait GpuNativePhysicalInstallObserver: Send + Sync {
+    fn source_upload_state(&self) -> Option<&crate::gpu_native_source_upload::State> {
+        None
+    }
     fn record_physical_victim(&self, global_id: u32);
     fn record_physical_install_attempt(&self);
     fn record_direct_staging_failure(&self);
@@ -798,6 +801,59 @@ impl GpuNativeTieredResidencyManager {
         )
     }
 
+    pub(crate) fn ensure_demand_set_source_upload(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        source_upload: &crate::gpu_native_source_upload::State,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        if source_upload.arm != crate::gpu_native_source_upload::Arm::Treatment {
+            return Err(GpuNativeTieredResidencyError::Backend(
+                GpuNativeBootstrapError::QualificationSourceUpload {
+                    detail: "ordinary production source/upload state must use treatment".into(),
+                },
+            ));
+        }
+        self.ensure_demand_set_inner_with_source_upload::<false>(
+            priority,
+            layer_index,
+            demands,
+            ordinary_demand_install_path(),
+            None,
+            Some(source_upload),
+        )
+    }
+
+    pub(crate) fn ensure_demand_set_source_upload_observed(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        source_upload: &crate::gpu_native_source_upload::State,
+        observer: &dyn GpuNativePhysicalInstallObserver,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        if source_upload.arm != crate::gpu_native_source_upload::Arm::Treatment
+            || observer
+                .source_upload_state()
+                .is_none_or(|observed| !std::ptr::eq(observed, source_upload))
+        {
+            return Err(GpuNativeTieredResidencyError::Backend(
+                GpuNativeBootstrapError::QualificationSourceUpload {
+                    detail: "observed source/upload state must be the production-owned treatment state".into(),
+                },
+            ));
+        }
+        self.ensure_demand_set_inner_with_source_upload::<true>(
+            priority,
+            layer_index,
+            demands,
+            ordinary_demand_install_path(),
+            Some(observer),
+            Some(source_upload),
+        )
+    }
+
     pub(crate) fn ensure_demand_set_legacy_control(
         &self,
         priority: GpuNativeResidencyPriority,
@@ -908,6 +964,25 @@ impl GpuNativeTieredResidencyManager {
         install_path: DemandPhysicalInstallPath,
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
     ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
+        self.ensure_demand_set_inner_with_source_upload::<OBSERVE>(
+            priority,
+            layer_index,
+            demands,
+            install_path,
+            observer,
+            None,
+        )
+    }
+
+    fn ensure_demand_set_inner_with_source_upload<const OBSERVE: bool>(
+        &self,
+        priority: GpuNativeResidencyPriority,
+        layer_index: usize,
+        demands: &[GpuNativeDemandExpert],
+        install_path: DemandPhysicalInstallPath,
+        observer: Option<&dyn GpuNativePhysicalInstallObserver>,
+        production_source_upload: Option<&crate::gpu_native_source_upload::State>,
+    ) -> Result<Vec<GpuNativeQ4ExpertResidency>, GpuNativeTieredResidencyError> {
         if !matches!(
             priority,
             GpuNativeResidencyPriority::Demand | GpuNativeResidencyPriority::OracleSafeBoundary
@@ -1007,6 +1082,7 @@ impl GpuNativeTieredResidencyManager {
                     &mut state,
                     &mut resolved,
                     observer,
+                    production_source_upload,
                 )?;
             } else {
                 self.install_parallel_physical_misses_locked::<OBSERVE, false>(
@@ -1016,6 +1092,7 @@ impl GpuNativeTieredResidencyManager {
                     &mut state,
                     &mut resolved,
                     observer,
+                    production_source_upload,
                 )?;
             }
         } else {
@@ -1079,6 +1156,7 @@ impl GpuNativeTieredResidencyManager {
         state: &mut MutexGuard<'_, LayerResidencyState>,
         resolved: &mut [Option<GpuNativeQ4ExpertResidency>],
         observer: Option<&dyn GpuNativePhysicalInstallObserver>,
+        production_source_upload: Option<&crate::gpu_native_source_upload::State>,
     ) -> Result<(), GpuNativeTieredResidencyError> {
         if misses.is_empty() {
             return Ok(());
@@ -1245,6 +1323,35 @@ impl GpuNativeTieredResidencyManager {
                 ));
         }
 
+        let upload = if let Some(production_source_upload) = production_source_upload {
+            if OBSERVE
+                && observer
+                    .and_then(|o| o.source_upload_state())
+                    .is_none_or(|observed| !std::ptr::eq(observed, production_source_upload))
+            {
+                return Err(GpuNativeTieredResidencyError::Backend(
+                    GpuNativeBootstrapError::QualificationSourceUpload {
+                        detail: "explicit production source/upload state disagrees with observer"
+                            .into(),
+                    },
+                ));
+            }
+            Some(production_source_upload)
+        } else if OBSERVE {
+            observer.and_then(|o| o.source_upload_state())
+        } else {
+            None
+        };
+        if let Some(upload) =
+            upload.filter(|u| u.arm == crate::gpu_native_source_upload::Arm::Treatment)
+        {
+            if reserved.iter().any(|r| upload.has_pending(r.global_id)) {
+                upload.add(|m| &mut m.fused_install_sets, 1);
+            }
+        }
+        let copies = upload
+            .filter(|u| u.arm == crate::gpu_native_source_upload::Arm::Treatment)
+            .map(crate::gpu_native_source_upload::CopySet::new);
         let stage_one = |reserved: ReservedPhysicalInstall<'a>| {
             if OBSERVE {
                 observer
@@ -1252,7 +1359,15 @@ impl GpuNativeTieredResidencyManager {
                     .record_physical_stage_started();
             }
             let stage_started = OBSERVE.then(Instant::now);
-            let result = if FULL_ZERO_CONTROL {
+            let lease = upload
+                .map(|u| u.take_lease(reserved.global_id, &reserved.resident))
+                .transpose();
+            let fused_source_upload = matches!(&lease, Ok(Some(Some(_))));
+            let result = match lease {
+                Err(detail) => Err(crate::backend::gpu_native::GpuNativeBootstrapError::QualificationSourceUpload { detail }),
+                Ok(Some(Some(lease))) => self.executor.stage_q4_expert_source_upload(
+                    reserved.permit, reserved.resident.data(), lease, copies.as_ref().expect("treatment copy set")),
+                _ => if FULL_ZERO_CONTROL {
                 self.executor
                     .stage_q4_expert_residency_full_zero_control_observed(
                         reserved.permit,
@@ -1267,10 +1382,35 @@ impl GpuNativeTieredResidencyManager {
                 self.executor
                     .stage_q4_expert_residency_production(reserved.permit, reserved.resident.data())
                     .map(|prepared| (prepared, GpuNativePhysicalInstallEvidence::default()))
-            };
+            }};
             match result {
                 Ok((prepared, mut evidence)) => {
                     let individual_stage_us = stage_started.map_or(0, qualification_elapsed_us);
+                    if !OBSERVE {
+                        if let Some(upload) = upload {
+                            upload.add(
+                                |m| &mut m.total_payload_bytes_staged,
+                                crate::gpu_native_source_upload::PAYLOAD as u64,
+                            );
+                            if fused_source_upload {
+                                upload.add(|m| &mut m.fused_installs, 1);
+                                upload.add(
+                                    |m| &mut m.fused_gpu_copy_bytes,
+                                    crate::gpu_native_source_upload::PAYLOAD as u64,
+                                );
+                            } else {
+                                upload.add(|m| &mut m.fallback_installs, 1);
+                                upload.add(
+                                    |m| &mut m.fallback_payload_copy_bytes,
+                                    crate::gpu_native_source_upload::PAYLOAD as u64,
+                                );
+                                upload.add(
+                                    |m| &mut m.physical_cpu_payload_copy_bytes,
+                                    crate::gpu_native_source_upload::PAYLOAD as u64,
+                                );
+                            }
+                        }
+                    }
                     if OBSERVE {
                         evidence.individual_physical_stage_us = individual_stage_us;
                         observer
@@ -1307,6 +1447,15 @@ impl GpuNativeTieredResidencyManager {
                 ));
         }
 
+        // Queue submission is deliberately separate from token compute and
+        // precedes every executable mapping publication, including a prefix
+        // retained by the existing ordered failure semantics.
+        if let Some(copies) = &copies {
+            copies.submit(&self.executor).map_err(|detail| {
+                upload.expect("copy audit").add(|m| &mut m.copy_failures, 1);
+                GpuNativeTieredResidencyError::from(crate::backend::gpu_native::GpuNativeBootstrapError::QualificationSourceUpload { detail })
+            })?;
+        }
         let first_stage_failure = staged.iter().position(Result::is_err);
         let mut remaining_successful = staged.iter().filter(|result| result.is_ok()).count() as u64;
         for (position, staged_result) in staged.into_iter().enumerate() {
@@ -2144,7 +2293,7 @@ mod tests {
 
     #[test]
     fn qualification_logical_only_physical_stage_source_witness() {
-        // Both production calls and the new qualification call consume the
+        // Both production calls and both qualification calls validate the
         // ExpertResident field of ReservedPhysicalInstall. Pin this contract
         // without changing the frozen engine/hash witnesses or requiring a GPU.
         let source = include_str!("gpu_native_residency.rs");
@@ -2155,7 +2304,8 @@ mod tests {
             .split("let parallel_stage_started =")
             .next()
             .unwrap();
-        assert_eq!(stage.matches("reserved.resident.data()").count(), 3);
+        assert_eq!(stage.matches("reserved.resident.data()").count(), 4);
+        assert_eq!(stage.matches("stage_q4_expert_source_upload(").count(), 1);
         let production = stage.split("} else if OBSERVE {").nth(1).unwrap();
         assert_eq!(production.matches("reserved.resident.data()").count(), 2);
         assert!(stage.contains("stage_q4_expert_residency_full_zero_control_observed("));

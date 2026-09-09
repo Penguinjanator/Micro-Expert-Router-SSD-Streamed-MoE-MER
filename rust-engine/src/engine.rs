@@ -31,6 +31,7 @@ use crate::gpu_native_residency::{
     GpuNativeSpeculativeInstall, GpuNativeSpeculativeProbe, GpuNativeTieredResidencyError,
     GpuNativeTieredResidencyManager, GpuNativeTieredResidencySnapshot,
 };
+use crate::gpu_native_source_upload::{Arm as SourceUploadArm, State as SourceUploadState};
 use crate::inference::{
     combine_outputs, run_inference_bf16, run_inference_f16, run_inference_int8,
     run_inference_mixed_quant, run_inference_mxfp4, run_inference_q4_0, run_inference_q4_0_qmm,
@@ -522,6 +523,8 @@ pub(crate) enum GpuNativePhysicalInstallConcurrencyQualificationArm {
     ConcurrentFullZeroControl,
     /// Zero-fill qualifier: observe ordinary production, with no zero fill.
     ProductionNoZeroFillTreatment,
+    SourceToUploadControl,
+    SourceToUploadTreatment,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,6 +532,7 @@ enum GpuNativeQualificationPurpose {
     DemandSource(GpuNativeDemandSourceQualificationArm),
     PhysicalInstallStaging(GpuNativePhysicalInstallStagingQualificationArm),
     PhysicalInstallConcurrency(GpuNativePhysicalInstallConcurrencyQualificationArm),
+    SourceToUpload(SourceUploadArm),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1003,6 +1007,7 @@ fn qualification_order_completed_residents(
 
 struct GpuNativeDemandSourceQualification {
     purpose: GpuNativeQualificationPurpose,
+    source_upload: Option<Arc<SourceUploadState>>,
     primary_pool_capacity: usize,
     shadow_pool_capacity: usize,
     active_demand_set: AtomicBool,
@@ -1099,6 +1104,7 @@ impl GpuNativeDemandSourceQualification {
     ) -> Self {
         Self {
             purpose: GpuNativeQualificationPurpose::DemandSource(arm),
+            source_upload: None,
             primary_pool_capacity,
             shadow_pool_capacity,
             active_demand_set: AtomicBool::new(false),
@@ -1223,6 +1229,17 @@ impl GpuNativeDemandSourceQualification {
             shadow_pool_capacity,
         );
         state.purpose = GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm);
+        state
+    }
+
+    fn new_source_upload(upload: Arc<SourceUploadState>, primary: usize, shadow: usize) -> Self {
+        let mut state = Self::new(
+            GpuNativeDemandSourceQualificationArm::Treatment,
+            primary,
+            shadow,
+        );
+        state.purpose = GpuNativeQualificationPurpose::SourceToUpload(upload.arm);
+        state.source_upload = Some(upload);
         state
     }
 
@@ -1401,8 +1418,17 @@ impl GpuNativeDemandSourceQualification {
     fn physical_install_concurrency_snapshot(
         &self,
     ) -> GpuNativePhysicalInstallConcurrencyQualificationSnapshot {
-        let GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm) = self.purpose else {
-            unreachable!("physical-install concurrency snapshot requested for another qualifier")
+        let arm = match self.purpose {
+            GpuNativeQualificationPurpose::PhysicalInstallConcurrency(arm) => arm,
+            GpuNativeQualificationPurpose::SourceToUpload(SourceUploadArm::Control) => {
+                GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadControl
+            }
+            GpuNativeQualificationPurpose::SourceToUpload(SourceUploadArm::Treatment) => {
+                GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadTreatment
+            }
+            _ => unreachable!(
+                "physical-install concurrency snapshot requested for another qualifier"
+            ),
         };
         let sets = self.physical_install_sets.load(Ordering::Relaxed);
         let width_min = self.install_set_width_min.load(Ordering::Relaxed);
@@ -1422,7 +1448,7 @@ impl GpuNativeDemandSourceQualification {
                 arm,
                 GpuNativePhysicalInstallConcurrencyQualificationArm::Treatment
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
-            ),
+            ) && !matches!(self.purpose, GpuNativeQualificationPurpose::SourceToUpload(SourceUploadArm::Treatment)),
             single_request_stream: self.overlapping_demand_sets.load(Ordering::Relaxed) == 0,
             overlapping_demand_sets: self.overlapping_demand_sets.load(Ordering::Relaxed),
             primary_pool_capacity: self.primary_pool_capacity,
@@ -1636,6 +1662,10 @@ impl GpuNativeDemandSourceQualification {
 }
 
 impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
+    fn source_upload_state(&self) -> Option<&SourceUploadState> {
+        self.source_upload.as_deref()
+    }
+
     fn record_physical_victim(&self, global_id: u32) {
         self.physical_victim_ids.lock().record_id(global_id);
         self.mapping_unpublications
@@ -1678,6 +1708,35 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
     ) {
         self.physical_install_completions
             .fetch_add(1, Ordering::Relaxed);
+        if let Some(upload) = &self.source_upload {
+            upload.add(
+                |m| &mut m.total_payload_bytes_staged,
+                evidence.physical_slot_bytes_staged - evidence.physical_slot_epoch_write_bytes,
+            );
+            upload.add(
+                |m| &mut m.physical_cpu_payload_copy_bytes,
+                evidence.physical_slot_payload_copy_bytes,
+            );
+            if upload.arm == SourceUploadArm::Treatment {
+                if evidence.direct_staging_writes == 0 {
+                    upload.add(|m| &mut m.fused_installs, 1);
+                    upload.add(
+                        |m| &mut m.fused_gpu_copy_bytes,
+                        crate::gpu_native_source_upload::PAYLOAD as u64,
+                    );
+                } else {
+                    upload.add(|m| &mut m.fallback_installs, 1);
+                    upload.add(
+                        |m| &mut m.fallback_payload_copy_bytes,
+                        evidence.physical_slot_payload_copy_bytes,
+                    );
+                    upload.add(
+                        |m| &mut m.fallback_payload_copy_us,
+                        evidence.physical_slot_payload_copy_us,
+                    );
+                }
+            }
+        }
         self.full_slot_vec_materializations
             .fetch_add(evidence.full_slot_vec_materializations, Ordering::Relaxed);
         self.direct_staging_writes
@@ -1726,6 +1785,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if !matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             return;
         }
@@ -1770,6 +1830,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.reservation_attempts.fetch_add(1, Ordering::Relaxed);
         }
@@ -1784,6 +1845,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.reservation_successes.fetch_add(1, Ordering::Relaxed);
             self.reservation_identities
@@ -1796,6 +1858,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.reservation_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -1809,6 +1872,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             return;
         }
@@ -1833,14 +1897,26 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             return;
         }
+        let fused = self
+            .source_upload
+            .as_ref()
+            .is_some_and(|u| u.arm == SourceUploadArm::Treatment)
+            && evidence.direct_staging_writes == 0;
+        let payload_bytes = if fused {
+            crate::gpu_native_source_upload::PAYLOAD as u64
+        } else {
+            evidence.physical_slot_payload_copy_bytes
+        };
         if evidence
             .physical_slot_epoch_write_bytes
-            .checked_add(evidence.physical_slot_payload_copy_bytes)
+            .checked_add(payload_bytes)
             != Some(evidence.physical_slot_bytes_staged)
-            || evidence.direct_staging_writes != 1
+            || (!fused && evidence.direct_staging_writes != 1)
+            || (fused && evidence.physical_slot_payload_copy_bytes != 0)
             || evidence.full_slot_vec_materializations != 0
         {
             self.evidence_accounting_errors
@@ -1872,6 +1948,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.physical_stage_failures.fetch_add(1, Ordering::Relaxed);
             self.active_physical_staging.fetch_sub(1, Ordering::AcqRel);
@@ -1886,6 +1963,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.physical_parallel_stage_wall_us
                 .fetch_add(wall_us, Ordering::Relaxed);
@@ -1900,6 +1978,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.ordered_commit_attempts.fetch_add(1, Ordering::Relaxed);
         }
@@ -1913,6 +1992,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ConcurrentFullZeroControl
                     | GpuNativePhysicalInstallConcurrencyQualificationArm::ProductionNoZeroFillTreatment
             )
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.ordered_commit_completions
                 .fetch_add(1, Ordering::Relaxed);
@@ -1925,6 +2005,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.ordered_commit_failures.fetch_add(1, Ordering::Relaxed);
             if violation {
@@ -1938,6 +2019,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.physical_reservation_us
                 .fetch_add(wall_us, Ordering::Relaxed);
@@ -1948,6 +2030,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.physical_install_transaction_us
                 .fetch_add(wall_us, Ordering::Relaxed);
@@ -1958,6 +2041,7 @@ impl GpuNativePhysicalInstallObserver for GpuNativeDemandSourceQualification {
         if matches!(
             self.purpose,
             GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             self.unpublished_physical_writes_after_failure
                 .fetch_add(count, Ordering::Relaxed);
@@ -2011,6 +2095,9 @@ impl QualificationDemandServiceGuard {
 
 impl Drop for QualificationDemandServiceGuard {
     fn drop(&mut self) {
+        if let Some(upload) = &self.state.source_upload {
+            upload.abandon_pending();
+        }
         self.state
             .total_residency_service_us
             .fetch_add(qualification_elapsed_us(self.started), Ordering::Relaxed);
@@ -2046,6 +2133,7 @@ fn gpu_native_physical_missing_ids(global_ids: &[u32], physical_current: &[bool]
 pub(crate) enum GpuNativeResidencyInstallError {
     LegacyPhysicalExpertPlaneActive,
     LogicalCacheMismatch,
+    SourceUploadInitializationFailed,
     AlreadyInstalled,
 }
 
@@ -2057,6 +2145,9 @@ impl std::fmt::Display for GpuNativeResidencyInstallError {
             ),
             Self::LogicalCacheMismatch => f.write_str(
                 "GPU-native residency manager does not share the execution context's logical GpuExpertCache",
+            ),
+            Self::SourceUploadInitializationFailed => f.write_str(
+                "GPU-native source-upload production state initialization failed",
             ),
             Self::AlreadyInstalled => {
                 f.write_str("GPU-native tiered residency manager is already installed")
@@ -3458,6 +3549,7 @@ pub struct Engine {
         parking_lot::RwLock<Option<Arc<dyn GpuNativeActualRouteObserver>>>,
     gpu_native_demand_source_qualification:
         parking_lot::RwLock<Option<Arc<GpuNativeDemandSourceQualification>>>,
+    gpu_native_source_upload_production: Option<Arc<SourceUploadState>>,
     production_demand_source: Arc<ProductionDemandSourceTelemetry>,
     #[cfg(test)]
     production_batch_test_hooks: parking_lot::Mutex<ProductionBatchTestHooks>,
@@ -3839,6 +3931,7 @@ impl Engine {
             gpu_native_actual_route_observer_armed: AtomicBool::new(false),
             gpu_native_actual_route_observer: parking_lot::RwLock::new(None),
             gpu_native_demand_source_qualification: parking_lot::RwLock::new(None),
+            gpu_native_source_upload_production: None,
             production_demand_source,
             #[cfg(test)]
             production_batch_test_hooks: parking_lot::Mutex::new(
@@ -4633,6 +4726,24 @@ impl Engine {
     /// activation of the legacy routed-expert GPU registry: Slice 10 may
     /// compose the GPU-native token loop, but it must never double-consume one
     /// request's configured expert capacity across both physical planes.
+    fn gpu_native_source_upload_production_supported(
+        &self,
+        manager: &GpuNativeTieredResidencyManager,
+    ) -> bool {
+        let expected_geometry =
+            crate::backend::gpu_native::GpuNativeQ4ExpertGeometry::try_new(2048, 768, 128, 8)
+                .expect("frozen Qwen source/upload geometry is valid");
+        let storage = self.core.storage.config();
+        cfg!(target_os = "linux")
+            && self.core.options.dtype == WeightDtype::Q4_0
+            && manager.plan().num_layers() == 48
+            && manager.plan().geometry() == expected_geometry
+            && storage.expert_size == crate::gpu_native_source_upload::FULL
+            && storage.block_align == crate::gpu_native_source_upload::ALIGN
+            && storage.use_direct_io
+            && !self.core.storage.is_packed()
+    }
+
     pub(crate) fn install_gpu_native_residency_manager(
         &mut self,
         manager: Arc<GpuNativeTieredResidencyManager>,
@@ -4651,8 +4762,17 @@ impl Engine {
         ) {
             return Err(GpuNativeResidencyInstallError::LogicalCacheMismatch);
         }
+        let source_upload = if self.gpu_native_source_upload_production_supported(&manager) {
+            Some(
+                SourceUploadState::new_production(manager.executor().clone())
+                    .map_err(|_| GpuNativeResidencyInstallError::SourceUploadInitializationFailed)?,
+            )
+        } else {
+            None
+        };
         self.core.gpu_cache = Some(manager.gpu_cache().clone());
         self.core.gpu_native_residency = Some(manager);
+        self.gpu_native_source_upload_production = source_upload;
         Ok(())
     }
 
@@ -4747,7 +4867,18 @@ impl Engine {
         let purpose = current.purpose;
         let primary_pool_capacity = current.primary_pool_capacity;
         let shadow_pool_capacity = current.shadow_pool_capacity;
+        let source_upload = current.source_upload.clone();
+        if let Some(upload) = &source_upload {
+            upload.reset()?;
+        }
         *slot = Some(Arc::new(match purpose {
+            GpuNativeQualificationPurpose::SourceToUpload(_) => {
+                GpuNativeDemandSourceQualification::new_source_upload(
+                    source_upload.expect("upload state"),
+                    primary_pool_capacity,
+                    shadow_pool_capacity,
+                )
+            }
             GpuNativeQualificationPurpose::DemandSource(arm) => {
                 GpuNativeDemandSourceQualification::new(
                     arm,
@@ -4775,6 +4906,7 @@ impl Engine {
             purpose,
             GpuNativeQualificationPurpose::PhysicalInstallStaging(_)
                 | GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_)
         ) {
             if let Some(manager) = self.core.gpu_native_residency.as_ref() {
                 manager.reset_production_physical_install_telemetry();
@@ -4848,6 +4980,15 @@ impl Engine {
         &self,
         arm: GpuNativePhysicalInstallConcurrencyQualificationArm,
     ) -> Result<(), String> {
+        if matches!(
+            arm,
+            GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadControl
+                | GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadTreatment
+        ) {
+            return Err(
+                "source/upload arms require the dedicated qualification constructor".into(),
+            );
+        }
         if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
             return Err(
                 "cannot enable physical-install concurrency qualification with active singleflight entries or cache reservations"
@@ -4882,9 +5023,64 @@ impl Engine {
                 matches!(
                     state.purpose,
                     GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                        | GpuNativeQualificationPurpose::SourceToUpload(_)
                 )
                 .then(|| state.physical_install_concurrency_snapshot())
             })
+    }
+
+    pub(crate) fn enable_gpu_native_source_upload_qualification(
+        &self,
+        arm: SourceUploadArm,
+    ) -> Result<(), String> {
+        if !self.core.in_flight.is_empty() || self.core.cache.reserved_slots() != 0 {
+            return Err("source/upload qualification requires an idle isolated runtime".into());
+        }
+        let mut slot = self.gpu_native_demand_source_qualification.write();
+        if slot.is_some() {
+            return Err("a residency qualification is already enabled".into());
+        }
+        let manager = self
+            .core
+            .gpu_native_residency
+            .as_ref()
+            .ok_or("missing physical manager")?;
+        let upload = match arm {
+            SourceUploadArm::Control => {
+                SourceUploadState::new(SourceUploadArm::Control, manager.executor().clone())?
+            }
+            SourceUploadArm::Treatment => {
+                let upload = self
+                    .gpu_native_source_upload_production
+                    .as_ref()
+                    .cloned()
+                    .ok_or("ordinary production source/upload state is unavailable")?;
+                upload.reset()?;
+                upload
+            }
+        };
+        *slot = Some(Arc::new(
+            GpuNativeDemandSourceQualification::new_source_upload(
+                upload,
+                self.core.pool.capacity(),
+                self.core.pool.shadow_capacity(),
+            ),
+        ));
+        self.production_demand_source.reset();
+        manager.reset_production_physical_install_telemetry();
+        Ok(())
+    }
+
+    pub(crate) fn gpu_native_source_upload_snapshot(
+        &self,
+    ) -> Option<crate::gpu_native_source_upload::Snapshot> {
+        match self.gpu_native_demand_source_qualification() {
+            Some(state) => state.source_upload.as_ref().map(|upload| upload.snapshot()),
+            None => self
+                .gpu_native_source_upload_production
+                .as_ref()
+                .map(|upload| upload.snapshot()),
+        }
     }
 
     pub(crate) fn production_demand_source_snapshot(&self) -> ProductionDemandSourceSnapshot {
@@ -5876,6 +6072,14 @@ impl Engine {
         self: &Arc<Self>,
         id: u32,
     ) -> Result<Arc<ExpertResident>, ExpertReadError> {
+        self.fetch_with_retry_inner(id, None).await
+    }
+
+    async fn fetch_with_retry_inner(
+        self: &Arc<Self>,
+        id: u32,
+        source_upload: Option<Arc<SourceUploadState>>,
+    ) -> Result<Arc<ExpertResident>, ExpertReadError> {
         // Fast path: already cached — no singleflight needed. We
         // deliberately do *not* bump the `hits` counter here: the
         // upstream `moe_step` path already increments hits/misses
@@ -5964,7 +6168,7 @@ impl Engine {
             const MAX_ATTEMPTS: usize = 3;
             let mut last_err: Option<String> = None;
             for attempt in 0..MAX_ATTEMPTS {
-                match self.fetch_once(id).await {
+                match self.fetch_once(id, source_upload.clone()).await {
                     Ok(r) => {
                         if attempt > 0 {
                             info!(expert = id, attempt, "expert fetch recovered after retry");
@@ -6016,6 +6220,7 @@ impl Engine {
         self: &Arc<Self>,
         global_id: u32,
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        source_upload: Option<Arc<SourceUploadState>>,
     ) -> Result<Arc<ExpertResident>, GpuNativeDemandResidencyError> {
         let qualification = self.gpu_native_demand_source_qualification();
         if let Some(state) = qualification.as_ref() {
@@ -6035,7 +6240,7 @@ impl Engine {
                 if let Some(state) = qualification.as_ref() {
                     state.source_ram_misses.fetch_add(1, Ordering::Relaxed);
                 }
-                self.fetch_with_retry(global_id).await?
+                self.fetch_with_retry_inner(global_id, source_upload.clone()).await?
             }
         };
         residents.insert(global_id, resident.clone());
@@ -6046,6 +6251,7 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        source_upload: Option<Arc<SourceUploadState>>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
         let qualification = self.gpu_native_demand_source_qualification();
         if let Some(state) = qualification.as_ref() {
@@ -6056,16 +6262,27 @@ impl Engine {
             Some(GpuNativeQualificationPurpose::DemandSource(
                 GpuNativeDemandSourceQualificationArm::Control,
             )) => {
-                self.gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                self.gpu_native_sequential_source_physical_missing_set(
+                    global_ids,
+                    residents,
+                    source_upload.clone(),
+                )
                     .await
             }
             Some(GpuNativeQualificationPurpose::DemandSource(
                 GpuNativeDemandSourceQualificationArm::Treatment,
             ))
             | Some(GpuNativeQualificationPurpose::PhysicalInstallStaging(_))
-            | Some(GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_))
+            | Some(
+                GpuNativeQualificationPurpose::PhysicalInstallConcurrency(_)
+                | GpuNativeQualificationPurpose::SourceToUpload(_),
+            )
             | None => {
-                self.gpu_native_production_source_physical_missing_set(global_ids, residents)
+                self.gpu_native_production_source_physical_missing_set(
+                    global_ids,
+                    residents,
+                    source_upload.clone(),
+                )
                     .await
             }
         };
@@ -6085,6 +6302,7 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        source_upload: Option<Arc<SourceUploadState>>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
         for &global_id in global_ids {
             if residents.contains_key(&global_id) {
@@ -6092,7 +6310,7 @@ impl Engine {
             }
             let individual_started = Instant::now();
             let source_result = self
-                .gpu_native_demand_source(global_id, residents)
+                .gpu_native_demand_source(global_id, residents, source_upload.clone())
                 .await
                 .map(|_| ());
             if let Some(state) = self.gpu_native_demand_source_qualification() {
@@ -6117,6 +6335,7 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        source_upload: Option<Arc<SourceUploadState>>,
     ) -> Result<(), GpuNativeDemandResidencyError> {
         let telemetry = self.production_demand_source.clone();
         telemetry.source_sets.fetch_add(1, Ordering::Relaxed);
@@ -6131,7 +6350,11 @@ impl Engine {
                 .fallback_single_item
                 .fetch_add(1, Ordering::Relaxed);
             return self
-                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .gpu_native_sequential_source_physical_missing_set(
+                    global_ids,
+                    residents,
+                    source_upload.clone(),
+                )
                 .await;
         }
 
@@ -6144,7 +6367,11 @@ impl Engine {
         {
             telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
             return self
-                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .gpu_native_sequential_source_physical_missing_set(
+                    global_ids,
+                    residents,
+                    source_upload.clone(),
+                )
                 .await;
         }
         telemetry
@@ -6189,7 +6416,11 @@ impl Engine {
                         }
                     }
                     return self
-                        .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .gpu_native_sequential_source_physical_missing_set(
+                            global_ids,
+                            residents,
+                            source_upload.clone(),
+                        )
                         .await;
                 }
             }
@@ -6214,7 +6445,11 @@ impl Engine {
             telemetry.fallback_mixed_ram.fetch_add(1, Ordering::Relaxed);
             drop(leadership);
             return self
-                .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                .gpu_native_sequential_source_physical_missing_set(
+                    global_ids,
+                    residents,
+                    source_upload.clone(),
+                )
                 .await;
         }
 
@@ -6227,7 +6462,11 @@ impl Engine {
                         .fetch_add(1, Ordering::Relaxed);
                     drop(leadership);
                     return self
-                        .gpu_native_sequential_source_physical_missing_set(global_ids, residents)
+                        .gpu_native_sequential_source_physical_missing_set(
+                            global_ids,
+                            residents,
+                            source_upload.clone(),
+                        )
                         .await;
                 }
             };
@@ -6280,16 +6519,62 @@ impl Engine {
         }
 
         let batch_started = Instant::now();
-        let mut refs = buffers.iter_mut().collect::<Vec<_>>();
+        let upload = source_upload.clone();
+        let production_fusion_eligible = upload.as_ref().is_some_and(|state| {
+            state.arm == SourceUploadArm::Treatment
+                && (!state.is_production_owned()
+                    || state.can_fuse_source_set(
+                        &unresolved,
+                        self.execution_context().gpu_expert_cache(),
+                    ))
+        });
+        if upload.as_ref().is_some_and(|state| {
+            state.arm == SourceUploadArm::Treatment
+                && state.is_production_owned()
+                && !production_fusion_eligible
+        }) {
+            upload
+                .as_ref()
+                .expect("production upload state")
+                .add(|m| &mut m.source_fallback_reads, unresolved.len() as u64);
+        }
+        let mut fused_residents = None;
+        let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
         let _foreground = self.core.governor.foreground_guard();
-        let read_result = self
-            .core
-            .storage
-            .read_experts_batch(&unresolved, &mut refs)
-            .await;
+        let read_result = if production_fusion_eligible {
+            let upload = upload.as_ref().expect("eligible upload state");
+            match upload
+                .read_source(
+                    &self.core.storage,
+                    &unresolved,
+                    std::mem::take(&mut buffers),
+                    self.execution_context().gpu_expert_cache(),
+                )
+                .await
+            {
+                Ok(residents) => {
+                    fused_residents = Some(residents);
+                    Ok(expected_bytes)
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            }
+        } else {
+            let mut refs = buffers.iter_mut().collect::<Vec<_>>();
+            self.core
+                .storage
+                .read_experts_batch(&unresolved, &mut refs)
+                .await
+        };
         drop(_foreground);
         let batch_wall_us = qualification_elapsed_us(batch_started);
-        let expected_bytes = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+        if read_result.is_err() {
+            if let Some(upload) = upload
+                .as_ref()
+                .filter(|u| u.arm == SourceUploadArm::Control)
+            {
+                upload.add(|m| &mut m.source_failures, 1);
+            }
+        }
         let read_bytes = match read_result {
             Ok(read_bytes) if read_bytes == expected_bytes => read_bytes,
             result => {
@@ -6311,6 +6596,9 @@ impl Engine {
             }
         };
 
+        if let Some(upload) = &upload {
+            upload.record_nvme(&unresolved);
+        }
         if let Some(qualification) = self.gpu_native_demand_source_qualification() {
             for &global_id in &unresolved {
                 qualification.record_source_request(global_id);
@@ -6332,21 +6620,29 @@ impl Engine {
         let _ = self.metrics.io_hist.lock().record(batch_wall_us.max(1));
 
         let block_align = self.core.storage.config().block_align;
-        let completed = unresolved
-            .iter()
-            .copied()
-            .zip(buffers)
-            .map(|(global_id, buffer)| {
-                (
-                    global_id,
-                    Arc::new(ExpertResident::new_with_block_align(
+        let completed = if let Some(residents) = fused_residents {
+            unresolved
+                .iter()
+                .copied()
+                .zip(residents)
+                .collect::<HashMap<_, _>>()
+        } else {
+            unresolved
+                .iter()
+                .copied()
+                .zip(buffers)
+                .map(|(global_id, buffer)| {
+                    (
                         global_id,
-                        buffer,
-                        block_align,
-                    )),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+                        Arc::new(ExpertResident::new_with_block_align(
+                            global_id,
+                            buffer,
+                            block_align,
+                        )),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
         let staged = qualification_order_completed_residents(&unresolved, completed)?;
         for (global_id, resident) in staged {
             if cache_reservation.commit(resident.clone()).is_err() {
@@ -6371,9 +6667,20 @@ impl Engine {
         self: &Arc<Self>,
         global_ids: &[u32],
         residents: &mut HashMap<u32, Arc<ExpertResident>>,
+        source_upload: Option<Arc<SourceUploadState>>,
     ) -> Result<(Vec<GpuAdmission>, usize), GpuNativeDemandResidencyError> {
         let gpu = self.execution_context().gpu_expert_cache();
         let mut payloads = HashMap::with_capacity(global_ids.len());
+        let upload = source_upload.clone();
+        let new_ids = if upload.is_some() {
+            global_ids
+                .iter()
+                .copied()
+                .filter(|id| gpu.current_admission(*id).is_none())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for attempt in 1..=GPU_NATIVE_LOGICAL_DEMAND_SET_ATTEMPTS {
             match gpu.demand_admit_set(global_ids, &payloads)? {
                 GpuDemandSetAdmission::Ready {
@@ -6385,6 +6692,19 @@ impl Engine {
                             prom.record_promotions(newly_admitted as u64);
                             prom.set_vram_used_bytes(gpu.used_bytes());
                         }
+                    }
+                    if let Some(upload) = &upload {
+                        if new_ids.len() != newly_admitted {
+                            upload.add(|m| &mut m.accounting_errors, 1);
+                        }
+                        upload.record_logical(
+                            global_ids,
+                            &admissions
+                                .iter()
+                                .map(GpuAdmission::generation)
+                                .collect::<Vec<_>>(),
+                            &new_ids,
+                        );
                     }
                     return Ok((admissions, newly_admitted));
                 }
@@ -6400,15 +6720,61 @@ impl Engine {
                 }
                 GpuDemandSetAdmission::PayloadRequired(missing) => {
                     for global_id in missing {
-                        let resident = self.gpu_native_demand_source(global_id, residents).await?;
-                        payloads.insert(
-                            global_id,
-                            Arc::new(GpuResident::new_with_dtype(
+                        let resident = self
+                            .gpu_native_demand_source(
                                 global_id,
-                                resident.data().to_vec(),
+                                residents,
+                                source_upload.clone(),
+                            )
+                            .await?;
+                        let payload = if let Some(upload) = upload
+                            .as_ref()
+                            .filter(|u| u.arm == SourceUploadArm::Treatment)
+                        {
+                            let shared = if upload.has_pending(global_id) {
+                                resident
+                                    .qualification_shared_payload()
+                                    .expect("fused resident has materialized shared bytes")
+                                    .clone()
+                            } else {
+                                // A RAM-hit readmission performs the same logical
+                                // materialization as production. No NVMe is issued.
+                                let start = Instant::now();
+                                let shared: Arc<[u8]> = Arc::from(resident.data());
+                                upload.add(|m| &mut m.logical_materialization_operations, 1);
+                                upload.add(
+                                    |m| &mut m.logical_materialization_bytes,
+                                    shared.len() as u64,
+                                );
+                                upload.add(
+                                    |m| &mut m.logical_materialization_us,
+                                    qualification_elapsed_us(start),
+                                );
+                                upload.add(|m| &mut m.shared_payload_constructions, 1);
+                                shared
+                            };
+                            GpuResident::new_qualification_shared(
+                                global_id,
+                                shared,
                                 self.core.options.dtype,
-                            )),
-                        );
+                            )
+                        } else {
+                            let start = upload.as_ref().map(|_| Instant::now());
+                            let bytes = resident.data().to_vec();
+                            if let Some(upload) = &upload {
+                                upload.add(|m| &mut m.logical_materialization_operations, 1);
+                                upload.add(
+                                    |m| &mut m.logical_materialization_bytes,
+                                    bytes.len() as u64,
+                                );
+                                upload.add(
+                                    |m| &mut m.logical_materialization_us,
+                                    qualification_elapsed_us(start.unwrap()),
+                                );
+                            }
+                            GpuResident::new_with_dtype(global_id, bytes, self.core.options.dtype)
+                        };
+                        payloads.insert(global_id, Arc::new(payload));
                     }
                 }
             }
@@ -6442,6 +6808,21 @@ impl Engine {
             .cloned()
             .map(QualificationDemandServiceGuard::enter)
             .transpose()?;
+        let production_upload_guard = if qualification.is_none() {
+            self.gpu_native_source_upload_production
+                .as_ref()
+                .and_then(|upload| upload.try_begin_production_demand())
+        } else {
+            None
+        };
+        let source_upload = qualification
+            .as_ref()
+            .and_then(|state| state.source_upload.clone())
+            .or_else(|| {
+                production_upload_guard
+                    .as_ref()
+                    .map(|guard| guard.state().clone())
+            });
         let num_layers = manager.plan().num_layers();
         let experts_per_layer = manager.plan().geometry().num_experts() as u32;
         let mut seen = HashSet::with_capacity(global_ids.len());
@@ -6505,11 +6886,19 @@ impl Engine {
                         manager.record_physical_source_acquisition();
                     }
                 }
-                self.gpu_native_source_physical_missing_set(&physical_missing, &mut residents)
-                    .await?;
+                self.gpu_native_source_physical_missing_set(
+                    &physical_missing,
+                    &mut residents,
+                    source_upload.clone(),
+                )
+                .await?;
                 let logical_admission_started = Instant::now();
                 let (admissions, newly_admitted) = self
-                    .ensure_gpu_native_logical_demand_set(&physical_missing, &mut residents)
+                    .ensure_gpu_native_logical_demand_set(
+                        &physical_missing,
+                        &mut residents,
+                        source_upload.clone(),
+                    )
                     .await?;
                 if let Some(state) = qualification.as_ref() {
                     state.logical_demand_admission_us.fetch_add(
@@ -6576,6 +6965,9 @@ impl Engine {
                         .as_ref()
                         .expect("physical-install concurrency qualification state is present");
                     match arm {
+                        GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadControl | GpuNativePhysicalInstallConcurrencyQualificationArm::SourceToUploadTreatment => {
+                            unreachable!("source/upload arms require their dedicated purpose")
+                        }
                         GpuNativePhysicalInstallConcurrencyQualificationArm::Control => manager
                             .ensure_demand_set_physical_install_concurrency_control(
                                 GpuNativeResidencyPriority::Demand,
@@ -6600,8 +6992,49 @@ impl Engine {
                             ),
                     }
                 }
-                Some(GpuNativeQualificationPurpose::DemandSource(_)) | None => manager
+                Some(GpuNativeQualificationPurpose::SourceToUpload(arm)) => {
+                    let observer = qualification
+                        .as_ref()
+                        .expect("source/upload qualification");
+                    match arm {
+                        SourceUploadArm::Control => manager.ensure_demand_set_production_observed(
+                            GpuNativeResidencyPriority::Demand,
+                            layer_index,
+                            &demands,
+                            observer.as_ref(),
+                        ),
+                        SourceUploadArm::Treatment => {
+                            let upload = source_upload
+                                .as_ref()
+                                .expect("treatment uses production-owned upload state");
+                            manager.ensure_demand_set_source_upload_observed(
+                                GpuNativeResidencyPriority::Demand,
+                                layer_index,
+                                &demands,
+                                upload.as_ref(),
+                                observer.as_ref(),
+                            )
+                        }
+                    }
+                }
+                Some(GpuNativeQualificationPurpose::DemandSource(_)) => manager
                     .ensure_demand_set(GpuNativeResidencyPriority::Demand, layer_index, &demands),
+                None => {
+                    if let Some(upload) = source_upload.as_ref() {
+                        manager.ensure_demand_set_source_upload(
+                            GpuNativeResidencyPriority::Demand,
+                            layer_index,
+                            &demands,
+                            upload.as_ref(),
+                        )
+                    } else {
+                        manager.ensure_demand_set(
+                            GpuNativeResidencyPriority::Demand,
+                            layer_index,
+                            &demands,
+                        )
+                    }
+                }
             };
             if let Some(state) = qualification.as_ref() {
                 state.physical_demand_install_us.fetch_add(
@@ -6610,7 +7043,17 @@ impl Engine {
                 );
             }
             match physical_install_result {
-                Ok(residencies) => return Ok(residencies),
+                Ok(residencies) => {
+                    if let Some(upload) = source_upload.as_ref() {
+                        upload.finish_request().map_err(|source| {
+                            GpuNativeDemandResidencyError::ProductionBatchReadFailedAfterReservation {
+                                global_ids: global_ids.to_vec(),
+                                source,
+                            }
+                        })?;
+                    }
+                    return Ok(residencies);
+                }
                 Err(GpuNativeTieredResidencyError::DemandSourceMissing { global_id: _ })
                     if gpu_native_physical_demand_recovery_allowed(recovery_attempts) =>
                 {
@@ -6636,7 +7079,11 @@ impl Engine {
     /// if the pool is under pressure), issues the read, and either
     /// installs the resident in the cache or surfaces the I/O error
     /// to the retry loop.
-    async fn fetch_once(self: &Arc<Self>, id: u32) -> Result<Arc<ExpertResident>, FetchOnceError> {
+    async fn fetch_once(
+        self: &Arc<Self>,
+        id: u32,
+        source_upload: Option<Arc<SourceUploadState>>,
+    ) -> Result<Arc<ExpertResident>, FetchOnceError> {
         let io_start = Instant::now();
         // Acquire-with-eviction: evict an LRU entry if the cache is at
         // capacity (which releases its `PooledBuffer` on `Arc` drop),
@@ -6663,15 +7110,62 @@ impl Engine {
                 drop(evicted);
             }
         }
-        let mut buf = self.core.pool.acquire().await;
+        let buf = self.core.pool.acquire().await;
         // Tier 4: mark this as a foreground (token-blocking) read for the
         // duration of the device I/O so the governor throttles
         // speculation that would otherwise queue ahead of it. No-op when
         // the governor is disabled.
         let _fg = self.core.governor.foreground_guard();
-        let read_result = self.core.storage.read_expert(id, &mut buf).await;
+        let source_bytes = buf.len();
+        let upload = source_upload.clone();
+        let production_fusion_eligible = upload.as_ref().is_some_and(|state| {
+            state.arm == SourceUploadArm::Treatment
+                && (!state.is_production_owned()
+                    || state.can_fuse_source_set(
+                        &[id],
+                        self.execution_context().gpu_expert_cache(),
+                    ))
+        });
+        if upload.as_ref().is_some_and(|state| {
+            state.arm == SourceUploadArm::Treatment
+                && state.is_production_owned()
+                && !production_fusion_eligible
+        }) {
+            upload
+                .as_ref()
+                .expect("production upload state")
+                .add(|m| &mut m.source_fallback_reads, 1);
+        }
+        let mut ordinary_buffer = Some(buf);
+        let mut fused_resident = None;
+        let read_result = if production_fusion_eligible {
+            let upload = upload.as_ref().expect("eligible upload state");
+            match upload
+                .read_source(
+                    &self.core.storage,
+                    &[id],
+                    vec![ordinary_buffer.take().expect("capacity lease")],
+                    self.execution_context().gpu_expert_cache(),
+                )
+                .await
+            {
+                Ok(mut residents) => {
+                    fused_resident = residents.pop();
+                    Ok(source_bytes)
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            }
+        } else {
+            self.core
+                .storage
+                .read_expert(id, ordinary_buffer.as_mut().expect("production buffer"))
+                .await
+        };
         match read_result {
             Ok(_) => {
+                if let Some(upload) = &upload {
+                    upload.record_nvme(&[id]);
+                }
                 let io_us = io_start.elapsed().as_micros() as u64;
                 let _ = self.metrics.io_hist.lock().record(io_us.max(1));
                 if let Some(qualification) = self.gpu_native_demand_source_qualification() {
@@ -6680,7 +7174,7 @@ impl Engine {
                         .fetch_add(1, Ordering::Relaxed);
                     qualification
                         .source_nvme_bytes
-                        .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                        .fetch_add(source_bytes as u64, Ordering::Relaxed);
                 }
                 // Track every byte the engine actually pulls off the
                 // SSD — including `fetch_with_retry`'s leader path,
@@ -6694,12 +7188,14 @@ impl Engine {
                 self.metrics
                     .counters
                     .bytes_read
-                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
-                let resident = Arc::new(ExpertResident::new_with_block_align(
-                    id,
-                    buf,
-                    self.core.storage.config().block_align,
-                ));
+                    .fetch_add(source_bytes as u64, Ordering::Relaxed);
+                let resident = fused_resident.unwrap_or_else(|| {
+                    Arc::new(ExpertResident::new_with_block_align(
+                        id,
+                        ordinary_buffer.expect("production source buffer"),
+                        self.core.storage.config().block_align,
+                    ))
+                });
                 match self.core.cache.insert(resident.clone()) {
                     Ok(Some(evicted)) => {
                         if let Some(qualification) =
@@ -6736,6 +7232,12 @@ impl Engine {
                 Ok(resident)
             }
             Err(e) => {
+                if let Some(upload) = upload
+                    .as_ref()
+                    .filter(|u| u.arm == SourceUploadArm::Control)
+                {
+                    upload.add(|m| &mut m.source_failures, 1);
+                }
                 // The buffer is returned to the pool when `buf` is dropped.
                 Err(FetchOnceError::Io(e.to_string()))
             }
@@ -9636,7 +10138,7 @@ mod tests {
 
         let mut first_request = HashMap::new();
         let first = engine
-            .gpu_native_demand_source(0, &mut first_request)
+            .gpu_native_demand_source(0, &mut first_request, None)
             .await
             .unwrap();
         let after_nvme = engine.report().bytes_read;
@@ -9644,14 +10146,14 @@ mod tests {
 
         let mut second_request = HashMap::new();
         let ram_hit = engine
-            .gpu_native_demand_source(0, &mut second_request)
+            .gpu_native_demand_source(0, &mut second_request, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first, &ram_hit));
         assert_eq!(engine.report().bytes_read, after_nvme);
 
         let same_request = engine
-            .gpu_native_demand_source(0, &mut second_request)
+            .gpu_native_demand_source(0, &mut second_request, None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&ram_hit, &same_request));
@@ -9786,7 +10288,7 @@ mod tests {
     ) -> Result<HashMap<u32, Arc<ExpertResident>>, GpuNativeDemandResidencyError> {
         let mut residents = HashMap::new();
         engine
-            .gpu_native_source_physical_missing_set(&ids, &mut residents)
+            .gpu_native_source_physical_missing_set(&ids, &mut residents, None)
             .await?;
         Ok(residents)
     }
@@ -9864,7 +10366,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in 0..6 {
             engine
-                .gpu_native_demand_source(id, &mut priming)
+                .gpu_native_demand_source(id, &mut priming, None)
                 .await
                 .unwrap();
         }
@@ -9948,7 +10450,7 @@ mod tests {
         let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 21);
         let mut priming = HashMap::new();
         let retained = engine
-            .gpu_native_demand_source(0, &mut priming)
+            .gpu_native_demand_source(0, &mut priming, None)
             .await
             .unwrap();
         drop(priming);
@@ -9983,7 +10485,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in 0..4 {
             engine
-                .gpu_native_demand_source(id, &mut priming)
+                .gpu_native_demand_source(id, &mut priming, None)
                 .await
                 .unwrap();
         }
@@ -9996,7 +10498,7 @@ mod tests {
             .unwrap();
         let mut residents = HashMap::new();
         let error = engine
-            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents)
+            .gpu_native_source_physical_missing_set(&[4, 5], &mut residents, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -10030,7 +10532,7 @@ mod tests {
         let mut retained = HashMap::new();
         for id in [0, 1] {
             engine
-                .gpu_native_demand_source(id, &mut retained)
+                .gpu_native_demand_source(id, &mut retained, None)
                 .await
                 .unwrap();
         }
@@ -10040,7 +10542,7 @@ mod tests {
         // can be acquired, forcing the post-reservation fail-closed path.
         let mut residents = HashMap::new();
         let error = engine
-            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents)
+            .gpu_native_source_physical_missing_set(&[2, 3], &mut residents, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -10176,7 +10678,7 @@ mod tests {
         let mut priming = HashMap::new();
         for id in [0, 1] {
             engine
-                .gpu_native_demand_source(id, &mut priming)
+                .gpu_native_demand_source(id, &mut priming, None)
                 .await
                 .unwrap();
         }
@@ -13070,6 +13572,92 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn source_upload_production_wiring_is_demand_scoped_and_preserves_qualification_override() {
+        let source = include_str!("engine.rs");
+        let demand = source
+            .split("pub(crate) async fn ensure_gpu_native_demand_residency(")
+            .nth(1)
+            .unwrap()
+            .split("/// One single fetch attempt.")
+            .next()
+            .unwrap();
+        assert!(demand.contains("try_begin_production_demand()"));
+        assert!(demand.contains("ensure_demand_set_source_upload("));
+        assert!(demand.contains("ensure_demand_set_source_upload_observed("));
+        let ordinary_fetch = source
+            .split("pub async fn fetch_with_retry(")
+            .nth(1)
+            .unwrap()
+            .split("async fn gpu_native_demand_source(")
+            .next()
+            .unwrap();
+        assert!(ordinary_fetch.contains("self.fetch_with_retry_inner(id, None).await"));
+        assert!(!ordinary_fetch.contains("gpu_native_source_upload_production.as_ref()"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_upload_ram_hit_never_acquires_an_upload_slot_or_reads_nvme() {
+        let dir = TempDir::new("upload-ram-hit");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 123);
+        let resident = engine.fetch_with_retry(0).await.unwrap();
+        let before = engine.report().bytes_read;
+        let upload = SourceUploadState::cpu_test_state(SourceUploadArm::Treatment);
+        *engine.gpu_native_demand_source_qualification.write() = Some(Arc::new(
+            GpuNativeDemandSourceQualification::new_source_upload(
+                upload.clone(),
+                engine.core.pool.capacity(),
+                0,
+            ),
+        ));
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[0], &mut residents, Some(upload.clone()))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&resident, &residents[&0]));
+        assert_eq!(engine.report().bytes_read, before);
+        assert!(upload.take_lease(0, &resident).unwrap().is_none());
+        let metrics = upload.snapshot().metrics;
+        assert_eq!(metrics.acquisition_attempts, 0);
+        assert_eq!(metrics.direct_source_reads, 0);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_upload_control_keeps_single_read_batch_and_request_order() {
+        let dir = TempDir::new("upload-control");
+        let engine = build_engine(&dir.path, 4, 8, 8, 4, 2, 0, 124);
+        assert!(engine.gpu_native_demand_source_qualification().is_none());
+        let upload = SourceUploadState::cpu_test_state(SourceUploadArm::Control);
+        *engine.gpu_native_demand_source_qualification.write() = Some(Arc::new(
+            GpuNativeDemandSourceQualification::new_source_upload(
+                upload.clone(),
+                engine.core.pool.capacity(),
+                0,
+            ),
+        ));
+        let mut residents = HashMap::new();
+        engine
+            .gpu_native_source_physical_missing_set(&[2, 0], &mut residents, Some(upload.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.report().bytes_read,
+            2 * engine.core.storage.config().expert_size as u64
+        );
+        assert_eq!(
+            engine
+                .production_demand_source_snapshot()
+                .production_batch_successes,
+            1
+        );
+        assert_eq!(upload.snapshot().metrics.leases_created, 0);
+        let expected = SourceUploadState::cpu_test_state(SourceUploadArm::Control);
+        expected.record_nvme(&[2, 0]);
+        assert_eq!(
+            upload.snapshot().ordered_nvme_ids_sha256,
+            expected.snapshot().ordered_nvme_ids_sha256
+        );
     }
 }
 // end mod engine::tests

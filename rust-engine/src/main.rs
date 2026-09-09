@@ -156,6 +156,7 @@ pub(crate) mod gpu_native_router_rank_diagnostics;
 pub(crate) mod gpu_native_semantic_parity_corpus;
 pub(crate) mod gpu_native_semantic_parity_v2;
 pub(crate) mod gpu_native_source_to_upload_copy_elision;
+pub(crate) mod gpu_native_source_upload;
 pub(crate) mod gpu_native_spanish_first_token_attribution;
 pub(crate) mod gpu_native_v2_holdout_failure_attribution;
 
@@ -1027,6 +1028,17 @@ enum Cmd {
     /// ordinary production concurrent complete overwrite with no explicit zero.
     #[command(name = "qualify-gpu-native-physical-zero-fill-production")]
     QualifyGpuNativePhysicalZeroFillProduction {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_adapter_name: String,
+        #[arg(long)]
+        report_out: PathBuf,
+    },
+
+    /// Qualification-only single-read source to mapped-upload real-inference A/B.
+    #[command(name = "qualify-gpu-native-source-to-upload-copy-elision-production")]
+    QualifyGpuNativeSourceToUploadCopyElisionProduction {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -2034,6 +2046,7 @@ fn startup_config_path(cmd: &Cmd) -> Option<&Path> {
         | Cmd::QualifyGpuNativePhysicalInstallStagingProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalInstallConcurrencyProduction { config, .. }
         | Cmd::QualifyGpuNativePhysicalZeroFillProduction { config, .. }
+        | Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction { config, .. }
         | Cmd::QualifyHybridQ4 { config, .. }
         | Cmd::QualifyHybridQ4Parity { config, .. }
         | Cmd::QualifyHybridQ4GreedyParity { config, .. }
@@ -2600,6 +2613,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?;
             rt.block_on(
                 crate::gpu_native_physical_install_staging::zero_fill_production::run_command(
+                    crate::gpu_native_physical_install_staging::CommandArgs {
+                        config,
+                        expected_adapter_name,
+                        report_out,
+                        progress_watchdog,
+                    },
+                ),
+            )
+        }
+        Cmd::QualifyGpuNativeSourceToUploadCopyElisionProduction {
+            config,
+            expected_adapter_name,
+            report_out,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(
+                crate::gpu_native_physical_install_staging::source_to_upload_production::run_command(
                     crate::gpu_native_physical_install_staging::CommandArgs {
                         config,
                         expected_adapter_name,
