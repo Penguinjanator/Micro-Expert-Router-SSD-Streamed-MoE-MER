@@ -4870,6 +4870,7 @@ impl Engine {
         let source_upload = current.source_upload.clone();
         if let Some(upload) = &source_upload {
             upload.reset()?;
+            self.core.storage.reset_source_upload_fd_proof_telemetry();
         }
         *slot = Some(Arc::new(match purpose {
             GpuNativeQualificationPurpose::SourceToUpload(_) => {
@@ -5059,6 +5060,7 @@ impl Engine {
                 upload
             }
         };
+        self.core.storage.reset_source_upload_fd_proof_telemetry();
         *slot = Some(Arc::new(
             GpuNativeDemandSourceQualification::new_source_upload(
                 upload,
@@ -5074,13 +5076,15 @@ impl Engine {
     pub(crate) fn gpu_native_source_upload_snapshot(
         &self,
     ) -> Option<crate::gpu_native_source_upload::Snapshot> {
-        match self.gpu_native_demand_source_qualification() {
+        let mut snapshot = match self.gpu_native_demand_source_qualification() {
             Some(state) => state.source_upload.as_ref().map(|upload| upload.snapshot()),
             None => self
                 .gpu_native_source_upload_production
                 .as_ref()
                 .map(|upload| upload.snapshot()),
-        }
+        }?;
+        snapshot.source_upload_fd_proof = Some(self.core.storage.source_upload_fd_proof_snapshot());
+        Some(snapshot)
     }
 
     pub(crate) fn production_demand_source_snapshot(&self) -> ProductionDemandSourceSnapshot {

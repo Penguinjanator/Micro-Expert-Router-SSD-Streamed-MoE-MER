@@ -14,6 +14,60 @@ const fn qualification_arms() -> (Arm, Arm) {
     (Arm::Control, Arm::Treatment)
 }
 
+/// Additive HMA-1A diagnostic under v2; existing timing, workload and copy
+/// counters retain their meanings. Counters span the same idle-boundary resets.
+#[derive(Clone, Debug, Serialize)]
+struct SourceUploadFdProofGate {
+    diagnostic_version: &'static str,
+    warmup_accounting_exact: bool,
+    measured_accounting_exact: bool,
+    first_use_misses_observed: bool,
+    measured_hits_observed: bool,
+    passed: bool,
+}
+
+fn source_upload_fd_proof_interval_exact(c: &UploadSnapshot, t: &UploadSnapshot) -> bool {
+    let (Some(c), Some(p)) = (&c.source_upload_fd_proof, &t.source_upload_fd_proof) else {
+        return false;
+    };
+    *c == crate::io_provider::SourceUploadFdProofSnapshot::default()
+        && p.source_upload_fd_proof_requests > 0
+        && p.source_upload_fd_proof_hits
+            .checked_add(p.source_upload_fd_proof_misses)
+            == Some(p.source_upload_fd_proof_requests)
+        && p.source_upload_fd_proof_requests == t.metrics.direct_source_reads
+        && p.source_upload_fd_proof_failures == 0
+}
+
+fn source_upload_fd_proof_gate(
+    cw: &UploadSnapshot,
+    tw: &UploadSnapshot,
+    cm: &UploadSnapshot,
+    tm: &UploadSnapshot,
+) -> SourceUploadFdProofGate {
+    let warmup_accounting_exact = source_upload_fd_proof_interval_exact(cw, tw);
+    let measured_accounting_exact = source_upload_fd_proof_interval_exact(cm, tm);
+    let first_use_misses_observed = tw
+        .source_upload_fd_proof
+        .as_ref()
+        .is_some_and(|p| p.source_upload_fd_proof_misses > 0);
+    // fd capacity depends on RLIMIT_NOFILE; caches are kept after warmup.
+    // Full churn can give zero hits, and complete warmup coverage zero measured
+    // misses. Neither is an accounting failure. First use must miss in warmup.
+    let measured_hits_observed = tm
+        .source_upload_fd_proof
+        .as_ref()
+        .is_some_and(|p| p.source_upload_fd_proof_hits > 0);
+    SourceUploadFdProofGate {
+        diagnostic_version: "hma1a.fd-proof.v1",
+        warmup_accounting_exact,
+        measured_accounting_exact,
+        first_use_misses_observed,
+        measured_hits_observed,
+        passed: warmup_accounting_exact && measured_accounting_exact && first_use_misses_observed,
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct PairMechanismGate {
     source_and_route_streams_exact: bool,
@@ -289,6 +343,7 @@ impl std::ops::Deref for UploadArmReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct Gates {
+    source_upload_fd_proof: SourceUploadFdProofGate,
     behavioral: BehavioralGate,
     work_equivalence: WorkEquivalenceGate,
     warmup_mechanism: PairMechanismGate,
@@ -561,7 +616,14 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
             })
         && warmup_mechanism.source_and_route_streams_exact
         && measured_mechanism.source_and_route_streams_exact;
-    let passed = behavioral.passed
+    let source_upload_fd_proof = source_upload_fd_proof_gate(
+        c.warmup_upload.as_ref().unwrap(),
+        t.warmup_upload.as_ref().unwrap(),
+        c.upload.as_ref().unwrap(),
+        t.upload.as_ref().unwrap(),
+    );
+    let passed = source_upload_fd_proof.passed
+        && behavioral.passed
         && work_equivalence.passed
         && warmup_mechanism.passed
         && measured_mechanism.passed
@@ -571,6 +633,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         && physical_installs_reconcile_with_residency
         && source_bytes_and_logical_admissions_reconcile;
     let gates = Gates {
+        source_upload_fd_proof,
         behavioral,
         work_equivalence,
         warmup_mechanism,
@@ -797,6 +860,134 @@ mod tests {
         }
         (s, p, u)
     }
+    #[test]
+    fn source_upload_fd_proof_gate_accepts_churn_and_warm_cache_intervals() {
+        let (_, _, mut c) = fixture(Arm::Control);
+        let (_, _, mut t) = fixture(Arm::Treatment);
+        use crate::io_provider::SourceUploadFdProofSnapshot as Proof;
+        c.source_upload_fd_proof = Some(Proof::default());
+        t.source_upload_fd_proof = Some(Proof {
+            source_upload_fd_proof_requests: 2,
+            source_upload_fd_proof_misses: 2,
+            ..Proof::default()
+        });
+        let churn = source_upload_fd_proof_gate(&c, &t, &c, &t);
+        assert!(churn.passed);
+        assert!(!churn.measured_hits_observed);
+        let mut measured = t.clone();
+        measured.source_upload_fd_proof = Some(Proof {
+            source_upload_fd_proof_requests: 2,
+            source_upload_fd_proof_hits: 2,
+            ..Proof::default()
+        });
+        let warm = source_upload_fd_proof_gate(&c, &t, &c, &measured);
+        assert!(warm.passed);
+        assert!(warm.measured_hits_observed);
+        assert!(!source_upload_fd_proof_gate(&c, &measured, &c, &measured).passed);
+        measured
+            .source_upload_fd_proof
+            .as_mut()
+            .unwrap()
+            .source_upload_fd_proof_hits = 1;
+        measured
+            .source_upload_fd_proof
+            .as_mut()
+            .unwrap()
+            .source_upload_fd_proof_misses = 1;
+        assert!(source_upload_fd_proof_gate(&c, &t, &c, &measured).passed);
+    }
+
+    #[test]
+    fn source_upload_fd_proof_gate_rejects_missing_corrupt_failed_and_control_activity() {
+        use crate::io_provider::SourceUploadFdProofSnapshot as Proof;
+        let (_, _, mut c) = fixture(Arm::Control);
+        let (_, _, mut t) = fixture(Arm::Treatment);
+        c.source_upload_fd_proof = Some(Proof::default());
+        let valid = Proof {
+            source_upload_fd_proof_requests: 2,
+            source_upload_fd_proof_hits: 1,
+            source_upload_fd_proof_misses: 1,
+            source_upload_fd_proof_failures: 0,
+        };
+        t.source_upload_fd_proof = Some(valid.clone());
+        for mutation in [
+            |p: &mut Proof| p.source_upload_fd_proof_requests += 1,
+            |p: &mut Proof| p.source_upload_fd_proof_hits += 1,
+            |p: &mut Proof| p.source_upload_fd_proof_misses += 1,
+            |p: &mut Proof| p.source_upload_fd_proof_failures = 1,
+            |p: &mut Proof| {
+                p.source_upload_fd_proof_hits = u64::MAX;
+                p.source_upload_fd_proof_misses = 3;
+            },
+            |p: &mut Proof| *p = Proof::default(),
+        ] {
+            let mut bad = t.clone();
+            mutation(bad.source_upload_fd_proof.as_mut().unwrap());
+            assert!(!source_upload_fd_proof_gate(&c, &t, &c, &bad).passed);
+            assert!(!source_upload_fd_proof_gate(&c, &bad, &c, &t).passed);
+        }
+        for mutation in [
+            |p: &mut Proof| p.source_upload_fd_proof_requests = 1,
+            |p: &mut Proof| p.source_upload_fd_proof_hits = 1,
+            |p: &mut Proof| p.source_upload_fd_proof_misses = 1,
+            |p: &mut Proof| p.source_upload_fd_proof_failures = 1,
+        ] {
+            let mut bad = c.clone();
+            mutation(bad.source_upload_fd_proof.as_mut().unwrap());
+            assert!(!source_upload_fd_proof_gate(&c, &t, &bad, &t).passed);
+            assert!(!source_upload_fd_proof_gate(&bad, &t, &c, &t).passed);
+        }
+        for arm in [Arm::Control, Arm::Treatment] {
+            let (_, _, missing) = fixture(arm);
+            assert!(!source_upload_fd_proof_gate(&missing, &t, &c, &t).passed);
+            assert!(!source_upload_fd_proof_gate(&c, &missing, &c, &t).passed);
+            assert!(!source_upload_fd_proof_gate(&c, &t, &missing, &t).passed);
+            assert!(!source_upload_fd_proof_gate(&c, &t, &c, &missing).passed);
+        }
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(
+            json["source_upload_fd_proof"]["source_upload_fd_proof_requests"],
+            2
+        );
+    }
+
+    #[test]
+    fn source_upload_fd_proof_engine_samples_and_resets_at_existing_idle_boundaries() {
+        let source = include_str!("engine.rs");
+        let reset = source
+            .split("fn reset_gpu_native_demand_source_qualification(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn")
+            .next()
+            .unwrap();
+        assert!(
+            reset.find("upload.reset()?").unwrap()
+                < reset
+                    .find("reset_source_upload_fd_proof_telemetry()")
+                    .unwrap()
+        );
+        assert!(reset.contains("current.active_demand_set.load"));
+        let enable = source
+            .split("fn enable_gpu_native_source_upload_qualification(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn")
+            .next()
+            .unwrap();
+        assert!(enable.contains("self.core.in_flight.is_empty()"));
+        assert!(enable.contains("reset_source_upload_fd_proof_telemetry()"));
+        let snapshot = source
+            .split("fn gpu_native_source_upload_snapshot(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn")
+            .next()
+            .unwrap();
+        assert!(snapshot.contains("self.core.storage.source_upload_fd_proof_snapshot()"));
+        assert!(!snapshot.contains("reset_source_upload_fd_proof_telemetry()"));
+    }
+
     #[test]
     fn source_upload_pair_accepts_exact_hybrid_copy_accounting_and_extra_submit() {
         let (c, cp, cu) = fixture(Arm::Control);
