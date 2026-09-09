@@ -48,7 +48,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -419,6 +419,42 @@ impl From<HardwareFailure> for io::Error {
 
 // =====================================================================
 
+/// Source-upload proof activity only. Read/reset at an idle qualification boundary;
+/// relaxed atomic loads are not a coherent snapshot while proofs are in flight.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SourceUploadFdProofSnapshot {
+    pub(crate) source_upload_fd_proof_requests: u64,
+    pub(crate) source_upload_fd_proof_hits: u64,
+    pub(crate) source_upload_fd_proof_misses: u64,
+    pub(crate) source_upload_fd_proof_failures: u64,
+}
+
+#[derive(Default)]
+struct SourceUploadFdProofCache {
+    // One weak identity per expert, never an additional owner of an open fd.
+    proven: Mutex<HashMap<u32, Weak<File>>>,
+    requests: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    failures: AtomicU64,
+}
+
+/// Keep the real validation shared with controlled syscall-failure tests.
+#[cfg(any(target_os = "linux", test))]
+fn validate_source_upload_fd(
+    expected_len: u64,
+    direct: impl FnOnce() -> io::Result<bool>,
+    length: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<()> {
+    if !direct()? || length()? != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source/upload source fd must be O_DIRECT and exactly one full expert",
+        ));
+    }
+    Ok(())
+}
+
 pub struct NvmeStorage {
     cfg: StorageConfig,
     /// **Bounded** LRU cache of open expert file descriptors.
@@ -434,6 +470,7 @@ pub struct NvmeStorage {
     /// always safe. Guarded by a [`Mutex`] (not an `RwLock`) because
     /// `LruCache::get` mutates recency order.
     files: Mutex<LruCache<u32, Arc<File>>>,
+    source_upload_fd_proofs: SourceUploadFdProofCache,
     /// Optional multi-drive layout. When non-empty, expert `id` lives at
     /// `extra_paths[id as usize % extra_paths.len()] / expert_<id>.bin`
     /// (with `cfg.base_path` *included* as `extra_paths[0]`). When
@@ -488,6 +525,7 @@ impl NvmeStorage {
                 NonZeroUsize::new(default_fd_cache_cap())
                     .expect("default_fd_cache_cap() is clamped to >= 64"),
             )),
+            source_upload_fd_proofs: SourceUploadFdProofCache::default(),
             striped_paths: Vec::new(),
             manifest: None,
             breakers: RwLock::new(HashMap::new()),
@@ -1239,6 +1277,86 @@ impl NvmeStorage {
         }
     }
 
+    pub(crate) fn source_upload_fd_proof_snapshot(&self) -> SourceUploadFdProofSnapshot {
+        let c = &self.source_upload_fd_proofs;
+        SourceUploadFdProofSnapshot {
+            source_upload_fd_proof_requests: c.requests.load(Ordering::Relaxed),
+            source_upload_fd_proof_hits: c.hits.load(Ordering::Relaxed),
+            source_upload_fd_proof_misses: c.misses.load(Ordering::Relaxed),
+            source_upload_fd_proof_failures: c.failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Caller must ensure no source reads are active. Retain both fd LRU and
+    /// proofs: a warmup-proven live Arc remains proven in the measured interval.
+    pub(crate) fn reset_source_upload_fd_proof_telemetry(&self) {
+        let c = &self.source_upload_fd_proofs;
+        c.requests.store(0, Ordering::Relaxed);
+        c.hits.store(0, Ordering::Relaxed);
+        c.misses.store(0, Ordering::Relaxed);
+        c.failures.store(0, Ordering::Relaxed);
+    }
+
+    fn prove_source_upload_fd(&self, id: u32, file: &Arc<File>) -> io::Result<()> {
+        self.prove_source_upload_fd_with(id, file, |file| {
+            #[cfg(target_os = "linux")]
+            {
+                validate_source_upload_fd(
+                    self.cfg.expert_size as u64,
+                    || {
+                        // SAFETY: the caller owns this live File throughout proof
+                        // and read. F_GETFL has no third argument.
+                        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                        if flags < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(flags & libc::O_DIRECT != 0)
+                    },
+                    || Ok(file.metadata()?.len()),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = file;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "source/upload direct source requires Linux O_DIRECT",
+                ))
+            }
+        })
+    }
+
+    // Production always supplies the real validator above. Tests inject only
+    // the proof operation, so identity/concurrency/accounting use the same path.
+    fn prove_source_upload_fd_with(
+        &self,
+        id: u32,
+        file: &Arc<File>,
+        prove: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let c = &self.source_upload_fd_proofs;
+        c.requests.fetch_add(1, Ordering::Relaxed);
+        let proven = c
+            .proven
+            .lock()
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|proven| Arc::ptr_eq(&proven, file));
+        if proven {
+            c.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        c.misses.fetch_add(1, Ordering::Relaxed);
+        // Neither the proof-cache lock nor the fd-LRU lock spans syscalls.
+        // Concurrent misses may duplicate proofs, but publish only on success.
+        if let Err(error) = prove(file) {
+            c.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        c.proven.lock().insert(id, Arc::downgrade(file));
+        Ok(())
+    }
+
     /// Batched read: fill `bufs[i]` with the bytes of `ids[i]`, all in
     /// one blocking-donation. The two slices must have the same length.
     ///
@@ -1382,33 +1500,9 @@ impl NvmeStorage {
         for &id in ids {
             files.push(self.fd_for(id)?);
         }
-        // Prove O_DIRECT on the actual Arc<File> passed to the retry helper;
-        // cache churn cannot substitute a different fd after this check.
-        for file in &files {
-            #[cfg(target_os = "linux")]
-            {
-                // SAFETY: files owns this live fd; F_GETFL has no third argument.
-                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-                if flags < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if flags & libc::O_DIRECT == 0
-                    || file.metadata()?.len() != self.cfg.expert_size as u64
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "source/upload source fd must be O_DIRECT and exactly one full expert",
-                    ));
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = file;
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "source/upload direct source requires Linux O_DIRECT",
-                ));
-            }
+        // Prove the exact resolved Arc once; retain resolution and error order.
+        for (&id, file) in ids.iter().zip(&files) {
+            self.prove_source_upload_fd(id, file)?;
         }
         let id_vec: Vec<u32> = ids.to_vec();
         tokio::task::block_in_place(|| -> io::Result<usize> {
@@ -3525,5 +3619,277 @@ mod source_to_upload_tests {
         }
         assert!(!treatment.contains("read_expert("));
         assert!(!treatment.contains("spawn_blocking"));
+        assert!(treatment.contains("self.prove_source_upload_fd(id, file)?"));
+        assert!(!treatment.contains("F_GETFL"));
+        assert!(!treatment.contains("metadata()"));
+        assert!(!production.contains("prove_source_upload_fd"));
+    }
+
+    fn proof_counts(s: &NvmeStorage, requests: u64, hits: u64, misses: u64, failures: u64) {
+        assert_eq!(
+            s.source_upload_fd_proof_snapshot(),
+            SourceUploadFdProofSnapshot {
+                source_upload_fd_proof_requests: requests,
+                source_upload_fd_proof_hits: hits,
+                source_upload_fd_proof_misses: misses,
+                source_upload_fd_proof_failures: failures,
+            }
+        );
+        assert_eq!(hits + misses, requests);
+        assert!(failures <= misses);
+    }
+
+    // Portable seam supplies the direct flag only; real File metadata and the
+    // production length validator still run. No production platform fallback.
+    fn portable_proof(file: &File) -> io::Result<()> {
+        validate_source_upload_fd(4096, || Ok(true), || Ok(file.metadata()?.len()))
+    }
+
+    #[test]
+    fn source_upload_fd_proof_first_miss_then_same_arc_hit_without_reproof() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), vec![0; 4096]).unwrap();
+        let s = storage(&path);
+        let first = s.fd_for(17).unwrap();
+        let attempts = AtomicU64::new(0);
+        s.prove_source_upload_fd_with(17, &first, |file| {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            assert!(s.source_upload_fd_proofs.proven.try_lock().is_some());
+            assert!(s.files.try_lock().is_some());
+            portable_proof(file)
+        })
+        .unwrap();
+        proof_counts(&s, 1, 0, 1, 0);
+        let second = s.fd_for(17).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        s.prove_source_upload_fd_with(17, &second, |_| panic!("hit ran real proof"))
+            .unwrap();
+        proof_counts(&s, 2, 1, 1, 0);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        s.reset_source_upload_fd_proof_telemetry();
+        proof_counts(&s, 0, 0, 0, 0);
+        s.prove_source_upload_fd_with(17, &second, |_| panic!("reset discarded proof"))
+            .unwrap();
+        proof_counts(&s, 1, 1, 0, 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_upload_fd_proof_eviction_reopen_rejects_dead_and_live_stale_weak() {
+        let path = directory();
+        for id in [17, 18] {
+            std::fs::write(path.join(format!("expert_{id}.bin")), vec![0; 4096]).unwrap();
+        }
+        let s = storage(&path).with_max_open_files(1);
+        let first = s.fd_for(17).unwrap();
+        s.prove_source_upload_fd_with(17, &first, portable_proof)
+            .unwrap();
+        let old = Arc::downgrade(&first);
+        drop(s.fd_for(18).unwrap());
+        assert_eq!(s.files.lock().len(), 1);
+        drop(first);
+        assert!(old.upgrade().is_none(), "proof must not keep the fd alive");
+        let second = s.fd_for(17).unwrap();
+        s.prove_source_upload_fd_with(17, &second, portable_proof)
+            .unwrap();
+        proof_counts(&s, 2, 0, 2, 0);
+        drop(s.fd_for(18).unwrap());
+        let third = s.fd_for(17).unwrap();
+        assert!(!Arc::ptr_eq(&second, &third));
+        assert!(s.source_upload_fd_proofs.proven.lock()[&17]
+            .upgrade()
+            .is_some());
+        s.prove_source_upload_fd_with(17, &third, portable_proof)
+            .unwrap();
+        proof_counts(&s, 3, 0, 3, 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_upload_fd_proof_wrong_file_sizes_fail_closed_and_are_not_cached() {
+        let path = directory();
+        for len in [4095, 4097, 8192] {
+            std::fs::write(path.join("expert_17.bin"), vec![0; len]).unwrap();
+            let s = storage(&path);
+            let file = s.fd_for(17).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    s.prove_source_upload_fd_with(17, &file, portable_proof)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            proof_counts(&s, 2, 0, 2, 2);
+            assert!(s.source_upload_fd_proofs.proven.lock().is_empty());
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_upload_fd_proof_syscall_failures_and_missing_direct_are_not_cached() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), vec![0; 4096]).unwrap();
+        let s = storage(&path);
+        let file = s.fd_for(17).unwrap();
+        for case in 0..3 {
+            let error = s
+                .prove_source_upload_fd_with(17, &file, |_| {
+                    validate_source_upload_fd(
+                        4096,
+                        || match case {
+                            0 => Err(io::Error::from_raw_os_error(libc::EBADF)),
+                            1 => Ok(false),
+                            _ => Ok(true),
+                        },
+                        || {
+                            assert_eq!(case, 2, "failed F_GETFL/direct check must short circuit");
+                            Err(io::Error::from_raw_os_error(libc::EIO))
+                        },
+                    )
+                })
+                .unwrap_err();
+            match case {
+                0 => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+                1 => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+                _ => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+            }
+        }
+        proof_counts(&s, 3, 0, 3, 3);
+        assert!(s.source_upload_fd_proofs.proven.lock().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_upload_fd_proof_real_buffered_fd_is_rejected_on_every_platform() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), vec![0; 4096]).unwrap();
+        let s = storage(&path);
+        let file = s.fd_for(17).unwrap();
+        let error = s.prove_source_upload_fd(17, &file).unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        proof_counts(&s, 1, 0, 1, 1);
+        assert!(s.source_upload_fd_proofs.proven.lock().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_upload_fd_proof_ordinary_batch_has_zero_activity() {
+        let path = directory();
+        for id in [17, 18] {
+            std::fs::write(path.join(format!("expert_{id}.bin")), vec![id as u8; 4096]).unwrap();
+        }
+        let s = storage(&path);
+        let pool = BufferPool::new(2, 4096, 4096);
+        let mut a = pool.try_acquire().unwrap();
+        let mut b = pool.try_acquire().unwrap();
+        assert_eq!(
+            s.read_experts_batch(&[17], &mut [&mut a]).await.unwrap(),
+            4096
+        );
+        assert_eq!(
+            s.read_experts_batch(&[18, 17], &mut [&mut a, &mut b])
+                .await
+                .unwrap(),
+            8192
+        );
+        assert!(a.as_slice().iter().all(|v| *v == 18));
+        assert!(b.as_slice().iter().all(|v| *v == 17));
+        proof_counts(&s, 0, 0, 0, 0);
+        assert!(s.source_upload_fd_proofs.proven.lock().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn source_upload_fd_proof_concurrent_first_use_publishes_only_success() {
+        let path = directory();
+        std::fs::write(path.join("expert_17.bin"), vec![0; 4096]).unwrap();
+        for succeed in [false, true] {
+            let s = storage(&path);
+            let file = s.fd_for(17).unwrap();
+            let barrier = std::sync::Barrier::new(4);
+            let attempts = AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            s.prove_source_upload_fd_with(17, &file, |file| {
+                                attempts.fetch_add(1, Ordering::Relaxed);
+                                // All four must reach proof, with neither cache lock held,
+                                // before any may publish; no sleeps or scheduling guesses.
+                                barrier.wait();
+                                if succeed {
+                                    portable_proof(file)
+                                } else {
+                                    Err(io::Error::other("proof failed"))
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    assert_eq!(handle.join().unwrap().is_ok(), succeed);
+                }
+            });
+            assert_eq!(attempts.load(Ordering::Relaxed), 4);
+            proof_counts(&s, 4, 0, 4, if succeed { 0 } else { 4 });
+            assert_eq!(s.source_upload_fd_proofs.proven.lock().is_empty(), !succeed);
+            if succeed {
+                s.prove_source_upload_fd_with(17, &file, |_| panic!("completed proof missing"))
+                    .unwrap();
+                proof_counts(&s, 5, 1, 4, 0);
+            }
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_upload_fd_proof_real_direct_batch_miss_hit_and_wrong_size() {
+        let path = directory();
+        let full = 2_658_304;
+        std::fs::write(path.join("expert_17.bin"), vec![17; full]).unwrap();
+        let s = NvmeStorage::new(StorageConfig {
+            base_path: path.clone(),
+            expert_size: full,
+            block_align: 4096,
+            use_direct_io: true,
+            num_experts_per_layer: None,
+        })
+        .unwrap();
+        if let Err(error) = s.fd_for(17) {
+            if error.kind() == io::ErrorKind::InvalidInput
+                || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+            {
+                eprintln!("O_DIRECT unavailable on test filesystem: {error}; portable proof seam covers identity and failures");
+                std::fs::remove_dir_all(path).unwrap();
+                return;
+            }
+            panic!("unexpected direct open failure: {error}");
+        }
+        let mut destination = AlignedBuffer::new(full, 4096);
+        for _ in 0..2 {
+            assert_eq!(
+                s.read_experts_batch_into_aligned_slices(&[17], &mut [destination.as_mut_slice()])
+                    .await
+                    .unwrap(),
+                full
+            );
+            assert!(destination.as_slice().iter().all(|v| *v == 17));
+        }
+        proof_counts(&s, 2, 1, 1, 0);
+        std::fs::write(path.join("expert_18.bin"), vec![0; full + 4096]).unwrap();
+        assert_eq!(
+            s.read_experts_batch_into_aligned_slices(&[18], &mut [destination.as_mut_slice()])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        proof_counts(&s, 3, 1, 2, 1);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

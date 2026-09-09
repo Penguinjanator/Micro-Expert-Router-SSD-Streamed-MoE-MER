@@ -93,6 +93,8 @@ impl Metrics {
 }
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Snapshot {
+    /// Additive diagnostic, sampled from storage at the idle engine boundary.
+    pub(crate) source_upload_fd_proof: Option<crate::io_provider::SourceUploadFdProofSnapshot>,
     pub(crate) arm: Arm,
     pub(crate) production_owned: bool,
     pub(crate) ring_capacity: usize,
@@ -292,6 +294,7 @@ impl State {
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
+            source_upload_fd_proof: None,
             arm: self.arm,
             production_owned: self.production_owned,
             ring_capacity: self.ring.as_ref().map_or(0, |r| r.slots.len()),

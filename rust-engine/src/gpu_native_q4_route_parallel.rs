@@ -1122,7 +1122,7 @@ mod tests {
         for (source, expected) in [
             (
                 include_str!("engine.rs"),
-                "7814eb2d76f4f0425ce78fbeadbf5cd4581488fcdab3011eb0f4aad5c48b5083",
+                "dd51bbad5d85a06950a1d8c82d7e43aff3d0231c128dcd7e09e0addff8134d8c",
             ),
             (
                 include_str!("gpu_native_residency.rs"),
