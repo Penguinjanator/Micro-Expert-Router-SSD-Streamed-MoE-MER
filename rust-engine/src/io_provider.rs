@@ -1351,10 +1351,10 @@ impl NvmeStorage {
         Ok(total)
     }
 
-    /// Qualification-only external destinations, with the production per-file
-    /// scheduler: resolve every fd, one blocking donation, scoped OS threads,
-    /// existing per-expert retries, and errors collected in original slot order.
-    /// There is no packed, buffered, or allocation fallback.
+    /// Source/upload external destinations with the production per-file scheduler:
+    /// resolve every fd, one blocking donation, scoped OS threads, existing
+    /// per-expert retries, and errors collected in original slot order. There is
+    /// no packed, buffered, or allocation fallback.
     pub(crate) async fn read_experts_batch_into_aligned_slices(
         &self,
         ids: &[u32],
@@ -1372,7 +1372,7 @@ impl NvmeStorage {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "qualification requires unpacked full-file 4096-aligned external destinations",
+                "source/upload requires unpacked full-file 4096-aligned external destinations",
             ));
         }
         if ids.is_empty() {
@@ -1397,7 +1397,7 @@ impl NvmeStorage {
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "qualification source fd must be O_DIRECT and exactly one full expert",
+                        "source/upload source fd must be O_DIRECT and exactly one full expert",
                     ));
                 }
             }
@@ -1406,7 +1406,7 @@ impl NvmeStorage {
                 let _ = file;
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "qualification direct source requires Linux O_DIRECT",
+                    "source/upload direct source requires Linux O_DIRECT",
                 ));
             }
         }

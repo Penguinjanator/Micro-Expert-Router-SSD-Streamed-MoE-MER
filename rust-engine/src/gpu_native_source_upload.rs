@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const FULL: usize = 2_658_304;
 pub(crate) const PAYLOAD: usize = 2_654_208;
@@ -93,6 +94,7 @@ impl Metrics {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Snapshot {
     pub(crate) arm: Arm,
+    pub(crate) production_owned: bool,
     pub(crate) ring_capacity: usize,
     pub(crate) active_leases: usize,
     pub(crate) pending_leases: usize,
@@ -141,6 +143,8 @@ struct Ring {
 
 pub(crate) struct State {
     pub(crate) arm: Arm,
+    production_owned: bool,
+    production_demand_gate: Arc<Semaphore>,
     ring: Option<Ring>,
     pub(crate) metrics: Mutex<Metrics>,
     pending: Mutex<HashMap<u32, Lease>>,
@@ -148,17 +152,54 @@ pub(crate) struct State {
     logical_ids: Mutex<Sha256>,
     generations: Mutex<Sha256>,
 }
+
+pub(crate) struct ProductionDemandGuard {
+    state: Arc<State>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ProductionDemandGuard {
+    pub(crate) fn state(&self) -> &Arc<State> {
+        &self.state
+    }
+}
+
+impl Drop for ProductionDemandGuard {
+    fn drop(&mut self) {
+        // This guard is the sole production owner of the ring while alive, so
+        // request failure/cancellation can safely clear its pending source leases.
+        self.state.abandon_pending();
+    }
+}
+
 impl State {
     pub(crate) fn new(
         arm: Arm,
         executor: Arc<GpuNativeExecutorContext>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_ownership(arm, executor, false)
+    }
+
+    pub(crate) fn new_production(
+        executor: Arc<GpuNativeExecutorContext>,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_ownership(Arm::Treatment, executor, true)
+    }
+
+    fn new_with_ownership(
+        arm: Arm,
+        executor: Arc<GpuNativeExecutorContext>,
+        production_owned: bool,
+    ) -> Result<Arc<Self>, String> {
+        if production_owned && arm != Arm::Treatment {
+            return Err("production source/upload state must use the treatment mechanism".into());
+        }
         let ring = if arm == Arm::Treatment {
             let gpu = executor.authoritative_gpu().map_err(|e| e.to_string())?;
             let slots = (0..CAPACITY)
                 .map(|_| Slot {
                     buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("qualification source-to-upload bounded slot"),
+                        label: Some("source-to-upload bounded slot"),
                         size: UPLOAD_BYTES as u64,
                         usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
                         mapped_at_creation: false,
@@ -173,6 +214,8 @@ impl State {
         };
         Ok(Arc::new(Self {
             arm,
+            production_owned,
+            production_demand_gate: Arc::new(Semaphore::new(1)),
             ring,
             metrics: Mutex::new(Metrics::default()),
             pending: Mutex::new(HashMap::new()),
@@ -181,10 +224,23 @@ impl State {
             generations: Mutex::new(Sha256::new()),
         }))
     }
+
     #[cfg(test)]
     pub(crate) fn cpu_test_state(arm: Arm) -> Arc<Self> {
+        Self::cpu_test_state_with_ownership(arm, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpu_test_production_state() -> Arc<Self> {
+        Self::cpu_test_state_with_ownership(Arm::Treatment, true)
+    }
+
+    #[cfg(test)]
+    fn cpu_test_state_with_ownership(arm: Arm, production_owned: bool) -> Arc<Self> {
         Arc::new(Self {
             arm,
+            production_owned,
+            production_demand_gate: Arc::new(Semaphore::new(1)),
             ring: None,
             metrics: Mutex::new(Metrics::default()),
             pending: Mutex::new(HashMap::new()),
@@ -194,12 +250,50 @@ impl State {
         })
     }
 
+    pub(crate) fn is_production_owned(&self) -> bool {
+        self.production_owned
+    }
+
+    pub(crate) fn try_begin_production_demand(
+        self: &Arc<Self>,
+    ) -> Option<ProductionDemandGuard> {
+        if !self.production_owned || self.arm != Arm::Treatment {
+            return None;
+        }
+        let permit = self
+            .production_demand_gate
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        Some(ProductionDemandGuard {
+            state: self.clone(),
+            _permit: permit,
+        })
+    }
+
+    pub(crate) fn can_fuse_source_set(
+        &self,
+        ids: &[u32],
+        logical: &GpuExpertCache,
+    ) -> bool {
+        self.arm == Arm::Treatment
+            && !ids.is_empty()
+            && ids.len() <= CAPACITY
+            && !ids.iter().any(|id| self.pending.lock().contains_key(id))
+            && ids.iter().all(|id| {
+                logical
+                    .current_admission(*id)
+                    .is_none_or(|a| a.resident().qualification_shared_payload().is_some())
+            })
+    }
+
     pub(crate) fn add(&self, field: fn(&mut Metrics) -> &mut u64, n: u64) {
         self.metrics.lock().add(field, n);
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
             arm: self.arm,
+            production_owned: self.production_owned,
             ring_capacity: self.ring.as_ref().map_or(0, |r| r.slots.len()),
             active_leases: self.active_leases(),
             pending_leases: self.pending.lock().len(),
@@ -224,8 +318,11 @@ impl State {
         })
     }
     pub(crate) fn reset(&self) -> Result<(), String> {
-        if self.active_leases() != 0 || !self.pending.lock().is_empty() {
-            return Err("cannot reset upload evidence with outstanding leases".into());
+        if self.active_leases() != 0
+            || !self.pending.lock().is_empty()
+            || (self.production_owned && self.production_demand_gate.available_permits() != 1)
+        {
+            return Err("cannot reset upload evidence with outstanding leases or production demand".into());
         }
         *self.metrics.lock() = Metrics::default();
         *self.nvme_ids.lock() = Sha256::new();
@@ -832,6 +929,23 @@ mod tests {
         assert_eq!(state.snapshot().metrics.leases_created, 0);
         assert_eq!(state.snapshot().metrics.direct_source_reads, 0);
     }
+
+    #[test]
+    fn source_upload_production_demand_gate_is_exclusive_and_owned() {
+        let state = State::cpu_test_production_state();
+        assert!(state.snapshot().production_owned);
+        let guard = state
+            .try_begin_production_demand()
+            .expect("first production demand owns the upload ring");
+        assert!(state.try_begin_production_demand().is_none());
+        drop(guard);
+        assert!(state.try_begin_production_demand().is_some());
+
+        let control = State::cpu_test_state(Arm::Control);
+        assert!(!control.snapshot().production_owned);
+        assert!(control.try_begin_production_demand().is_none());
+    }
+
     #[test]
     fn source_upload_counter_overflow_is_a_visible_accounting_error() {
         let mut metrics = Metrics::default();

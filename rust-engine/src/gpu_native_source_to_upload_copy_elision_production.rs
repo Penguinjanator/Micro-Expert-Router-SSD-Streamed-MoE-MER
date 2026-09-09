@@ -3,7 +3,7 @@
 use super::*;
 use crate::engine::GpuNativePhysicalInstallConcurrencyQualificationSnapshot as Snapshot;
 
-pub(crate) const SCHEMA: &str = "mer.gpu-native-source-to-upload-copy-elision-production.v1";
+pub(crate) const SCHEMA: &str = "mer.gpu-native-source-to-upload-copy-elision-production.v2";
 pub(crate) const MODE: &str = "qualify-gpu-native-source-to-upload-copy-elision-production";
 const LOGICAL_EXPERT_BYTES: u64 = 2_654_208;
 const SLOT_STRIDE_BYTES: u64 = 2_654_212;
@@ -24,6 +24,7 @@ struct PairMechanismGate {
     treatment_fused_and_fallback_bytes_exact: bool,
     treatment_every_nvme_read_fused: bool,
     ring_and_submission_accounting_exact: bool,
+    production_upload_ownership_exact: bool,
     failures_and_accounting_errors_zero: bool,
     production_install_reconciliation: bool,
     passed: bool,
@@ -237,6 +238,7 @@ fn pair_mechanism_gate(
         && tm.direct_source_reads.checked_mul(PAYLOAD as u64) == Some(tm.direct_payload_bytes)
         && tm.odirect_observations == tm.direct_source_reads;
     let ring_and_submission_accounting_exact = ring_exact(cu, tu);
+    let production_upload_ownership_exact = !cu.production_owned && tu.production_owned;
     let failures_and_accounting_errors_zero = upload_errors_zero(cu)
         && upload_errors_zero(tu)
         && zero_fill_production::failures_zero(c)
@@ -252,6 +254,7 @@ fn pair_mechanism_gate(
         && treatment_fused_and_fallback_bytes_exact
         && treatment_every_nvme_read_fused
         && ring_and_submission_accounting_exact
+        && production_upload_ownership_exact
         && failures_and_accounting_errors_zero
         && production_install_reconciliation;
     PairMechanismGate {
@@ -263,6 +266,7 @@ fn pair_mechanism_gate(
         treatment_fused_and_fallback_bytes_exact,
         treatment_every_nvme_read_fused,
         ring_and_submission_accounting_exact,
+        production_upload_ownership_exact,
         failures_and_accounting_errors_zero,
         production_install_reconciliation,
         passed,
@@ -388,7 +392,7 @@ pub(crate) async fn run_command(args: CommandArgs) -> Result<(), Box<dyn std::er
         treatment: None,
         control_path: "ordinary production source and concurrent no-zero Queue::write_buffer_with",
         treatment_path:
-            "single-read NVMe to bounded mapped upload; shared logical/RAM payload; GPU-copy fused misses; ordinary RAM-hit physical fallback",
+            "ordinary production-owned single-read NVMe to bounded mapped upload; shared logical/RAM payload; GPU-copy fused misses; ordinary RAM-hit physical fallback",
         both_arms_same_reservation_and_commit: true,
         source_scheduler_changed: false,
         staging_byte_count_changed: false,
@@ -750,7 +754,11 @@ mod tests {
         s.source_nvme_bytes = 2 * FULL as u64;
         s.source_ram_misses = 2;
         s.source_ram_hits = 1;
-        let mut u = crate::gpu_native_source_upload::State::cpu_test_state(arm).snapshot();
+        let mut u = if arm == Arm::Treatment {
+            crate::gpu_native_source_upload::State::cpu_test_production_state().snapshot()
+        } else {
+            crate::gpu_native_source_upload::State::cpu_test_state(arm).snapshot()
+        };
         let m = &mut u.metrics;
         m.logical_admissions = 2;
         m.logical_generation_observations = 3;
@@ -848,6 +856,7 @@ mod tests {
             |s| s.active_leases = 1,
             |s| s.pending_leases = 1,
             |s| s.ring_capacity = 17,
+            |s| s.production_owned = false,
             |s| s.arm = Arm::Control,
         ];
         for (i, mutate) in mutations.iter().enumerate() {
@@ -945,7 +954,7 @@ mod tests {
         assert!(crate::Cli::try_parse_from(invalid).is_err());
         assert_eq!(
             SCHEMA,
-            "mer.gpu-native-source-to-upload-copy-elision-production.v1"
+            "mer.gpu-native-source-to-upload-copy-elision-production.v2"
         );
         assert_eq!(
             (
